@@ -1,10 +1,23 @@
 # Synto
 
-Synto is a knowledge compiler. Point it at any source of expertise and it produces a portable pack any AI agent can install and query.
+<p align="center">
+     <a href="https://github.com/kytmanov/synto/commits/master"><img alt="GitHub last commit" src="https://img.shields.io/github/last-commit/kytmanov/obsidian-llm-wiki-local?style=flat"></a> 
+     <a href="https://github.com/kytmanov/synto/actions/workflows/ci.yml"><img alt="CI status" src="https://img.shields.io/github/actions/workflow/status/kytmanov/synto/ci.yml?style=flat&amp;label=CI"></a> 
+     <a href="https://pypi.org/project/synto/"><img alt="PyPI version" src="https://img.shields.io/pypi/v/synto?style=flat"></a>
+</p>
+
+**Turn your raw notes into a self-improving, interlinked wiki — powered by a local LLM.**
+
+Synto is a knowledge compiler. Point it at any source of expertise and it produces a portable wiki pack any AI agent can install and query.
+
 
 **Local-first, provider-flexible.** Runs 100% locally with Ollama or LM Studio. Switch to a cloud provider — Groq, OpenRouter, Mistral — when you need more power. Your notes and source material never leave your machine unless you choose.
 
 Synto succeeds [obsidian-llm-wiki-local](https://github.com/kytmanov/obsidian-llm-wiki-local) (608 ★, 9k+ downloads) — same proven local pipeline, redesigned for distributable knowledge packs.
+
+<p align=center>
+<img width="341" height="463" alt="image" src="https://github.com/user-attachments/assets/b3e13203-bb4a-42a4-a16d-0d4d93404f71" />
+</p>
 
 ---
 
@@ -96,7 +109,7 @@ Any file-aware agent can read the articles directly. `INDEX.json` enables fast c
 
 ---
 
-## What ships now (Phase 1A)
+## What ships now
 
 - Full ingest → compile → approve pipeline; currently supports Markdown notes and Obsidian vaults
 - `synto pack export --target agents` — portable knowledge pack with INDEX.json and agent metadata
