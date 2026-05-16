@@ -1,0 +1,12 @@
+{
+  "articles": [
+    {
+      "title": "Quantum Entanglement",
+      "action": "create",
+      "path": "quantum-entanglement.md",
+      "reasoning": "Core concept present in multiple sources",
+      "source_paths": ["raw/note1.md"]
+    }
+  ],
+  "mocs_to_update": ["MOC-Physics.md"]
+}

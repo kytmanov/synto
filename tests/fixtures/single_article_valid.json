@@ -1,0 +1,5 @@
+{
+  "title": "Quantum Entanglement",
+  "content": "## Overview\n\nQuantum entanglement is a phenomenon where two particles become correlated such that the quantum state of each cannot be described independently.\n\n## Key Properties\n\n- Non-local correlations\n- Cannot be used for faster-than-light communication\n- Foundation of [[Quantum Computing Basics]]\n\n## Applications\n\nUsed in quantum key distribution and quantum teleportation.",
+  "tags": ["quantum-physics", "entanglement", "quantum-computing"]
+}

@@ -1,0 +1,118 @@
+"""Tests for OllamaClient._last_stats capture."""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock, patch
+
+import httpx
+import pytest
+
+from synto.ollama_client import OllamaClient, OllamaError
+from synto.openai_compat_client import LLMTruncatedError
+
+
+def _make_client() -> OllamaClient:
+    return OllamaClient(base_url="http://localhost:11434", timeout=5.0)
+
+
+def test_generate_captures_last_stats_on_success():
+    """`_last_stats` populated with latency + prompt_eval_count/eval_count."""
+    client = _make_client()
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.raise_for_status.return_value = None
+    mock_resp.json.return_value = {
+        "response": "hello",
+        "prompt_eval_count": 77,
+        "eval_count": 22,
+    }
+    with patch.object(client._client, "post", return_value=mock_resp):
+        result = client.generate(prompt="hi", model="gemma4:e4b")
+    assert result == "hello"
+    assert client._last_stats["prompt_tokens"] == 77
+    assert client._last_stats["completion_tokens"] == 22
+    assert client._last_stats["latency_ms"] >= 0
+
+
+def test_generate_last_stats_on_connect_error():
+    client = _make_client()
+    with patch.object(client._client, "post", side_effect=httpx.ConnectError("refused")):
+        with pytest.raises(OllamaError):
+            client.generate(prompt="hi", model="gemma4:e4b")
+    assert "latency_ms" in client._last_stats
+    assert "prompt_tokens" not in client._last_stats
+
+
+def test_generate_last_stats_missing_token_fields():
+    """Ollama response missing eval counts → tokens = None."""
+    client = _make_client()
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.raise_for_status.return_value = None
+    mock_resp.json.return_value = {"response": "x"}
+    with patch.object(client._client, "post", return_value=mock_resp):
+        client.generate(prompt="hi", model="gemma4:e4b")
+    assert client._last_stats["prompt_tokens"] is None
+    assert client._last_stats["completion_tokens"] is None
+
+
+def test_generate_raises_truncated_on_done_reason_length():
+    """done_reason='length' → LLMTruncatedError with the cap echoed back."""
+    client = _make_client()
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.raise_for_status.return_value = None
+    mock_resp.json.return_value = {
+        "response": "incomplete...",
+        "done_reason": "length",
+        "eval_count": 4096,
+    }
+    with patch.object(client._client, "post", return_value=mock_resp):
+        with pytest.raises(LLMTruncatedError) as exc_info:
+            client.generate(prompt="hi", model="gemma4:e4b", num_predict=4096)
+    err = exc_info.value
+    assert err.max_tokens == 4096
+    assert err.finish_reason == "length"
+    assert "article_max_tokens" in str(err)
+
+
+def test_generate_raises_truncated_on_empty_response():
+    """Empty response with no done_reason → LLMTruncatedError (defensive: catches
+    providers that silently return empty body when capped)."""
+    client = _make_client()
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.raise_for_status.return_value = None
+    mock_resp.json.return_value = {"response": ""}
+    with patch.object(client._client, "post", return_value=mock_resp):
+        with pytest.raises(LLMTruncatedError):
+            client.generate(prompt="hi", model="gemma4:e4b", num_predict=2048)
+
+
+def test_generate_returns_normally_on_done_reason_stop():
+    """done_reason='stop' is the success case — return content unchanged."""
+    client = _make_client()
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.raise_for_status.return_value = None
+    mock_resp.json.return_value = {"response": "complete answer", "done_reason": "stop"}
+    with patch.object(client._client, "post", return_value=mock_resp):
+        result = client.generate(prompt="hi", model="gemma4:e4b", num_predict=4096)
+    assert result == "complete answer"
+
+
+def test_generate_sets_temperature_option_when_provided():
+    client = _make_client()
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.raise_for_status.return_value = None
+    mock_resp.json.return_value = {"response": "hello", "done_reason": "stop"}
+    captured = {}
+
+    def fake_post(url, json=None, **kw):
+        captured["payload"] = json
+        return mock_resp
+
+    with patch.object(client._client, "post", side_effect=fake_post):
+        client.generate(prompt="hi", model="gemma4:e4b", temperature=0)
+    assert captured["payload"]["options"]["temperature"] == 0

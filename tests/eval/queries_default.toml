@@ -1,0 +1,29 @@
+[[query]]
+id = "concept-direct"
+question = "What is API testing?"
+expected_concepts = ["API Testing"]
+expected_contains = ["API"]
+
+[[query]]
+id = "concept-related"
+question = "What is response validation?"
+expected_concepts = ["Response Validation"]
+expected_contains = ["validation"]
+
+[[query]]
+id = "agile"
+question = "What is scrum?"
+expected_concepts = ["Scrum"]
+expected_contains = ["agile"]
+
+[[query]]
+id = "multi-concept"
+question = "How are astrology and precession related?"
+expected_concepts = ["Astrology", "Precession of the Equinoxes"]
+expected_contains = []
+
+[[query]]
+id = "absence"
+question = "What is the airspeed velocity of an unladen swallow?"
+expected_concepts = []
+expected_contains = []

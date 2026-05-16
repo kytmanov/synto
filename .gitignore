@@ -1,0 +1,32 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+.env
+*.log
+
+# Vault artifacts (not part of the tool itself)
+.chroma/
+*.db
+.olw-compare/
+
+# Test artifacts
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Claude Code local settings (user-specific, never commit)
+.claude/
+
+# Ruff cache
+.ruff_cache/
+
+# Local planning/review artifacts
+CONTEXT.md
+REQUIREMENTS.md
+IMPLEMENTATION_PLAN.md
+IMPLEMENTAION_PLAN.md
+REVIEW.md
