@@ -4,6 +4,8 @@
      <a href="https://github.com/kytmanov/synto/commits/master"><img alt="GitHub last commit" src="https://img.shields.io/github/last-commit/kytmanov/synto?style=flat"></a> 
      <a href="https://github.com/kytmanov/synto/actions/workflows/ci.yml"><img alt="CI status" src="https://img.shields.io/github/actions/workflow/status/kytmanov/synto/ci.yml?style=flat&amp;label=CI"></a> 
      <a href="https://pypi.org/project/synto/"><img alt="PyPI version" src="https://img.shields.io/pypi/v/synto?style=flat"></a>
+     <a href="https://tip.md/kytmanov"><img alt="Tip in Crypto" src="https://tip.md/badge.svg"></a>
+     <a href="https://buymeacoffee.com/kytmanov"><img alt="Buy Me A Coffee" src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-%E2%98%95-yellow?style=flat&logo=buymeacoffee&logoColor=white"></a>
 </p>
 
 **Turn your raw notes into a self-improving, interlinked wiki — powered by a local LLM.**
