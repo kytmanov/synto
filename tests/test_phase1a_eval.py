@@ -58,8 +58,8 @@ def test_eval_empty_vault_is_deterministic(tmp_path: Path) -> None:
     assert first == second
     assert first.article_coverage == 0.0
     assert first.term_recall is None
-    assert first.index_json_validity == 0.0
-    assert first.details["index_json_validity"] == {"reason": "missing"}
+    assert first.index_json_validity is None
+    assert first.details["index_json_validity"] == {"reason": "missing", "skipped": True}
     assert first.wikilink_resolution == 1.0
     assert first.harmonic_mean == 0.0
 
@@ -67,9 +67,27 @@ def test_eval_empty_vault_is_deterministic(tmp_path: Path) -> None:
 def test_eval_missing_index_json_returns_missing(tmp_path: Path) -> None:
     config = _init_eval_vault(tmp_path)
     result = run_offline(config, _write_query_fixture(tmp_path / "queries.toml"))
-    assert result.index_json_validity == 0.0
-    assert result.details["index_json_validity"] == {"reason": "missing"}
+    assert result.index_json_validity is None
+    assert result.details["index_json_validity"] == {"reason": "missing", "skipped": True}
     assert not (config.synto_dir / "INDEX.json").exists()
+
+
+def test_eval_render_text_shows_missing_index_as_na(tmp_path: Path) -> None:
+    config = _init_eval_vault(tmp_path)
+    result = CliRunner().invoke(
+        cli,
+        ["eval", "--vault", str(config.vault), "--queries", str(_write_query_fixture(tmp_path / "q.toml"))],
+    )
+    assert result.exit_code == 0
+    assert "INDEX.json validity: n/a" in result.output
+
+
+def test_eval_invalid_index_json_returns_zero(tmp_path: Path) -> None:
+    config = _init_eval_vault(tmp_path)
+    (config.synto_dir / "INDEX.json").write_text("{broken", encoding="utf-8")
+    result = run_offline(config, _write_query_fixture(tmp_path / "queries.toml"))
+    assert result.index_json_validity == 0.0
+    assert result.details["index_json_validity"] == {"reason": "invalid_json"}
 
 
 def test_eval_broken_wikilinks_reduce_resolution(tmp_path: Path, db) -> None:

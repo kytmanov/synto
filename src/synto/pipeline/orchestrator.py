@@ -199,6 +199,8 @@ class PipelineOrchestrator:
             report.held_back = len(draft_paths) - len(published)
             generate_index(config, db)
             append_log(config, f"run | {report.published} articles published")
+            lint_result = run_lint(config, db)
+            report.lint_issues = len(lint_result.issues)
 
         # ── Commit ─────────────────────────────────────────────────────────────
         if config.pipeline.auto_commit and not dry_run and (report.compiled or report.published):

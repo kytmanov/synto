@@ -2490,7 +2490,10 @@ def maintain(vault_str, fix, stubs_only, dry_run):
         result = run_lint(config, db, fix=fix and not dry_run)
         score = result.health_score
         colour = "green" if score >= 80 else "yellow" if score >= 50 else "red"
-        console.print(f"\n[bold {colour}]Health: {score}/100[/bold {colour}]  {result.summary}")
+        headline = f"[bold {colour}]Structural health: {score}/100[/bold {colour}]"
+        if result.advisory_issue_count:
+            headline += f"  [dim]({result.advisory_issue_count} advisory issue(s))[/dim]"
+        console.print(f"\n{headline}  {result.summary}")
 
         if result.issues:
             console.print()

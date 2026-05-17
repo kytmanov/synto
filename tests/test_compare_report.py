@@ -35,7 +35,7 @@ def _report() -> CompareReport:
             heavy_model="h1",
             provider_name="ollama",
             provider_url="http://localhost:11434",
-            diagnostics={"lint_health": 90.0, "link_health": 0.8},
+            diagnostics={"lint_health": 90.0, "link_health": 0.8, "advisory_issue_count": 3},
             wall_time_seconds=10.0,
         ),
         challenger=ContestantRunResult(
@@ -44,7 +44,7 @@ def _report() -> CompareReport:
             heavy_model="h2",
             provider_name="ollama",
             provider_url="http://localhost:11434",
-            diagnostics={"lint_health": 95.0, "link_health": 0.9},
+            diagnostics={"lint_health": 95.0, "link_health": 0.9, "advisory_issue_count": 1},
             wall_time_seconds=12.0,
         ),
         page_diff=PageDiffSummary(changed=["A"], added=["B"], removed=[]),
@@ -79,6 +79,14 @@ def test_render_markdown_has_expected_sections():
         "## Caveats",
     ):
         assert section in md
+
+
+def test_render_markdown_mentions_advisory_issue_counts():
+    report = _report()
+    resolve(report)
+    md = render_markdown(report)
+    assert "Current structural health: 90.00 (3 advisory issue(s))" in md
+    assert "Challenger structural health: 95.00 (1 advisory issue(s))" in md
 
 
 def test_render_json_round_trips():

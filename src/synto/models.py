@@ -190,6 +190,7 @@ class LintResult(BaseModel):
     issues: list[LintIssue]
     health_score: float = Field(ge=0, le=100)
     summary: str
+    advisory_issue_count: int = 0
 
 
 # ── Internal State Models (not sent to LLM) ───────────────────────────────────

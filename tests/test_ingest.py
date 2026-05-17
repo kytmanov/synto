@@ -842,6 +842,35 @@ def test_ingest_note_respects_max_concepts_per_source(vault, config, db):
     assert len(names) <= 2
 
 
+def test_ingest_note_filters_before_medium_quality_cap(vault, config, db):
+    config2 = Config(vault=vault, pipeline={"max_concepts_per_source": 8})
+    path = _write_raw(
+        vault,
+        "agile.md",
+        "# Agile\n\nThis note discusses Scrum, канбан, and Extreme Programming in one process.",
+    )
+    client = _make_client(
+        _analysis_json(
+            concepts=[
+                "Noise One",
+                "Noise Two",
+                "Noise Three",
+                "Noise Four",
+                "Канбан",
+                "Extreme Programming",
+            ],
+            quality="medium",
+            suggested_topics=[],
+        )
+    )
+
+    ingest_note(path, config2, client, db)
+
+    names = db.list_all_concept_names()
+    assert "Канбан" in names
+    assert "Extreme Programming" in names
+
+
 def test_ingest_all_updates_existing_topics_within_run(vault, config, db):
     _write_raw(vault, "a.md", "# A\n\nAlpha content.")
     _write_raw(vault, "b.md", "# B\n\nBeta content.")

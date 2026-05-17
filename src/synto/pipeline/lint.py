@@ -50,6 +50,16 @@ _BARE_LATEX_LINE_RE = re.compile(
 # Vault-internal directory names that LLMs sometimes write as wikilinks
 _VAULT_DIRS = frozenset({"wiki", "raw", "source", "sources", "queries", ".drafts", ".olw"})
 
+_ADVISORY_ISSUE_TYPES = frozenset(
+    {
+        "graph_noise",
+        "graph_connectivity",
+        "synthesis_chain",
+        "stale_lock",
+        "missing_media",
+    }
+)
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -904,18 +914,10 @@ def run_lint(config: Config, db: StateDB, fix: bool = False) -> LintResult:
     # they should be visible in lint output without turning a structurally healthy
     # vault into a failing one or driving the score negative.
     total = max(len(all_pages), 1)
-    advisory_issue_types = {
-        "graph_noise",
-        "graph_connectivity",
-        "synthesis_chain",
-        "stale_lock",
-        "missing_media",
-    }
-    pages_with_issues = len(
-        {iss.path for iss in issues if iss.issue_type not in advisory_issue_types}
-    )
+    pages_with_issues = len({iss.path for iss in issues if iss.issue_type not in _ADVISORY_ISSUE_TYPES})
     score = round(100.0 * (1 - pages_with_issues / total), 1)
     score = max(0.0, min(100.0, score))
+    advisory_issue_count = sum(1 for iss in issues if iss.issue_type in _ADVISORY_ISSUE_TYPES)
 
     # Summary
     if not issues:
@@ -927,4 +929,9 @@ def run_lint(config: Config, db: StateDB, fix: bool = False) -> LintResult:
         parts = [f"{v} {k}" for k, v in sorted(counts.items())]
         summary = f"{len(issues)} issue(s): {', '.join(parts)}. {len(all_pages)} pages checked."
 
-    return LintResult(issues=issues, health_score=round(score, 1), summary=summary)
+    return LintResult(
+        issues=issues,
+        health_score=round(score, 1),
+        summary=summary,
+        advisory_issue_count=advisory_issue_count,
+    )

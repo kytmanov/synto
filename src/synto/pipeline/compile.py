@@ -350,6 +350,7 @@ def _gather_sources(
         p, rel = resolved_path
         try:
             _, body = parse_note(p)
+            body = _strip_placeholder_embeds(body)
             ref = ref_by_raw.get(rel)
             if ref is not None:
                 parts.append(f"## Source [{ref.id}]: {ref.title} ({ref.raw_path})\n{body}")
@@ -461,6 +462,7 @@ def _repair_literal_newlines(content: str) -> str:
 
 
 _MEDIA_EXT_RE = r"(?:pdf|png|jpe?g|gif|svg|webp)"
+_PLACEHOLDER_EMBED_RE = re.compile(r"!\[\[[^\]]*unknown_filename[^\]]*\]\]", re.I)
 _MALFORMED_MEDIA_EMBED_RE = re.compile(rf"(?<!\S)!([^\s\[]+\.{_MEDIA_EXT_RE})", re.I)
 _MALFORMED_MARKDOWN_MEDIA_RE = re.compile(
     rf"\\?!\\?\[([^\[\]\n]*?\.{_MEDIA_EXT_RE})(?:\\?\])?(?!\()", re.I
@@ -482,6 +484,11 @@ def _repair_malformed_embeds(content: str) -> str:
     repaired = _MALFORMED_MEDIA_EMBED_RE.sub(replace, repaired)
     repaired = re.sub(r"\]\]!\[\[", "]]\n![[", repaired)
     return _restore_code_blocks(repaired, replacements)
+
+
+def _strip_placeholder_embeds(content: str) -> str:
+    """Drop Obsidian clipper placeholder embeds before source text reaches the writer."""
+    return _PLACEHOLDER_EMBED_RE.sub("", content)
 
 
 def _remove_dangling_open_brackets(content: str) -> str:

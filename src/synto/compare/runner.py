@@ -275,10 +275,12 @@ def _capture_diagnostics(vault: Path, db, config: Config, events) -> dict:
     try:
         lint_result = run_lint(config, db, fix=False)
         lint_health = lint_result.health_score
+        advisory_issue_count = lint_result.advisory_issue_count
         for issue in lint_result.issues:
             issue_counts[issue.issue_type] = issue_counts.get(issue.issue_type, 0) + 1
     except Exception as e:  # noqa: BLE001
         log.warning("compare lint diagnostics failed: %s", e)
+        advisory_issue_count = None
 
     total_pages = 0
     total_wikilinks = 0
@@ -296,6 +298,7 @@ def _capture_diagnostics(vault: Path, db, config: Config, events) -> dict:
 
     return {
         "lint_health": lint_health,
+        "advisory_issue_count": advisory_issue_count,
         "issue_counts": issue_counts,
         "total_pages": total_pages,
         "total_wikilinks": total_wikilinks,

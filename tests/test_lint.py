@@ -526,6 +526,7 @@ def test_graph_quality_issues_do_not_reduce_health_score(vault, config, db):
 
     assert [i for i in result.issues if i.issue_type == "graph_noise"]
     assert result.health_score == 100.0
+    assert result.advisory_issue_count == len(result.issues)
 
 
 # ── Low confidence ────────────────────────────────────────────────────────────
@@ -828,6 +829,18 @@ def test_summary_mentions_issue_counts(vault, config, db):
 def test_summary_healthy_when_no_issues(vault, config, db):
     result = run_lint(config, db)
     assert "healthy" in result.summary.lower()
+
+
+def test_missing_media_counts_as_advisory_issue(vault, config, db):
+    _write_page(
+        config,
+        "Media Note",
+        "Diagram ![[./_resources/missing.pdf]].",
+        meta_override={"title": "Media Note", "tags": [], "status": "published"},
+    )
+    result = run_lint(config, db)
+    assert [i for i in result.issues if i.issue_type == "missing_media"]
+    assert result.advisory_issue_count == 1
 
 
 # ── Config sanity ─────────────────────────────────────────────────────────────

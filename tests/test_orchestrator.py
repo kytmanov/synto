@@ -375,6 +375,52 @@ def test_orchestrator_auto_approve(config, db):
     assert report.published >= 0  # may be 0 if compile skipped but no crash
 
 
+def test_orchestrator_reports_post_publish_lint_count(config, db):
+    import json
+
+    db.upsert_raw(RawNoteRecord(path="raw/a.md", content_hash="h1", status="ingested"))
+    db.upsert_concepts("raw/a.md", ["Weak"])
+    (config.vault / "raw" / "a.md").write_text("---\ntitle: A\n---\nContent.")
+
+    mock_response = json.dumps({"title": "Weak", "content": "Content.", "tags": []})
+    client = make_mock_client(mock_response)
+
+    import synto.pipeline.lint as lint_mod
+
+    original_lint = lint_mod.run_lint
+    lint_calls = []
+
+    def fake_lint(config, db, fix=False):
+        from synto.models import LintIssue, LintResult
+
+        lint_calls.append("post" if lint_calls else "pre")
+        if len(lint_calls) == 1:
+            return LintResult(issues=[], health_score=100.0, summary="pre", advisory_issue_count=0)
+        return LintResult(
+            issues=[
+                LintIssue(
+                    path="wiki/Weak.md",
+                    issue_type="low_confidence",
+                    description="Confidence 0.1 below threshold 0.3",
+                    suggestion="Add more source notes covering this concept.",
+                )
+            ],
+            health_score=90.0,
+            summary="post",
+            advisory_issue_count=0,
+        )
+
+    lint_mod.run_lint = fake_lint
+    try:
+        orch = PipelineOrchestrator(config, client, db)
+        report = orch.run(paths=[], auto_approve=True)
+    finally:
+        lint_mod.run_lint = original_lint
+
+    assert len(lint_calls) == 2
+    assert report.lint_issues == 1
+
+
 def test_orchestrator_lint_runs_when_no_drafts_produced(config, db):
     """lint must run even when compile produces no new drafts."""
     import synto.pipeline.lint as lint_mod

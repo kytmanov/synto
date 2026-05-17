@@ -1214,9 +1214,8 @@ def ingest_note(
     db_alias_map = db.list_alias_map()
     quality_cap = {"high": max_concepts, "medium": min(max_concepts, 4), "low": 2}
     effective_max = quality_cap.get(result.quality or "low", max_concepts)
-    concept_candidates = _dedup_by_shared_alias(
-        _filter_concept_candidates(result.concepts[:effective_max], result, body, path.name)
-    )
+    filtered_candidates = _filter_concept_candidates(result.concepts, result, body, path.name)
+    concept_candidates = _dedup_by_shared_alias(filtered_candidates[:effective_max])
     if not concept_candidates:
         concept_candidates = _suggested_topic_candidates(result, body, path.name)[:3]
     matching_seed_concepts = _matching_seeded_source_concepts(

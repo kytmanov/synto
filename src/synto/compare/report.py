@@ -80,9 +80,13 @@ def render_markdown(report: CompareReport) -> str:
     out.append("")
     out.append("## Structure And Reliability")
     out.append("")
-    out.append(f"- Current lint health: {report.current.diagnostics.get('lint_health', 'n/a')}")
     out.append(
-        f"- Challenger lint health: {report.challenger.diagnostics.get('lint_health', 'n/a')}"
+        f"- Current structural health: {_fmt(report.current.diagnostics.get('lint_health'))}"
+        f"{_fmt_advisory(report.current.diagnostics)}"
+    )
+    out.append(
+        f"- Challenger structural health: {_fmt(report.challenger.diagnostics.get('lint_health'))}"
+        f"{_fmt_advisory(report.challenger.diagnostics)}"
     )
     out.append(f"- Current link health: {_fmt(report.current.diagnostics.get('link_health'))}")
     out.append(
@@ -164,6 +168,13 @@ def _fmt(value) -> str:
     if isinstance(value, float):
         return f"{value:.2f}"
     return str(value)
+
+
+def _fmt_advisory(diagnostics: dict) -> str:
+    advisory = diagnostics.get("advisory_issue_count")
+    if advisory in (None, 0):
+        return ""
+    return f" ({advisory} advisory issue(s))"
 
 
 def _jsonable_report(report: CompareReport) -> dict:

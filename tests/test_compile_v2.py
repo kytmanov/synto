@@ -23,6 +23,7 @@ from synto.pipeline.compile import (
     _repair_malformed_embeds,
     _repair_malformed_wikilinks,
     _rewrite_citation_markers,
+    _strip_placeholder_embeds,
     _strip_draft_annotations,
     _strip_empty_wikilinks,
     _strip_self_wikilinks,
@@ -432,6 +433,29 @@ def test_apply_draft_media_mode_omit_removes_embeds():
     body = _apply_draft_media_mode("Diagram ![[./_resources/file.pdf]].", "omit")
 
     assert body == "Diagram ."
+
+
+def test_strip_placeholder_embeds_removes_unknown_filename_embeds_only():
+    body = _strip_placeholder_embeds(
+        "Before ![[./_resources/unknown_filename.jpeg]] keep ![[./_resources/diagram.jpeg]] after."
+    )
+
+    assert "unknown_filename" not in body
+    assert "diagram.jpeg" in body
+
+
+def test_gather_sources_strips_placeholder_embeds_from_raw_sources(vault):
+    raw = vault / "raw" / "a.md"
+    raw.parent.mkdir(parents=True, exist_ok=True)
+    raw.write_text(
+        "---\ntitle: A\n---\nBody before ![[./_resources/unknown_filename.jpeg]] after.",
+        encoding="utf-8",
+    )
+
+    text, resolved = _gather_sources(["raw/a.md"], vault)
+
+    assert resolved == ["raw/a.md"]
+    assert "unknown_filename" not in text
 
 
 def test_inject_body_sections_uses_id_legend_when_enabled(config):

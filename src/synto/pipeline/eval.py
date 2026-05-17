@@ -147,7 +147,7 @@ def _citation_coverage(reader: VaultReader) -> tuple[float | None, dict[str, obj
 def _index_json_validity(config: Config) -> tuple[float, dict[str, object]]:
     index_path = config.app_dir / "INDEX.json"
     if not index_path.exists():
-        return 0.0, {"reason": "missing"}
+        return None, {"reason": "missing", "skipped": True}
 
     try:
         payload = json.loads(index_path.read_text(encoding="utf-8"))
