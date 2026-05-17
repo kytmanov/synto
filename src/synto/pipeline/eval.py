@@ -144,7 +144,7 @@ def _citation_coverage(reader: VaultReader) -> tuple[float | None, dict[str, obj
     return with_sources / len(refs), {"with_sources": with_sources, "articles": len(refs)}
 
 
-def _index_json_validity(config: Config) -> tuple[float, dict[str, object]]:
+def _index_json_validity(config: Config) -> tuple[float | None, dict[str, object]]:
     index_path = config.app_dir / "INDEX.json"
     if not index_path.exists():
         return None, {"reason": "missing", "skipped": True}

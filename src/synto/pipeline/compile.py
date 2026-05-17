@@ -462,7 +462,7 @@ def _repair_literal_newlines(content: str) -> str:
 
 
 _MEDIA_EXT_RE = r"(?:pdf|png|jpe?g|gif|svg|webp)"
-_PLACEHOLDER_EMBED_RE = re.compile(r"!\[\[[^\]]*unknown_filename[^\]]*\]\]", re.I)
+_PLACEHOLDER_EMBED_RE = re.compile(r"!\[\[[^\]]*\bunknown_filename\b[^\]]*\]\]", re.I)
 _MALFORMED_MEDIA_EMBED_RE = re.compile(rf"(?<!\S)!([^\s\[]+\.{_MEDIA_EXT_RE})", re.I)
 _MALFORMED_MARKDOWN_MEDIA_RE = re.compile(
     rf"\\?!\\?\[([^\[\]\n]*?\.{_MEDIA_EXT_RE})(?:\\?\])?(?!\()", re.I
@@ -531,7 +531,7 @@ def _apply_draft_media_mode(content: str, mode: str) -> str:
 
     def replace(match: re.Match[str]) -> str:
         target = match.group(1).strip()
-        if "unknown_filename" in target.lower():
+        if re.search(r"\bunknown_filename\b", target, re.I):
             return ""  # Obsidian clipper placeholder — drop in all modes
         if mode == "omit":
             return ""
