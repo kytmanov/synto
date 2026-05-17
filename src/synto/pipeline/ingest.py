@@ -13,6 +13,7 @@ import re
 import unicodedata
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -33,6 +34,8 @@ from .items import extract_named_reference_items, extract_quoted_title_items, st
 
 log = logging.getLogger(__name__)
 
+INGEST_ANALYSIS_PROMPT_VERSION = "analysis-v2-language-policy"
+
 _SYSTEM = (
     "You are a knowledge analyst. Read the provided note and extract structured information. "
     "Be concise and accurate. Do not invent information not present in the note. "
@@ -45,14 +48,92 @@ def _content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+@dataclass(frozen=True)
+class _PromptConceptContext:
+    canonical: str
+    aliases: tuple[str, ...] = ()
+
+
+def _ingest_prompt_version(config: Config) -> str:
+    language = config.pipeline.language or "auto"
+    return f"{INGEST_ANALYSIS_PROMPT_VERSION}|language={language}"
+
+
+def _canonical_prompt_contexts(
+    canonical_names: list[str], alias_map: dict[str, str] | None = None
+) -> list[_PromptConceptContext]:
+    alias_map = alias_map or {}
+    aliases_by_canonical: dict[str, list[str]] = {name: [] for name in canonical_names}
+    for alias, canonical in sorted(alias_map.items()):
+        if canonical not in aliases_by_canonical:
+            continue
+        cleaned_alias = _clean_concept_text(alias)
+        if cleaned_alias and cleaned_alias not in aliases_by_canonical[canonical]:
+            aliases_by_canonical[canonical].append(cleaned_alias)
+    return [
+        _PromptConceptContext(canonical=name, aliases=tuple(aliases_by_canonical.get(name, [])))
+        for name in canonical_names
+    ]
+
+
+def _prompt_context_names(contexts: list[_PromptConceptContext]) -> list[str]:
+    return [ctx.canonical for ctx in contexts]
+
+
+def _format_prompt_concept_hint(context: _PromptConceptContext) -> str:
+    if not context.aliases:
+        return context.canonical
+    aliases = ", ".join(context.aliases[:3])
+    return f"{context.canonical} (aliases: {aliases})"
+
+
+def _prompt_context_matches_body(
+    context: _PromptConceptContext,
+    body: str,
+    path_name: str = "",
+) -> bool:
+    if _has_title_or_body_evidence(context.canonical, body, path_name):
+        return True
+    return any(_has_title_or_body_evidence(alias, body, path_name) for alias in context.aliases)
+
+
+def _checkpoint_hash(
+    content_hash: str,
+    config: Config,
+    prompt_contexts: list[_PromptConceptContext],
+) -> str:
+    payload = {
+        "content_hash": content_hash,
+        "prompt_version": _ingest_prompt_version(config),
+        "fast_model": config.models.fast,
+        "contexts": [
+            {"canonical": ctx.canonical, "aliases": list(ctx.aliases)} for ctx in prompt_contexts
+        ],
+    }
+    encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _build_analysis_prompt(
     body: str,
     existing_concepts: list[str],
     path_name: str = "",
     chunk_label: str = "",
+    language: str | None = None,
+    prompt_concepts: list[_PromptConceptContext] | None = None,
 ) -> str:
     concepts_hint = "none yet"
-    if existing_concepts:
+    if prompt_concepts:
+        matched = [
+            context
+            for context in prompt_concepts
+            if _prompt_context_matches_body(context, body, path_name)
+        ]
+        unmatched = [context for context in prompt_concepts if context not in matched]
+        concepts_hint = ", ".join(
+            _format_prompt_concept_hint(context) for context in [*matched, *unmatched][:30]
+        )
+    elif existing_concepts:
         matched = [
             concept
             for concept in existing_concepts
@@ -61,16 +142,38 @@ def _build_analysis_prompt(
         unmatched = [concept for concept in existing_concepts if concept not in matched]
         concepts_hint = ", ".join([*matched, *unmatched][:30])
     label = f" {chunk_label}" if chunk_label else ""
+
+    if language:
+        # Names follow the configured language; existing canonicals are always kept by their
+        # exact listed name so _normalize_concepts() can match them. Aliases are intentionally
+        # multi-lingual: the model should include the note's native surface form so the evidence
+        # filter can find body evidence even when the concept name is a translation.
+        lang_instruction = (
+            f"Output concept names in {language} (ISO 639-1). "
+            f"Exception: for concepts already in the wiki (listed above), always use the exact "
+            f"canonical name shown — do not translate it.\n\n"
+            f"Aliases may be in any language. Include short forms and abbreviations used in the "
+            f"note text. If the concept name is a translation of how it appears in the note text, "
+            f"include the note's surface form as the first alias.\n\n"
+        )
+    else:
+        # Use whatever surface form the note itself uses. Scope "international form" to pure
+        # acronyms/initialisms only — methodology and domain terms have native-language forms
+        # and must not be forced into any specific language.
+        lang_instruction = (
+            "Use concept names in the form they appear in the note text, unless reusing an "
+            "existing wiki concept exactly. Do not translate concept names on your own.\n\n"
+            "Do not create separate concepts for the same topic in different languages. "
+            "Only keep an internationally-fixed form when the concept is a pure acronym or "
+            "initialism with no natural native spelling (e.g. 'API', 'HTTP', 'JSON', 'PDF'). "
+            "Methodology and domain terms such as 'Scrum' or 'Extreme Programming' are not in "
+            "this category — use the form from the note.\n\n"
+        )
+
     return (
         f"Analyze this note{label} and extract structured metadata.\n\n"
         f"Existing wiki concepts (reuse these names where applicable): {concepts_hint}\n\n"
-        "Keep concept names in the same language used by the note unless you are reusing an "
-        "existing wiki concept exactly. Do not translate concept names on your own.\n\n"
-        "Do not create separate concepts for the same topic in different languages. "
-        "If a concept has a universally recognised international name (e.g. 'Scrum', "
-        "'Extreme Programming', 'API'), use that form as the canonical name even if "
-        "the note is in another language. Treat the same concept in two languages as "
-        "one concept, not two.\n\n"
+        f"{lang_instruction}"
         f"For each concept, provide 3-5 short surface forms used in running text "
         f"(abbreviations, short names). Example: name='Program Counter (PC)', "
         f"aliases=['PC', 'program counter']. Use empty list if no natural aliases exist.\n\n"
@@ -155,12 +258,19 @@ def _analyze_body(
     *,
     on_chunk_result=None,
     skip_completed: set[int] | None = None,
+    prompt_contexts: list[_PromptConceptContext] | None = None,
 ) -> AnalysisResult:
     """Analyze note body, splitting into chunks if body exceeds fast_ctx // 2 chars."""
     chunk_size = config.effective_provider.fast_ctx // 2
 
     if len(body) <= chunk_size:
-        prompt = _build_analysis_prompt(body, existing_concepts, path_name)
+        prompt = _build_analysis_prompt(
+            body,
+            existing_concepts,
+            path_name,
+            language=config.pipeline.language,
+            prompt_concepts=prompt_contexts,
+        )
         return request_structured(
             client=client,
             prompt=prompt,
@@ -189,7 +299,15 @@ def _analyze_body(
         label = f"[part {idx + 1}/{len(chunks)}]"
         log.info("Analyzing %s %s …", path_name or "note", label)
         t0 = time.monotonic()
-        prompt = _build_analysis_prompt(chunk, existing_concepts, path_name, chunk_label=label)
+        lang = config.pipeline.language
+        prompt = _build_analysis_prompt(
+            chunk,
+            existing_concepts,
+            path_name,
+            chunk_label=label,
+            language=lang,
+            prompt_concepts=prompt_contexts,
+        )
         result = request_structured(
             client=client,
             prompt=prompt,
@@ -249,24 +367,33 @@ def _analyze_body_with_checkpoints(
     db: StateDB,
     *,
     force: bool = False,
+    prompt_contexts: list[_PromptConceptContext] | None = None,
 ) -> AnalysisResult:
     chunk_size = config.effective_provider.fast_ctx // 2
     rel_path = str(path.relative_to(config.vault))
+    checkpoint_hash = _checkpoint_hash(content_hash, config, prompt_contexts or [])
 
     if len(body) <= chunk_size:
         if force:
             db.purge_ingest_chunks(rel_path)
         else:
-            db.purge_ingest_chunks(rel_path, keep_hash=content_hash)
-        return _analyze_body(body, existing_concepts, path.name, client, config)
+            db.purge_ingest_chunks(rel_path, keep_hash=checkpoint_hash)
+        return _analyze_body(
+            body,
+            existing_concepts,
+            path.name,
+            client,
+            config,
+            prompt_contexts=prompt_contexts,
+        )
 
     chunks = [body[i : i + chunk_size] for i in range(0, len(body), chunk_size)]
     if force:
         db.purge_ingest_chunks(rel_path)
     else:
-        db.purge_ingest_chunks(rel_path, keep_hash=content_hash)
+        db.purge_ingest_chunks(rel_path, keep_hash=checkpoint_hash)
 
-    stored = db.list_ingest_chunks(rel_path, content_hash, len(chunks), chunk_size)
+    stored = db.list_ingest_chunks(rel_path, checkpoint_hash, len(chunks), chunk_size)
     chunk_results: list[AnalysisResult | None] = [None] * len(chunks)
     completed: set[int] = set()
 
@@ -290,7 +417,7 @@ def _analyze_body_with_checkpoints(
         chunk_results[idx] = result
         db.upsert_ingest_chunk(
             rel_path,
-            content_hash,
+            checkpoint_hash,
             idx,
             len(chunks),
             chunk_size,
@@ -306,11 +433,12 @@ def _analyze_body_with_checkpoints(
             config,
             on_chunk_result=_save_chunk,
             skip_completed=completed,
+            prompt_contexts=prompt_contexts,
         )
 
     results = [result for result in chunk_results if result is not None]
     merged = _merge_chunk_results(results)
-    db.delete_ingest_chunks(rel_path, content_hash, len(chunks), chunk_size)
+    db.delete_ingest_chunks(rel_path, checkpoint_hash, len(chunks), chunk_size)
     return merged
 
 
@@ -459,7 +587,15 @@ def _filter_concept_candidates(
             continue
         has_evidence = _has_title_or_body_evidence(name, body, path_name)
         if result.quality in ("low", "medium") and not has_evidence:
-            continue
+            # Translated concept names may not appear in the source body; check validated
+            # aliases (e.g., the native-language surface form returned as the first alias).
+            # Guard with _validate_aliases + _is_noise_concept to prevent generic aliases
+            # ("document", "file") from rescuing hallucinated concepts.
+            validated_aliases = [
+                a for a in _validate_aliases(name, concept.aliases) if not _is_noise_concept(a)
+            ]
+            if not any(_has_title_or_body_evidence(a, body, path_name) for a in validated_aliases):
+                continue
         filtered.append(concept)
     return filtered
 
@@ -724,7 +860,14 @@ def _rewrite_candidates_to_canonicals(
         original_name = _clean_concept_text(candidate.name)
         if not original_name:
             continue
-        canonical = rewrite_index.get(_concept_key(original_name), original_name)
+        canonical = rewrite_index.get(_concept_key(original_name))
+        if canonical is None:
+            trusted_matches = {
+                rewrite_index[_concept_key(alias)]
+                for alias in _validate_aliases(original_name, candidate.aliases)
+                if _concept_key(alias) in rewrite_index
+            }
+            canonical = next(iter(trusted_matches)) if len(trusted_matches) == 1 else original_name
         canonical_key = _concept_key(canonical)
         if canonical_key in seen_keys:
             continue
@@ -967,15 +1110,26 @@ def ingest_note(
 
     rel_path = str(path.relative_to(config.vault))
     record = db.get_raw(rel_path)
+    current_prompt_version = _ingest_prompt_version(config)
 
     if (
         record
         and record.status in {"ingested", "compiled"}
         and record.content_hash == h
+        and record.prompt_version == current_prompt_version
         and not force
     ):
         log.info("Already ingested: %s", path.name)
         return None
+
+    if (
+        record
+        and record.status in {"ingested", "compiled"}
+        and record.content_hash == h
+        and record.prompt_version != current_prompt_version
+        and not force
+    ):
+        log.info("Re-ingesting %s: ingest language policy changed", path.name)
 
     # Pre-process web clips
     meta, body = parse_note(path)
@@ -1001,10 +1155,14 @@ def ingest_note(
     if existing_topics is None:
         existing_topics = db.list_all_concept_names()
         if not existing_topics:
-            existing_topics = _load_seed_concepts_from_index(config)
             seed_concepts = _load_seed_canonical_names_from_index(config)
             seed_alias_map = _load_seed_alias_map_from_index(config)
             source_concept_seeds = _load_source_concept_seeds_from_index(config)
+            existing_topics = list(seed_concepts)
+    prompt_contexts = _canonical_prompt_contexts(
+        existing_topics,
+        seed_alias_map or db.list_alias_map(),
+    )
     try:
         result: AnalysisResult = _analyze_body_with_checkpoints(
             body=body,
@@ -1015,6 +1173,7 @@ def ingest_note(
             config=config,
             db=db,
             force=force,
+            prompt_contexts=prompt_contexts,
         )
     except Exception as e:
         log.error("Analysis failed for %s: %s", path.name, e)
@@ -1024,6 +1183,7 @@ def ingest_note(
                 content_hash=h,
                 status="failed",
                 error=str(e),
+                prompt_version=current_prompt_version,
             )
         )
         return None
@@ -1037,6 +1197,7 @@ def ingest_note(
             summary=result.summary,
             quality=result.quality,
             language=result.language,
+            prompt_version=current_prompt_version,
             ingested_at=datetime.now(),
         )
     )
@@ -1139,10 +1300,10 @@ def ingest_all(
     seed_alias_map = None
     source_concept_seeds = None
     if not existing_topics:
-        existing_topics = _load_seed_concepts_from_index(config)
         seed_concepts = _load_seed_canonical_names_from_index(config)
         seed_alias_map = _load_seed_alias_map_from_index(config)
         source_concept_seeds = _load_source_concept_seeds_from_index(config)
+        existing_topics = list(seed_concepts)
     existing_topic_keys = {topic.casefold() for topic in existing_topics}
     results = []
     total = len(raw_files)

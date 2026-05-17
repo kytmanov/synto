@@ -31,7 +31,7 @@ from pathlib import Path
 from .models import ItemMentionRecord, KnowledgeItemRecord, RawNoteRecord, WikiArticleRecord
 
 _CURRENT_SCHEMA_VERSION = 10
-_CHECKPOINT_SCHEMA_VERSION = 1
+_CHECKPOINT_SCHEMA_VERSION = 2
 
 _CROCKFORD32_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 
@@ -922,10 +922,10 @@ class StateDB:
             self._conn.execute(
                 """INSERT INTO raw_notes
                        (path, content_hash, status, summary, quality, language,
-                        ingested_at, compiled_at, error)
+                        ingested_at, compiled_at, error, prompt_version)
                    VALUES
                        (:path, :content_hash, :status, :summary, :quality, :language,
-                        :ingested_at, :compiled_at, :error)
+                        :ingested_at, :compiled_at, :error, :prompt_version)
                    ON CONFLICT(path) DO UPDATE SET
                        content_hash=excluded.content_hash,
                        status=excluded.status,
@@ -934,7 +934,8 @@ class StateDB:
                        language=excluded.language,
                        ingested_at=excluded.ingested_at,
                        compiled_at=excluded.compiled_at,
-                       error=excluded.error""",
+                       error=excluded.error,
+                       prompt_version=excluded.prompt_version""",
                 {
                     "path": record.path,
                     "content_hash": record.content_hash,
@@ -945,6 +946,7 @@ class StateDB:
                     "ingested_at": record.ingested_at.isoformat() if record.ingested_at else None,
                     "compiled_at": record.compiled_at.isoformat() if record.compiled_at else None,
                     "error": record.error,
+                    "prompt_version": record.prompt_version,
                 },
             )
 
@@ -2156,6 +2158,7 @@ def _row_to_raw(row: sqlite3.Row) -> RawNoteRecord:
         summary=row["summary"] if "summary" in keys else None,
         quality=row["quality"] if "quality" in keys else None,
         language=row["language"] if "language" in keys else None,
+        prompt_version=row["prompt_version"] if "prompt_version" in keys else None,
         ingested_at=datetime.fromisoformat(row["ingested_at"]) if row["ingested_at"] else None,
         compiled_at=datetime.fromisoformat(row["compiled_at"]) if row["compiled_at"] else None,
         error=row["error"],

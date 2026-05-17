@@ -202,6 +202,7 @@ class RawNoteRecord(BaseModel):
     summary: str | None = None
     quality: str | None = None
     language: str | None = None
+    prompt_version: str | None = None
     ingested_at: datetime | None = None
     compiled_at: datetime | None = None
     error: str | None = None

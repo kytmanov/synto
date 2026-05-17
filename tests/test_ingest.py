@@ -19,11 +19,14 @@ from synto.pipeline.ingest import (
     _base_concept_name,
     _build_analysis_prompt,
     _build_trusted_alias_rewrite_index,
+    _canonical_prompt_contexts,
+    _checkpoint_hash,
     _concept_key,
     _content_hash,
     _dedup_by_shared_alias,
     _display_aliases,
     _filter_concept_candidates,
+    _ingest_prompt_version,
     _is_noise_concept,
     _meaningful_text_stats,
     _merge_chunk_results,
@@ -173,10 +176,47 @@ def test_build_prompt_prioritizes_body_matched_existing_concepts():
     assert "Noise 39" not in hint_line
 
 
+def test_build_prompt_prioritizes_canonical_when_alias_matches_body():
+    prompt = _build_analysis_prompt(
+        "Русский текст про каталог шаблонов.",
+        ["Template Catalog"],
+        "note.md",
+        prompt_concepts=_canonical_prompt_contexts(
+            ["Template Catalog"], {"каталог шаблонов": "Template Catalog"}
+        ),
+    )
+
+    hint_line = prompt.splitlines()[2]
+    assert "Template Catalog" in hint_line
+    assert "aliases: каталог шаблонов" in hint_line
+
+
 def test_build_prompt_preserves_note_language_for_concepts():
     prompt = _build_analysis_prompt("Русский текст про каталог шаблонов.", [])
-    assert "same language used by the note" in prompt
+    # Surface-form based rule (not "same language" wording which was English-centric)
+    assert "form they appear in the note text" in prompt
     assert "Do not translate concept names" in prompt
+    # Acronym heuristic is present but scoped to pure acronyms; methodology terms are excluded
+    assert "pure acronym or initialism" in prompt
+    assert "API" in prompt
+    assert "Methodology and domain terms" in prompt
+    assert "not in this category" in prompt
+
+
+def test_build_prompt_language_override_suppresses_note_language_rule():
+    prompt = _build_analysis_prompt("Some content", [], language="de")
+    assert "de (ISO 639-1)" in prompt
+    assert "form they appear in the note text" not in prompt
+    assert "pure acronym or initialism" not in prompt
+    # Must include canonical-reuse exception so existing wiki concepts are not translated
+    assert "exact canonical name shown" in prompt
+
+
+def test_build_prompt_language_override_alias_instruction_requests_native_form():
+    prompt = _build_analysis_prompt("Some content", [], language="ru")
+    # Aliases are explicitly multi-lingual; native surface form must be requested
+    assert "Aliases may be in any language" in prompt
+    assert "surface form as the first alias" in prompt
 
 
 def test_build_prompt_includes_full_body():
@@ -288,6 +328,32 @@ def test_filter_concept_candidates_keeps_low_quality_title_evidence():
     )
 
     assert [c.name for c in kept] == ["Example Artist documentary"]
+
+
+def test_filter_concept_candidates_passes_translated_concept_via_validated_alias():
+    """Translated concept name not in body survives when a validated alias provides evidence."""
+    # Body uses the exact surface form that the alias captures; Russian nominative case
+    body = "Каталог шаблонов применяется для управления проектными ресурсами." * 3
+    result = AnalysisResult(
+        summary="About template systems.",
+        concepts=[Concept(name="Vorlagenkatalog", aliases=["Каталог шаблонов"])],
+        suggested_topics=[],
+        quality="medium",
+    )
+    kept = _filter_concept_candidates(result.concepts, result, body)
+    assert [c.name for c in kept] == ["Vorlagenkatalog"]
+
+
+def test_filter_concept_candidates_drops_noise_alias_false_positive():
+    """Noise-concept alias ('document') must not rescue a concept with no real evidence."""
+    body = "This document contains some information about the system."
+    result = AnalysisResult(
+        summary="A document.",
+        concepts=[Concept(name="Vorlagenkatalog", aliases=["document"])],
+        suggested_topics=[],
+        quality="medium",
+    )
+    assert _filter_concept_candidates(result.concepts, result, body) == []
 
 
 def _make_concepts(names):
@@ -418,6 +484,17 @@ def test_rewrite_candidates_to_canonicals_skips_alias_that_is_also_other_canonic
     assert rewritten == [Concept(name="Каталог шаблонов", aliases=[])]
 
 
+def test_rewrite_candidates_to_canonicals_uses_trusted_candidate_alias_match(vault, config, db):
+    rewritten = _rewrite_candidates_to_canonicals(
+        [Concept(name="Vorlagenkatalog", aliases=["Каталог шаблонов"])],
+        ["Template Catalog"],
+        {"каталог шаблонов": "Template Catalog"},
+    )
+
+    assert [candidate.name for candidate in rewritten] == ["Template Catalog"]
+    assert _display_aliases(rewritten[0].aliases) == ["Vorlagenkatalog", "Каталог шаблонов"]
+
+
 def test_normalize_deduplicates(vault, config, db):
     result = _normalize_concepts(_make_concepts(["ML", "ML", "Machine Learning"]), db)
     assert len(result) == 2
@@ -482,6 +559,32 @@ def test_ingest_note_skip_already_ingested(vault, config, db):
     assert result is None
     # Client called only once (for first ingest)
     assert client.generate.call_count == 1
+
+
+def test_ingest_note_stores_prompt_version(vault, config, db):
+    path = _write_raw(vault, "versioned.md", "# Note\n\nSome content here.")
+    client = _make_client(_analysis_json())
+
+    ingest_note(path, config, client, db)
+
+    rec = db.get_raw("raw/versioned.md")
+    assert rec is not None
+    assert rec.prompt_version == _ingest_prompt_version(config)
+
+
+def test_ingest_note_reingests_when_language_policy_changes(vault, config, db):
+    path = _write_raw(vault, "policy.md", "# Note\n\nSome content here.")
+    client = _make_client(_analysis_json())
+    ingest_note(path, config, client, db)
+
+    config.pipeline.language = "de"
+    result = ingest_note(path, config, client, db)
+
+    assert result is not None
+    assert client.generate.call_count == 2
+    rec = db.get_raw("raw/policy.md")
+    assert rec is not None
+    assert rec.prompt_version == _ingest_prompt_version(config)
 
 
 def test_ingest_note_force_reingest(vault, config, db):
@@ -796,7 +899,32 @@ def test_ingest_all_seeds_existing_topics_from_index_when_db_empty(vault, config
 
     prompt = client.generate.call_args.kwargs["prompt"]
     assert "Template Catalog" in prompt
-    assert "Каталог шаблонов" in prompt
+    assert "aliases: каталог шаблонов" in prompt.lower()
+
+
+def test_ingest_note_reuses_existing_canonical_via_trusted_alias_from_llm_alias(vault, config, db):
+    db.upsert_concepts("raw/existing.md", ["Template Catalog"])
+    db.upsert_aliases("Template Catalog", ["Каталог шаблонов"])
+    path = _write_raw(
+        vault,
+        "catalog.md",
+        "# Note\n\nКаталог шаблонов помогает организовать шаблоны проекта.",
+    )
+    analysis = json.dumps(
+        {
+            "summary": "A multilingual note.",
+            "concepts": [{"name": "Vorlagenkatalog", "aliases": ["Каталог шаблонов"]}],
+            "suggested_topics": [],
+            "named_references": [],
+            "quality": "medium",
+        }
+    )
+    client = _make_client(analysis)
+
+    ingest_note(path, config, client, db)
+
+    assert db.get_concepts_for_sources(["raw/catalog.md"]) == ["Template Catalog"]
+    assert "Vorlagenkatalog" not in db.list_all_concept_names()
 
 
 def test_ingest_all_reuses_seeded_aliases_across_full_run(vault, config, db):
@@ -1096,6 +1224,39 @@ def test_analyze_body_chunk_labels_in_prompt(vault, config, db):
     assert any("[part 2/" in p for p in prompts)
 
 
+def test_analyze_body_passes_language_from_config(vault, config, db):
+    """config.pipeline.language is forwarded to _build_analysis_prompt."""
+    config.pipeline.language = "ru"
+    client = _make_client(_analysis_json())
+    _analyze_body("Short note.", [], "test.md", client, config)
+    prompt = client.generate.call_args.kwargs["prompt"]
+    assert "ru (ISO 639-1)" in prompt
+    assert "same language used by the note" not in prompt
+
+
+def test_analyze_body_passes_language_from_config_for_all_chunks(vault, config, db):
+    config.pipeline.language = "ru"
+    config.ollama.fast_ctx = 100
+    body = "x" * 200
+    client = _make_client(_analysis_json())
+
+    _analyze_body(body, [], "long.md", client, config)
+
+    prompts = [call.kwargs["prompt"] for call in client.generate.call_args_list]
+    assert len(prompts) == 4
+    assert all("ru (ISO 639-1)" in prompt for prompt in prompts)
+    assert all("exact canonical name shown" in prompt for prompt in prompts)
+
+
+def test_analyze_body_no_language_config_uses_note_language_rule(vault, config, db):
+    """When config.pipeline.language is None, prompt uses the surface-form heuristic."""
+    assert config.pipeline.language is None
+    client = _make_client(_analysis_json())
+    _analyze_body("Short note.", [], "test.md", client, config)
+    prompt = client.generate.call_args.kwargs["prompt"]
+    assert "form they appear in the note text" in prompt
+
+
 def test_analyze_body_parallel_mode(vault):
     """ingest_parallel=True still produces one call per chunk, results merged."""
     config2 = Config(
@@ -1115,6 +1276,7 @@ def test_analyze_body_with_checkpoints_resumes_after_failure(vault, config, db):
     path = _write_raw(vault, "long.md", "x" * 200)
     body = path.read_text()
     content_hash = _content_hash(body)
+    checkpoint_hash = _checkpoint_hash(content_hash, config2, [])
 
     client = MagicMock()
     calls = {"count": 0}
@@ -1130,14 +1292,14 @@ def test_analyze_body_with_checkpoints_resumes_after_failure(vault, config, db):
     with pytest.raises(RuntimeError, match="chunk timeout"):
         _analyze_body_with_checkpoints(body, [], path, content_hash, client, config2, db)
 
-    rows = db.list_ingest_chunks("raw/long.md", content_hash, 4, 50)
+    rows = db.list_ingest_chunks("raw/long.md", checkpoint_hash, 4, 50)
     assert [row["chunk_index"] for row in rows] == [0, 1]
 
     client2 = _make_client(_analysis_json(concepts=["Recovered"]))
     result = _analyze_body_with_checkpoints(body, [], path, content_hash, client2, config2, db)
     assert isinstance(result, AnalysisResult)
     assert client2.generate.call_count == 2
-    assert db.list_ingest_chunks("raw/long.md", content_hash, 4, 50) == []
+    assert db.list_ingest_chunks("raw/long.md", checkpoint_hash, 4, 50) == []
 
 
 def test_analyze_body_with_checkpoints_loads_existing_partial_resume(vault, config, db):
@@ -1145,10 +1307,11 @@ def test_analyze_body_with_checkpoints_loads_existing_partial_resume(vault, conf
     path = _write_raw(vault, "resume.md", "x" * 200)
     body = path.read_text()
     content_hash = _content_hash(body)
+    checkpoint_hash = _checkpoint_hash(content_hash, config2, [])
 
     db.upsert_ingest_chunk(
         "raw/resume.md",
-        content_hash,
+        checkpoint_hash,
         0,
         4,
         50,
@@ -1156,7 +1319,7 @@ def test_analyze_body_with_checkpoints_loads_existing_partial_resume(vault, conf
     )
     db.upsert_ingest_chunk(
         "raw/resume.md",
-        content_hash,
+        checkpoint_hash,
         1,
         4,
         50,
@@ -1172,7 +1335,7 @@ def test_analyze_body_with_checkpoints_loads_existing_partial_resume(vault, conf
         "Stored Beta",
         "Fresh Gamma",
     ]
-    assert db.list_ingest_chunks("raw/resume.md", content_hash, 4, 50) == []
+    assert db.list_ingest_chunks("raw/resume.md", checkpoint_hash, 4, 50) == []
 
 
 def test_analyze_body_with_checkpoints_purges_stale_chunks_for_short_note(vault, config, db):
@@ -1180,6 +1343,7 @@ def test_analyze_body_with_checkpoints_purges_stale_chunks_for_short_note(vault,
     path = _write_raw(vault, "shortened.md", "short body")
     old_hash = _content_hash("x" * 200)
     new_hash = _content_hash(path.read_text())
+    # Old row uses old_hash directly (pre-compound-hash, simulating stale data)
     db.upsert_ingest_chunk(
         "raw/shortened.md",
         old_hash,
@@ -1196,6 +1360,101 @@ def test_analyze_body_with_checkpoints_purges_stale_chunks_for_short_note(vault,
 
     assert [concept.name for concept in result.concepts] == ["Fresh Short"]
     assert db.list_ingest_chunks("raw/shortened.md", old_hash, 4, 50) == []
+
+
+def test_analyze_body_with_checkpoints_language_change_invalidates_cache(vault, config, db):
+    """Changing config.pipeline.language must not reuse checkpoints from prior language."""
+    config_de = Config(vault=vault, ollama={"fast_ctx": 100}, pipeline={"language": "de"})
+
+    path = _write_raw(vault, "multilang.md", "x" * 200)
+    body = path.read_text()
+    content_hash = _content_hash(body)
+
+    # Partially ingest under language=None (2 of 4 chunks saved to checkpoints)
+    checkpoint_hash_none = _checkpoint_hash(content_hash, config, [])
+    db.upsert_ingest_chunk(
+        "raw/multilang.md",
+        checkpoint_hash_none,
+        0,
+        4,
+        50,
+        _analysis_json(concepts=["OldConcept"]),
+    )
+    db.upsert_ingest_chunk(
+        "raw/multilang.md",
+        checkpoint_hash_none,
+        1,
+        4,
+        50,
+        _analysis_json(concepts=["OldConcept2"]),
+    )
+
+    # Now re-run with language="de" — all 4 chunks must be re-analyzed, none reused
+    client_de = _make_client(_analysis_json(concepts=["NeuKonzept"]))
+    _analyze_body_with_checkpoints(body, [], path, content_hash, client_de, config_de, db)
+
+    assert client_de.generate.call_count == 4  # all chunks re-analyzed, none reused
+    # Stale language=None rows are purged by purge_ingest_chunks(keep_hash=checkpoint_hash_de)
+    assert db.list_ingest_chunks("raw/multilang.md", checkpoint_hash_none, 4, 50) == []
+
+
+def test_analyze_body_with_checkpoints_context_change_invalidates_cache(vault, config, db):
+    config2 = Config(vault=vault, ollama={"fast_ctx": 100})
+    path = _write_raw(vault, "context.md", "x" * 200)
+    body = path.read_text()
+    content_hash = _content_hash(body)
+    old_contexts = _canonical_prompt_contexts(["Alpha"], {"alpha alias": "Alpha"})
+    old_checkpoint_hash = _checkpoint_hash(content_hash, config2, old_contexts)
+    db.upsert_ingest_chunk(
+        "raw/context.md",
+        old_checkpoint_hash,
+        0,
+        4,
+        50,
+        _analysis_json(concepts=["Old Chunk"]),
+    )
+
+    client = _make_client(_analysis_json(concepts=["Fresh Chunk"]))
+    new_contexts = _canonical_prompt_contexts(["Beta"], {"beta alias": "Beta"})
+    _analyze_body_with_checkpoints(
+        body,
+        ["Beta"],
+        path,
+        content_hash,
+        client,
+        config2,
+        db,
+        prompt_contexts=new_contexts,
+    )
+
+    assert client.generate.call_count == 4
+    assert db.list_ingest_chunks("raw/context.md", old_checkpoint_hash, 4, 50) == []
+
+
+def test_analyze_body_with_checkpoints_ignores_previous_schema_rows(vault, config, db):
+    config2 = Config(vault=vault, ollama={"fast_ctx": 100})
+    path = _write_raw(vault, "schema.md", "x" * 200)
+    body = path.read_text()
+    content_hash = _content_hash(body)
+    current_checkpoint_hash = _checkpoint_hash(content_hash, config2, [])
+    db.upsert_ingest_chunk(
+        "raw/schema.md",
+        current_checkpoint_hash,
+        0,
+        4,
+        50,
+        _analysis_json(concepts=["Old Schema"]),
+        checkpoint_schema=1,
+    )
+
+    client = _make_client(_analysis_json(concepts=["Fresh Schema"]))
+    _analyze_body_with_checkpoints(body, [], path, content_hash, client, config2, db)
+
+    assert client.generate.call_count == 4
+    assert (
+        db.list_ingest_chunks("raw/schema.md", current_checkpoint_hash, 4, 50, checkpoint_schema=1)
+        != []
+    )
 
 
 def test_ingest_note_replaces_stale_source_concepts(vault, config, db):
