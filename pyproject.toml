@@ -29,6 +29,7 @@ dependencies = [
     "watchdog>=4.0",
     "python-frontmatter>=1.1",
     "python-ulid>=2.0",
+    "pymupdf4llm>=0.0.5",
 ]
 
 [project.optional-dependencies]
