@@ -329,6 +329,14 @@ class TermRecord(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
 
 
+class TermExtractionResult(BaseModel):
+    """Result of the term-extraction LLM pass over a source segment."""
+
+    terms: list[TermRecord]
+    source_segment_id: str
+    model: str
+
+
 class RelationCandidate(BaseModel):
     """Concept-to-concept relation extracted as a separate pass (V6 §13.4)."""
 

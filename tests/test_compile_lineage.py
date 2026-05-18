@@ -43,7 +43,7 @@ def test_compile_runs_schema(tmp_path: Path) -> None:
 def test_current_schema_version() -> None:
     from synto.state import _CURRENT_SCHEMA_VERSION
 
-    assert _CURRENT_SCHEMA_VERSION == 12
+    assert _CURRENT_SCHEMA_VERSION == 13
 
 
 # ---------------------------------------------------------------------------

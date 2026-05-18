@@ -30,7 +30,7 @@ from pathlib import Path
 
 from .models import ItemMentionRecord, KnowledgeItemRecord, RawNoteRecord, WikiArticleRecord
 
-_CURRENT_SCHEMA_VERSION = 12
+_CURRENT_SCHEMA_VERSION = 13
 _CHECKPOINT_SCHEMA_VERSION = 2
 
 _CROCKFORD32_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
@@ -276,6 +276,18 @@ CREATE TABLE IF NOT EXISTS llm_cache (
     last_hit_at  TEXT,
     hit_count    INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS concept_occurrences (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    concept_name      TEXT NOT NULL,
+    source_segment_id TEXT NOT NULL,
+    ordinal           INTEGER NOT NULL DEFAULT 0,
+    confidence        REAL NOT NULL DEFAULT 1.0,
+    extraction_run    TEXT,
+    UNIQUE(concept_name, source_segment_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_concept_occurrences_concept ON concept_occurrences(concept_name);
 """
 
 # Migrations keyed by version they bring the DB to.
@@ -565,6 +577,19 @@ _VERSIONED_MIGRATIONS: dict[int, list[str]] = {
                last_hit_at   TEXT,
                hit_count     INTEGER NOT NULL DEFAULT 0
            )""",
+    ],
+    13: [
+        """CREATE TABLE IF NOT EXISTS concept_occurrences (
+               id                INTEGER PRIMARY KEY AUTOINCREMENT,
+               concept_name      TEXT NOT NULL,
+               source_segment_id TEXT NOT NULL,
+               ordinal           INTEGER NOT NULL DEFAULT 0,
+               confidence        REAL NOT NULL DEFAULT 1.0,
+               extraction_run    TEXT,
+               UNIQUE(concept_name, source_segment_id)
+           )""",
+        "CREATE INDEX IF NOT EXISTS idx_concept_occurrences_concept "
+        "ON concept_occurrences(concept_name)",
     ],
 }
 
@@ -1962,6 +1987,33 @@ class StateDB:
         return self._conn.execute(
             "SELECT * FROM compile_runs WHERE run_ulid = ?", (run_ulid,)
         ).fetchone()
+
+    # ── Term extraction (concept occurrences) ──────────────────────────────
+
+    def upsert_concept_occurrences(
+        self,
+        terms: list,
+        source_segment_id: str,
+        extraction_run: str | None = None,
+    ) -> None:
+        """Persist TermRecord list to concept_occurrences. Idempotent."""
+        if not self._has_table("concept_occurrences"):
+            return
+        with self._tx():
+            for ordinal, term in enumerate(terms):
+                self._conn.execute(
+                    """INSERT OR REPLACE INTO concept_occurrences
+                       (concept_name, source_segment_id, ordinal, confidence, extraction_run)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (term.name, source_segment_id, ordinal, term.confidence, extraction_run),
+                )
+
+    def list_concept_occurrences(self) -> list[sqlite3.Row]:
+        if not self._has_table("concept_occurrences"):
+            return []
+        return self._conn.execute(
+            "SELECT * FROM concept_occurrences ORDER BY concept_name, source_segment_id"
+        ).fetchall()
 
     def list_source_documents(self) -> list[tuple[str, str | None, str]]:
         if not self._has_table("source_documents"):

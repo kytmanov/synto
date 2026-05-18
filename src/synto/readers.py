@@ -633,7 +633,18 @@ class VaultReader:
         return ConceptRef(name=name, canonical_article_id=article_id, aliases=tuple(aliases))
 
     def list_terms(self) -> list[TermRef]:
-        return []
+        state = self._state()
+        if state is None:
+            return []
+        if not state._has_table("concept_occurrences"):
+            return []
+        rows = state._conn.execute(
+            "SELECT concept_name, MAX(confidence) as confidence "
+            "FROM concept_occurrences GROUP BY concept_name ORDER BY concept_name"
+        ).fetchall()
+        return [
+            TermRef(name=row["concept_name"], definition="", provenance="extracted") for row in rows
+        ]
 
     def find_term(self, query: str) -> TermRef | None:
         return None

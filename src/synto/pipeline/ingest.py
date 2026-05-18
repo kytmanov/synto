@@ -17,8 +17,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from pydantic import BaseModel as _BaseModel
+
 from ..config import Config
-from ..models import AnalysisResult, Concept, RawNoteRecord
+from ..models import AnalysisResult, Concept, RawNoteRecord, SourceSegment, TermExtractionResult
 from ..protocols import LLMClientProtocol
 from ..state import StateDB
 from ..structured_output import request_structured
@@ -1334,3 +1336,65 @@ def ingest_all(
         if on_progress is not None:
             on_progress(done, total, str(path.relative_to(config.vault)))
     return results
+
+
+_TERM_EXTRACTION_SYSTEM = (
+    "You are a technical vocabulary extractor. "
+    "Extract defined or implied terms from the provided text. "
+    "Return JSON only, no explanation."
+)
+
+
+class _TermLLMItem(_BaseModel):
+    name: str
+    definition: str
+    aliases: list[str] = []
+    provenance: str = "extracted"
+    confidence: float = 0.9
+
+
+class _TermLLMResponse(_BaseModel):
+    terms: list[_TermLLMItem] = []
+
+
+def extract_terms(
+    segment: SourceSegment,
+    client: LLMClientProtocol,
+    config: Config,
+) -> TermExtractionResult:
+    """Second LLM pass: extract technical terms from a source segment."""
+    from ..models import TermRecord
+
+    prompt = (
+        "Extract technical terms with definitions from the following text.\n"
+        'Return JSON: {"terms": [{"name": "...", "definition": "...", "aliases": [], '
+        '"provenance": "extracted", "confidence": 0.9}]}\n\n'
+        f"{segment.text[:4000]}"
+    )
+    llm_result = request_structured(
+        client=client,
+        prompt=prompt,
+        model_class=_TermLLMResponse,
+        model=config.models.fast,
+        system=_TERM_EXTRACTION_SYSTEM,
+        num_ctx=config.effective_provider.fast_ctx,
+        temperature=0,
+        stage="term_extraction",
+        model_role="fast",
+    )
+    terms = [
+        TermRecord(
+            name=t.name,
+            definition=t.definition,
+            aliases=t.aliases,
+            source_segment_id=segment.id,
+            provenance=t.provenance,  # type: ignore[arg-type]
+            confidence=min(max(t.confidence, 0.0), 1.0),
+        )
+        for t in llm_result.terms
+    ]
+    return TermExtractionResult(
+        terms=terms,
+        source_segment_id=segment.id,
+        model=config.models.fast,
+    )
