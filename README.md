@@ -1,7 +1,6 @@
 # Synto
 
 <p align="center">
-     <a href="https://pepy.tech/projects/synto"><img alt="PyPI Downloads" src="https://img.shields.io/pypi/dt/synto?style=flat"></a>
      <a href="https://github.com/kytmanov/synto/commits/master"><img alt="GitHub last commit" src="https://img.shields.io/github/last-commit/kytmanov/synto?style=flat"></a> 
      <a href="https://github.com/kytmanov/synto/actions/workflows/ci.yml"><img alt="CI status" src="https://img.shields.io/github/actions/workflow/status/kytmanov/synto/ci.yml?style=flat&amp;label=CI"></a> 
      <a href="https://pypi.org/project/synto/"><img alt="PyPI version" src="https://img.shields.io/pypi/v/synto?style=flat"></a>
