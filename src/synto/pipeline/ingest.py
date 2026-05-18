@@ -31,17 +31,15 @@ from ..vault import (
     write_note,
 )
 from .items import extract_named_reference_items, extract_quoted_title_items, store_extracted_items
+from .prompts import load_prompt
 
 log = logging.getLogger(__name__)
 
 INGEST_ANALYSIS_PROMPT_VERSION = "analysis-v2-language-policy"
 
-_SYSTEM = (
-    "You are a knowledge analyst. Read the provided note and extract structured information. "
-    "Be concise and accurate. Do not invent information not present in the note. "
-    "Detect the primary language of the note and return its ISO 639-1 code in the 'language' field "
-    "(e.g. 'en', 'fr', 'de'). Use null if uncertain."
-)
+# Kept for backward compatibility (imported by tests).  Actual system prompts live in
+# pipeline/prompts/ and are loaded per source_type via load_prompt().
+_SYSTEM = load_prompt("notes")
 
 
 def _content_hash(text: str) -> str:
@@ -259,6 +257,7 @@ def _analyze_body(
     on_chunk_result=None,
     skip_completed: set[int] | None = None,
     prompt_contexts: list[_PromptConceptContext] | None = None,
+    source_type: str = "notes",
 ) -> AnalysisResult:
     """Analyze note body, splitting into chunks if body exceeds fast_ctx // 2 chars."""
     chunk_size = config.effective_provider.fast_ctx // 2
@@ -276,7 +275,7 @@ def _analyze_body(
             prompt=prompt,
             model_class=AnalysisResult,
             model=config.models.fast,
-            system=_SYSTEM,
+            system=load_prompt(source_type),
             num_ctx=config.effective_provider.fast_ctx,
             temperature=0,
             stage="ingest",
@@ -313,7 +312,7 @@ def _analyze_body(
             prompt=prompt,
             model_class=AnalysisResult,
             model=config.models.fast,
-            system=_SYSTEM,
+            system=load_prompt(source_type),
             num_ctx=config.effective_provider.fast_ctx,
             temperature=0,
             stage="ingest",
@@ -368,6 +367,7 @@ def _analyze_body_with_checkpoints(
     *,
     force: bool = False,
     prompt_contexts: list[_PromptConceptContext] | None = None,
+    source_type: str = "notes",
 ) -> AnalysisResult:
     chunk_size = config.effective_provider.fast_ctx // 2
     rel_path = str(path.relative_to(config.vault))
@@ -385,6 +385,7 @@ def _analyze_body_with_checkpoints(
             client,
             config,
             prompt_contexts=prompt_contexts,
+            source_type=source_type,
         )
 
     chunks = [body[i : i + chunk_size] for i in range(0, len(body), chunk_size)]
@@ -434,6 +435,7 @@ def _analyze_body_with_checkpoints(
             on_chunk_result=_save_chunk,
             skip_completed=completed,
             prompt_contexts=prompt_contexts,
+            source_type=source_type,
         )
 
     results = [result for result in chunk_results if result is not None]
@@ -1133,6 +1135,7 @@ def ingest_note(
 
     # Pre-process web clips
     meta, body = parse_note(path)
+    source_type = str(meta.get("source_type", "notes"))
     # Strip Obsidian clipper placeholder embeds before they reach the LLM
     body = re.sub(r"!\[\[[^\]]*unknown_filename[^\]]*\]\]", "", body, flags=re.IGNORECASE)
     if meta.get("source") or meta.get("url"):  # web clipper adds these
@@ -1174,6 +1177,7 @@ def ingest_note(
             db=db,
             force=force,
             prompt_contexts=prompt_contexts,
+            source_type=source_type,
         )
     except Exception as e:
         log.error("Analysis failed for %s: %s", path.name, e)
