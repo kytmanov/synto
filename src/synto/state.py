@@ -30,7 +30,7 @@ from pathlib import Path
 
 from .models import ItemMentionRecord, KnowledgeItemRecord, RawNoteRecord, WikiArticleRecord
 
-_CURRENT_SCHEMA_VERSION = 10
+_CURRENT_SCHEMA_VERSION = 11
 _CHECKPOINT_SCHEMA_VERSION = 2
 
 _CROCKFORD32_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
@@ -255,6 +255,18 @@ CREATE INDEX IF NOT EXISTS idx_metric_events_ts ON metric_events(ts);
 CREATE INDEX IF NOT EXISTS idx_metric_events_type_ts ON metric_events(event_type, ts);
 CREATE INDEX IF NOT EXISTS idx_metric_daily_rollups_day ON metric_daily_rollups(day);
 CREATE INDEX IF NOT EXISTS idx_generated_assets_source ON generated_assets(source_id);
+
+CREATE TABLE IF NOT EXISTS compile_runs (
+    run_ulid        TEXT PRIMARY KEY,
+    pipeline_json   TEXT NOT NULL,
+    fast_model      TEXT NOT NULL,
+    heavy_model     TEXT NOT NULL,
+    started_at      TEXT NOT NULL,
+    finished_at     TEXT,
+    article_count   INTEGER NOT NULL DEFAULT 0,
+    total_tokens    INTEGER NOT NULL DEFAULT 0,
+    total_cost_usd  REAL NOT NULL DEFAULT 0.0
+);
 """
 
 # Migrations keyed by version they bring the DB to.
@@ -521,6 +533,19 @@ _VERSIONED_MIGRATIONS: dict[int, list[str]] = {
         "CREATE INDEX IF NOT EXISTS idx_metric_events_ts ON metric_events(ts)",
         ("CREATE INDEX IF NOT EXISTS idx_metric_events_type_ts ON metric_events(event_type, ts)"),
         ("CREATE INDEX IF NOT EXISTS idx_metric_daily_rollups_day ON metric_daily_rollups(day)"),
+    ],
+    11: [
+        """CREATE TABLE IF NOT EXISTS compile_runs (
+               run_ulid        TEXT PRIMARY KEY,
+               pipeline_json   TEXT NOT NULL,
+               fast_model      TEXT NOT NULL,
+               heavy_model     TEXT NOT NULL,
+               started_at      TEXT NOT NULL,
+               finished_at     TEXT,
+               article_count   INTEGER NOT NULL DEFAULT 0,
+               total_tokens    INTEGER NOT NULL DEFAULT 0,
+               total_cost_usd  REAL NOT NULL DEFAULT 0.0
+           )""",
     ],
 }
 
@@ -1870,6 +1895,54 @@ class StateDB:
         if not self._has_table("source_segments"):
             return 0
         return int(self._conn.execute("SELECT COUNT(*) FROM source_segments").fetchone()[0])
+
+    # ── Compile run tracking ──────────────────────────────────────────────
+
+    def start_compile_run(
+        self,
+        run_ulid: str,
+        pipeline_json: str,
+        fast_model: str,
+        heavy_model: str,
+    ) -> None:
+        now = datetime.now().isoformat()
+        self._conn.execute(
+            """INSERT OR REPLACE INTO compile_runs
+               (run_ulid, pipeline_json, fast_model, heavy_model, started_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (run_ulid, pipeline_json, fast_model, heavy_model, now),
+        )
+        self._conn.commit()
+
+    def finish_compile_run(
+        self,
+        run_ulid: str,
+        article_count: int = 0,
+        total_tokens: int = 0,
+        total_cost_usd: float = 0.0,
+    ) -> None:
+        now = datetime.now().isoformat()
+        self._conn.execute(
+            """UPDATE compile_runs
+               SET finished_at = ?, article_count = ?, total_tokens = ?, total_cost_usd = ?
+               WHERE run_ulid = ?""",
+            (now, article_count, total_tokens, total_cost_usd, run_ulid),
+        )
+        self._conn.commit()
+
+    def update_article_compile_run(self, article_path: str, run_ulid: str) -> None:
+        self._conn.execute(
+            "UPDATE wiki_articles SET last_compile_pipeline = ? WHERE path = ?",
+            (run_ulid, article_path),
+        )
+        self._conn.commit()
+
+    def get_compile_run(self, run_ulid: str) -> sqlite3.Row | None:
+        if not self._has_table("compile_runs"):
+            return None
+        return self._conn.execute(
+            "SELECT * FROM compile_runs WHERE run_ulid = ?", (run_ulid,)
+        ).fetchone()
 
     def list_source_documents(self) -> list[tuple[str, str | None, str]]:
         if not self._has_table("source_documents"):

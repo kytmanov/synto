@@ -10,9 +10,7 @@ log = logging.getLogger(__name__)
 _PROMPTS_DIR = Path(__file__).parent
 
 # Source types that have dedicated prompt files
-_KNOWN_TYPES = frozenset(
-    {"notes", "textbook", "paper", "api_docs", "web_article", "corp_docs"}
-)
+_KNOWN_TYPES = frozenset({"notes", "textbook", "paper", "api_docs", "web_article", "corp_docs"})
 
 
 def load_prompt(source_type: str) -> str:

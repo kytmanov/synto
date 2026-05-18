@@ -2860,3 +2860,56 @@ def compare(
             ),
             markup=False,
         )
+
+
+# ── Trace commands ────────────────────────────────────────────────────────────
+
+
+@cli.group()
+def trace():
+    """Trace compile history for articles and concepts."""
+
+
+@trace.command("article")
+@click.argument("name")
+@click.option("--vault", "vault_str", envvar=VAULT_ENV_VAR, default=None)
+def trace_article(name: str, vault_str: str | None) -> None:
+    """Print compile history for article NAME."""
+    from .vault import parse_note, sanitize_filename
+
+    config = _load_config(vault_str)
+    db = _load_db(config)
+
+    safe = sanitize_filename(name)
+    candidates = [
+        config.wiki_dir / f"{safe}.md",
+        config.drafts_dir / f"{safe}.md",
+    ]
+    article_path = next((p for p in candidates if p.exists()), None)
+    if article_path is None:
+        console.print(f"[red]Article not found:[/red] {name}")
+        raise SystemExit(1)
+
+    meta, _ = parse_note(article_path)
+    lineage = meta.get("lineage", [])
+    if not lineage:
+        console.print(f"[yellow]No lineage recorded for:[/yellow] {name}")
+        return
+
+    table = Table(title=f"Compile history: {name}", show_header=True, header_style="bold")
+    table.add_column("Compile run", style="cyan", no_wrap=True)
+    table.add_column("Fast model")
+    table.add_column("Heavy model")
+    table.add_column("Timestamp")
+
+    for entry in lineage:
+        pipeline = entry.get("pipeline", {})
+        run_id = str(entry.get("compile_run", ""))
+        # Also look up the full row from DB if available
+        row = db.get_compile_run(run_id) if run_id else None
+        fast = row["fast_model"] if row else pipeline.get("fast_model", "—")
+        heavy = row["heavy_model"] if row else pipeline.get("heavy_model", "—")
+        ts = str(entry.get("timestamp", "—"))[:19]
+        table.add_row(run_id[:16] or "—", fast, heavy, ts)
+
+    console.print(table)
