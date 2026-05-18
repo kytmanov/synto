@@ -914,7 +914,9 @@ def run_lint(config: Config, db: StateDB, fix: bool = False) -> LintResult:
     # they should be visible in lint output without turning a structurally healthy
     # vault into a failing one or driving the score negative.
     total = max(len(all_pages), 1)
-    pages_with_issues = len({iss.path for iss in issues if iss.issue_type not in _ADVISORY_ISSUE_TYPES})
+    pages_with_issues = len(
+        {iss.path for iss in issues if iss.issue_type not in _ADVISORY_ISSUE_TYPES}
+    )
     score = round(100.0 * (1 - pages_with_issues / total), 1)
     score = max(0.0, min(100.0, score))
     advisory_issue_count = sum(1 for iss in issues if iss.issue_type in _ADVISORY_ISSUE_TYPES)

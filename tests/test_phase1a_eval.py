@@ -76,7 +76,8 @@ def test_eval_render_text_shows_missing_index_as_na(tmp_path: Path) -> None:
     config = _init_eval_vault(tmp_path)
     result = CliRunner().invoke(
         cli,
-        ["eval", "--vault", str(config.vault), "--queries", str(_write_query_fixture(tmp_path / "q.toml"))],
+        ["eval", "--vault", str(config.vault), "--queries",
+         str(_write_query_fixture(tmp_path / "q.toml"))],
     )
     assert result.exit_code == 0
     assert "INDEX.json validity: n/a" in result.output
