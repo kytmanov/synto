@@ -2430,11 +2430,20 @@ def _review_single(
 )  # noqa: E501
 @click.option("--stubs-only", is_flag=True, help="Only create stub articles")
 @click.option("--dry-run", is_flag=True, help="Report issues without making changes")
-def maintain(vault_str, fix, stubs_only, dry_run):
+@click.option("--clear-cache", is_flag=True, help="Delete all LLM cache entries")
+@click.option(
+    "--older-than",
+    "older_than_days",
+    type=int,
+    default=None,
+    help="With --clear-cache: delete only entries older than N days",
+)
+def maintain(vault_str, fix, stubs_only, dry_run, clear_cache, older_than_days):
     """Wiki maintenance: health check, stub creation, orphan suggestions, and merge hints.
 
     Use --dry-run for a read-only health check.
     """
+    from .cache import LLMCache
     from .pipeline.lint import run_lint
     from .pipeline.lock import pipeline_lock
     from .pipeline.maintain import (
@@ -2447,6 +2456,15 @@ def maintain(vault_str, fix, stubs_only, dry_run):
 
     config = _load_config(vault_str)
     db = _load_db(config)
+
+    if clear_cache:
+        cache = LLMCache(db)
+        deleted = cache.clear(older_than_days=older_than_days)
+        if older_than_days is not None:
+            console.print(f"Cleared {deleted} LLM cache entries older than {older_than_days} days.")
+        else:
+            console.print(f"Cleared {deleted} LLM cache entries.")
+        return
 
     if dry_run:
         console.print("[dim]Dry run — no changes will be made.[/dim]\n")

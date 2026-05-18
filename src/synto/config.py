@@ -197,6 +197,10 @@ class McpConfig(BaseModel):
         return value
 
 
+class CacheConfig(BaseModel):
+    enabled: bool = False
+
+
 class Config(BaseModel):
     vault: Path
     models: ModelsConfig = ModelsConfig()
@@ -206,6 +210,7 @@ class Config(BaseModel):
     rag: RagConfig = RagConfig()
     metrics: MetricsConfig = MetricsConfig()
     mcp: McpConfig = McpConfig()
+    cache: CacheConfig = CacheConfig()
 
     @field_validator("vault", mode="before")
     @classmethod

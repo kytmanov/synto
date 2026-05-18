@@ -30,7 +30,7 @@ from pathlib import Path
 
 from .models import ItemMentionRecord, KnowledgeItemRecord, RawNoteRecord, WikiArticleRecord
 
-_CURRENT_SCHEMA_VERSION = 11
+_CURRENT_SCHEMA_VERSION = 12
 _CHECKPOINT_SCHEMA_VERSION = 2
 
 _CROCKFORD32_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
@@ -266,6 +266,15 @@ CREATE TABLE IF NOT EXISTS compile_runs (
     article_count   INTEGER NOT NULL DEFAULT 0,
     total_tokens    INTEGER NOT NULL DEFAULT 0,
     total_cost_usd  REAL NOT NULL DEFAULT 0.0
+);
+
+CREATE TABLE IF NOT EXISTS llm_cache (
+    cache_key    TEXT PRIMARY KEY,
+    model        TEXT NOT NULL,
+    response_json TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    last_hit_at  TEXT,
+    hit_count    INTEGER NOT NULL DEFAULT 0
 );
 """
 
@@ -545,6 +554,16 @@ _VERSIONED_MIGRATIONS: dict[int, list[str]] = {
                article_count   INTEGER NOT NULL DEFAULT 0,
                total_tokens    INTEGER NOT NULL DEFAULT 0,
                total_cost_usd  REAL NOT NULL DEFAULT 0.0
+           )""",
+    ],
+    12: [
+        """CREATE TABLE IF NOT EXISTS llm_cache (
+               cache_key     TEXT PRIMARY KEY,
+               model         TEXT NOT NULL,
+               response_json TEXT NOT NULL,
+               created_at    TEXT NOT NULL,
+               last_hit_at   TEXT,
+               hit_count     INTEGER NOT NULL DEFAULT 0
            )""",
     ],
 }

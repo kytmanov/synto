@@ -26,8 +26,12 @@ from __future__ import annotations
 
 import logging
 import time
+from typing import TYPE_CHECKING
 
 import httpx
+
+if TYPE_CHECKING:
+    from .cache import LLMCache
 
 log = logging.getLogger(__name__)
 
@@ -114,6 +118,7 @@ class OpenAICompatClient:
         supports_embeddings: bool = False,
         azure: bool = False,
         azure_api_version: str = "2024-02-15-preview",
+        cache: LLMCache | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.provider_name = provider_name
@@ -128,6 +133,7 @@ class OpenAICompatClient:
             timeout=timeout,
         )
         self._last_stats: dict = {}
+        self._cache = cache
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -350,6 +356,12 @@ class OpenAICompatClient:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
 
+        if self._cache is not None:
+            cached = self._cache.get(model, messages)
+            if cached is not None:
+                self._last_stats = {"latency_ms": 0, "cache_hit": True}
+                return cached
+
         payload: dict = {"model": model, "messages": messages, "stream": False}
         if temperature is not None:
             payload["temperature"] = temperature
@@ -430,6 +442,9 @@ class OpenAICompatClient:
                 completion_tokens=usage.get("completion_tokens"),
                 finish_reason=finish_reason or ("empty_content" if is_empty_content else None),
             )
+
+        if self._cache is not None:
+            self._cache.put(model, messages, content)
 
         return content
 

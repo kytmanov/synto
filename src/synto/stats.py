@@ -31,6 +31,8 @@ class VaultStats:
     low_confidence_articles: int
     single_source_articles: int
     manual_edit_conflicts_avoided: int | None
+    cache_entries: int = 0
+    cache_hit_rate: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -98,6 +100,8 @@ def _empty_stats_report(config: Config, *, since: str | None = None) -> StatsRep
         low_confidence_articles=low_confidence_articles,
         single_source_articles=0,
         manual_edit_conflicts_avoided=None,
+        cache_entries=0,
+        cache_hit_rate=0.0,
     )
     metrics = MetricsStats(
         since=since_label,
@@ -137,6 +141,9 @@ def compute_stats_from_db(config: Config, db: StateDB, *, since: str | None = No
         1 for record in db.list_articles() if not record.is_draft and len(record.sources) == 1
     )
 
+    from .cache import LLMCache
+
+    cache_stats = LLMCache(db).stats() if db._has_table("llm_cache") else {}
     vault = VaultStats(
         raw_notes=sum(int(v) for v in raw.values()),
         drafts=int(base_stats["drafts"]),
@@ -154,6 +161,8 @@ def compute_stats_from_db(config: Config, db: StateDB, *, since: str | None = No
         low_confidence_articles=low_confidence_articles,
         single_source_articles=single_source_articles,
         manual_edit_conflicts_avoided=None,
+        cache_entries=cache_stats.get("total_entries", 0),
+        cache_hit_rate=cache_stats.get("hit_rate", 0.0),
     )
 
     rollup_totals = db.metric_rollup_totals(since_day=since_day)
@@ -240,6 +249,8 @@ def render_text(report: StatsReport) -> str:
             if report.vault.manual_edit_conflicts_avoided is None
             else str(report.vault.manual_edit_conflicts_avoided)
         ),
+        f"  Cache entries: {report.vault.cache_entries}",
+        f"  Cache hit rate: {report.vault.cache_hit_rate:.1%}",
         "",
         "Runtime and Cost Metrics",
     ]
