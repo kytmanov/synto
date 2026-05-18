@@ -6,7 +6,7 @@ import re
 import struct
 import zlib
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import fitz
 import pytest
@@ -111,7 +111,7 @@ def test_extract_pdf_basic(db: StateDB) -> None:
 
 def test_segment_ids_format(db: StateDB) -> None:
     segs = extract_pdf("test-src", SAMPLE_PDF, db)
-    pattern = re.compile(r"^test-src:\d+-\d+:[0-9a-f]{8}$")
+    pattern = re.compile(r"^test-src:(page:\d+|section:[a-z0-9-]+(:(part\d+))?):[0-9a-f]{8}$")
     for seg in segs:
         assert pattern.match(seg.id), f"Bad ID format: {seg.id}"
 
@@ -265,3 +265,153 @@ def test_vault_root_created_automatically(
     # Do NOT pre-create vault
     extract_pdf("autocreate-src", pdf_with_image, db, vault_root=vault)
     assert (vault / "assets" / "autocreate-src").exists()
+
+
+# ---------------------------------------------------------------------------
+# Heading-aware grouping (Stages 1-4 of heading split plan)
+# ---------------------------------------------------------------------------
+
+
+def _make_chunk(text: str, page_number: int) -> dict:
+    return {"text": text, "metadata": {"page_number": page_number}}
+
+
+def test_extract_heading_atx() -> None:
+    from synto.extractors.pdf import _extract_heading
+
+    assert _extract_heading("# Introduction\nSome text") == "Introduction"
+    assert _extract_heading("## Methods\n\nContent") == "Methods"
+    assert _extract_heading("### Results\nData") == "Results"
+
+
+def test_extract_heading_bold() -> None:
+    from synto.extractors.pdf import _extract_heading
+
+    assert _extract_heading("**Abstract**\nContent") == "Abstract"
+    assert _extract_heading("**Chapter 3: Methods**\nText") == "Chapter 3: Methods"
+
+
+def test_extract_heading_none() -> None:
+    from synto.extractors.pdf import _extract_heading
+
+    assert _extract_heading("No heading here") is None
+    assert _extract_heading("") is None
+
+
+def test_heading_grouping_two_sections(single_page_pdf: Path, db: StateDB) -> None:
+    chunks = [
+        _make_chunk("# Introduction\nIntro text", 1),
+        _make_chunk("# Methods\nMethods text", 2),
+        _make_chunk("# Methods\nMore methods", 3),
+    ]
+    with patch("synto.extractors.pdf.pymupdf4llm.to_markdown", return_value=chunks):
+        segs = extract_pdf("head-src", single_page_pdf, db)
+    assert len(segs) == 2
+    locators = {s.structural_locator for s in segs}
+    assert "section:introduction" in locators
+    assert "section:methods" in locators
+
+
+def test_bold_heading_detected(single_page_pdf: Path, db: StateDB) -> None:
+    chunks = [_make_chunk("**Abstract**\nContent of abstract.", 1)]
+    with patch("synto.extractors.pdf.pymupdf4llm.to_markdown", return_value=chunks):
+        segs = extract_pdf("bold-src", single_page_pdf, db)
+    assert len(segs) == 1
+    assert segs[0].structural_locator == "section:abstract"
+
+
+def test_no_heading_fallback(single_page_pdf: Path, db: StateDB) -> None:
+    chunks = [
+        _make_chunk("Plain text on page one", 1),
+        _make_chunk("Plain text on page two", 2),
+    ]
+    with patch("synto.extractors.pdf.pymupdf4llm.to_markdown", return_value=chunks):
+        segs = extract_pdf("plain-src", single_page_pdf, db)
+    assert len(segs) == 2
+    assert segs[0].structural_locator == "page:0"
+    assert segs[1].structural_locator == "page:1"
+
+
+def test_size_ceiling_splits_section(single_page_pdf: Path, db: StateDB) -> None:
+    # All three pages share the same heading so they merge into one group,
+    # then _split_by_size breaks them apart because 3×3011 chars > 5000.
+    long_text = "x" * 3000
+    chunks = [
+        _make_chunk(f"# Results\n{long_text}", 1),
+        _make_chunk(f"# Results\n{long_text}", 2),
+        _make_chunk(f"# Results\n{long_text}", 3),
+    ]
+    with patch("synto.extractors.pdf.pymupdf4llm.to_markdown", return_value=chunks):
+        segs = extract_pdf("large-src", single_page_pdf, db, max_chars=5000)
+    assert len(segs) >= 2
+    locators = [s.structural_locator for s in segs]
+    assert "section:results:part1" in locators
+    assert "section:results:part2" in locators
+
+
+def test_toc_grouping_unit() -> None:
+    from synto.extractors.pdf import _toc_groups
+
+    mock_doc = MagicMock()
+    mock_doc.get_toc.return_value = [
+        [1, "Introduction", 1],
+        [1, "Methods", 3],
+    ]
+    chunks = [
+        _make_chunk("Intro text", 1),
+        _make_chunk("Intro p2", 2),
+        _make_chunk("Methods text", 3),
+        _make_chunk("Methods p2", 4),
+    ]
+    groups = _toc_groups(chunks, mock_doc)
+    assert groups is not None
+    assert len(groups) == 2
+    assert groups[0][0] == "introduction"
+    assert len(groups[0][1]) == 2
+    assert groups[1][0] == "methods"
+    assert len(groups[1][1]) == 2
+
+
+def test_toc_absent_returns_none() -> None:
+    from synto.extractors.pdf import _toc_groups
+
+    mock_doc = MagicMock()
+    mock_doc.get_toc.return_value = []
+    assert _toc_groups([_make_chunk("text", 1)], mock_doc) is None
+
+
+def test_multi_page_section_page_range(single_page_pdf: Path, db: StateDB) -> None:
+    chunks = [
+        _make_chunk("# Chapter One\nPage 1", 1),
+        _make_chunk("# Chapter One\nPage 2", 2),
+        _make_chunk("# Chapter One\nPage 3", 3),
+    ]
+    with patch("synto.extractors.pdf.pymupdf4llm.to_markdown", return_value=chunks):
+        segs = extract_pdf("range-src", single_page_pdf, db)
+    assert len(segs) == 1
+    assert segs[0].page_range == (0, 2)
+
+
+def test_grouped_section_collects_images(pdf_with_image: Path, tmp_path: Path, db: StateDB) -> None:
+    # pdf_with_image is a single-page PDF; mock one chunk with a heading
+    chunks = [_make_chunk("# Section One\nText with image", 1)]
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    with patch("synto.extractors.pdf.pymupdf4llm.to_markdown", return_value=chunks):
+        segs = extract_pdf("imggroup-src", pdf_with_image, db, vault_root=vault)
+    assert segs
+    assert segs[0].image_refs, "Image from grouped section should be collected"
+
+
+def test_stable_ids_heading_mode(single_page_pdf: Path, tmp_path: Path) -> None:
+    chunks = [
+        _make_chunk("# Introduction\nContent", 1),
+        _make_chunk("# Methods\nContent", 2),
+    ]
+    db1 = StateDB(tmp_path / "s1.db")
+    db2 = StateDB(tmp_path / "s2.db")
+    with patch("synto.extractors.pdf.pymupdf4llm.to_markdown", return_value=chunks):
+        segs1 = extract_pdf("stable2-src", single_page_pdf, db1)
+    with patch("synto.extractors.pdf.pymupdf4llm.to_markdown", return_value=chunks):
+        segs2 = extract_pdf("stable2-src", single_page_pdf, db2)
+    assert [s.id for s in segs1] == [s.id for s in segs2]
