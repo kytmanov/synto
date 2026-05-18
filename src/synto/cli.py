@@ -2931,3 +2931,151 @@ def trace_article(name: str, vault_str: str | None) -> None:
         table.add_row(run_id[:16] or "—", fast, heavy, ts)
 
     console.print(table)
+
+
+# ── synto add ─────────────────────────────────────────────────────────────────
+
+_SOURCE_TYPES = [
+    "notes",
+    "textbook",
+    "paper",
+    "spec",
+    "api_docs",
+    "web_article",
+    "corp_docs",
+    "transcript",
+    "unknown_text",
+]
+
+
+def _source_slug(text: str) -> str:
+    """Lowercase alphanumeric slug, max 30 chars."""
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:30]
+
+
+def _make_source_id(path: Path) -> str:
+    """Stable source_id: slugified stem + first 8 hex chars of SHA-256 of file bytes."""
+    import hashlib
+
+    raw = path.read_bytes()
+    content_hash = hashlib.sha256(raw).hexdigest()
+    return f"{_source_slug(path.stem)}-{content_hash[:8]}"
+
+
+@cli.command("add")
+@click.argument("source", type=click.Path(exists=True))
+@click.option(
+    "--type",
+    "source_type",
+    default=None,
+    type=click.Choice(_SOURCE_TYPES),
+    help="Override source type (default: inferred from extension).",
+)
+@click.option("--vault", "vault_str", envvar=VAULT_ENV_VAR, default=None)
+@click.option(
+    "--extend-pack",
+    "extend_pack",
+    default=None,
+    metavar="PACK_NAME",
+    help="Append a [[pack.sources]] entry to synto.toml under the given pack name.",
+)
+@click.option("--force", is_flag=True, help="Re-import even if source already exists.")
+def add(
+    source: str,
+    source_type: str | None,
+    vault_str: str | None,
+    extend_pack: str | None,
+    force: bool,
+) -> None:
+    """Import a source document into the vault.
+
+    SOURCE is a file path (PDF, markdown, text).  The original is copied to
+    .synto/sources/<source_id>/ and recorded in the state database.  For PDF
+    files, segments are extracted immediately.
+    """
+    import hashlib
+    import shutil
+    from datetime import UTC, datetime
+
+    from .models import SourceDocument
+    from .paths import config_path, effective_app_dir, effective_config_path
+
+    config = _load_config(vault_str)
+    db = _load_db(config)
+
+    src_path = Path(source).expanduser().resolve()
+    ext = src_path.suffix.lower()
+
+    # Infer source_type from extension when not provided
+    if source_type is None:
+        source_type = "paper" if ext == ".pdf" else "notes"
+
+    # Compute content hash and stable source_id
+    raw_bytes = src_path.read_bytes()
+    raw_hash = hashlib.sha256(raw_bytes).hexdigest()
+    source_id = _make_source_id(src_path)
+
+    # --- Duplicate detection ---
+    existing = db.get_source_document(source_id)
+    if existing and not force:
+        console.print(
+            f"[yellow]Already imported:[/yellow] {source_id}\n"
+            f"Use [bold]--force[/bold] to re-import."
+        )
+        raise SystemExit(1)
+
+    # --- Copy original to .synto/sources/<source_id>/ ---
+    app_dir = effective_app_dir(config.vault)
+    dest_dir = app_dir / "sources" / source_id
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_path = dest_dir / f"original{ext}"
+    shutil.copy2(src_path, dest_path)
+
+    # --- Record in source_documents ---
+    doc = SourceDocument(
+        id=source_id,
+        source_type=source_type,
+        origin_uri=src_path.as_uri(),
+        title=src_path.stem,
+        imported_at=datetime.now(UTC),
+        raw_hash=raw_hash,
+        redistribution="unknown",
+    )
+    db.upsert_source_document(doc)
+
+    # --- Extract segments (PDF only) ---
+    segment_count = 0
+    if ext == ".pdf":
+        from .extractors.pdf import extract_pdf
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+            transient=True,
+        ) as progress:
+            progress.add_task(f"Extracting segments from {src_path.name}…", total=None)
+            segs = extract_pdf(source_id, dest_path, db, vault_root=config.vault)
+        segment_count = len(segs)
+
+    # --- --extend-pack: append [[pack.sources]] to synto.toml ---
+    if extend_pack is not None:
+        # Prefer the existing config file; if absent, always create synto.toml
+        toml_path = effective_config_path(config.vault)
+        if not toml_path.exists():
+            toml_path = config_path(config.vault)
+        entry = f'\n[[pack.sources]]\nid = "{source_id}"\ntype = "{source_type}"\n'
+        if toml_path.exists():
+            existing_text = toml_path.read_text(encoding="utf-8")
+        else:
+            existing_text = f'[pack]\nname = "{extend_pack}"\n'
+        toml_path.write_text(existing_text + entry, encoding="utf-8")
+
+    # --- Summary ---
+    console.print(f"[green]Imported:[/green] {source_id}")
+    console.print(f"  Type:    {source_type}")
+    console.print(f"  Stored:  {dest_path.relative_to(config.vault)}")
+    if segment_count:
+        console.print(f"  Segments extracted: {segment_count}")
+    if extend_pack:
+        console.print(f"  Added to pack: {extend_pack}")

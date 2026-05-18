@@ -2015,6 +2015,51 @@ class StateDB:
             "SELECT * FROM concept_occurrences ORDER BY concept_name, source_segment_id"
         ).fetchall()
 
+    def upsert_source_document(self, doc: object) -> None:
+        """Insert or replace a SourceDocument record."""
+        import json
+        from datetime import UTC, datetime
+
+        imported_at = getattr(doc, "imported_at", None)
+        if imported_at is None:
+            imported_at = datetime.now(UTC).isoformat()
+        elif hasattr(imported_at, "isoformat"):
+            imported_at = imported_at.isoformat()
+
+        meta = dict(getattr(doc, "metadata", {}) or {})
+        biblio = getattr(doc, "bibliographic_metadata", None)
+        if biblio is not None:
+            meta["bibliographic_metadata"] = biblio.model_dump(exclude_none=True)
+
+        self._conn.execute(
+            """INSERT OR REPLACE INTO source_documents
+               (id, source_type, origin_uri, title, imported_at, raw_hash,
+                normalized_hash, extractor_version, license, redistribution, metadata_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                doc.id,
+                getattr(doc, "source_type", "unknown_text"),
+                getattr(doc, "origin_uri", None),
+                getattr(doc, "title", None),
+                imported_at,
+                getattr(doc, "raw_hash", None),
+                getattr(doc, "normalized_hash", None),
+                getattr(doc, "extractor_version", None),
+                getattr(doc, "license", None),
+                getattr(doc, "redistribution", "unknown"),
+                json.dumps(meta) if meta else None,
+            ),
+        )
+        self._conn.commit()
+
+    def get_source_document(self, source_id: str) -> sqlite3.Row | None:
+        """Fetch a source document by ID, or None if not found."""
+        if not self._has_table("source_documents"):
+            return None
+        return self._conn.execute(
+            "SELECT * FROM source_documents WHERE id = ?", (source_id,)
+        ).fetchone()
+
     def list_source_documents(self) -> list[tuple[str, str | None, str]]:
         if not self._has_table("source_documents"):
             return []
