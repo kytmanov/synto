@@ -245,39 +245,29 @@ def test_add_pdf_writes_raw_note_with_segments(
     assert "source_type: paper" in content
 
 
-# ---------------------------------------------------------------------------
-# Term extraction
-# ---------------------------------------------------------------------------
-
-
-def test_add_pdf_shows_term_count_when_extraction_succeeds(
-    config: Config, db: StateDB, sample_pdf: Path, runner: CliRunner
+def test_add_pdf_writes_raw_note_from_extracted_segments_directly(
+    config: Config, sample_pdf: Path, runner: CliRunner
 ) -> None:
-    """When _try_extract_terms returns > 0, the summary line is shown."""
-    with patch("synto.cli._try_extract_terms", return_value=5):
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    segs = [
+        SimpleNamespace(text="Segment A", structural_locator="section:intro"),
+        SimpleNamespace(text="Segment B", structural_locator="section:methods"),
+    ]
+
+    with patch("synto.extractors.pdf.extract_pdf", return_value=segs), patch(
+        "synto.state.StateDB.list_segments_for_source",
+        side_effect=AssertionError("raw note should be built from extracted segments directly"),
+    ):
         result = runner.invoke(cli, ["add", str(sample_pdf), "--vault", str(config.vault)])
+
     assert result.exit_code == 0, result.output
-    assert "Terms extracted: 5" in result.output
-
-
-def test_add_pdf_skips_term_count_line_when_llm_unavailable(
-    config: Config, db: StateDB, sample_pdf: Path, runner: CliRunner
-) -> None:
-    """When _try_extract_terms returns 0 (LLM unavailable), no terms line is shown."""
-    with patch("synto.cli._try_extract_terms", return_value=0):
-        result = runner.invoke(cli, ["add", str(sample_pdf), "--vault", str(config.vault)])
-    assert result.exit_code == 0, result.output
-    assert "Terms extracted" not in result.output
-
-
-def test_add_txt_does_not_run_term_extraction(
-    config: Config, db: StateDB, sample_txt: Path, runner: CliRunner
-) -> None:
-    """Term extraction is PDF-only; _try_extract_terms must not be called for .txt."""
-    with patch("synto.cli._try_extract_terms") as mock_extract:
-        result = runner.invoke(cli, ["add", str(sample_txt), "--vault", str(config.vault)])
-    assert result.exit_code == 0, result.output
-    mock_extract.assert_not_called()
+    raw_files = list((config.vault / "raw").glob("*.md"))
+    assert len(raw_files) == 1
+    content = raw_files[0].read_text()
+    assert "Segment A" in content
+    assert "Segment B" in content
 
 
 # ---------------------------------------------------------------------------

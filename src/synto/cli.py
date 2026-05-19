@@ -2988,39 +2988,6 @@ def _make_source_id(path: Path) -> str:
     return f"{_source_slug(path.stem)}-{content_hash[:8]}"
 
 
-def _try_extract_terms(pdf_segs, config, db) -> int:
-    """Best-effort term extraction from PDF segments; returns term count or 0 if LLM unavailable."""
-    import logging
-
-    from .cache import LLMCache
-    from .client_factory import build_client
-    from .pipeline.ingest import extract_terms
-
-    log = logging.getLogger(__name__)
-
-    try:
-        cache = LLMCache(db)
-        client = build_client(config, cache=cache)
-        client.require_healthy()
-    except Exception as e:
-        log.debug("Term extraction skipped (LLM unavailable): %s", e)
-        return 0
-
-    count = 0
-    try:
-        for seg in pdf_segs:
-            try:
-                result = extract_terms(seg, client, config)
-                db.upsert_concept_occurrences(result.terms, seg.id)
-                count += len(result.terms)
-            except Exception as e:
-                log.warning("Term extraction failed for segment %s: %s", seg.id, e)
-                continue
-    finally:
-        client.close()
-    return count
-
-
 @cli.command("add")
 @click.argument("source", type=click.Path(exists=True))
 @click.option(
@@ -3118,18 +3085,6 @@ def add(
             pdf_segs = extract_pdf(source_id, dest_path, db, vault_root=config.vault)
         segment_count = len(pdf_segs)
 
-    # --- Term extraction (optional, requires LLM) ---
-    term_count = 0
-    if pdf_segs:
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            console=console,
-            transient=True,
-        ) as progress:
-            progress.add_task(f"Extracting terms from {segment_count} segment(s)…", total=None)
-            term_count = _try_extract_terms(pdf_segs, config, db)
-
     # --- --extend-pack: append [[pack.sources]] to synto.toml ---
     if extend_pack is not None:
         # Prefer the existing config file; if absent, always create synto.toml
@@ -3148,9 +3103,8 @@ def add(
 
     from .pipeline.ingest import write_source_content_md as _write_cm
 
-    segs = db.list_segments_for_source(source_id)
-    if segs:
-        raw_path = _write_cm(source_id, source_type, src_path.stem, segs, config.vault)
+    if pdf_segs:
+        raw_path = _write_cm(source_id, source_type, src_path.stem, pdf_segs, config.vault)
     else:
         raw_path = _write_cm(
             source_id,
@@ -3166,8 +3120,6 @@ def add(
     console.print(f"  Stored:  {dest_path.relative_to(config.vault)}")
     if segment_count:
         console.print(f"  Segments extracted: {segment_count}")
-    if term_count:
-        console.print(f"  Terms extracted: {term_count}")
     console.print(f"  Raw note: {raw_path.relative_to(config.vault)}")
     if extend_pack:
         console.print(f"  Added to pack: {extend_pack}")
