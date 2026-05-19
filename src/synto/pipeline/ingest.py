@@ -1190,6 +1190,9 @@ def ingest_note(
     source_type = str(meta.get("source_type", "notes"))
     # Strip Obsidian clipper placeholder embeds before they reach the LLM
     body = re.sub(r"!\[\[[^\]]*unknown_filename[^\]]*\]\]", "", body, flags=re.IGNORECASE)
+    # Strip ### Media sections — image paths are opaque to the LLM and waste tokens;
+    # the embeds remain in the raw/ file for the human reader in Obsidian.
+    body = re.sub(r"\n### Media\n(?:- !\[\[[^\]]*\]\]\n?)*", "\n", body)
     if meta.get("source") or meta.get("url"):  # web clipper adds these
         body = _preprocess_web_clip(body)
 

@@ -1722,3 +1722,28 @@ def test_write_source_content_md_preserves_image_refs(tmp_path):
     content = path.read_text()
     assert "### Media" in content
     assert "![[assets/src-003/img-0-0.png]]" in content
+
+
+def test_media_section_stripped_before_llm_analysis(vault, config, db):
+    """### Media + ![[...]] embeds are removed from body before LLM sees it.
+
+    The raw/ file retains the embeds for human readers in Obsidian;
+    only the in-memory body passed to the LLM is cleaned.
+    """
+    body = (
+        "## section:intro\n\nSome meaningful text.\n\n"
+        "### Media\n- ![[assets/src-001/img-0-0.png]]\n- ![[assets/src-001/img-0-1.png]]\n\n"
+        "## section:results\n\nMore meaningful text.\n\n"
+        "### Media\n- ![[assets/src-001/img-1-0.png]]\n"
+    )
+    path = _write_raw(vault, "pdf-source.md", body)
+    client = _make_client(_analysis_json())
+    ingest_note(path, config, client, db)
+
+    prompt_sent = client.generate.call_args.kwargs["prompt"]
+    assert "### Media" not in prompt_sent
+    assert "![[assets" not in prompt_sent
+    assert "Some meaningful text." in prompt_sent
+    assert "More meaningful text." in prompt_sent
+    # Raw file on disk is unchanged — embeds are still there for Obsidian
+    assert "![[assets/src-001/img-0-0.png]]" in path.read_text()
