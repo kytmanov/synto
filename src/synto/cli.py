@@ -2422,7 +2422,7 @@ def _review_single(
             if reason:
                 count = db.rejection_count(summary.title)
                 if db.is_concept_blocked(summary.title):
-                    console.print(f"[red]⚠ '{summary.title}' is now blocked.[/red]")
+                    console.print(f"[red]⚠ '{escape(summary.title)}' is now blocked.[/red]")
                 else:
                     console.print(f"[dim]({count}/{db._REJECTION_CAP} rejections)[/dim]")
             return
