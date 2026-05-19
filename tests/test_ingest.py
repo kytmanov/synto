@@ -15,7 +15,6 @@ from synto.models import AnalysisResult, Concept
 from synto.pipeline.ingest import (
     _SYSTEM,
     _analyze_body,
-    write_source_content_md,
     _analyze_body_with_checkpoints,
     _base_concept_name,
     _build_analysis_prompt,
@@ -38,6 +37,7 @@ from synto.pipeline.ingest import (
     _suggested_topic_candidates,
     ingest_all,
     ingest_note,
+    write_source_content_md,
 )
 from synto.state import StateDB
 

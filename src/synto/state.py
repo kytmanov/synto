@@ -2087,7 +2087,10 @@ class StateDB:
             "WHERE source_id = ? ORDER BY ordinal",
             (source_id,),
         ).fetchall()
-        return [SimpleNamespace(text=row["text"], structural_locator=row["structural_locator"]) for row in rows]
+        return [
+            SimpleNamespace(text=row["text"], structural_locator=row["structural_locator"])
+            for row in rows
+        ]
 
     def list_metric_rollups(self) -> list[sqlite3.Row]:
         if not self._has_table("metric_daily_rollups"):

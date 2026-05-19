@@ -180,9 +180,7 @@ def _fix_json_ctrl_escapes(obj: Any) -> Any:
     \\n in JSON and must be preserved.
     """
     if isinstance(obj, str):
-        return _CTRL_ESCAPE_RE.sub(
-            lambda m: "\\" + _CTRL_TO_ESCAPE[m.group(1)] + m.group(2), obj
-        )
+        return _CTRL_ESCAPE_RE.sub(lambda m: "\\" + _CTRL_TO_ESCAPE[m.group(1)] + m.group(2), obj)
     if isinstance(obj, dict):
         return {k: _fix_json_ctrl_escapes(v) for k, v in obj.items()}
     if isinstance(obj, list):

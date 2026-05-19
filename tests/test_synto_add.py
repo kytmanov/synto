@@ -255,9 +255,7 @@ def test_add_pdf_shows_term_count_when_extraction_succeeds(
 ) -> None:
     """When _try_extract_terms returns > 0, the summary line is shown."""
     with patch("synto.cli._try_extract_terms", return_value=5):
-        result = runner.invoke(
-            cli, ["add", str(sample_pdf), "--vault", str(config.vault)]
-        )
+        result = runner.invoke(cli, ["add", str(sample_pdf), "--vault", str(config.vault)])
     assert result.exit_code == 0, result.output
     assert "Terms extracted: 5" in result.output
 
@@ -267,9 +265,7 @@ def test_add_pdf_skips_term_count_line_when_llm_unavailable(
 ) -> None:
     """When _try_extract_terms returns 0 (LLM unavailable), no terms line is shown."""
     with patch("synto.cli._try_extract_terms", return_value=0):
-        result = runner.invoke(
-            cli, ["add", str(sample_pdf), "--vault", str(config.vault)]
-        )
+        result = runner.invoke(cli, ["add", str(sample_pdf), "--vault", str(config.vault)])
     assert result.exit_code == 0, result.output
     assert "Terms extracted" not in result.output
 
@@ -279,9 +275,7 @@ def test_add_txt_does_not_run_term_extraction(
 ) -> None:
     """Term extraction is PDF-only; _try_extract_terms must not be called for .txt."""
     with patch("synto.cli._try_extract_terms") as mock_extract:
-        result = runner.invoke(
-            cli, ["add", str(sample_txt), "--vault", str(config.vault)]
-        )
+        result = runner.invoke(cli, ["add", str(sample_txt), "--vault", str(config.vault)])
     assert result.exit_code == 0, result.output
     mock_extract.assert_not_called()
 
