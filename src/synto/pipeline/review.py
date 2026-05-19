@@ -94,11 +94,10 @@ def compute_diff(draft_path: Path, wiki_path: Path) -> str | None:
 
     diff_lines = list(
         difflib.unified_diff(
-            wiki_body.splitlines(keepends=True),
-            draft_body.splitlines(keepends=True),
+            wiki_body.splitlines(),
+            draft_body.splitlines(),
             fromfile="published",
             tofile="draft",
-            lineterm="",
         )
     )
     if not diff_lines:
@@ -124,11 +123,10 @@ def compute_rejection_diff(draft_path: Path, db: StateDB, concept: str) -> str |
     rejected_body = rejections[0]["body"]
     diff_lines = list(
         difflib.unified_diff(
-            rejected_body.splitlines(keepends=True),
-            current_body.splitlines(keepends=True),
+            rejected_body.splitlines(),
+            current_body.splitlines(),
             fromfile="rejected",
             tofile="current",
-            lineterm="",
         )
     )
     if not diff_lines:

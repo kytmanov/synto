@@ -1,12 +1,15 @@
 # Synto
 
 <p align="center">
+     <a href="https://pepy.tech/projects/synto"><img alt="PyPI downloads" src="https://static.pepy.tech/badge/synto"></a>
      <a href="https://github.com/kytmanov/synto/commits/master"><img alt="GitHub last commit" src="https://img.shields.io/github/last-commit/kytmanov/synto?style=flat"></a> 
      <a href="https://github.com/kytmanov/synto/actions/workflows/ci.yml"><img alt="CI status" src="https://img.shields.io/github/actions/workflow/status/kytmanov/synto/ci.yml?style=flat&amp;label=CI"></a> 
      <a href="https://pypi.org/project/synto/"><img alt="PyPI version" src="https://img.shields.io/pypi/v/synto?style=flat"></a>
      <a href="https://tip.md/kytmanov"><img alt="Tip in Crypto" src="https://tip.md/badge.svg" height="20"></a>
      <a href="https://buymeacoffee.com/kytmanov"><img alt="Buy Me A Coffee" src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-%E2%98%95-yellow?style=flat&logo=buymeacoffee&logoColor=white"></a>
 </p>
+
+[Install](#install) · [Quick start](#quick-start) · [How it works](#how-it-works) · [Features](#features) · [Use cases](#use-cases) · [Provider support](#provider-support) · [What's in a pack](#whats-in-a-pack)
 
 **Turn your raw notes into a self-improving, interlinked wiki — powered by a local LLM.**
 
@@ -120,11 +123,11 @@ from the file extension.
 
 **Architectural reference from a textbook**
 
-[Dobryakov took Tanenbaum's *Distributed Systems*](https://www.facebook.com/dobryakov/posts/pfbid021pwPPJZ77KsyWMs3zTdMQEbgpmxgeE9wzoX1SDFE12y5vC3HtdFZV5i5HnS2dUAul), compiled it into a cross-linked wiki, and installed it into Claude/Cursor. Instead of generic suggestions, the AI started reasoning from established distributed systems principles — recommending consistent hashing and two-phase commit instead of "use a shared database." Any technical book, spec, or documentation set becomes a live context layer for your AI tools.
+[@dobryakov](https://github.com/dobryakov) turned Tanenbaum's *Distributed Systems* into a cross-linked wiki and used it as context for Claude/Cursor. Instead of falling back to generic integration advice, the AI started reasoning from distributed-systems concepts like persistent messaging, idempotency, eventual consistency, and two-phase commit when designing a production-grade event-driven architecture. Read the write-up: [Book-as-context](https://www.dobryakov.com/howto/book-as-context.html). Any technical book, spec, or documentation set can become a live context layer for your AI tools.
 
-**Karpathy's LLM Wiki**
+**Course material as a wiki**
 
-[Andrej Karpathy's](https://karpathy.ai) neural-network series is 20 hours of dense, high-quality material. Compile the transcripts and blog posts into a Synto pack and the content becomes queryable: any agent in your project can explain backpropagation, walk through the attention mechanism, or cite a specific lecture — from the source, not from model weights.
+[Andrej Karpathy's LLM Wiki idea](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f) works well for learning. Start with lectures, transcripts, and notes from a course like Karpathy's neural-network series. Instead of searching through raw files every time you ask a question, Synto turns them into a linked wiki that grows as you add more material. Then an agent can answer questions about backpropagation, attention, or training using your own course material. Good answers can also be saved back into the wiki, so it becomes more useful over time.
 
 **Your own research notes**
 

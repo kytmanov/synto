@@ -35,7 +35,13 @@ def db(config):
     return StateDB(config.state_db_path)
 
 
-def _write_draft(config, title: str, confidence: float = 0.5, sources: list | None = None):
+def _write_draft(
+    config,
+    title: str,
+    confidence: float = 0.5,
+    sources: list | None = None,
+    body: str | None = None,
+):
     """Helper: write a draft file with frontmatter."""
     import frontmatter as fm_lib
 
@@ -50,7 +56,7 @@ def _write_draft(config, title: str, confidence: float = 0.5, sources: list | No
         "created": "2024-01-01",
         "updated": "2024-01-01",
     }
-    body = f"## Overview\n\nThis is a draft about {title}."
+    body = body or f"## Overview\n\nThis is a draft about {title}."
     post = fm_lib.Post(body, **meta)
     draft_path = config.drafts_dir / f"{title.replace(' ', '_')}.md"
     atomic_write(draft_path, fm_lib.dumps(post))
@@ -253,3 +259,74 @@ def test_compute_diff_unreadable_draft_returns_none(config, db):
 
     result = compute_diff(draft_path, wiki_path)
     assert result is None
+
+
+# ── regression: diff output format and wikilink preservation (issue #5) ─────
+
+
+def test_compute_diff_header_lines_have_newlines(config, db):
+    """Header lines must be newline-terminated, not smashed together."""
+    import frontmatter as fm_lib
+
+    from synto.vault import atomic_write
+
+    wiki_path = config.wiki_dir / "Topic.md"
+    post = fm_lib.Post("Old content.", title="Topic", status="published", tags=[], sources=[])
+    atomic_write(wiki_path, fm_lib.dumps(post))
+    draft_path = _write_draft(config, "Topic")
+
+    result = compute_diff(draft_path, wiki_path)
+
+    assert result is not None
+    assert "--- published\n" in result
+    assert "+++ draft\n" in result
+
+
+def test_compute_diff_preserves_wikilinks(config, db):
+    """[[wikilinks]] in body must survive unchanged through diff computation."""
+    import frontmatter as fm_lib
+
+    from synto.vault import atomic_write
+
+    old_body = "See [[Alpha]] and [[Beta]] for context."
+    wiki_path = config.wiki_dir / "Topic.md"
+    post = fm_lib.Post(old_body, title="Topic", status="published", tags=[], sources=[])
+    atomic_write(wiki_path, fm_lib.dumps(post))
+
+    new_body = "See [[Alpha]] and [[Gamma]] for context."
+    draft_path = _write_draft(config, "Topic", body=new_body)
+
+    result = compute_diff(draft_path, wiki_path)
+
+    assert result is not None
+    assert "[[Alpha]]" in result
+    assert "[[Gamma]]" in result
+    assert "[[]]" not in result
+
+
+def test_compute_rejection_diff_header_lines_have_newlines(config, db):
+    """Rejection diff header lines must be newline-terminated."""
+    old_body = "## Old\n\nOld content."
+    draft_path = _write_draft(config, "Topic", body="## New\n\nNew content.")
+    db.add_rejection("Topic", "Needs work", body=old_body)
+
+    result = compute_rejection_diff(draft_path, db, "Topic")
+
+    assert result is not None
+    assert "--- rejected\n" in result
+    assert "+++ current\n" in result
+
+
+def test_compute_rejection_diff_preserves_wikilinks(config, db):
+    """[[wikilinks]] must survive unchanged through rejection diff computation."""
+    old_body = "See [[Alpha]] and [[Beta]]."
+    new_body = "See [[Alpha]] and [[Gamma]]."
+    draft_path = _write_draft(config, "Topic", body=new_body)
+    db.add_rejection("Topic", "Stale links", body=old_body)
+
+    result = compute_rejection_diff(draft_path, db, "Topic")
+
+    assert result is not None
+    assert "[[Alpha]]" in result
+    assert "[[Gamma]]" in result
+    assert "[[]]" not in result
