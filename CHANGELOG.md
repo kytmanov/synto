@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-05-19
+
+### Fixed
+
+- `synto review` now renders all `[[wikilinks]]` in draft bodies correctly. Previously, Rich's
+  markup parser interpreted `[[...]]` as nested markup tags, so only the first link was visible
+  and the rest appeared as `[[]]`.
+- Review diff output (`d` / `v` actions) no longer concatenates header lines. The `---`/`+++`
+  and `@@` lines are now properly newline-terminated.
+- Draft titles containing `[` or `]` are now escaped before being passed to Rich in the review
+  table, metadata line, and blocked-concept message.
+
 ## [0.2.0] - 2026-05-19
 
 ### Added
