@@ -452,6 +452,16 @@ def _strip_empty_wikilinks(content: str) -> str:
     return _restore_code_blocks(empty_wikilink_re.sub(replace, masked), replacements)
 
 
+def _repair_wikilink_placeholders(content: str) -> str:
+    """Collapse stray placeholder tokens like [[wikilinks][[Title]]] into valid markdown."""
+    masked, replacements = _mask_code_blocks(content)
+    repaired = masked
+    repaired = re.sub(r"\[\[wikilinks\]\[\[([^\]]+)\]\]\]", r"[[\1]]", repaired, flags=re.I)
+    repaired = re.sub(r"\[\[wikilinks\]\[\[([^\]]+)\]\]", r"[[\1]]", repaired, flags=re.I)
+    repaired = re.sub(r"\[\[wikilinks\]\s*([^\]\n]+)\]", r"\1", repaired, flags=re.I)
+    return _restore_code_blocks(repaired, replacements)
+
+
 def _repair_literal_newlines(content: str) -> str:
     """Repair LLM output that escaped Markdown newlines into literal \n text."""
     if "\\n" not in content:
@@ -672,6 +682,7 @@ def _write_draft(
         )
     source_targets = [ref.wiki_target for ref in source_refs]
     body = _repair_malformed_wikilinks(body, (existing_titles or []) + source_targets)
+    body = _repair_wikilink_placeholders(body)
     body = _strip_unknown_wikilinks(body, (existing_titles or []) + source_targets)
     body = _strip_self_wikilinks(body, article_title)
     body = _strip_empty_wikilinks(body)

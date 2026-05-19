@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from click.testing import CliRunner
 
 from synto.cli import cli
@@ -54,3 +56,14 @@ def test_status_shows_live_pipeline_lock(tmp_path):
 
     assert result.exit_code == 0
     assert "Pipeline lock held by PID" in result.output
+
+
+def test_status_counts_uningested_raw_files_as_new(tmp_path):
+    _init_status_vault(tmp_path)
+    StateDB(tmp_path / ".synto" / "state.db")
+    (tmp_path / "raw" / "imported.md").write_text("# Imported\n", encoding="utf-8")
+
+    result = CliRunner().invoke(cli, ["status", "--vault", str(tmp_path)])
+
+    assert result.exit_code == 0
+    assert re.search(r"Raw: new\s+│\s+1\s+│", result.output)

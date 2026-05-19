@@ -193,9 +193,10 @@ def _try_parse(raw: str, model_class: type[T]) -> tuple[T | None, str]:
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as e:
-        if "Invalid \\escape" in str(e):
+        if "Invalid \\escape" in str(e) or "Invalid \\uXXXX escape" in str(e):
             try:
-                data = json.loads(re.sub(r"\\(?![\"\\/bfnrtu])", r"\\\\", raw))
+                repaired = re.sub(r"\\(?![\"\\/bfnrt]|u[0-9a-fA-F]{4})", r"\\\\", raw)
+                data = json.loads(repaired)
             except json.JSONDecodeError:
                 return None, f"Invalid JSON: {e}"
         else:

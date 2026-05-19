@@ -22,6 +22,7 @@ from synto.pipeline.compile import (
     _repair_literal_newlines,
     _repair_malformed_embeds,
     _repair_malformed_wikilinks,
+    _repair_wikilink_placeholders,
     _rewrite_citation_markers,
     _strip_draft_annotations,
     _strip_empty_wikilinks,
@@ -415,6 +416,14 @@ def test_repair_malformed_wikilinks_strips_quote_and_citation_debris():
     )
 
     assert body == "See [[Independent publishing culture]] and [[Documentary notes]]."
+
+
+def test_repair_wikilink_placeholders_collapses_nested_and_stray_tokens():
+    body = _repair_wikilink_placeholders(
+        "Bad [[wikilinks][[Agentic ROI]]] and stray [[wikilinks]LLM agents]."
+    )
+
+    assert body == "Bad [[Agentic ROI]] and stray LLM agents."
 
 
 def test_apply_draft_media_mode_reference_replaces_embeds():

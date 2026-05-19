@@ -256,6 +256,20 @@ def test_invalid_backslash_escape_in_content_is_repaired():
     assert result.content == r"Windows path C:\Projects\Vault\File.md"
 
 
+def test_invalid_unicode_style_escape_in_content_is_repaired():
+    raw = '{"title":"T","content":"Equation: \\underbrace{x+y} and \\uparrow","tags":["t"]}'
+
+    result = request_structured(
+        client=_client(raw),
+        prompt="write",
+        model_class=SingleArticle,
+        model="qwen2.5:14b",
+        max_retries=0,
+    )
+
+    assert result.content == "Equation: \\underbrace{x+y} and \\uparrow"
+
+
 def test_latex_backslash_t_commands_are_restored():
     # LLM emits \text and \times without double-escaping; json.loads converts \t → tab
     raw = '{"title":"T","content":"C_{\\text{generate},i} and 24\\times","tags":["t"]}'

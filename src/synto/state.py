@@ -1877,6 +1877,20 @@ class StateDB:
                 "SELECT status, COUNT(*) as cnt FROM raw_notes GROUP BY status"
             ).fetchall()
         }
+        if vault is not None:
+            raw_dir = vault / "raw"
+            if raw_dir.exists():
+                tracked_rows = self._conn.execute("SELECT path FROM raw_notes").fetchall()
+                tracked_paths = {row["path"] for row in tracked_rows}
+                untracked_raw = sum(
+                    1
+                    for path in raw_dir.rglob("*.md")
+                    if "processed" not in path.parts
+                    and not path.name.startswith(".")
+                    and str(path.relative_to(vault)) not in tracked_paths
+                )
+                if untracked_raw:
+                    raw_counts["new"] = raw_counts.get("new", 0) + untracked_raw
         db_draft_count = self._conn.execute(
             "SELECT COUNT(*) FROM wiki_articles WHERE is_draft=1"
         ).fetchone()[0]
