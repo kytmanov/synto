@@ -54,9 +54,10 @@ def _extract_heading(text: str) -> str | None:
     return None
 
 
-def _heading_slug(heading: str) -> str:
-    """Lowercase alphanumeric slug, max 40 chars."""
-    return re.sub(r"[^a-z0-9]+", "-", heading.lower()).strip("-")[:40]
+def _heading_slug(heading: str) -> str | None:
+    """Lowercase alphanumeric slug, max 40 chars; None when nothing survives."""
+    slug = re.sub(r"[^a-z0-9]+", "-", heading.lower()).strip("-")[:40]
+    return slug or None
 
 
 def _group_by_heading(chunks: list[dict]) -> list[tuple[str | None, list[dict]]]:
@@ -92,7 +93,9 @@ def _group_by_heading(chunks: list[dict]) -> list[tuple[str | None, list[dict]]]
     return groups
 
 
-def _toc_groups(chunks: list[dict], fitz_doc: fitz.Document) -> list[tuple[str, list[dict]]] | None:
+def _toc_groups(
+    chunks: list[dict], fitz_doc: fitz.Document
+) -> list[tuple[str | None, list[dict]]] | None:
     """Return [(slug, chunk_list), ...] from the PDF's table of contents.
 
     Returns None when the ToC is absent or has no level-1 entries.
@@ -114,15 +117,24 @@ def _toc_groups(chunks: list[dict], fitz_doc: fitz.Document) -> list[tuple[str, 
 
     max_page = max(page_to_chunks.keys(), default=0)
     slug_counter: dict[str, int] = {}
-    groups: list[tuple[str, list[dict]]] = []
+    groups: list[tuple[str | None, list[dict]]] = []
+
+    first_start_page = level1[0][1]
+    preamble_chunks: list[dict] = []
+    for pn in range(1, first_start_page):
+        preamble_chunks.extend(page_to_chunks.get(pn, []))
+    if preamble_chunks:
+        groups.append((None, preamble_chunks))
 
     for i, (title, start_page) in enumerate(level1):
         end_page = level1[i + 1][1] - 1 if i + 1 < len(level1) else max_page
 
-        base_slug = _heading_slug(title)
-        slug_counter[base_slug] = slug_counter.get(base_slug, 0) + 1
-        count = slug_counter[base_slug]
-        slug = base_slug if count == 1 else f"{base_slug}-{count}"
+        slug = _heading_slug(title)
+        if slug is not None:
+            slug_counter[slug] = slug_counter.get(slug, 0) + 1
+            count = slug_counter[slug]
+            if count > 1:
+                slug = f"{slug}-{count}"
 
         group_chunks: list[dict] = []
         for pn in range(start_page, end_page + 1):
@@ -197,107 +209,109 @@ def extract_pdf(
         return []
 
     fitz_doc = fitz.open(str(path))
-    heading_groups = _toc_groups(chunks, fitz_doc) or _group_by_heading(chunks)
-    final_groups = _split_by_size(heading_groups, max_chars)
+    try:
+        heading_groups = _toc_groups(chunks, fitz_doc) or _group_by_heading(chunks)
+        final_groups = _split_by_size(heading_groups, max_chars)
 
-    segments: list[SourceSegment] = []
-    now = datetime.now(UTC).isoformat()
+        segments: list[SourceSegment] = []
+        now = datetime.now(UTC).isoformat()
 
-    for ordinal, (slug, group_chunks, part_idx) in enumerate(final_groups):
-        text = "\n".join(c.get("text", "") for c in group_chunks)
-        content_hash = hashlib.sha256(text.encode()).hexdigest()
+        for ordinal, (slug, group_chunks, part_idx) in enumerate(final_groups):
+            text = "\n".join(c.get("text", "") for c in group_chunks)
+            content_hash = hashlib.sha256(text.encode()).hexdigest()
 
-        # Build structural locator
-        if slug is None:
-            pn = group_chunks[0].get("metadata", {}).get("page_number", ordinal + 1) - 1
-            locator = f"page:{pn}"
-        elif part_idx is None:
-            locator = f"section:{slug}"
-        else:
-            locator = f"section:{slug}:part{part_idx}"
+            # Build structural locator
+            if slug is None:
+                pn = group_chunks[0].get("metadata", {}).get("page_number", ordinal + 1) - 1
+                locator = f"page:{pn}"
+            elif part_idx is None:
+                locator = f"section:{slug}"
+            else:
+                locator = f"section:{slug}:part{part_idx}"
 
-        seg_id = f"{source_id}:{locator}:{content_hash[:8]}"
-        identity = f"{source_id}:{locator}"
+            seg_id = f"{source_id}:{locator}:{content_hash[:8]}"
+            identity = f"{source_id}:{locator}"
 
-        # page_range: 0-indexed min/max across all chunks in this group
-        pages = [c.get("metadata", {}).get("page_number", 1) - 1 for c in group_chunks]
-        page_range = (min(pages), max(pages))
+            # page_range: 0-indexed min/max across all chunks in this group
+            pages = [c.get("metadata", {}).get("page_number", 1) - 1 for c in group_chunks]
+            page_range = (min(pages), max(pages))
 
-        # Images: collect from every page in the range using fitz
-        image_refs: list[str] = []
-        if vault_root is not None:
-            for page in range(page_range[0], page_range[1] + 1):
-                if page >= len(fitz_doc):
-                    continue
-                fitz_page = fitz_doc[page]
-                for img_idx, img_tuple in enumerate(fitz_page.get_images(full=True)):
-                    xref = img_tuple[0]
-                    base_image = fitz_doc.extract_image(xref)
-                    ext = base_image.get("ext", "png")
-                    img_bytes = base_image.get("image", b"")
-                    if not img_bytes:
+            # Images: collect from every page in the range using fitz
+            image_refs: list[str] = []
+            if vault_root is not None:
+                for page in range(page_range[0], page_range[1] + 1):
+                    if page >= len(fitz_doc):
                         continue
-                    img_dir = vault_root / "assets" / source_id
-                    img_dir.mkdir(parents=True, exist_ok=True)
-                    rel_path = f"assets/{source_id}/img-{page}-{img_idx}.{ext}"
-                    (vault_root / rel_path).write_bytes(img_bytes)
-                    image_refs.append(rel_path)
-                    db._conn.execute(
-                        """INSERT OR REPLACE INTO generated_assets
-                           (path, source_id, asset_type, master_path,
-                            created_at, referenced_by_json)
-                           VALUES (?, ?, 'image', ?, ?, '[]')""",
-                        (rel_path, source_id, str(path), now),
-                    )
+                    fitz_page = fitz_doc[page]
+                    for img_idx, img_tuple in enumerate(fitz_page.get_images(full=True)):
+                        xref = img_tuple[0]
+                        base_image = fitz_doc.extract_image(xref)
+                        ext = base_image.get("ext", "png")
+                        img_bytes = base_image.get("image", b"")
+                        if not img_bytes:
+                            continue
+                        img_dir = vault_root / "assets" / source_id
+                        img_dir.mkdir(parents=True, exist_ok=True)
+                        rel_path = f"assets/{source_id}/img-{page}-{img_idx}.{ext}"
+                        (vault_root / rel_path).write_bytes(img_bytes)
+                        image_refs.append(rel_path)
+                        db._conn.execute(
+                            """INSERT OR REPLACE INTO generated_assets
+                               (path, source_id, asset_type, master_path,
+                                created_at, referenced_by_json)
+                               VALUES (?, ?, 'image', ?, ?, '[]')""",
+                            (rel_path, source_id, str(path), now),
+                        )
 
-        # Equations: collect per chunk, preserving original page number for ref keys
-        eq_refs: list[str] = []
-        for c in group_chunks:
-            pg = c.get("metadata", {}).get("page_number", 1) - 1
-            eq_refs.extend(_detect_equations(c.get("text", ""), pg))
+            # Equations: collect per chunk, preserving original page number for ref keys
+            eq_refs: list[str] = []
+            for c in group_chunks:
+                pg = c.get("metadata", {}).get("page_number", 1) - 1
+                eq_refs.extend(_detect_equations(c.get("text", ""), pg))
 
-        segment = SourceSegment(
-            id=seg_id,
-            identity=identity,
-            ordinal=ordinal,
-            source_id=source_id,
-            structural_locator=locator,
-            content_hash=content_hash,
-            text=text,
-            page_range=page_range,
-            image_refs=image_refs,
-            equation_refs=eq_refs,
-        )
-        segments.append(segment)
+            segment = SourceSegment(
+                id=seg_id,
+                identity=identity,
+                ordinal=ordinal,
+                source_id=source_id,
+                structural_locator=locator,
+                content_hash=content_hash,
+                text=text,
+                page_range=page_range,
+                image_refs=image_refs,
+                equation_refs=eq_refs,
+            )
+            segments.append(segment)
 
-        extra: dict = {}
-        if image_refs:
-            extra["image_refs"] = image_refs
-        if eq_refs:
-            extra["equation_refs"] = eq_refs
+            extra: dict = {}
+            if image_refs:
+                extra["image_refs"] = image_refs
+            if eq_refs:
+                extra["equation_refs"] = eq_refs
 
-        db._conn.execute(
-            """INSERT OR REPLACE INTO source_segments
-               (id, identity, ordinal, source_id, structural_locator, content_hash,
-                text, section_path_json, page_start, page_end, metadata_json)
-               VALUES (?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?)""",
-            (
-                seg_id,
-                identity,
-                ordinal,
-                source_id,
-                locator,
-                content_hash,
-                text,
-                page_range[0],
-                page_range[1],
-                json.dumps(extra) if extra else None,
-            ),
-        )
+            db._conn.execute(
+                """INSERT OR REPLACE INTO source_segments
+                   (id, identity, ordinal, source_id, structural_locator, content_hash,
+                    text, section_path_json, page_start, page_end, metadata_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?)""",
+                (
+                    seg_id,
+                    identity,
+                    ordinal,
+                    source_id,
+                    locator,
+                    content_hash,
+                    text,
+                    page_range[0],
+                    page_range[1],
+                    json.dumps(extra) if extra else None,
+                ),
+            )
 
-    fitz_doc.close()
-    db._conn.commit()
-    return segments
+        db._conn.commit()
+        return segments
+    finally:
+        fitz_doc.close()
 
 
 def extract_bibliographic_metadata(path: Path, first_page_md: str) -> BibliographicMetadata:
@@ -307,8 +321,10 @@ def extract_bibliographic_metadata(path: Path, first_page_md: str) -> Bibliograp
     for title.  DOI and year are extracted via regex from the first page markdown.
     """
     doc = fitz.open(str(path))
-    meta = doc.metadata or {}
-    doc.close()
+    try:
+        meta = doc.metadata or {}
+    finally:
+        doc.close()
 
     title = meta.get("title", "").strip()
     if not title:

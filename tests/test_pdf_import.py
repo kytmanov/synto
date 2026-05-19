@@ -298,6 +298,14 @@ def test_extract_heading_none() -> None:
     assert _extract_heading("") is None
 
 
+def test_non_latin_heading_falls_back_to_page_locator(single_page_pdf: Path, db: StateDB) -> None:
+    chunks = [_make_chunk("# Введение\nТекст", 1)]
+    with patch("synto.extractors.pdf.pymupdf4llm.to_markdown", return_value=chunks):
+        segs = extract_pdf("cyrillic-src", single_page_pdf, db)
+    assert len(segs) == 1
+    assert segs[0].structural_locator == "page:0"
+
+
 def test_heading_grouping_two_sections(single_page_pdf: Path, db: StateDB) -> None:
     chunks = [
         _make_chunk("# Introduction\nIntro text", 1),
@@ -378,6 +386,23 @@ def test_toc_absent_returns_none() -> None:
     mock_doc = MagicMock()
     mock_doc.get_toc.return_value = []
     assert _toc_groups([_make_chunk("text", 1)], mock_doc) is None
+
+
+def test_toc_grouping_preserves_preamble_pages() -> None:
+    from synto.extractors.pdf import _toc_groups
+
+    mock_doc = MagicMock()
+    mock_doc.get_toc.return_value = [[1, "Chapter One", 3]]
+    chunks = [
+        _make_chunk("Cover page", 1),
+        _make_chunk("Abstract page", 2),
+        _make_chunk("Chapter text", 3),
+    ]
+    groups = _toc_groups(chunks, mock_doc)
+    assert groups is not None
+    assert groups[0][0] is None
+    assert len(groups[0][1]) == 2
+    assert groups[1][0] == "chapter-one"
 
 
 def test_multi_page_section_page_range(single_page_pdf: Path, db: StateDB) -> None:
