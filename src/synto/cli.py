@@ -3094,8 +3094,9 @@ def add(
         db.upsert_source_document(doc)
 
         # --- Extract segments (PDF only) ---
+        note_meta: dict[str, object] | None = None
         if ext == ".pdf":
-            from .extractors.pdf import extract_pdf
+            from .extractors.pdf import extract_bibliographic_metadata, extract_pdf
 
             with Progress(
                 SpinnerColumn(),
@@ -3106,6 +3107,15 @@ def add(
                 progress.add_task(f"Extracting segments from {src_path.name}…", total=None)
                 pdf_segs = extract_pdf(source_id, dest_path, db, vault_root=config.vault)
             segment_count = len(pdf_segs)
+            if pdf_segs:
+                biblio = extract_bibliographic_metadata(dest_path, pdf_segs[0].text)
+                note_meta = {
+                    "authors": biblio.authors,
+                    "doi": biblio.doi,
+                    "year": biblio.year,
+                }
+                if biblio.title and biblio.title != src_path.stem:
+                    note_meta["source_title"] = biblio.title
 
         # --- --extend-pack: append [[pack.sources]] to synto.toml ---
         if extend_pack is not None:
@@ -3122,9 +3132,15 @@ def add(
 
         # Write assembled content to raw/ so ingest_all picks it up on next run
         if pdf_segs:
-            raw_path = _write_cm(source_id, source_type, src_path.stem, pdf_segs, config.vault)
+            raw_path = _write_cm(
+                source_id,
+                source_type,
+                src_path.stem,
+                pdf_segs,
+                config.vault,
+                metadata=note_meta,
+            )
         else:
-            note_meta: dict[str, object] | None = None
             note_title = src_path.stem
             note_body = dest_path.read_text(errors="replace")
             if ext == ".md":

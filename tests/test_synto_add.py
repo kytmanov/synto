@@ -347,6 +347,28 @@ def test_add_pdf_writes_raw_note_with_segments(
     assert "source_type: paper" in content
 
 
+def test_add_pdf_surfaces_bibliographic_metadata_in_raw_frontmatter(
+    config: Config, db: StateDB, tmp_path: Path, runner: CliRunner
+) -> None:
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), "DOI: 10.9999/example.2021 Published 2021.")
+    doc.set_metadata({"title": "Metadata Title", "author": "Alice; Bob"})
+    pdf_path = tmp_path / "with_meta.pdf"
+    doc.save(str(pdf_path))
+    doc.close()
+
+    result = runner.invoke(cli, ["add", str(pdf_path), "--vault", str(config.vault)])
+
+    assert result.exit_code == 0, result.output
+    raw_files = list((config.vault / "raw").glob("*.md"))
+    assert len(raw_files) == 1
+    content = raw_files[0].read_text()
+    assert "source_title: Metadata Title" in content
+    assert "doi: 10.9999/example.2021" in content
+    assert "year: 2021" in content
+
+
 def test_add_pdf_raw_note_preserves_image_refs(
     config: Config, db: StateDB, sample_pdf: Path, runner: CliRunner
 ) -> None:
