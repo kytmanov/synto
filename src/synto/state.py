@@ -2096,22 +2096,6 @@ class StateDB:
         ).fetchall()
         return [(row["id"], row["identity"], row["source_id"], row["content_hash"]) for row in rows]
 
-    def list_segments_for_source(self, source_id: str) -> list:
-        """Return full segment rows for source_id ordered by ordinal."""
-        from types import SimpleNamespace
-
-        if not self._has_table("source_segments"):
-            return []
-        rows = self._conn.execute(
-            "SELECT text, structural_locator FROM source_segments "
-            "WHERE source_id = ? ORDER BY ordinal",
-            (source_id,),
-        ).fetchall()
-        return [
-            SimpleNamespace(text=row["text"], structural_locator=row["structural_locator"])
-            for row in rows
-        ]
-
     def list_metric_rollups(self) -> list[sqlite3.Row]:
         if not self._has_table("metric_daily_rollups"):
             return []

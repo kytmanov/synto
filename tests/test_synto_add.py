@@ -174,32 +174,32 @@ def test_add_pdf_segments_linked_to_source(
 # ---------------------------------------------------------------------------
 
 
-def test_extend_pack_creates_toml_entry(
+def test_extend_pack_does_not_mutate_config(
     config: Config, db: StateDB, sample_txt: Path, runner: CliRunner
 ) -> None:
-    runner.invoke(
+    result = runner.invoke(
         cli,
         ["add", "--extend-pack", "my-pack", str(sample_txt), "--vault", str(config.vault)],
     )
+    assert result.exit_code == 0, result.output
     toml_path = config.vault / "synto.toml"
-    assert toml_path.exists()
-    text = toml_path.read_text()
-    assert "[[pack.sources]]" in text
-    assert "my-pack" in text or "id" in text
+    assert not toml_path.exists()
+    assert "not implemented" in result.output
 
 
-def test_extend_pack_appends_to_existing_toml(
+def test_extend_pack_preserves_existing_toml(
     config: Config, db: StateDB, sample_txt: Path, runner: CliRunner
 ) -> None:
     toml_path = config.vault / "synto.toml"
     toml_path.write_text('[models]\nfast = "gemma4:e4b"\n')
-    runner.invoke(
+    result = runner.invoke(
         cli,
         ["add", "--extend-pack", "my-pack", str(sample_txt), "--vault", str(config.vault)],
     )
+    assert result.exit_code == 0, result.output
     text = toml_path.read_text()
     assert "[models]" in text  # original content preserved
-    assert "[[pack.sources]]" in text
+    assert "[[pack.sources]]" not in text
 
 
 # ---------------------------------------------------------------------------
@@ -404,10 +404,7 @@ def test_add_pdf_writes_raw_note_from_extracted_segments_directly(
         SimpleNamespace(text="Segment B", structural_locator="section:methods"),
     ]
 
-    with patch("synto.extractors.pdf.extract_pdf", return_value=segs), patch(
-        "synto.state.StateDB.list_segments_for_source",
-        side_effect=AssertionError("raw note should be built from extracted segments directly"),
-    ):
+    with patch("synto.extractors.pdf.extract_pdf", return_value=segs):
         result = runner.invoke(cli, ["add", str(sample_pdf), "--vault", str(config.vault)])
 
     assert result.exit_code == 0, result.output

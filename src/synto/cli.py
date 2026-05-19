@@ -3003,7 +3003,7 @@ def _make_source_id(path: Path) -> str:
     "extend_pack",
     default=None,
     metavar="PACK_NAME",
-    help="Append a [[pack.sources]] entry to synto.toml under the given pack name.",
+    help="Reserved for future pack integration; currently a no-op.",
 )
 @click.option("--force", is_flag=True, help="Re-import even if source already exists.")
 def add(
@@ -3025,7 +3025,7 @@ def add(
     from types import SimpleNamespace as _NS
 
     from .models import SourceDocument
-    from .paths import config_path, effective_app_dir, effective_config_path
+    from .paths import effective_app_dir
     from .pipeline.ingest import write_source_content_md as _write_cm
     from .vault import parse_note
 
@@ -3117,18 +3117,12 @@ def add(
                 if biblio.title and biblio.title != src_path.stem:
                     note_meta["source_title"] = biblio.title
 
-        # --- --extend-pack: append [[pack.sources]] to synto.toml ---
+        # --- --extend-pack: reserved for future pack integration ---
         if extend_pack is not None:
-            # Prefer the existing config file; if absent, always create synto.toml
-            toml_path = effective_config_path(config.vault)
-            if not toml_path.exists():
-                toml_path = config_path(config.vault)
-            entry = f'\n[[pack.sources]]\nid = "{source_id}"\ntype = "{source_type}"\n'
-            if toml_path.exists():
-                existing_text = toml_path.read_text(encoding="utf-8")
-            else:
-                existing_text = f'[pack]\nname = "{extend_pack}"\n'
-            toml_path.write_text(existing_text + entry, encoding="utf-8")
+            console.print(
+                f"  Note: pack extension for '{extend_pack}' is not implemented; "
+                "exports remain vault-wide."
+            )
 
         # Write assembled content to raw/ so ingest_all picks it up on next run
         if pdf_segs:
@@ -3174,5 +3168,3 @@ def add(
     if segment_count:
         console.print(f"  Segments extracted: {segment_count}")
     console.print(f"  Raw note: {raw_path.relative_to(config.vault)}")
-    if extend_pack:
-        console.print(f"  Added to pack: {extend_pack}")
