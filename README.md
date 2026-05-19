@@ -1,12 +1,15 @@
 # Synto
 
 <p align="center">
+     <a href="https://pepy.tech/projects/synto"><img alt="PyPI downloads" src="https://static.pepy.tech/badge/synto"></a>
      <a href="https://github.com/kytmanov/synto/commits/master"><img alt="GitHub last commit" src="https://img.shields.io/github/last-commit/kytmanov/synto?style=flat"></a> 
      <a href="https://github.com/kytmanov/synto/actions/workflows/ci.yml"><img alt="CI status" src="https://img.shields.io/github/actions/workflow/status/kytmanov/synto/ci.yml?style=flat&amp;label=CI"></a> 
      <a href="https://pypi.org/project/synto/"><img alt="PyPI version" src="https://img.shields.io/pypi/v/synto?style=flat"></a>
      <a href="https://tip.md/kytmanov"><img alt="Tip in Crypto" src="https://tip.md/badge.svg" height="20"></a>
      <a href="https://buymeacoffee.com/kytmanov"><img alt="Buy Me A Coffee" src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-%E2%98%95-yellow?style=flat&logo=buymeacoffee&logoColor=white"></a>
 </p>
+
+[Install](#install) · [Quick start](#quick-start) · [How it works](#how-it-works) · [Features](#features) · [Use cases](#use-cases) · [Provider support](#provider-support) · [What's in a pack](#whats-in-a-pack)
 
 **Turn your raw notes into a self-improving, interlinked wiki — powered by a local LLM.**
 
