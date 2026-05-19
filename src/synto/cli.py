@@ -3045,6 +3045,10 @@ def add(
     source_id = _make_source_id(src_path)
 
     # --- Duplicate detection ---
+    existing_by_hash = db.get_source_document_by_raw_hash(raw_hash)
+    if existing_by_hash is not None:
+        source_id = str(existing_by_hash["id"])
+
     existing = db.get_source_document(source_id)
     if existing and not force:
         console.print(
@@ -3059,8 +3063,20 @@ def add(
     raw_path = config.vault / "raw" / f"{source_id}.md"
     segment_count = 0
     pdf_segs = []
+    assets_dir = config.vault / "assets" / source_id
 
     try:
+        if force:
+            db.delete_source_import_data(source_id)
+            if raw_path.exists():
+                raw_path.unlink()
+            if assets_dir.exists():
+                shutil.rmtree(assets_dir)
+            if dest_path.exists():
+                dest_path.unlink()
+            if dest_dir.exists() and not any(dest_dir.iterdir()):
+                dest_dir.rmdir()
+
         # --- Copy original to .synto/sources/<source_id>/ ---
         dest_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src_path, dest_path)
@@ -3129,6 +3145,8 @@ def add(
         for path in (raw_path, dest_path):
             if path.exists():
                 path.unlink()
+        if assets_dir.exists():
+            shutil.rmtree(assets_dir)
         if dest_dir.exists() and not any(dest_dir.iterdir()):
             dest_dir.rmdir()
         raise

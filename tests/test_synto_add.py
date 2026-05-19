@@ -69,6 +69,13 @@ def sample_md(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def renamed_sample_txt(tmp_path: Path, sample_txt: Path) -> Path:
+    p = tmp_path / "renamed-notes.txt"
+    p.write_text(sample_txt.read_text())
+    return p
+
+
+@pytest.fixture
 def runner() -> CliRunner:
     return CliRunner()
 
@@ -215,6 +222,70 @@ def test_duplicate_import_allowed_with_force(
     runner.invoke(cli, ["add", str(sample_txt), "--vault", str(config.vault)])
     result = runner.invoke(cli, ["add", "--force", str(sample_txt), "--vault", str(config.vault)])
     assert result.exit_code == 0
+
+
+def test_duplicate_import_blocked_by_content_hash_for_renamed_file(
+    config: Config, db: StateDB, sample_txt: Path, renamed_sample_txt: Path, runner: CliRunner
+) -> None:
+    first = runner.invoke(cli, ["add", str(sample_txt), "--vault", str(config.vault)])
+    second = runner.invoke(cli, ["add", str(renamed_sample_txt), "--vault", str(config.vault)])
+
+    assert first.exit_code == 0, first.output
+    assert second.exit_code != 0
+    assert len(db.list_source_documents()) == 1
+
+
+def test_force_reimport_replaces_prior_raw_and_assets(
+    config: Config, db: StateDB, sample_pdf: Path, runner: CliRunner
+) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    first_segs = [
+        SimpleNamespace(
+            text="First import text.",
+            structural_locator="section:first",
+            image_refs=["assets/sample-src/img-old.png"],
+        )
+    ]
+    second_segs = [
+        SimpleNamespace(
+            text="Second import text.",
+            structural_locator="section:second",
+            image_refs=["assets/sample-src/img-new.png"],
+        )
+    ]
+
+    def fake_extract(*_args, **kwargs):
+        vault_root = kwargs["vault_root"]
+        source_id = _args[0]
+        assets_dir = vault_root / "assets" / source_id
+        assets_dir.mkdir(parents=True, exist_ok=True)
+        filename = "img-old.png" if fake_extract.calls == 0 else "img-new.png"
+        (assets_dir / filename).write_bytes(b"img")
+        result = first_segs if fake_extract.calls == 0 else second_segs
+        fake_extract.calls += 1
+        return result
+
+    fake_extract.calls = 0
+
+    with patch("synto.extractors.pdf.extract_pdf", side_effect=fake_extract):
+        first = runner.invoke(cli, ["add", str(sample_pdf), "--vault", str(config.vault)])
+        second = runner.invoke(
+            cli, ["add", "--force", str(sample_pdf), "--vault", str(config.vault)]
+        )
+
+    assert first.exit_code == 0, first.output
+    assert second.exit_code == 0, second.output
+    raw_files = list((config.vault / "raw").glob("*.md"))
+    assert len(raw_files) == 1
+    content = raw_files[0].read_text()
+    assert "Second import text." in content
+    assert "First import text." not in content
+
+    assets = config.vault / "assets"
+    assert list(assets.glob("**/img-old.png")) == []
+    assert list(assets.glob("**/img-new.png"))
 
 
 def test_get_source_document_method(config: Config, db: StateDB) -> None:
