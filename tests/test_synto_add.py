@@ -57,11 +57,11 @@ def sample_md(tmp_path: Path) -> Path:
     p = tmp_path / "clip.md"
     p.write_text(
         "---\n"
-        'title: Imported Clip\n'
-        'source: https://example.com/post\n'
-        'url: https://example.com/post\n'
-        'tags:\n'
-        '  - clip\n'
+        "title: Imported Clip\n"
+        "source: https://example.com/post\n"
+        "url: https://example.com/post\n"
+        "tags:\n"
+        "  - clip\n"
         "---\n\n"
         "Imported markdown body.\n"
     )
