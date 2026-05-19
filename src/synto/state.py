@@ -30,7 +30,7 @@ from pathlib import Path
 
 from .models import ItemMentionRecord, KnowledgeItemRecord, RawNoteRecord, WikiArticleRecord
 
-_CURRENT_SCHEMA_VERSION = 10
+_CURRENT_SCHEMA_VERSION = 13
 _CHECKPOINT_SCHEMA_VERSION = 2
 
 _CROCKFORD32_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
@@ -255,6 +255,39 @@ CREATE INDEX IF NOT EXISTS idx_metric_events_ts ON metric_events(ts);
 CREATE INDEX IF NOT EXISTS idx_metric_events_type_ts ON metric_events(event_type, ts);
 CREATE INDEX IF NOT EXISTS idx_metric_daily_rollups_day ON metric_daily_rollups(day);
 CREATE INDEX IF NOT EXISTS idx_generated_assets_source ON generated_assets(source_id);
+
+CREATE TABLE IF NOT EXISTS compile_runs (
+    run_ulid        TEXT PRIMARY KEY,
+    pipeline_json   TEXT NOT NULL,
+    fast_model      TEXT NOT NULL,
+    heavy_model     TEXT NOT NULL,
+    started_at      TEXT NOT NULL,
+    finished_at     TEXT,
+    article_count   INTEGER NOT NULL DEFAULT 0,
+    total_tokens    INTEGER NOT NULL DEFAULT 0,
+    total_cost_usd  REAL NOT NULL DEFAULT 0.0
+);
+
+CREATE TABLE IF NOT EXISTS llm_cache (
+    cache_key    TEXT PRIMARY KEY,
+    model        TEXT NOT NULL,
+    response_json TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    last_hit_at  TEXT,
+    hit_count    INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS concept_occurrences (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    concept_name      TEXT NOT NULL,
+    source_segment_id TEXT NOT NULL,
+    ordinal           INTEGER NOT NULL DEFAULT 0,
+    confidence        REAL NOT NULL DEFAULT 1.0,
+    extraction_run    TEXT,
+    UNIQUE(concept_name, source_segment_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_concept_occurrences_concept ON concept_occurrences(concept_name);
 """
 
 # Migrations keyed by version they bring the DB to.
@@ -521,6 +554,42 @@ _VERSIONED_MIGRATIONS: dict[int, list[str]] = {
         "CREATE INDEX IF NOT EXISTS idx_metric_events_ts ON metric_events(ts)",
         ("CREATE INDEX IF NOT EXISTS idx_metric_events_type_ts ON metric_events(event_type, ts)"),
         ("CREATE INDEX IF NOT EXISTS idx_metric_daily_rollups_day ON metric_daily_rollups(day)"),
+    ],
+    11: [
+        """CREATE TABLE IF NOT EXISTS compile_runs (
+               run_ulid        TEXT PRIMARY KEY,
+               pipeline_json   TEXT NOT NULL,
+               fast_model      TEXT NOT NULL,
+               heavy_model     TEXT NOT NULL,
+               started_at      TEXT NOT NULL,
+               finished_at     TEXT,
+               article_count   INTEGER NOT NULL DEFAULT 0,
+               total_tokens    INTEGER NOT NULL DEFAULT 0,
+               total_cost_usd  REAL NOT NULL DEFAULT 0.0
+           )""",
+    ],
+    12: [
+        """CREATE TABLE IF NOT EXISTS llm_cache (
+               cache_key     TEXT PRIMARY KEY,
+               model         TEXT NOT NULL,
+               response_json TEXT NOT NULL,
+               created_at    TEXT NOT NULL,
+               last_hit_at   TEXT,
+               hit_count     INTEGER NOT NULL DEFAULT 0
+           )""",
+    ],
+    13: [
+        """CREATE TABLE IF NOT EXISTS concept_occurrences (
+               id                INTEGER PRIMARY KEY AUTOINCREMENT,
+               concept_name      TEXT NOT NULL,
+               source_segment_id TEXT NOT NULL,
+               ordinal           INTEGER NOT NULL DEFAULT 0,
+               confidence        REAL NOT NULL DEFAULT 1.0,
+               extraction_run    TEXT,
+               UNIQUE(concept_name, source_segment_id)
+           )""",
+        "CREATE INDEX IF NOT EXISTS idx_concept_occurrences_concept "
+        "ON concept_occurrences(concept_name)",
     ],
 }
 
@@ -1808,6 +1877,20 @@ class StateDB:
                 "SELECT status, COUNT(*) as cnt FROM raw_notes GROUP BY status"
             ).fetchall()
         }
+        if vault is not None:
+            raw_dir = vault / "raw"
+            if raw_dir.exists():
+                tracked_rows = self._conn.execute("SELECT path FROM raw_notes").fetchall()
+                tracked_paths = {row["path"] for row in tracked_rows}
+                untracked_raw = sum(
+                    1
+                    for path in raw_dir.rglob("*.md")
+                    if "processed" not in path.parts
+                    and not path.name.startswith(".")
+                    and str(path.relative_to(vault)) not in tracked_paths
+                )
+                if untracked_raw:
+                    raw_counts["new"] = raw_counts.get("new", 0) + untracked_raw
         db_draft_count = self._conn.execute(
             "SELECT COUNT(*) FROM wiki_articles WHERE is_draft=1"
         ).fetchone()[0]
@@ -1871,6 +1954,136 @@ class StateDB:
             return 0
         return int(self._conn.execute("SELECT COUNT(*) FROM source_segments").fetchone()[0])
 
+    # ── Compile run tracking ──────────────────────────────────────────────
+
+    def start_compile_run(
+        self,
+        run_ulid: str,
+        pipeline_json: str,
+        fast_model: str,
+        heavy_model: str,
+    ) -> None:
+        now = datetime.now().isoformat()
+        self._conn.execute(
+            """INSERT OR REPLACE INTO compile_runs
+               (run_ulid, pipeline_json, fast_model, heavy_model, started_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (run_ulid, pipeline_json, fast_model, heavy_model, now),
+        )
+        self._conn.commit()
+
+    def finish_compile_run(
+        self,
+        run_ulid: str,
+        article_count: int = 0,
+        total_tokens: int = 0,
+        total_cost_usd: float = 0.0,
+    ) -> None:
+        now = datetime.now().isoformat()
+        self._conn.execute(
+            """UPDATE compile_runs
+               SET finished_at = ?, article_count = ?, total_tokens = ?, total_cost_usd = ?
+               WHERE run_ulid = ?""",
+            (now, article_count, total_tokens, total_cost_usd, run_ulid),
+        )
+        self._conn.commit()
+
+    def update_article_compile_run(self, article_path: str, run_ulid: str) -> None:
+        self._conn.execute(
+            "UPDATE wiki_articles SET last_compile_pipeline = ? WHERE path = ?",
+            (run_ulid, article_path),
+        )
+        self._conn.commit()
+
+    def get_compile_run(self, run_ulid: str) -> sqlite3.Row | None:
+        if not self._has_table("compile_runs"):
+            return None
+        return self._conn.execute(
+            "SELECT * FROM compile_runs WHERE run_ulid = ?", (run_ulid,)
+        ).fetchone()
+
+    # ── Term extraction (concept occurrences) ──────────────────────────────
+
+    def upsert_concept_occurrences(
+        self,
+        terms: list,
+        source_segment_id: str,
+        extraction_run: str | None = None,
+    ) -> None:
+        """Persist TermRecord list to concept_occurrences. Idempotent."""
+        if not self._has_table("concept_occurrences"):
+            return
+        with self._tx():
+            for ordinal, term in enumerate(terms):
+                self._conn.execute(
+                    """INSERT OR REPLACE INTO concept_occurrences
+                       (concept_name, source_segment_id, ordinal, confidence, extraction_run)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (term.name, source_segment_id, ordinal, term.confidence, extraction_run),
+                )
+
+    def list_concept_occurrences(self) -> list[sqlite3.Row]:
+        if not self._has_table("concept_occurrences"):
+            return []
+        return self._conn.execute(
+            "SELECT * FROM concept_occurrences ORDER BY concept_name, source_segment_id"
+        ).fetchall()
+
+    def upsert_source_document(self, doc: object) -> None:
+        """Insert or replace a SourceDocument record."""
+        import json
+        from datetime import UTC, datetime
+
+        imported_at = getattr(doc, "imported_at", None)
+        if imported_at is None:
+            imported_at = datetime.now(UTC).isoformat()
+        elif hasattr(imported_at, "isoformat"):
+            imported_at = imported_at.isoformat()
+
+        meta = dict(getattr(doc, "metadata", {}) or {})
+        biblio = getattr(doc, "bibliographic_metadata", None)
+        if biblio is not None:
+            meta["bibliographic_metadata"] = biblio.model_dump(exclude_none=True)
+
+        self._conn.execute(
+            """INSERT OR REPLACE INTO source_documents
+               (id, source_type, origin_uri, title, imported_at, raw_hash,
+                normalized_hash, extractor_version, license, redistribution, metadata_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                doc.id,
+                getattr(doc, "source_type", "unknown_text"),
+                getattr(doc, "origin_uri", None),
+                getattr(doc, "title", None),
+                imported_at,
+                getattr(doc, "raw_hash", None),
+                getattr(doc, "normalized_hash", None),
+                getattr(doc, "extractor_version", None),
+                getattr(doc, "license", None),
+                getattr(doc, "redistribution", "unknown"),
+                json.dumps(meta) if meta else None,
+            ),
+        )
+        self._conn.commit()
+
+    def get_source_document(self, source_id: str) -> sqlite3.Row | None:
+        """Fetch a source document by ID, or None if not found."""
+        if not self._has_table("source_documents"):
+            return None
+        return self._conn.execute(
+            "SELECT * FROM source_documents WHERE id = ?", (source_id,)
+        ).fetchone()
+
+    def get_source_document_by_raw_hash(self, raw_hash: str) -> sqlite3.Row | None:
+        """Fetch the first source document with the given raw hash, or None."""
+        if not self._has_table("source_documents"):
+            return None
+        return self._conn.execute(
+            "SELECT * FROM source_documents WHERE raw_hash = ? "
+            "ORDER BY imported_at DESC, id DESC LIMIT 1",
+            (raw_hash,),
+        ).fetchone()
+
     def list_source_documents(self) -> list[tuple[str, str | None, str]]:
         if not self._has_table("source_documents"):
             return []
@@ -1878,6 +2091,16 @@ class StateDB:
             "SELECT id, title, source_type FROM source_documents ORDER BY id"
         ).fetchall()
         return [(row["id"], row["title"], row["source_type"]) for row in rows]
+
+    def delete_source_import_data(self, source_id: str) -> None:
+        """Remove source import records for a single source document."""
+        with self._tx():
+            if self._has_table("generated_assets"):
+                self._conn.execute("DELETE FROM generated_assets WHERE source_id = ?", (source_id,))
+            if self._has_table("source_segments"):
+                self._conn.execute("DELETE FROM source_segments WHERE source_id = ?", (source_id,))
+            if self._has_table("source_documents"):
+                self._conn.execute("DELETE FROM source_documents WHERE id = ?", (source_id,))
 
     def list_source_segments_brief(self) -> list[tuple[str, str, str, str]]:
         if not self._has_table("source_segments"):

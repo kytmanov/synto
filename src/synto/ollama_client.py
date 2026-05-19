@@ -7,10 +7,14 @@ from __future__ import annotations
 
 import logging
 import time
+from typing import TYPE_CHECKING
 
 import httpx
 
 from .openai_compat_client import LLMError, LLMTruncatedError
+
+if TYPE_CHECKING:
+    from .cache import LLMCache
 
 log = logging.getLogger(__name__)
 
@@ -33,10 +37,12 @@ class OllamaClient:
         self,
         base_url: str = "http://localhost:11434",
         timeout: float = 300.0,
+        cache: LLMCache | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self._client = httpx.Client(timeout=timeout)
         self._last_stats: dict = {}
+        self._cache = cache
 
     # ── Health ────────────────────────────────────────────────────────────────
 
@@ -100,6 +106,16 @@ class OllamaClient:
         num_predict: int = -1,
         temperature: float | None = None,
     ) -> str:
+        if self._cache is not None:
+            cache_messages = []
+            if system:
+                cache_messages.append({"role": "system", "content": system})
+            cache_messages.append({"role": "user", "content": prompt})
+            cached = self._cache.get(model, cache_messages)
+            if cached is not None:
+                self._last_stats = {"latency_ms": 0, "cache_hit": True}
+                return cached
+
         payload: dict = {
             "model": model,
             "prompt": prompt,
@@ -147,6 +163,13 @@ class OllamaClient:
                 completion_tokens=body.get("eval_count"),
                 finish_reason=done_reason or ("empty_content" if is_empty_response else None),
             )
+
+        if self._cache is not None:
+            cache_messages = []
+            if system:
+                cache_messages.append({"role": "system", "content": system})
+            cache_messages.append({"role": "user", "content": prompt})
+            self._cache.put(model, cache_messages, response_text)
 
         return response_text
 

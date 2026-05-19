@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
@@ -164,18 +164,44 @@ def _unwrap(data: dict, model_class: type[T]) -> dict:
     return data
 
 
+_CTRL_TO_ESCAPE = {"\t": "t", "\x08": "b", "\x0c": "f"}
+_CTRL_ESCAPE_RE = re.compile(r"([\t\x08\x0c])([a-zA-Z])")
+
+
+def _fix_json_ctrl_escapes(obj: Any) -> Any:
+    """Undo json.loads() silently converting LaTeX command starts to control chars.
+
+    LLMs routinely emit \\text{}, \\beta, \\frac etc. in JSON strings without
+    double-escaping. json.loads() converts \\t→tab, \\b→backspace, \\f→form-feed
+    with no error. A control char followed by a letter in our content is almost always
+    a corrupted LaTeX command, not a real control character.
+
+    \\n is intentionally excluded — real newlines (paragraph breaks) also come from
+    \\n in JSON and must be preserved.
+    """
+    if isinstance(obj, str):
+        return _CTRL_ESCAPE_RE.sub(lambda m: "\\" + _CTRL_TO_ESCAPE[m.group(1)] + m.group(2), obj)
+    if isinstance(obj, dict):
+        return {k: _fix_json_ctrl_escapes(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_fix_json_ctrl_escapes(item) for item in obj]
+    return obj
+
+
 def _try_parse(raw: str, model_class: type[T]) -> tuple[T | None, str]:
     """Try direct JSON parse + Pydantic validation. Returns (result, error_str)."""
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as e:
-        if "Invalid \\escape" in str(e):
+        if "Invalid \\escape" in str(e) or "Invalid \\uXXXX escape" in str(e):
             try:
-                data = json.loads(re.sub(r"\\(?![\"\\/bfnrtu])", r"\\\\", raw))
+                repaired = re.sub(r"\\(?![\"\\/bfnrt]|u[0-9a-fA-F]{4})", r"\\\\", raw)
+                data = json.loads(repaired)
             except json.JSONDecodeError:
                 return None, f"Invalid JSON: {e}"
         else:
             return None, f"Invalid JSON: {e}"
+    data = _fix_json_ctrl_escapes(data)
     # Try direct validation first
     last_err = ""
     try:

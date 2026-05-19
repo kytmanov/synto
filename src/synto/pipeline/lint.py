@@ -43,6 +43,8 @@ _OBSIDIAN_EMBED_RE = re.compile(r"!\[\[[^\]]+\.(?:pdf|png|jpe?g|gif|svg|webp)\]\
 _PLAIN_CITATION_RE = re.compile(r"\[(S\d+(?:\s*,\s*S\d+)*)\](?!\()")
 _EMBED_TARGET_RE = re.compile(r"!\[\[([^\]|#]+)")
 _DISPLAY_LATEX_RE = re.compile(r"\\{1,2}\[.*?\\{1,2}\]", re.DOTALL)
+_INLINE_MATH_RE = re.compile(r"\$[^$\n]+\$")
+_DISPLAY_MATH_DOLLAR_RE = re.compile(r"\$\$.*?\$\$", re.DOTALL)
 _BARE_LATEX_LINE_RE = re.compile(
     r"(?m)^(?![ \t]*(?:#|>|[-*+] |\d+\. |\|))[ \t]*\\{1,2}[A-Za-z{_].*$"
 )
@@ -113,9 +115,14 @@ def _body_hash(body: str) -> str:
 
 
 def _check_malformed_links(rel_path: str, body: str, issues: list[LintIssue]) -> None:
+    # Strip math spans so $H_i \in [0, 1]$ does not trigger a false positive.
+    clean = _DISPLAY_MATH_DOLLAR_RE.sub(" ", body)
+    clean = _INLINE_MATH_RE.sub(" ", clean)
+    clean = _DISPLAY_LATEX_RE.sub(" ", clean)
+
     seen: set[str] = set()
-    for match in _MALFORMED_BRACKET_LINK_RE.finditer(body):
-        if match.start() > 0 and body[match.start() - 1] == "\\":
+    for match in _MALFORMED_BRACKET_LINK_RE.finditer(clean):
+        if match.start() > 0 and clean[match.start() - 1] == "\\":
             continue
         text = match.group(1).strip()
         if not text or text in seen:
@@ -177,12 +184,16 @@ def _check_broken_wikilinks(
         if is_url or is_path_fragment:
             continue
         seen_broken.add(link.lower())
+        if link.lower().startswith("sources/"):
+            suggestion = "Run `synto run` to regenerate source summary pages, or remove the link."
+        else:
+            suggestion = f"Create a page for '{link}' or remove the link."
         issues.append(
             LintIssue(
                 path=rel_path,
                 issue_type="broken_link",
                 description=f"[[{link}]] has no matching wiki page",
-                suggestion=f"Create a page for '{link}' or remove the link.",
+                suggestion=suggestion,
                 auto_fixable=False,
             )
         )

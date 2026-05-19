@@ -693,3 +693,27 @@ def test_init_gitignore_skipped_when_exists(
     runner.invoke(cli, ["init", str(vault)])
     # Existing .gitignore is preserved (not overwritten by init)
     assert (vault / ".gitignore").read_text() == "# custom\n"
+
+
+def test_init_default_flag_sets_vault_in_global_config(
+    runner: CliRunner, cfg_dir: Path, tmp_path: Path
+) -> None:
+    save_global_config(GlobalConfig(fast_model="gemma4:e4b", heavy_model="qwen2.5:14b"))
+    vault = tmp_path / "new-vault"
+    result = runner.invoke(cli, ["init", str(vault), "--default"])
+    assert result.exit_code == 0
+    cfg = load_global_config()
+    assert cfg is not None
+    assert cfg.vault == str(vault)
+
+
+def test_init_without_default_flag_does_not_change_global_config(
+    runner: CliRunner, cfg_dir: Path, tmp_path: Path
+) -> None:
+    save_global_config(GlobalConfig(fast_model="gemma4:e4b", vault="/original/vault"))
+    vault = tmp_path / "new-vault"
+    result = runner.invoke(cli, ["init", str(vault)])
+    assert result.exit_code == 0
+    cfg = load_global_config()
+    assert cfg is not None
+    assert cfg.vault == "/original/vault"

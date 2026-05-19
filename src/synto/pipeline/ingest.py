@@ -17,8 +17,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from pydantic import BaseModel as _BaseModel
+
 from ..config import Config
-from ..models import AnalysisResult, Concept, RawNoteRecord
+from ..models import AnalysisResult, Concept, RawNoteRecord, SourceSegment, TermExtractionResult
 from ..protocols import LLMClientProtocol
 from ..state import StateDB
 from ..structured_output import request_structured
@@ -31,17 +33,15 @@ from ..vault import (
     write_note,
 )
 from .items import extract_named_reference_items, extract_quoted_title_items, store_extracted_items
+from .prompts import load_prompt
 
 log = logging.getLogger(__name__)
 
 INGEST_ANALYSIS_PROMPT_VERSION = "analysis-v2-language-policy"
 
-_SYSTEM = (
-    "You are a knowledge analyst. Read the provided note and extract structured information. "
-    "Be concise and accurate. Do not invent information not present in the note. "
-    "Detect the primary language of the note and return its ISO 639-1 code in the 'language' field "
-    "(e.g. 'en', 'fr', 'de'). Use null if uncertain."
-)
+# Kept for backward compatibility (imported by tests).  Actual system prompts live in
+# pipeline/prompts/ and are loaded per source_type via load_prompt().
+_SYSTEM = load_prompt("notes")
 
 
 def _content_hash(text: str) -> str:
@@ -56,7 +56,13 @@ class _PromptConceptContext:
 
 def _ingest_prompt_version(config: Config) -> str:
     language = config.pipeline.language or "auto"
-    return f"{INGEST_ANALYSIS_PROMPT_VERSION}|language={language}"
+    prompt_hash = hashlib.sha256(_SYSTEM.encode("utf-8")).hexdigest()[:12]
+    return f"{INGEST_ANALYSIS_PROMPT_VERSION}|language={language}|notes={prompt_hash}"
+
+
+def _source_prompt_fingerprint(source_type: str) -> str:
+    prompt = load_prompt(source_type)
+    return hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:12]
 
 
 def _canonical_prompt_contexts(
@@ -101,10 +107,13 @@ def _checkpoint_hash(
     content_hash: str,
     config: Config,
     prompt_contexts: list[_PromptConceptContext],
+    source_type: str = "notes",
 ) -> str:
     payload = {
         "content_hash": content_hash,
         "prompt_version": _ingest_prompt_version(config),
+        "source_type": source_type,
+        "source_prompt": _source_prompt_fingerprint(source_type),
         "fast_model": config.models.fast,
         "contexts": [
             {"canonical": ctx.canonical, "aliases": list(ctx.aliases)} for ctx in prompt_contexts
@@ -259,6 +268,7 @@ def _analyze_body(
     on_chunk_result=None,
     skip_completed: set[int] | None = None,
     prompt_contexts: list[_PromptConceptContext] | None = None,
+    source_type: str = "notes",
 ) -> AnalysisResult:
     """Analyze note body, splitting into chunks if body exceeds fast_ctx // 2 chars."""
     chunk_size = config.effective_provider.fast_ctx // 2
@@ -276,7 +286,7 @@ def _analyze_body(
             prompt=prompt,
             model_class=AnalysisResult,
             model=config.models.fast,
-            system=_SYSTEM,
+            system=load_prompt(source_type),
             num_ctx=config.effective_provider.fast_ctx,
             temperature=0,
             stage="ingest",
@@ -313,7 +323,7 @@ def _analyze_body(
             prompt=prompt,
             model_class=AnalysisResult,
             model=config.models.fast,
-            system=_SYSTEM,
+            system=load_prompt(source_type),
             num_ctx=config.effective_provider.fast_ctx,
             temperature=0,
             stage="ingest",
@@ -368,10 +378,16 @@ def _analyze_body_with_checkpoints(
     *,
     force: bool = False,
     prompt_contexts: list[_PromptConceptContext] | None = None,
+    source_type: str = "notes",
 ) -> AnalysisResult:
     chunk_size = config.effective_provider.fast_ctx // 2
     rel_path = str(path.relative_to(config.vault))
-    checkpoint_hash = _checkpoint_hash(content_hash, config, prompt_contexts or [])
+    checkpoint_hash = _checkpoint_hash(
+        content_hash,
+        config,
+        prompt_contexts or [],
+        source_type=source_type,
+    )
 
     if len(body) <= chunk_size:
         if force:
@@ -385,6 +401,7 @@ def _analyze_body_with_checkpoints(
             client,
             config,
             prompt_contexts=prompt_contexts,
+            source_type=source_type,
         )
 
     chunks = [body[i : i + chunk_size] for i in range(0, len(body), chunk_size)]
@@ -434,6 +451,7 @@ def _analyze_body_with_checkpoints(
             on_chunk_result=_save_chunk,
             skip_completed=completed,
             prompt_contexts=prompt_contexts,
+            source_type=source_type,
         )
 
     results = [result for result in chunk_results if result is not None]
@@ -1076,6 +1094,42 @@ def _create_source_summary_page(
     return out_path
 
 
+def write_source_content_md(
+    source_id: str,
+    source_type: str,
+    title: str | None,
+    segments: list,
+    vault_dir: Path,
+    *,
+    metadata: dict[str, object] | None = None,
+) -> Path:
+    """Assemble source segments into raw/<source_id>.md for the ingest pipeline."""
+    raw_dir = vault_dir / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    dest = raw_dir / f"{source_id}.md"
+
+    lines: list[str] = []
+    for seg in segments:
+        loc = getattr(seg, "structural_locator", None)
+        if loc:
+            lines.append(f"## {loc}\n")
+        lines.append(seg.text.strip())
+        image_refs = getattr(seg, "image_refs", None) or []
+        if image_refs:
+            lines.append("")
+            lines.append("### Media")
+            lines.extend(f"- ![[{ref}]]" for ref in image_refs)
+        lines.append("")
+
+    meta: dict[str, object] = dict(metadata or {})
+    meta["source_type"] = source_type
+    if title:
+        meta.setdefault("title", title)
+
+    write_note(dest, meta, "\n".join(lines))
+    return dest
+
+
 def ingest_note(
     path: Path,
     config: Config,
@@ -1133,8 +1187,12 @@ def ingest_note(
 
     # Pre-process web clips
     meta, body = parse_note(path)
+    source_type = str(meta.get("source_type", "notes"))
     # Strip Obsidian clipper placeholder embeds before they reach the LLM
     body = re.sub(r"!\[\[[^\]]*unknown_filename[^\]]*\]\]", "", body, flags=re.IGNORECASE)
+    # Strip ### Media sections — image paths are opaque to the LLM and waste tokens;
+    # the embeds remain in the raw/ file for the human reader in Obsidian.
+    body = re.sub(r"\n### Media\n(?:- !\[\[[^\]]*\]\]\n?)*", "\n", body)
     if meta.get("source") or meta.get("url"):  # web clipper adds these
         body = _preprocess_web_clip(body)
 
@@ -1174,6 +1232,7 @@ def ingest_note(
             db=db,
             force=force,
             prompt_contexts=prompt_contexts,
+            source_type=source_type,
         )
     except Exception as e:
         log.error("Analysis failed for %s: %s", path.name, e)
@@ -1270,11 +1329,14 @@ def ingest_note(
     except Exception as e:
         log.warning("Source summary page failed for %s: %s", path.name, e)
 
+    _concept_preview = canonical_names[:3]
+    if len(canonical_names) > 3:
+        _concept_preview = canonical_names[:3] + [f"+{len(canonical_names) - 3} more"]
     log.info(
         "Ingested: %s (quality=%s, concepts=%s)",
         path.name,
         result.quality,
-        canonical_names[:3],
+        _concept_preview,
     )
     return result
 
@@ -1330,3 +1392,65 @@ def ingest_all(
         if on_progress is not None:
             on_progress(done, total, str(path.relative_to(config.vault)))
     return results
+
+
+_TERM_EXTRACTION_SYSTEM = (
+    "You are a technical vocabulary extractor. "
+    "Extract defined or implied terms from the provided text. "
+    "Return JSON only, no explanation."
+)
+
+
+class _TermLLMItem(_BaseModel):
+    name: str
+    definition: str
+    aliases: list[str] = []
+    provenance: str = "extracted"
+    confidence: float = 0.9
+
+
+class _TermLLMResponse(_BaseModel):
+    terms: list[_TermLLMItem] = []
+
+
+def extract_terms(
+    segment: SourceSegment,
+    client: LLMClientProtocol,
+    config: Config,
+) -> TermExtractionResult:
+    """Second LLM pass: extract technical terms from a source segment."""
+    from ..models import TermRecord
+
+    prompt = (
+        "Extract technical terms with definitions from the following text.\n"
+        'Return JSON: {"terms": [{"name": "...", "definition": "...", "aliases": [], '
+        '"provenance": "extracted", "confidence": 0.9}]}\n\n'
+        f"{segment.text[:4000]}"
+    )
+    llm_result = request_structured(
+        client=client,
+        prompt=prompt,
+        model_class=_TermLLMResponse,
+        model=config.models.fast,
+        system=_TERM_EXTRACTION_SYSTEM,
+        num_ctx=config.effective_provider.fast_ctx,
+        temperature=0,
+        stage="term_extraction",
+        model_role="fast",
+    )
+    terms = [
+        TermRecord(
+            name=t.name,
+            definition=t.definition,
+            aliases=t.aliases,
+            source_segment_id=segment.id,
+            provenance=t.provenance,  # type: ignore[arg-type]
+            confidence=min(max(t.confidence, 0.0), 1.0),
+        )
+        for t in llm_result.terms
+    ]
+    return TermExtractionResult(
+        terms=terms,
+        source_segment_id=segment.id,
+        model=config.models.fast,
+    )

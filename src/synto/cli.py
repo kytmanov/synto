@@ -282,15 +282,18 @@ def _resolve_draft_arg(config, raw_path: str | Path) -> Path:
 
 
 def _load_deps(config):
+    from .cache import LLMCache
     from .client_factory import LLMError, build_client
 
-    client = build_client(config)
+    db = _load_db(config)
+    cache = LLMCache(db)
+    client = build_client(config, cache=cache)
     try:
         client.require_healthy()
     except LLMError as e:
         err_console.print(str(e))
+        db.close()
         sys.exit(1)
-    db = _load_db(config)
     ctx = click.get_current_context(silent=True)
     if ctx is not None:
         metrics_cm = _metrics_context(config, db)
@@ -408,7 +411,13 @@ def report_clear(vault_str: str | None, yes: bool) -> None:
 @click.argument("vault_path", type=click.Path())
 @click.option("--existing", is_flag=True, help="Adopt an existing Obsidian vault")
 @click.option("--non-interactive", is_flag=True)
-def init(vault_path: str, existing: bool, non_interactive: bool):
+@click.option(
+    "--default",
+    "set_default",
+    is_flag=True,
+    help="Set this vault as the default (no --vault flag needed for future commands)",
+)
+def init(vault_path: str, existing: bool, non_interactive: bool, set_default: bool):
     """Create vault structure and initialise Synto."""
     from .git_ops import git_init
 
@@ -423,7 +432,7 @@ def init(vault_path: str, existing: bool, non_interactive: bool):
     # Write or sync synto.toml from global config
     toml_path = vault / CONFIG_FILE_NAME
     from .config import default_wiki_toml
-    from .global_config import load_global_config
+    from .global_config import GlobalConfig, load_global_config, save_global_config
 
     gcfg = load_global_config()
     provider_name = gcfg.provider_name if gcfg and gcfg.provider_name else "ollama"
@@ -484,12 +493,29 @@ def init(vault_path: str, existing: bool, non_interactive: bool):
             "*.log\n"
         )
 
+    if set_default:
+        try:
+            _gcfg = gcfg if gcfg is not None else GlobalConfig()
+            _gcfg.vault = str(vault)
+            save_global_config(_gcfg)
+        except Exception:
+            console.print("[yellow]⚠ Could not save default vault to global config.[/yellow]")
+
     console.print(f"[green]Vault initialised:[/green] {vault}")
+    if set_default:
+        console.print("[dim]Set as default vault — no --vault flag needed.[/dim]")
     console.print("Next steps:")
     console.print("  1. Drop .md notes into [bold]raw/[/bold]")
-    console.print(f"  2. Run [bold]{CLI_NAME} run --vault {vault}[/bold]")
-    console.print(f"  3. Review drafts: [bold]{CLI_NAME} review --vault {vault}[/bold]")
-    console.print(f"  4. Publish all drafts: [bold]{CLI_NAME} approve --all --vault {vault}[/bold]")
+    if set_default:
+        console.print(f"  2. Run [bold]{CLI_NAME} run[/bold]")
+        console.print(f"  3. Review drafts: [bold]{CLI_NAME} review[/bold]")
+        console.print(f"  4. Publish all drafts: [bold]{CLI_NAME} approve --all[/bold]")
+    else:
+        console.print(f"  2. Run [bold]{CLI_NAME} run --vault {vault}[/bold]")
+        console.print(f"  3. Review drafts: [bold]{CLI_NAME} review --vault {vault}[/bold]")
+        console.print(
+            f"  4. Publish all drafts: [bold]{CLI_NAME} approve --all --vault {vault}[/bold]"
+        )
 
 
 def _sync_wiki_toml_models(
@@ -1462,8 +1488,8 @@ def compile(
     # Update index and log
     from .indexer import append_log, generate_index
 
-    generate_index(config, db)
     if draft_paths:
+        generate_index(config, db)
         append_log(config, f"compile | {len(draft_paths)} drafts written")
 
     if auto_approve and draft_paths:
@@ -2430,11 +2456,20 @@ def _review_single(
 )  # noqa: E501
 @click.option("--stubs-only", is_flag=True, help="Only create stub articles")
 @click.option("--dry-run", is_flag=True, help="Report issues without making changes")
-def maintain(vault_str, fix, stubs_only, dry_run):
+@click.option("--clear-cache", is_flag=True, help="Delete all LLM cache entries")
+@click.option(
+    "--older-than",
+    "older_than_days",
+    type=int,
+    default=None,
+    help="With --clear-cache: delete only entries older than N days",
+)
+def maintain(vault_str, fix, stubs_only, dry_run, clear_cache, older_than_days):
     """Wiki maintenance: health check, stub creation, orphan suggestions, and merge hints.
 
     Use --dry-run for a read-only health check.
     """
+    from .cache import LLMCache
     from .pipeline.lint import run_lint
     from .pipeline.lock import pipeline_lock
     from .pipeline.maintain import (
@@ -2447,6 +2482,15 @@ def maintain(vault_str, fix, stubs_only, dry_run):
 
     config = _load_config(vault_str)
     db = _load_db(config)
+
+    if clear_cache:
+        cache = LLMCache(db)
+        deleted = cache.clear(older_than_days=older_than_days)
+        if older_than_days is not None:
+            console.print(f"Cleared {deleted} LLM cache entries older than {older_than_days} days.")
+        else:
+            console.print(f"Cleared {deleted} LLM cache entries.")
+        return
 
     if dry_run:
         console.print("[dim]Dry run — no changes will be made.[/dim]\n")
@@ -2860,3 +2904,267 @@ def compare(
             ),
             markup=False,
         )
+
+
+# ── Trace commands ────────────────────────────────────────────────────────────
+
+
+@cli.group()
+def trace():
+    """Trace compile history for articles and concepts."""
+
+
+@trace.command("article")
+@click.argument("name")
+@click.option("--vault", "vault_str", envvar=VAULT_ENV_VAR, default=None)
+def trace_article(name: str, vault_str: str | None) -> None:
+    """Print compile history for article NAME."""
+    from .vault import parse_note, sanitize_filename
+
+    config = _load_config(vault_str)
+    db = _load_db(config)
+
+    safe = sanitize_filename(name)
+    candidates = [
+        config.wiki_dir / f"{safe}.md",
+        config.drafts_dir / f"{safe}.md",
+    ]
+    article_path = next((p for p in candidates if p.exists()), None)
+    if article_path is None:
+        console.print(f"[red]Article not found:[/red] {name}")
+        raise SystemExit(1)
+
+    meta, _ = parse_note(article_path)
+    lineage = meta.get("lineage", [])
+    if not lineage:
+        console.print(f"[yellow]No lineage recorded for:[/yellow] {name}")
+        return
+
+    table = Table(title=f"Compile history: {name}", show_header=True, header_style="bold")
+    table.add_column("Compile run", style="cyan", no_wrap=True)
+    table.add_column("Fast model")
+    table.add_column("Heavy model")
+    table.add_column("Timestamp")
+
+    for entry in lineage:
+        pipeline = entry.get("pipeline", {})
+        run_id = str(entry.get("compile_run", ""))
+        # Also look up the full row from DB if available
+        row = db.get_compile_run(run_id) if run_id else None
+        fast = row["fast_model"] if row else pipeline.get("fast_model", "—")
+        heavy = row["heavy_model"] if row else pipeline.get("heavy_model", "—")
+        ts = str(entry.get("timestamp", "—"))[:19]
+        table.add_row(run_id[:16] or "—", fast, heavy, ts)
+
+    console.print(table)
+
+
+# ── synto add ─────────────────────────────────────────────────────────────────
+
+_SOURCE_TYPES = [
+    "notes",
+    "textbook",
+    "paper",
+    "spec",
+    "api_docs",
+    "web_article",
+    "corp_docs",
+    "transcript",
+    "unknown_text",
+]
+
+
+def _source_slug(text: str) -> str:
+    """Lowercase alphanumeric slug, max 30 chars."""
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:30]
+
+
+def _make_source_id(path: Path) -> str:
+    """Stable source_id: slugified stem + first 8 hex chars of SHA-256 of file bytes."""
+    import hashlib
+
+    raw = path.read_bytes()
+    content_hash = hashlib.sha256(raw).hexdigest()
+    return f"{_source_slug(path.stem)}-{content_hash[:8]}"
+
+
+@cli.command("add")
+@click.argument("source", type=click.Path(exists=True))
+@click.option(
+    "--type",
+    "source_type",
+    default=None,
+    type=click.Choice(_SOURCE_TYPES),
+    help="Override source type (default: inferred from extension).",
+)
+@click.option("--vault", "vault_str", envvar=VAULT_ENV_VAR, default=None)
+@click.option(
+    "--extend-pack",
+    "extend_pack",
+    default=None,
+    metavar="PACK_NAME",
+    help="Reserved for future pack integration; currently a no-op.",
+)
+@click.option("--force", is_flag=True, help="Re-import even if source already exists.")
+def add(
+    source: str,
+    source_type: str | None,
+    vault_str: str | None,
+    extend_pack: str | None,
+    force: bool,
+) -> None:
+    """Import a source document into the vault.
+
+    SOURCE is a file path (PDF, markdown, text).  The original is copied to
+    .synto/sources/<source_id>/ and recorded in the state database.  For PDF
+    files, segments are extracted immediately.
+    """
+    import hashlib
+    import shutil
+    from datetime import UTC, datetime
+    from types import SimpleNamespace as _NS
+
+    from .models import SourceDocument
+    from .paths import effective_app_dir
+    from .pipeline.ingest import write_source_content_md as _write_cm
+    from .vault import parse_note
+
+    config = _load_config(vault_str)
+    db = _load_db(config)
+
+    src_path = Path(source).expanduser().resolve()
+    ext = src_path.suffix.lower()
+
+    # Infer source_type from extension when not provided
+    if source_type is None:
+        source_type = "paper" if ext == ".pdf" else "notes"
+
+    # Compute content hash and stable source_id
+    raw_bytes = src_path.read_bytes()
+    raw_hash = hashlib.sha256(raw_bytes).hexdigest()
+    source_id = _make_source_id(src_path)
+
+    # --- Duplicate detection ---
+    existing_by_hash = db.get_source_document_by_raw_hash(raw_hash)
+    if existing_by_hash is not None:
+        source_id = str(existing_by_hash["id"])
+
+    existing = db.get_source_document(source_id)
+    if existing and not force:
+        console.print(
+            f"[yellow]Already imported:[/yellow] {source_id}\n"
+            f"Use [bold]--force[/bold] to re-import."
+        )
+        raise SystemExit(1)
+
+    app_dir = effective_app_dir(config.vault)
+    dest_dir = app_dir / "sources" / source_id
+    dest_path = dest_dir / f"original{ext}"
+    raw_path = config.vault / "raw" / f"{source_id}.md"
+    segment_count = 0
+    pdf_segs = []
+    assets_dir = config.vault / "assets" / source_id
+
+    try:
+        if force:
+            db.delete_source_import_data(source_id)
+            if raw_path.exists():
+                raw_path.unlink()
+            if assets_dir.exists():
+                shutil.rmtree(assets_dir)
+            if dest_path.exists():
+                dest_path.unlink()
+            if dest_dir.exists() and not any(dest_dir.iterdir()):
+                dest_dir.rmdir()
+
+        # --- Copy original to .synto/sources/<source_id>/ ---
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_path, dest_path)
+
+        # --- Record in source_documents ---
+        doc = SourceDocument(
+            id=source_id,
+            source_type=source_type,
+            origin_uri=src_path.as_uri(),
+            title=src_path.stem,
+            imported_at=datetime.now(UTC),
+            raw_hash=raw_hash,
+            redistribution="unknown",
+        )
+        db.upsert_source_document(doc)
+
+        # --- Extract segments (PDF only) ---
+        note_meta: dict[str, object] | None = None
+        if ext == ".pdf":
+            from .extractors.pdf import extract_bibliographic_metadata, extract_pdf
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                console=console,
+                transient=True,
+            ) as progress:
+                progress.add_task(f"Extracting segments from {src_path.name}…", total=None)
+                pdf_segs = extract_pdf(source_id, dest_path, db, vault_root=config.vault)
+            segment_count = len(pdf_segs)
+            if pdf_segs:
+                biblio = extract_bibliographic_metadata(dest_path, pdf_segs[0].text)
+                note_meta = {
+                    "authors": biblio.authors,
+                    "doi": biblio.doi,
+                    "year": biblio.year,
+                }
+                if biblio.title and biblio.title != src_path.stem:
+                    note_meta["source_title"] = biblio.title
+
+        # --- --extend-pack: reserved for future pack integration ---
+        if extend_pack is not None:
+            console.print(
+                f"  Note: pack extension for '{extend_pack}' is not implemented; "
+                "exports remain vault-wide."
+            )
+
+        # Write assembled content to raw/ so ingest_all picks it up on next run
+        if pdf_segs:
+            raw_path = _write_cm(
+                source_id,
+                source_type,
+                src_path.stem,
+                pdf_segs,
+                config.vault,
+                metadata=note_meta,
+            )
+        else:
+            note_title = src_path.stem
+            note_body = dest_path.read_text(errors="replace")
+            if ext == ".md":
+                note_meta, note_body = parse_note(dest_path)
+                raw_title = note_meta.get("title")
+                if isinstance(raw_title, str) and raw_title.strip():
+                    note_title = raw_title.strip()
+            raw_path = _write_cm(
+                source_id,
+                source_type,
+                note_title,
+                [_NS(text=note_body, structural_locator=None, image_refs=[])],
+                config.vault,
+                metadata=note_meta,
+            )
+    except Exception:
+        db.delete_source_import_data(source_id)
+        for path in (raw_path, dest_path):
+            if path.exists():
+                path.unlink()
+        if assets_dir.exists():
+            shutil.rmtree(assets_dir)
+        if dest_dir.exists() and not any(dest_dir.iterdir()):
+            dest_dir.rmdir()
+        raise
+
+    # --- Summary ---
+    console.print(f"[green]Imported:[/green] {source_id}")
+    console.print(f"  Type:    {source_type}")
+    console.print(f"  Stored:  {dest_path.relative_to(config.vault)}")
+    if segment_count:
+        console.print(f"  Segments extracted: {segment_count}")
+    console.print(f"  Raw note: {raw_path.relative_to(config.vault)}")

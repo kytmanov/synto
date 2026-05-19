@@ -37,6 +37,7 @@ from synto.pipeline.ingest import (
     _suggested_topic_candidates,
     ingest_all,
     ingest_note,
+    write_source_content_md,
 )
 from synto.state import StateDB
 
@@ -1460,6 +1461,37 @@ def test_analyze_body_with_checkpoints_context_change_invalidates_cache(vault, c
     assert db.list_ingest_chunks("raw/context.md", old_checkpoint_hash, 4, 50) == []
 
 
+def test_analyze_body_with_checkpoints_source_type_change_invalidates_cache(vault, config, db):
+    config2 = Config(vault=vault, ollama={"fast_ctx": 100})
+    path = _write_raw(vault, "source-type.md", "x" * 200)
+    body = path.read_text()
+    content_hash = _content_hash(body)
+    paper_hash = _checkpoint_hash(content_hash, config2, [], source_type="paper")
+    db.upsert_ingest_chunk(
+        "raw/source-type.md",
+        paper_hash,
+        0,
+        4,
+        50,
+        _analysis_json(concepts=["Paper Chunk"]),
+    )
+
+    client = _make_client(_analysis_json(concepts=["Notes Chunk"]))
+    _analyze_body_with_checkpoints(
+        body,
+        [],
+        path,
+        content_hash,
+        client,
+        config2,
+        db,
+        source_type="notes",
+    )
+
+    assert client.generate.call_count == 4
+    assert db.list_ingest_chunks("raw/source-type.md", paper_hash, 4, 50) == []
+
+
 def test_analyze_body_with_checkpoints_ignores_previous_schema_rows(vault, config, db):
     config2 = Config(vault=vault, ollama={"fast_ctx": 100})
     path = _write_raw(vault, "schema.md", "x" * 200)
@@ -1643,3 +1675,75 @@ def test_suggested_topic_candidates_medium_quality_requires_evidence():
     names = [c.name for c in candidates]
     assert "API Testing" in names
     assert "Проверка статуса ответа API" not in names
+
+
+# ---------------------------------------------------------------------------
+# write_source_content_md
+# ---------------------------------------------------------------------------
+
+
+def _seg(text: str, locator: str | None = None):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(text=text, structural_locator=locator)
+
+
+def test_write_source_content_md_with_locators(tmp_path):
+    segs = [_seg("Intro text.", "Introduction"), _seg("Background text.", "Background")]
+    path = write_source_content_md("src-001", "paper", "My Paper", segs, tmp_path)
+    assert path == tmp_path / "raw" / "src-001.md"
+    content = path.read_text()
+    assert "source_type: paper" in content
+    assert "## Introduction" in content
+    assert "Intro text." in content
+    assert "## Background" in content
+
+
+def test_write_source_content_md_no_locator(tmp_path):
+    segs = [_seg("Plain text content.")]
+    path = write_source_content_md("src-002", "notes", None, segs, tmp_path)
+    content = path.read_text()
+    assert "Plain text content." in content
+    assert "##" not in content
+    assert "source_type: notes" in content
+
+
+def test_write_source_content_md_preserves_image_refs(tmp_path):
+    from types import SimpleNamespace
+
+    segs = [
+        SimpleNamespace(
+            text="Segment text.",
+            structural_locator="Images",
+            image_refs=["assets/src-003/img-0-0.png"],
+        )
+    ]
+    path = write_source_content_md("src-003", "paper", "With Images", segs, tmp_path)
+    content = path.read_text()
+    assert "### Media" in content
+    assert "![[assets/src-003/img-0-0.png]]" in content
+
+
+def test_media_section_stripped_before_llm_analysis(vault, config, db):
+    """### Media + ![[...]] embeds are removed from body before LLM sees it.
+
+    The raw/ file retains the embeds for human readers in Obsidian;
+    only the in-memory body passed to the LLM is cleaned.
+    """
+    body = (
+        "## section:intro\n\nSome meaningful text.\n\n"
+        "### Media\n- ![[assets/src-001/img-0-0.png]]\n- ![[assets/src-001/img-0-1.png]]\n\n"
+        "## section:results\n\nMore meaningful text.\n\n"
+        "### Media\n- ![[assets/src-001/img-1-0.png]]\n"
+    )
+    path = _write_raw(vault, "pdf-source.md", body)
+    client = _make_client(_analysis_json())
+    ingest_note(path, config, client, db)
+
+    prompt_sent = client.generate.call_args.kwargs["prompt"]
+    assert "### Media" not in prompt_sent
+    assert "![[assets" not in prompt_sent
+    assert "Some meaningful text." in prompt_sent
+    assert "More meaningful text." in prompt_sent
+    # Raw file on disk is unchanged — embeds are still there for Obsidian
+    assert "![[assets/src-001/img-0-0.png]]" in path.read_text()

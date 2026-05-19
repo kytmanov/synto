@@ -99,3 +99,22 @@ def test_compile_auto_approve_commits_synto_dir(tmp_path, monkeypatch):
     assert result.exit_code == 0
     assert commit_calls
     assert commit_calls[0][2] == ["wiki/", ".synto/"]
+
+
+def test_compile_noop_does_not_update_index(tmp_path, monkeypatch):
+    (tmp_path / "raw").mkdir()
+    (tmp_path / "wiki").mkdir()
+    (tmp_path / "wiki" / ".drafts").mkdir()
+    (tmp_path / ".synto").mkdir()
+    config = Config(vault=tmp_path)
+    db = StateDB(config.state_db_path)
+    client = MagicMock()
+
+    gen_idx = MagicMock()
+    monkeypatch.setattr("synto.cli._load_deps", lambda cfg: (client, db))
+    monkeypatch.setattr("synto.indexer.generate_index", gen_idx)
+
+    result = CliRunner().invoke(cli, ["compile", "--vault", str(tmp_path)])
+
+    assert result.exit_code == 0
+    gen_idx.assert_not_called()

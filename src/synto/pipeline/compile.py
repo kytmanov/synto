@@ -28,7 +28,7 @@ import frontmatter as fm_lib
 
 from ..config import Config
 from ..markdown_math import mask_markdown_regions, restore_markdown_regions, sanitize_obsidian_math
-from ..models import ArticlePlan, CompilePlan, SingleArticle, WikiArticleRecord
+from ..models import ArticlePlan, CompilePlan, PipelineVersion, SingleArticle, WikiArticleRecord
 from ..openai_compat_client import LLMBadRequestError, LLMTruncatedError
 from ..protocols import LLMClientProtocol
 from ..sanitize import sanitize_tags
@@ -452,6 +452,16 @@ def _strip_empty_wikilinks(content: str) -> str:
     return _restore_code_blocks(empty_wikilink_re.sub(replace, masked), replacements)
 
 
+def _repair_wikilink_placeholders(content: str) -> str:
+    """Collapse stray placeholder tokens like [[wikilinks][[Title]]] into valid markdown."""
+    masked, replacements = _mask_code_blocks(content)
+    repaired = masked
+    repaired = re.sub(r"\[\[wikilinks\]\[\[([^\]]+)\]\]\]", r"[[\1]]", repaired, flags=re.I)
+    repaired = re.sub(r"\[\[wikilinks\]\[\[([^\]]+)\]\]", r"[[\1]]", repaired, flags=re.I)
+    repaired = re.sub(r"\[\[wikilinks\]\s*([^\]\n]+)\]", r"\1", repaired, flags=re.I)
+    return _restore_code_blocks(repaired, replacements)
+
+
 def _repair_literal_newlines(content: str) -> str:
     """Repair LLM output that escaped Markdown newlines into literal \n text."""
     if "\\n" not in content:
@@ -642,6 +652,8 @@ def _write_draft(
     alias_map: dict[str, str] | None = None,
     canonical_title: str | None = None,
     prompt_degraded: bool = False,
+    run_ulid: str | None = None,
+    pipeline: PipelineVersion | None = None,
 ) -> Path:
     """Write SingleArticle to wiki/.drafts/ and record in state DB."""
     config.drafts_dir.mkdir(parents=True, exist_ok=True)
@@ -670,6 +682,7 @@ def _write_draft(
         )
     source_targets = [ref.wiki_target for ref in source_refs]
     body = _repair_malformed_wikilinks(body, (existing_titles or []) + source_targets)
+    body = _repair_wikilink_placeholders(body)
     body = _strip_unknown_wikilinks(body, (existing_titles or []) + source_targets)
     body = _strip_self_wikilinks(body, article_title)
     body = _strip_empty_wikilinks(body)
@@ -700,6 +713,15 @@ def _write_draft(
         else:
             body = annotation_block + body
 
+    lineage_entry: list[dict] = []
+    if run_ulid:
+        lineage_entry = [
+            {
+                "compile_run": run_ulid,
+                "pipeline": pipeline.model_dump() if pipeline else {},
+                "timestamp": datetime.now().isoformat(),
+            }
+        ]
     meta = build_wiki_frontmatter(
         title=article_title,
         tags=content_result.tags,
@@ -708,6 +730,7 @@ def _write_draft(
         is_draft=True,
         existing_meta=existing_meta,
         aliases=concept_aliases or [],
+        lineage=lineage_entry if lineage_entry else None,
     )
 
     post = fm_lib.Post(body, **meta)
@@ -851,6 +874,21 @@ def compile_concepts(
     if not concept_names:
         log.info("No concepts needing compile")
         return [], [], {}
+
+    # Start compile run tracking
+    try:
+        import ulid as _ulid_mod
+
+        run_ulid = str(_ulid_mod.ULID())
+    except ImportError:
+        import uuid
+
+        run_ulid = uuid.uuid4().hex.upper()
+    pipeline = PipelineVersion(fast_model=config.models.fast, heavy_model=config.models.heavy)
+    if not dry_run and db._has_table("compile_runs"):
+        db.start_compile_run(
+            run_ulid, pipeline.model_dump_json(), config.models.fast, config.models.heavy
+        )
 
     log.info("Compiling %d concept(s)", len(concept_names))
     existing_titles = [t for t, _ in list_wiki_articles(config.wiki_dir)]
@@ -1177,9 +1215,15 @@ def compile_concepts(
             concept_aliases=db.get_aliases(name),
             alias_map=alias_map,
             prompt_degraded=prompt_degraded,
+            run_ulid=run_ulid,
+            pipeline=pipeline,
         )
         draft_paths.append(draft_path)
         db.mark_concept_compile_state(name, resolved_paths, "compiled")
+        # Track per-article compile run
+        if not dry_run and db._has_table("compile_runs"):
+            rel = str(draft_path.relative_to(config.vault))
+            db.update_article_compile_run(rel, run_ulid)
         elapsed = time.monotonic() - _t_concept
         concept_timings[name] = elapsed
         log.info("Draft written: %s (%.1fs)", draft_path.name, elapsed)
@@ -1187,6 +1231,10 @@ def compile_concepts(
     if failure_categories:
         summary = ", ".join(f"{len(v)} {k}" for k, v in sorted(failure_categories.items()))
         log.warning("Compile failures by category: %s", summary)
+
+    # Finish compile run
+    if not dry_run and db._has_table("compile_runs"):
+        db.finish_compile_run(run_ulid, article_count=len(draft_paths))
 
     return draft_paths, failed, concept_timings
 

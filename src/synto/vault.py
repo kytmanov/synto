@@ -270,6 +270,7 @@ def build_wiki_frontmatter(
     is_draft: bool = True,
     existing_meta: dict | None = None,
     aliases: list[str] | None = None,
+    lineage: list[dict] | None = None,
 ) -> dict[str, Any]:
     now = datetime.now().strftime("%Y-%m-%d")
     sanitized_tags = sanitize_tags(tags)
@@ -291,6 +292,13 @@ def build_wiki_frontmatter(
         meta["created"] = existing_meta["created"]
     else:
         meta["created"] = now
+    if lineage:
+        # Merge new entry with any existing lineage entries (keep last 10)
+        existing_lineage = existing_meta.get("lineage", []) if existing_meta else []
+        merged = list(existing_lineage) + lineage
+        meta["lineage"] = merged[-10:]
+    elif existing_meta and "lineage" in existing_meta:
+        meta["lineage"] = existing_meta["lineage"]
     return meta
 
 

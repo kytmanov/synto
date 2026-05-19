@@ -320,7 +320,7 @@ def test_migrate_olw_upgrades_v9_db_and_drops_legacy_telemetry_tables(tmp_path):
         row[0]
         for row in migrated.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
     }
-    assert version == 10
+    assert version == 13
     assert "metric_events" in tables
     assert "metric_daily_rollups" in tables
     assert "telemetry_events" not in tables

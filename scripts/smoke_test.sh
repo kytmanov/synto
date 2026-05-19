@@ -995,9 +995,9 @@ LINT_OUT=$($OLW maintain --dry-run 2>&1); _LINT_RC=$?
 echo "$LINT_OUT"
 check "maintain --dry-run exits 0" "test $_LINT_RC -eq 0"
 _TMP=$(mktemp); echo "$LINT_OUT" > "$_TMP"
-# CLI prints: "Health: {score}/100  {summary}"
-check "maintain --dry-run prints Health: <score>/100 header" \
-    "grep -qE 'Health: [0-9]+(\.[0-9]+)?/100' \"$_TMP\""
+# CLI prints: "Structural health: {score}/100  {summary}"
+check "maintain --dry-run prints Structural health: <score>/100 header" \
+    "grep -qiE 'health: [0-9]+(\.[0-9]+)?/100' \"$_TMP\""
 rm -f "$_TMP"
 
 # maintain --fix must exit 0

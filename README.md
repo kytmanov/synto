@@ -46,23 +46,25 @@ Unlike a chatbot that forgets, the wiki **persists and compounds**. Every note y
 
 ## How it works
 
-Three stages. Two LLM tiers.
+Four stages. Two LLM tiers.
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│  Stage 1: Ingest    Stage 2: Compile       Stage 3: Export          │
-│                                                                      │
-│  raw/*.md  ──────►  wiki/.drafts/  ──────►  pack/                   │
-│                                                                      │
-│  fast model         heavy model            agent-ready directory     │
-│  (4B params)        (14B+ params)                                    │
-│                                                                      │
-│  extracts:          writes:                produces:                 │
-│  · concepts         · one article          · INDEX.json              │
-│  · summaries          per concept          · AGENTS.md               │
-│  · relationships    · cross-linked         · CLAUDE.md               │
-│  · language           with [[wikilinks]]   · articles/               │
-└─────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────┐
+│  Stage 1: Import  Stage 2: Ingest  Stage 3: Compile  Stage 4: Export  │
+│                                                                        │
+│  synto add ─────┐                                                      │
+│  (PDF/md/txt)   ├─ raw/*.md ──────► wiki/.drafts/ ──────► pack/       │
+│  .synto/sources/┘  fast model       heavy model      agent-ready      │
+│                    (4B params)      (14B+ params)     directory        │
+│                                                                        │
+│  archives:         extracts:        writes:           produces:       │
+│  · original file   · concepts       · one article     · INDEX.json    │
+│  · segments        · summaries        per concept     · AGENTS.md     │
+│  · source type     · relationships  · cross-linked    · CLAUDE.md     │
+│                    · language         [[wikilinks]]   · articles/     │
+│                                     · source-type                     │
+│                                       prompt                          │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
 **Why two LLM tiers?** Analysis is pattern-matching — a 4B model running locally can extract "this note is about Qubit, Superposition, and Entanglement" reliably and fast. Writing a coherent, cross-linked article requires more reasoning — a 14B+ model does this well. Splitting the work keeps the pipeline cheap and fast on consumer hardware.
@@ -79,6 +81,7 @@ Three stages. Two LLM tiers.
     synthesis/      ← synthesized answers published as wiki pages
   .synto/
     state.db        ← SQLite: note lifecycle, concept registry, metrics
+    sources/        ← originals archived via synto add (PDF, md, txt)
   synto.toml        ← vault config (provider, models, pipeline settings)
   pack/             ← agent-ready export (created by synto pack export)
 ```
@@ -103,6 +106,13 @@ synto approve --min-confidence 0.8    # hold back uncertain drafts
 **Hand-edit protection.** Edit a published article in Obsidian or any editor. Synto tracks a SHA-256 content hash and detects your change on the next run — your edits are never overwritten by a recompile.
 
 **No embeddings, no vector database.** `synto query` routes questions to relevant articles using `INDEX.json`. It works on any machine without a GPU, FAISS, or Chroma.
+
+**Source-type analysis.** Imported documents carry a type — `notes`, `textbook`, `paper`,
+`spec`, `api_docs`, `web_article`, `corp_docs`, `transcript`, or `unknown_text`. During ingest
+analysis the fast model receives a matching system prompt: a `paper` prompt extracts
+abstract/methods/results structure; an `api_docs` prompt preserves parameter names; a
+`textbook` prompt follows chapter/definition flow. If `--type` is omitted, Synto infers it
+from the file extension.
 
 ---
 
@@ -151,6 +161,34 @@ Works today with Markdown. Drop notes in `raw/`, run `synto run`, and get a cros
 **Multi-language.** Each note's language is auto-detected at ingest. Articles are written in that language. No hard-coded word lists or language config required.
 
 **Git-aware.** Every automatic operation commits with a `[synto]` prefix. `synto undo` reverts the last N auto-commits. Raw notes are never modified.
+
+**Source import.** `synto add` imports PDFs, Markdown, and text files as tracked source
+documents. PDFs are segmented into heading-aware chunks, archived under `.synto/sources/`,
+and written back as canonical `raw/*.md` notes for the normal ingest flow. Pick the right
+type for your document to get the matching ingest-analysis prompt:
+
+| Type | Use for |
+|---|---|
+| `notes` | Your own notes, meeting minutes, personal writing |
+| `textbook` | Educational material with chapters and exercises |
+| `paper` | Academic papers (abstract / methods / results) |
+| `spec` | Technical specifications, RFCs, standards |
+| `api_docs` | API references, SDK docs, OpenAPI specs |
+| `web_article` | Blog posts, news articles, web clips |
+| `corp_docs` | Internal wikis, runbooks, design documents |
+| `transcript` | Video/audio transcripts, interview notes |
+| `unknown_text` | Fallback when text doesn't fit a richer source type |
+
+**Compile lineage.** Every compiled article records which source notes and compile run it
+came from. `synto trace article <name>` prints the full history: timestamp, model,
+contributing sources.
+
+**LLM response cache.** Identical prompts reuse cached responses from a local SQLite
+table instead of hitting the model. `synto maintain --clear-cache` flushes it;
+`--older-than N` prunes entries older than N days.
+
+**Pack extension flag.** `synto add --extend-pack NAME` is reserved for future pack-scoped
+imports. In `v0.2.0` it is intentionally a safe no-op and does not mutate `synto.toml`.
 
 ---
 
@@ -230,7 +268,7 @@ synto init ~/my-wiki
 
 Creates the folder structure and a `synto.toml` pre-filled with your wizard settings.
 
-### 4. Add notes
+### 4. Add notes and sources
 
 Drop any `.md` files into `~/my-wiki/raw/`. Web clips, book notes, meeting notes, transcripts — anything.
 
@@ -240,6 +278,20 @@ Drop any `.md` files into `~/my-wiki/raw/`. Web clips, book notes, meeting notes
   ml-fundamentals.md
   distributed-systems-chapter3.md
 ```
+
+**To import a PDF or other structured document:**
+
+```bash
+synto add paper.pdf --type paper --vault ~/my-wiki
+synto add textbook_chapter.pdf --type textbook --vault ~/my-wiki
+synto add api-reference.md --type api_docs --vault ~/my-wiki
+```
+
+Use `--type` to select the matching ingest-analysis prompt (see the table in Features).
+If omitted, the type is inferred from the file extension.
+
+`synto add --force` re-imports an existing source in place. `--extend-pack` is reserved for
+future pack integration and currently reports a safe no-op.
 
 ### 5. Run the pipeline
 
@@ -313,6 +365,15 @@ Any OpenAI-compatible endpoint works. Use `synto setup` to configure interactive
 - `synto doctor` — configuration and connectivity diagnostics
 - Multi-language: notes are ingested and compiled in their source language
 - 20+ LLM providers supported via OpenAI-compatible API
+- `synto add SOURCE` — import PDF, Markdown, or text files as tracked source documents;
+  PDFs are segmented automatically into heading-aware chunks and written back as canonical raw notes
+- Source-type prompts: built-in templates for `notes`, `textbook`, `paper`, `spec`,
+  `api_docs`, `web_article`, `corp_docs`, `transcript`, plus `unknown_text` fallback,
+  select the optimal ingest strategy per document type
+- Compile lineage: every article records its source notes and compile run;
+  `synto trace article <name>` shows the full history
+- LLM response cache: identical prompts reuse cached responses;
+  `synto maintain --clear-cache` manages it
 
 ---
 
