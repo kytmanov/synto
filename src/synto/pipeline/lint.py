@@ -184,12 +184,16 @@ def _check_broken_wikilinks(
         if is_url or is_path_fragment:
             continue
         seen_broken.add(link.lower())
+        if link.lower().startswith("sources/"):
+            suggestion = "Run `synto run` to regenerate source summary pages, or remove the link."
+        else:
+            suggestion = f"Create a page for '{link}' or remove the link."
         issues.append(
             LintIssue(
                 path=rel_path,
                 issue_type="broken_link",
                 description=f"[[{link}]] has no matching wiki page",
-                suggestion=f"Create a page for '{link}' or remove the link.",
+                suggestion=suggestion,
                 auto_fixable=False,
             )
         )

@@ -231,6 +231,13 @@ def create_stubs(
         if not target:
             continue
 
+        # Path-prefixed targets like sources/SomePaper are pipeline-managed pages,
+        # not concept stubs. sanitize_filename would strip the slash and produce a
+        # wrong name (sourcesSomePaper). Skip them — the fix is to run synto run.
+        if "/" in target:
+            log.debug("Skipping path-fragment broken link target: %s", target)
+            continue
+
         if target in seen:
             continue
         seen.add(target)
