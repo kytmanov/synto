@@ -2256,6 +2256,8 @@ def run(
 def review(vault_str):
     """Interactive draft review: approve, reject, edit, or diff drafts."""
 
+    from rich.markup import escape
+
     from .pipeline.compile import approve_drafts, reject_draft
     from .pipeline.review import (
         compute_diff,
@@ -2293,7 +2295,7 @@ def review(vault_str):
             )
             table.add_row(
                 str(i),
-                s.title,
+                escape(s.title),
                 f"[{conf_color}]{s.confidence:.2f}[/{conf_color}]",
                 str(s.source_count),
                 str(s.rejection_count),
@@ -2380,7 +2382,7 @@ def _review_single(
 
         # Show metadata
         console.print(
-            f"[bold]{summary.title}[/bold]  "
+            f"[bold]{escape(summary.title)}[/bold]  "
             f"conf={meta.get('confidence', 0):.2f}  "
             f"sources={summary.source_count}  "
             f"rejections={summary.rejection_count}"
