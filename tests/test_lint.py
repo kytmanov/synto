@@ -240,6 +240,24 @@ def test_obsidian_callout_marker_not_malformed_link(vault, config, db):
     assert not malformed
 
 
+def test_inline_math_interval_not_flagged(vault, config, db):
+    _write_page(config, "Alpha", "The rate $H_i \\in [0, 1]$ defines coverage.")
+
+    result = run_lint(config, db)
+
+    malformed = [i for i in result.issues if i.issue_type == "malformed_link"]
+    assert not malformed
+
+
+def test_display_math_bracket_not_flagged(vault, config, db):
+    _write_page(config, "Alpha", "$$x \\in [0, \\infty)$$")
+
+    result = run_lint(config, db)
+
+    malformed = [i for i in result.issues if i.issue_type == "malformed_link"]
+    assert not malformed
+
+
 def test_malformed_bracket_link_detected_in_draft(vault, config, db):
     write_note(
         config.drafts_dir / "Draft.md",

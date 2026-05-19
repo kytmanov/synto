@@ -15,6 +15,7 @@ from synto.models import AnalysisResult, Concept
 from synto.pipeline.ingest import (
     _SYSTEM,
     _analyze_body,
+    write_source_content_md,
     _analyze_body_with_checkpoints,
     _base_concept_name,
     _build_analysis_prompt,
@@ -1643,3 +1644,34 @@ def test_suggested_topic_candidates_medium_quality_requires_evidence():
     names = [c.name for c in candidates]
     assert "API Testing" in names
     assert "Проверка статуса ответа API" not in names
+
+
+# ---------------------------------------------------------------------------
+# write_source_content_md
+# ---------------------------------------------------------------------------
+
+
+def _seg(text: str, locator: str | None = None):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(text=text, structural_locator=locator)
+
+
+def test_write_source_content_md_with_locators(tmp_path):
+    segs = [_seg("Intro text.", "Introduction"), _seg("Background text.", "Background")]
+    path = write_source_content_md("src-001", "paper", "My Paper", segs, tmp_path)
+    assert path == tmp_path / "raw" / "src-001.md"
+    content = path.read_text()
+    assert "source_type: paper" in content
+    assert "## Introduction" in content
+    assert "Intro text." in content
+    assert "## Background" in content
+
+
+def test_write_source_content_md_no_locator(tmp_path):
+    segs = [_seg("Plain text content.")]
+    path = write_source_content_md("src-002", "notes", None, segs, tmp_path)
+    content = path.read_text()
+    assert "Plain text content." in content
+    assert "##" not in content
+    assert "source_type: notes" in content

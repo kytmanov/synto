@@ -1080,6 +1080,34 @@ def _create_source_summary_page(
     return out_path
 
 
+def write_source_content_md(
+    source_id: str,
+    source_type: str,
+    title: str | None,
+    segments: list,
+    vault_dir: Path,
+) -> Path:
+    """Assemble source segments into raw/<source_id>.md for the ingest pipeline."""
+    raw_dir = vault_dir / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    dest = raw_dir / f"{source_id}.md"
+
+    lines: list[str] = []
+    for seg in segments:
+        loc = getattr(seg, "structural_locator", None)
+        if loc:
+            lines.append(f"## {loc}\n")
+        lines.append(seg.text.strip())
+        lines.append("")
+
+    meta: dict[str, str] = {"source_type": source_type}
+    if title:
+        meta["title"] = title
+
+    write_note(dest, meta, "\n".join(lines))
+    return dest
+
+
 def ingest_note(
     path: Path,
     config: Config,
@@ -1276,11 +1304,14 @@ def ingest_note(
     except Exception as e:
         log.warning("Source summary page failed for %s: %s", path.name, e)
 
+    _concept_preview = canonical_names[:3]
+    if len(canonical_names) > 3:
+        _concept_preview = canonical_names[:3] + [f"+{len(canonical_names) - 3} more"]
     log.info(
         "Ingested: %s (quality=%s, concepts=%s)",
         path.name,
         result.quality,
-        canonical_names[:3],
+        _concept_preview,
     )
     return result
 

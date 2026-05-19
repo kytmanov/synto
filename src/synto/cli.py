@@ -282,15 +282,18 @@ def _resolve_draft_arg(config, raw_path: str | Path) -> Path:
 
 
 def _load_deps(config):
+    from .cache import LLMCache
     from .client_factory import LLMError, build_client
 
-    client = build_client(config)
+    db = _load_db(config)
+    cache = LLMCache(db)
+    client = build_client(config, cache=cache)
     try:
         client.require_healthy()
     except LLMError as e:
         err_console.print(str(e))
+        db.close()
         sys.exit(1)
-    db = _load_db(config)
     ctx = click.get_current_context(silent=True)
     if ctx is not None:
         metrics_cm = _metrics_context(config, db)
@@ -408,7 +411,13 @@ def report_clear(vault_str: str | None, yes: bool) -> None:
 @click.argument("vault_path", type=click.Path())
 @click.option("--existing", is_flag=True, help="Adopt an existing Obsidian vault")
 @click.option("--non-interactive", is_flag=True)
-def init(vault_path: str, existing: bool, non_interactive: bool):
+@click.option(
+    "--default",
+    "set_default",
+    is_flag=True,
+    help="Set this vault as the default (no --vault flag needed for future commands)",
+)
+def init(vault_path: str, existing: bool, non_interactive: bool, set_default: bool):
     """Create vault structure and initialise Synto."""
     from .git_ops import git_init
 
@@ -423,7 +432,7 @@ def init(vault_path: str, existing: bool, non_interactive: bool):
     # Write or sync synto.toml from global config
     toml_path = vault / CONFIG_FILE_NAME
     from .config import default_wiki_toml
-    from .global_config import load_global_config
+    from .global_config import GlobalConfig, load_global_config, save_global_config
 
     gcfg = load_global_config()
     provider_name = gcfg.provider_name if gcfg and gcfg.provider_name else "ollama"
@@ -484,12 +493,29 @@ def init(vault_path: str, existing: bool, non_interactive: bool):
             "*.log\n"
         )
 
+    if set_default:
+        try:
+            _gcfg = gcfg if gcfg is not None else GlobalConfig()
+            _gcfg.vault = str(vault)
+            save_global_config(_gcfg)
+        except Exception:
+            console.print("[yellow]⚠ Could not save default vault to global config.[/yellow]")
+
     console.print(f"[green]Vault initialised:[/green] {vault}")
+    if set_default:
+        console.print("[dim]Set as default vault — no --vault flag needed.[/dim]")
     console.print("Next steps:")
     console.print("  1. Drop .md notes into [bold]raw/[/bold]")
-    console.print(f"  2. Run [bold]{CLI_NAME} run --vault {vault}[/bold]")
-    console.print(f"  3. Review drafts: [bold]{CLI_NAME} review --vault {vault}[/bold]")
-    console.print(f"  4. Publish all drafts: [bold]{CLI_NAME} approve --all --vault {vault}[/bold]")
+    if set_default:
+        console.print(f"  2. Run [bold]{CLI_NAME} run[/bold]")
+        console.print(f"  3. Review drafts: [bold]{CLI_NAME} review[/bold]")
+        console.print(f"  4. Publish all drafts: [bold]{CLI_NAME} approve --all[/bold]")
+    else:
+        console.print(f"  2. Run [bold]{CLI_NAME} run --vault {vault}[/bold]")
+        console.print(f"  3. Review drafts: [bold]{CLI_NAME} review --vault {vault}[/bold]")
+        console.print(
+            f"  4. Publish all drafts: [bold]{CLI_NAME} approve --all --vault {vault}[/bold]"
+        )
 
 
 def _sync_wiki_toml_models(
@@ -1462,8 +1488,8 @@ def compile(
     # Update index and log
     from .indexer import append_log, generate_index
 
-    generate_index(config, db)
     if draft_paths:
+        generate_index(config, db)
         append_log(config, f"compile | {len(draft_paths)} drafts written")
 
     if auto_approve and draft_paths:
@@ -2962,6 +2988,39 @@ def _make_source_id(path: Path) -> str:
     return f"{_source_slug(path.stem)}-{content_hash[:8]}"
 
 
+def _try_extract_terms(pdf_segs, config, db) -> int:
+    """Best-effort term extraction from PDF segments; returns term count or 0 if LLM unavailable."""
+    import logging
+
+    from .cache import LLMCache
+    from .client_factory import build_client
+    from .pipeline.ingest import extract_terms
+
+    log = logging.getLogger(__name__)
+
+    try:
+        cache = LLMCache(db)
+        client = build_client(config, cache=cache)
+        client.require_healthy()
+    except Exception as e:
+        log.debug("Term extraction skipped (LLM unavailable): %s", e)
+        return 0
+
+    count = 0
+    try:
+        for seg in pdf_segs:
+            try:
+                result = extract_terms(seg, client, config)
+                db.upsert_concept_occurrences(result.terms, seg.id)
+                count += len(result.terms)
+            except Exception as e:
+                log.warning("Term extraction failed for segment %s: %s", seg.id, e)
+                continue
+    finally:
+        client.close()
+    return count
+
+
 @cli.command("add")
 @click.argument("source", type=click.Path(exists=True))
 @click.option(
@@ -3045,6 +3104,7 @@ def add(
 
     # --- Extract segments (PDF only) ---
     segment_count = 0
+    pdf_segs = []
     if ext == ".pdf":
         from .extractors.pdf import extract_pdf
 
@@ -3055,8 +3115,20 @@ def add(
             transient=True,
         ) as progress:
             progress.add_task(f"Extracting segments from {src_path.name}…", total=None)
-            segs = extract_pdf(source_id, dest_path, db, vault_root=config.vault)
-        segment_count = len(segs)
+            pdf_segs = extract_pdf(source_id, dest_path, db, vault_root=config.vault)
+        segment_count = len(pdf_segs)
+
+    # --- Term extraction (optional, requires LLM) ---
+    term_count = 0
+    if pdf_segs:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+            transient=True,
+        ) as progress:
+            progress.add_task(f"Extracting terms from {segment_count} segment(s)…", total=None)
+            term_count = _try_extract_terms(pdf_segs, config, db)
 
     # --- --extend-pack: append [[pack.sources]] to synto.toml ---
     if extend_pack is not None:
@@ -3071,11 +3143,31 @@ def add(
             existing_text = f'[pack]\nname = "{extend_pack}"\n'
         toml_path.write_text(existing_text + entry, encoding="utf-8")
 
+    # Write assembled content to raw/ so ingest_all picks it up on next run
+    from types import SimpleNamespace as _NS
+
+    from .pipeline.ingest import write_source_content_md as _write_cm
+
+    segs = db.list_segments_for_source(source_id)
+    if segs:
+        raw_path = _write_cm(source_id, source_type, src_path.stem, segs, config.vault)
+    else:
+        raw_path = _write_cm(
+            source_id,
+            source_type,
+            src_path.stem,
+            [_NS(text=dest_path.read_text(errors="replace"), structural_locator=None)],
+            config.vault,
+        )
+
     # --- Summary ---
     console.print(f"[green]Imported:[/green] {source_id}")
     console.print(f"  Type:    {source_type}")
     console.print(f"  Stored:  {dest_path.relative_to(config.vault)}")
     if segment_count:
         console.print(f"  Segments extracted: {segment_count}")
+    if term_count:
+        console.print(f"  Terms extracted: {term_count}")
+    console.print(f"  Raw note: {raw_path.relative_to(config.vault)}")
     if extend_pack:
         console.print(f"  Added to pack: {extend_pack}")
