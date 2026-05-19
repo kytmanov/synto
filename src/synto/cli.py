@@ -2351,6 +2351,7 @@ def _review_single(
     load_draft_content,
 ):
     """Handle single-draft review loop."""
+    from rich.markup import escape
     from rich.panel import Panel
 
     from .vault import sanitize_filename
@@ -2371,7 +2372,7 @@ def _review_single(
         if rejections:
             console.print(
                 Panel(
-                    "\n".join(f"• {r['feedback']}" for r in rejections),
+                    "\n".join(f"• {escape(r['feedback'])}" for r in rejections),
                     title=f"[red]Previous rejections ({len(rejections)})[/red]",
                     border_style="red",
                 )
@@ -2386,7 +2387,8 @@ def _review_single(
         )
 
         # Show body
-        console.print(Panel(body[:3000] + ("…" if len(body) > 3000 else ""), title="Draft"))
+        body_display = body[:3000] + ("…" if len(body) > 3000 else "")
+        console.print(Panel(escape(body_display), title="Draft"))
 
         console.print(
             "\n[dim]Type: a=approve, r=reject, e=edit, "
@@ -2435,13 +2437,13 @@ def _review_single(
             if diff is None:
                 console.print("[dim]No published version — this is a new article.[/dim]")
             else:
-                console.print(diff)
+                console.print(diff, markup=False)
         elif action == "v":
             diff = compute_rejection_diff(summary.path, db, summary.title)
             if diff is None:
                 console.print("[dim]No rejected body stored for this concept.[/dim]")
             else:
-                console.print(diff)
+                console.print(diff, markup=False)
         else:
             console.print("[red]Unknown action.[/red]")
 
