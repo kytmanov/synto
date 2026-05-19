@@ -2060,6 +2060,16 @@ class StateDB:
             "SELECT * FROM source_documents WHERE id = ?", (source_id,)
         ).fetchone()
 
+    def get_source_document_by_raw_hash(self, raw_hash: str) -> sqlite3.Row | None:
+        """Fetch the first source document with the given raw hash, or None."""
+        if not self._has_table("source_documents"):
+            return None
+        return self._conn.execute(
+            "SELECT * FROM source_documents WHERE raw_hash = ? "
+            "ORDER BY imported_at DESC, id DESC LIMIT 1",
+            (raw_hash,),
+        ).fetchone()
+
     def list_source_documents(self) -> list[tuple[str, str | None, str]]:
         if not self._has_table("source_documents"):
             return []
@@ -2067,6 +2077,16 @@ class StateDB:
             "SELECT id, title, source_type FROM source_documents ORDER BY id"
         ).fetchall()
         return [(row["id"], row["title"], row["source_type"]) for row in rows]
+
+    def delete_source_import_data(self, source_id: str) -> None:
+        """Remove source import records for a single source document."""
+        with self._tx():
+            if self._has_table("generated_assets"):
+                self._conn.execute("DELETE FROM generated_assets WHERE source_id = ?", (source_id,))
+            if self._has_table("source_segments"):
+                self._conn.execute("DELETE FROM source_segments WHERE source_id = ?", (source_id,))
+            if self._has_table("source_documents"):
+                self._conn.execute("DELETE FROM source_documents WHERE id = ?", (source_id,))
 
     def list_source_segments_brief(self) -> list[tuple[str, str, str, str]]:
         if not self._has_table("source_segments"):

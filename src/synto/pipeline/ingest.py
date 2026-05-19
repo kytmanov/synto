@@ -1086,6 +1086,8 @@ def write_source_content_md(
     title: str | None,
     segments: list,
     vault_dir: Path,
+    *,
+    metadata: dict[str, object] | None = None,
 ) -> Path:
     """Assemble source segments into raw/<source_id>.md for the ingest pipeline."""
     raw_dir = vault_dir / "raw"
@@ -1098,11 +1100,17 @@ def write_source_content_md(
         if loc:
             lines.append(f"## {loc}\n")
         lines.append(seg.text.strip())
+        image_refs = getattr(seg, "image_refs", None) or []
+        if image_refs:
+            lines.append("")
+            lines.append("### Media")
+            lines.extend(f"- ![[{ref}]]" for ref in image_refs)
         lines.append("")
 
-    meta: dict[str, str] = {"source_type": source_type}
+    meta: dict[str, object] = dict(metadata or {})
+    meta["source_type"] = source_type
     if title:
-        meta["title"] = title
+        meta.setdefault("title", title)
 
     write_note(dest, meta, "\n".join(lines))
     return dest

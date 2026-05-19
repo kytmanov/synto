@@ -1675,3 +1675,19 @@ def test_write_source_content_md_no_locator(tmp_path):
     assert "Plain text content." in content
     assert "##" not in content
     assert "source_type: notes" in content
+
+
+def test_write_source_content_md_preserves_image_refs(tmp_path):
+    from types import SimpleNamespace
+
+    segs = [
+        SimpleNamespace(
+            text="Segment text.",
+            structural_locator="Images",
+            image_refs=["assets/src-003/img-0-0.png"],
+        )
+    ]
+    path = write_source_content_md("src-003", "paper", "With Images", segs, tmp_path)
+    content = path.read_text()
+    assert "### Media" in content
+    assert "![[assets/src-003/img-0-0.png]]" in content

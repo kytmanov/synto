@@ -3022,9 +3022,12 @@ def add(
     import hashlib
     import shutil
     from datetime import UTC, datetime
+    from types import SimpleNamespace as _NS
 
     from .models import SourceDocument
     from .paths import config_path, effective_app_dir, effective_config_path
+    from .pipeline.ingest import write_source_content_md as _write_cm
+    from .vault import parse_note
 
     config = _load_config(vault_str)
     db = _load_db(config)
@@ -3050,69 +3053,85 @@ def add(
         )
         raise SystemExit(1)
 
-    # --- Copy original to .synto/sources/<source_id>/ ---
     app_dir = effective_app_dir(config.vault)
     dest_dir = app_dir / "sources" / source_id
-    dest_dir.mkdir(parents=True, exist_ok=True)
     dest_path = dest_dir / f"original{ext}"
-    shutil.copy2(src_path, dest_path)
-
-    # --- Record in source_documents ---
-    doc = SourceDocument(
-        id=source_id,
-        source_type=source_type,
-        origin_uri=src_path.as_uri(),
-        title=src_path.stem,
-        imported_at=datetime.now(UTC),
-        raw_hash=raw_hash,
-        redistribution="unknown",
-    )
-    db.upsert_source_document(doc)
-
-    # --- Extract segments (PDF only) ---
+    raw_path = config.vault / "raw" / f"{source_id}.md"
     segment_count = 0
     pdf_segs = []
-    if ext == ".pdf":
-        from .extractors.pdf import extract_pdf
 
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            console=console,
-            transient=True,
-        ) as progress:
-            progress.add_task(f"Extracting segments from {src_path.name}…", total=None)
-            pdf_segs = extract_pdf(source_id, dest_path, db, vault_root=config.vault)
-        segment_count = len(pdf_segs)
+    try:
+        # --- Copy original to .synto/sources/<source_id>/ ---
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_path, dest_path)
 
-    # --- --extend-pack: append [[pack.sources]] to synto.toml ---
-    if extend_pack is not None:
-        # Prefer the existing config file; if absent, always create synto.toml
-        toml_path = effective_config_path(config.vault)
-        if not toml_path.exists():
-            toml_path = config_path(config.vault)
-        entry = f'\n[[pack.sources]]\nid = "{source_id}"\ntype = "{source_type}"\n'
-        if toml_path.exists():
-            existing_text = toml_path.read_text(encoding="utf-8")
-        else:
-            existing_text = f'[pack]\nname = "{extend_pack}"\n'
-        toml_path.write_text(existing_text + entry, encoding="utf-8")
-
-    # Write assembled content to raw/ so ingest_all picks it up on next run
-    from types import SimpleNamespace as _NS
-
-    from .pipeline.ingest import write_source_content_md as _write_cm
-
-    if pdf_segs:
-        raw_path = _write_cm(source_id, source_type, src_path.stem, pdf_segs, config.vault)
-    else:
-        raw_path = _write_cm(
-            source_id,
-            source_type,
-            src_path.stem,
-            [_NS(text=dest_path.read_text(errors="replace"), structural_locator=None)],
-            config.vault,
+        # --- Record in source_documents ---
+        doc = SourceDocument(
+            id=source_id,
+            source_type=source_type,
+            origin_uri=src_path.as_uri(),
+            title=src_path.stem,
+            imported_at=datetime.now(UTC),
+            raw_hash=raw_hash,
+            redistribution="unknown",
         )
+        db.upsert_source_document(doc)
+
+        # --- Extract segments (PDF only) ---
+        if ext == ".pdf":
+            from .extractors.pdf import extract_pdf
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                console=console,
+                transient=True,
+            ) as progress:
+                progress.add_task(f"Extracting segments from {src_path.name}…", total=None)
+                pdf_segs = extract_pdf(source_id, dest_path, db, vault_root=config.vault)
+            segment_count = len(pdf_segs)
+
+        # --- --extend-pack: append [[pack.sources]] to synto.toml ---
+        if extend_pack is not None:
+            # Prefer the existing config file; if absent, always create synto.toml
+            toml_path = effective_config_path(config.vault)
+            if not toml_path.exists():
+                toml_path = config_path(config.vault)
+            entry = f'\n[[pack.sources]]\nid = "{source_id}"\ntype = "{source_type}"\n'
+            if toml_path.exists():
+                existing_text = toml_path.read_text(encoding="utf-8")
+            else:
+                existing_text = f'[pack]\nname = "{extend_pack}"\n'
+            toml_path.write_text(existing_text + entry, encoding="utf-8")
+
+        # Write assembled content to raw/ so ingest_all picks it up on next run
+        if pdf_segs:
+            raw_path = _write_cm(source_id, source_type, src_path.stem, pdf_segs, config.vault)
+        else:
+            note_meta: dict[str, object] | None = None
+            note_title = src_path.stem
+            note_body = dest_path.read_text(errors="replace")
+            if ext == ".md":
+                note_meta, note_body = parse_note(dest_path)
+                raw_title = note_meta.get("title")
+                if isinstance(raw_title, str) and raw_title.strip():
+                    note_title = raw_title.strip()
+            raw_path = _write_cm(
+                source_id,
+                source_type,
+                note_title,
+                [_NS(text=note_body, structural_locator=None, image_refs=[])],
+                config.vault,
+                metadata=note_meta,
+            )
+    except Exception:
+        db.delete_source_import_data(source_id)
+        for path in (raw_path, dest_path):
+            if path.exists():
+                path.unlink()
+        if dest_dir.exists() and not any(dest_dir.iterdir()):
+            dest_dir.rmdir()
+        raise
 
     # --- Summary ---
     console.print(f"[green]Imported:[/green] {source_id}")

@@ -53,6 +53,22 @@ def sample_txt(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def sample_md(tmp_path: Path) -> Path:
+    p = tmp_path / "clip.md"
+    p.write_text(
+        "---\n"
+        'title: Imported Clip\n'
+        'source: https://example.com/post\n'
+        'url: https://example.com/post\n'
+        'tags:\n'
+        '  - clip\n'
+        "---\n\n"
+        "Imported markdown body.\n"
+    )
+    return p
+
+
+@pytest.fixture
 def runner() -> CliRunner:
     return CliRunner()
 
@@ -232,6 +248,21 @@ def test_add_txt_raw_note_has_source_type_frontmatter(
     assert "source_type:" in content
 
 
+def test_add_md_preserves_existing_frontmatter(
+    config: Config, db: StateDB, sample_md: Path, runner: CliRunner
+) -> None:
+    result = runner.invoke(cli, ["add", str(sample_md), "--vault", str(config.vault)])
+    assert result.exit_code == 0, result.output
+    raw_files = list((config.vault / "raw").glob("*.md"))
+    assert len(raw_files) == 1
+    content = raw_files[0].read_text()
+    assert "title: Imported Clip" in content
+    assert "source: https://example.com/post" in content
+    assert "url: https://example.com/post" in content
+    assert "source_type: notes" in content
+    assert "Imported markdown body." in content
+
+
 def test_add_pdf_writes_raw_note_with_segments(
     config: Config, db: StateDB, sample_pdf: Path, runner: CliRunner
 ) -> None:
@@ -243,6 +274,30 @@ def test_add_pdf_writes_raw_note_with_segments(
     assert len(raw_files) == 1
     content = raw_files[0].read_text()
     assert "source_type: paper" in content
+
+
+def test_add_pdf_raw_note_preserves_image_refs(
+    config: Config, db: StateDB, sample_pdf: Path, runner: CliRunner
+) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    segs = [
+        SimpleNamespace(
+            text="Segment with image.",
+            structural_locator="section:intro",
+            image_refs=["assets/src-1/img-0-0.png"],
+        )
+    ]
+    with patch("synto.extractors.pdf.extract_pdf", return_value=segs):
+        result = runner.invoke(cli, ["add", str(sample_pdf), "--vault", str(config.vault)])
+
+    assert result.exit_code == 0, result.output
+    raw_files = list((config.vault / "raw").glob("*.md"))
+    assert len(raw_files) == 1
+    content = raw_files[0].read_text()
+    assert "### Media" in content
+    assert "![[assets/src-1/img-0-0.png]]" in content
 
 
 def test_add_pdf_writes_raw_note_from_extracted_segments_directly(
@@ -268,6 +323,18 @@ def test_add_pdf_writes_raw_note_from_extracted_segments_directly(
     content = raw_files[0].read_text()
     assert "Segment A" in content
     assert "Segment B" in content
+
+
+def test_add_cleans_up_partial_import_when_raw_note_write_fails(
+    config: Config, db: StateDB, sample_txt: Path, runner: CliRunner
+) -> None:
+    with patch("synto.pipeline.ingest.write_note", side_effect=RuntimeError("boom")):
+        result = runner.invoke(cli, ["add", str(sample_txt), "--vault", str(config.vault)])
+
+    assert result.exit_code != 0
+    assert db.list_source_documents() == []
+    assert list((config.vault / "raw").glob("*.md")) == []
+    assert list((config.app_dir / "sources").glob("*/original.txt")) == []
 
 
 # ---------------------------------------------------------------------------
