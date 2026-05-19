@@ -10,8 +10,8 @@
   them. Use `--type` to specify the document type; `--force` to re-import; `--extend-pack`
   to register the source under a named pack in `synto.toml`.
 - Source-type prompt system: 6 per-type system prompt templates (`notes`, `textbook`,
-  `paper`, `api_docs`, `web_article`, `corp_docs`) are loaded at compile time based on
-  the declared source type, steering the heavy model toward type-appropriate structure and
+  `paper`, `api_docs`, `web_article`, `corp_docs`) are loaded during ingest analysis based on
+  the declared source type, steering the fast model toward type-appropriate structure and
   terminology.
 - Compile lineage: `compile_runs` table records every compile job (models, token counts,
   timestamps). Published articles carry a `lineage:` frontmatter field listing their
@@ -42,4 +42,3 @@
   into compiled articles. The regex uses word boundaries so files that happen to contain
   `unknown_filename` as a substring in a longer name are not affected.
 - Type annotation on `_index_json_validity` corrected (`float | None`, was `float`).
-

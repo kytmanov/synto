@@ -107,8 +107,8 @@ synto approve --min-confidence 0.8    # hold back uncertain drafts
 
 **No embeddings, no vector database.** `synto query` routes questions to relevant articles using `INDEX.json`. It works on any machine without a GPU, FAISS, or Chroma.
 
-**Source-type compile.** Imported documents carry a type — `textbook`, `paper`,
-`api_docs`, `web_article`, `corp_docs`, `notes`. At compile time the heavy model receives
+**Source-type analysis.** Imported documents carry a type — `textbook`, `paper`,
+`api_docs`, `web_article`, `corp_docs`, `notes`. During ingest analysis the fast model receives
 a matching system prompt: a `paper` prompt extracts abstract/methods/results structure; an
 `api_docs` prompt preserves parameter names; a `textbook` prompt follows chapter/definition
 flow. If `--type` is omitted, synto infers it from the file extension.
@@ -163,7 +163,7 @@ Works today with Markdown. Drop notes in `raw/`, run `synto run`, and get a cros
 
 **Source import.** `synto add` imports PDFs, Markdown, and text files as tracked source
 documents. PDFs are segmented into heading-aware chunks. Pick the right type for your
-document to get the matching compile prompt:
+document to get the matching ingest-analysis prompt:
 
 | Type | Use for |
 |---|---|
@@ -280,7 +280,7 @@ synto add paper.pdf --type paper --vault ~/my-wiki
 synto add textbook_chapter.pdf --type textbook --vault ~/my-wiki
 ```
 
-Use `--type` to select the matching compile prompt (see the table in Features).
+Use `--type` to select the matching ingest-analysis prompt (see the table in Features).
 If omitted, the type is inferred from the file extension.
 
 ### 5. Run the pipeline

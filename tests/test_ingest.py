@@ -1461,6 +1461,37 @@ def test_analyze_body_with_checkpoints_context_change_invalidates_cache(vault, c
     assert db.list_ingest_chunks("raw/context.md", old_checkpoint_hash, 4, 50) == []
 
 
+def test_analyze_body_with_checkpoints_source_type_change_invalidates_cache(vault, config, db):
+    config2 = Config(vault=vault, ollama={"fast_ctx": 100})
+    path = _write_raw(vault, "source-type.md", "x" * 200)
+    body = path.read_text()
+    content_hash = _content_hash(body)
+    paper_hash = _checkpoint_hash(content_hash, config2, [], source_type="paper")
+    db.upsert_ingest_chunk(
+        "raw/source-type.md",
+        paper_hash,
+        0,
+        4,
+        50,
+        _analysis_json(concepts=["Paper Chunk"]),
+    )
+
+    client = _make_client(_analysis_json(concepts=["Notes Chunk"]))
+    _analyze_body_with_checkpoints(
+        body,
+        [],
+        path,
+        content_hash,
+        client,
+        config2,
+        db,
+        source_type="notes",
+    )
+
+    assert client.generate.call_count == 4
+    assert db.list_ingest_chunks("raw/source-type.md", paper_hash, 4, 50) == []
+
+
 def test_analyze_body_with_checkpoints_ignores_previous_schema_rows(vault, config, db):
     config2 = Config(vault=vault, ollama={"fast_ctx": 100})
     path = _write_raw(vault, "schema.md", "x" * 200)

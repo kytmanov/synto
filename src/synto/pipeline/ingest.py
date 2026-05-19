@@ -56,7 +56,13 @@ class _PromptConceptContext:
 
 def _ingest_prompt_version(config: Config) -> str:
     language = config.pipeline.language or "auto"
-    return f"{INGEST_ANALYSIS_PROMPT_VERSION}|language={language}"
+    prompt_hash = hashlib.sha256(_SYSTEM.encode("utf-8")).hexdigest()[:12]
+    return f"{INGEST_ANALYSIS_PROMPT_VERSION}|language={language}|notes={prompt_hash}"
+
+
+def _source_prompt_fingerprint(source_type: str) -> str:
+    prompt = load_prompt(source_type)
+    return hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:12]
 
 
 def _canonical_prompt_contexts(
@@ -101,10 +107,13 @@ def _checkpoint_hash(
     content_hash: str,
     config: Config,
     prompt_contexts: list[_PromptConceptContext],
+    source_type: str = "notes",
 ) -> str:
     payload = {
         "content_hash": content_hash,
         "prompt_version": _ingest_prompt_version(config),
+        "source_type": source_type,
+        "source_prompt": _source_prompt_fingerprint(source_type),
         "fast_model": config.models.fast,
         "contexts": [
             {"canonical": ctx.canonical, "aliases": list(ctx.aliases)} for ctx in prompt_contexts
@@ -373,7 +382,12 @@ def _analyze_body_with_checkpoints(
 ) -> AnalysisResult:
     chunk_size = config.effective_provider.fast_ctx // 2
     rel_path = str(path.relative_to(config.vault))
-    checkpoint_hash = _checkpoint_hash(content_hash, config, prompt_contexts or [])
+    checkpoint_hash = _checkpoint_hash(
+        content_hash,
+        config,
+        prompt_contexts or [],
+        source_type=source_type,
+    )
 
     if len(body) <= chunk_size:
         if force:
