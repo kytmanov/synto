@@ -34,6 +34,66 @@ case "$PROVIDER" in
     ;;
 esac
 
+resolve_loaded_model() {
+  local model="$1"
+  uv run python - <<'PY' "$PROVIDER" "$PROVIDER_URL" "$model"
+import re
+import sys
+import tempfile
+from pathlib import Path
+
+from synto.client_factory import build_client
+from synto.config import Config
+
+provider, url, model = sys.argv[1:4]
+
+
+def norm(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+with tempfile.TemporaryDirectory(prefix="smoke-model-resolve-") as tmp:
+    vault = Path(tmp)
+    (vault / "raw").mkdir()
+    (vault / "wiki").mkdir()
+    (vault / ".synto").mkdir()
+    (vault / "synto.toml").write_text(
+        f"[models]\nfast = \"{model}\"\nheavy = \"{model}\"\n\n"
+        f"[provider]\nname = \"{provider}\"\nurl = \"{url}\"\n",
+        encoding="utf-8",
+    )
+    cfg = Config.from_vault(vault)
+    client = build_client(cfg)
+    try:
+        client.require_healthy()
+        models = client.list_models()
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+if model in models:
+    print(model)
+    raise SystemExit(0)
+
+wanted = norm(model)
+matches = [m for m in models if wanted == norm(m) or wanted in norm(m) or norm(m) in wanted]
+if len(matches) == 1:
+    print(matches[0])
+    raise SystemExit(0)
+
+raise SystemExit(
+    f"Model {model!r} is not loaded in {provider} at {url}. Available: {models}"
+)
+PY
+}
+
+if [[ "$PROVIDER" != "ollama" ]]; then
+  FAST_MODEL="$(resolve_loaded_model "$FAST_MODEL")"
+  HEAVY_MODEL="$(resolve_loaded_model "$HEAVY_MODEL")"
+fi
+
 # ── vault + config ─────────────────────────────────────────────────────────────
 VAULT_DIR="$(mktemp -d)"
 DB="$VAULT_DIR/.synto/state.db"
@@ -132,9 +192,14 @@ check "add --force succeeds" \
 
 # ── Section D: --extend-pack (offline) ────────────────────────────────────────
 header "synto add --extend-pack"
-$OLW add --force "$VAULT_DIR/source_note.txt" --extend-pack smoke-pack 2>&1 || true
-check "[[pack.sources]] written to synto.toml" \
-  "grep -q '\[\[pack.sources\]\]' '$VAULT_DIR/synto.toml'"
+EXTEND_OUT_FILE="$(mktemp)"
+EXTEND_RC=0; $OLW add --force "$VAULT_DIR/source_note.txt" --extend-pack smoke-pack > "$EXTEND_OUT_FILE" 2>&1 || EXTEND_RC=$?
+check "add --extend-pack exits 0" \
+  "test $EXTEND_RC -eq 0"
+check "extend-pack reports safe no-op" \
+  "grep -q 'not implemented' '$EXTEND_OUT_FILE'"
+check "extend-pack does not mutate synto.toml" \
+  "! grep -q '\[\[pack.sources\]\]' '$VAULT_DIR/synto.toml'"
 
 # ── Section E: source-type prompts — offline load check ───────────────────────
 header "source-type prompts — load check"
