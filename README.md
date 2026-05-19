@@ -9,7 +9,9 @@
      <a href="https://buymeacoffee.com/kytmanov"><img alt="Buy Me A Coffee" src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-%E2%98%95-yellow?style=flat&logo=buymeacoffee&logoColor=white"></a>
 </p>
 
-[Install](#install) · [Quick start](#quick-start) · [How it works](#how-it-works) · [Features](#features) · [Use cases](#use-cases) · [Provider support](#provider-support) · [What's in a pack](#whats-in-a-pack)
+<p align="center">
+<a href="#install">Install</a> · <a href="#quick-start">Quick start</a> · <a href="#how-it-works">How it works</a> · <a href="#features">Features</a> · <a href="#use-cases">Use cases</a> · <a href="#provider-support">Provider support</a> · <a href="#whats-in-a-pack">What's in a pack</a>
+</p>
 
 **Turn your raw notes into a self-improving, interlinked wiki — powered by a local LLM.**
 
