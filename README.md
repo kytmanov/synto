@@ -107,11 +107,12 @@ synto approve --min-confidence 0.8    # hold back uncertain drafts
 
 **No embeddings, no vector database.** `synto query` routes questions to relevant articles using `INDEX.json`. It works on any machine without a GPU, FAISS, or Chroma.
 
-**Source-type analysis.** Imported documents carry a type — `textbook`, `paper`,
-`api_docs`, `web_article`, `corp_docs`, `notes`. During ingest analysis the fast model receives
-a matching system prompt: a `paper` prompt extracts abstract/methods/results structure; an
-`api_docs` prompt preserves parameter names; a `textbook` prompt follows chapter/definition
-flow. If `--type` is omitted, synto infers it from the file extension.
+**Source-type analysis.** Imported documents carry a type — `notes`, `textbook`, `paper`,
+`spec`, `api_docs`, `web_article`, `corp_docs`, `transcript`, or `unknown_text`. During ingest
+analysis the fast model receives a matching system prompt: a `paper` prompt extracts
+abstract/methods/results structure; an `api_docs` prompt preserves parameter names; a
+`textbook` prompt follows chapter/definition flow. If `--type` is omitted, Synto infers it
+from the file extension.
 
 ---
 
@@ -162,8 +163,9 @@ Works today with Markdown. Drop notes in `raw/`, run `synto run`, and get a cros
 **Git-aware.** Every automatic operation commits with a `[synto]` prefix. `synto undo` reverts the last N auto-commits. Raw notes are never modified.
 
 **Source import.** `synto add` imports PDFs, Markdown, and text files as tracked source
-documents. PDFs are segmented into heading-aware chunks. Pick the right type for your
-document to get the matching ingest-analysis prompt:
+documents. PDFs are segmented into heading-aware chunks, archived under `.synto/sources/`,
+and written back as canonical `raw/*.md` notes for the normal ingest flow. Pick the right
+type for your document to get the matching ingest-analysis prompt:
 
 | Type | Use for |
 |---|---|
@@ -175,6 +177,7 @@ document to get the matching ingest-analysis prompt:
 | `web_article` | Blog posts, news articles, web clips |
 | `corp_docs` | Internal wikis, runbooks, design documents |
 | `transcript` | Video/audio transcripts, interview notes |
+| `unknown_text` | Fallback when text doesn't fit a richer source type |
 
 **Compile lineage.** Every compiled article records which source notes and compile run it
 came from. `synto trace article <name>` prints the full history: timestamp, model,
@@ -183,6 +186,9 @@ contributing sources.
 **LLM response cache.** Identical prompts reuse cached responses from a local SQLite
 table instead of hitting the model. `synto maintain --clear-cache` flushes it;
 `--older-than N` prunes entries older than N days.
+
+**Pack extension flag.** `synto add --extend-pack NAME` is reserved for future pack-scoped
+imports. In `v0.2.0` it is intentionally a safe no-op and does not mutate `synto.toml`.
 
 ---
 
@@ -278,10 +284,14 @@ Drop any `.md` files into `~/my-wiki/raw/`. Web clips, book notes, meeting notes
 ```bash
 synto add paper.pdf --type paper --vault ~/my-wiki
 synto add textbook_chapter.pdf --type textbook --vault ~/my-wiki
+synto add api-reference.md --type api_docs --vault ~/my-wiki
 ```
 
 Use `--type` to select the matching ingest-analysis prompt (see the table in Features).
 If omitted, the type is inferred from the file extension.
+
+`synto add --force` re-imports an existing source in place. `--extend-pack` is reserved for
+future pack integration and currently reports a safe no-op.
 
 ### 5. Run the pipeline
 
@@ -356,9 +366,10 @@ Any OpenAI-compatible endpoint works. Use `synto setup` to configure interactive
 - Multi-language: notes are ingested and compiled in their source language
 - 20+ LLM providers supported via OpenAI-compatible API
 - `synto add SOURCE` — import PDF, Markdown, or text files as tracked source documents;
-  PDFs are segmented automatically into heading-aware chunks
-- Source-type prompts: 6 built-in templates (`notes`, `textbook`, `paper`, `api_docs`,
-  `web_article`, `corp_docs`) select the optimal compile strategy per document type
+  PDFs are segmented automatically into heading-aware chunks and written back as canonical raw notes
+- Source-type prompts: built-in templates for `notes`, `textbook`, `paper`, `spec`,
+  `api_docs`, `web_article`, `corp_docs`, `transcript`, plus `unknown_text` fallback,
+  select the optimal ingest strategy per document type
 - Compile lineage: every article records its source notes and compile run;
   `synto trace article <name>` shows the full history
 - LLM response cache: identical prompts reuse cached responses;
