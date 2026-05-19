@@ -36,7 +36,11 @@ def db(config):
 
 
 def _write_draft(
-    config, title: str, confidence: float = 0.5, sources: list | None = None, body: str | None = None
+    config,
+    title: str,
+    confidence: float = 0.5,
+    sources: list | None = None,
+    body: str | None = None,
 ):
     """Helper: write a draft file with frontmatter."""
     import frontmatter as fm_lib
