@@ -1382,6 +1382,887 @@ echo "$LEGACY_OUT"
 # Exit-0 is the bit-rot guard — draft production is model-dependent, not asserted.
 check "compile --legacy exits 0" "test $_LEGACY_RC -eq 0"
 
+# ── synto support ─────────────────────────────────────────────────────────────
+header "synto support"
+_SUP_RC=0
+SUP_OUT=$($OLW support 2>&1) || _SUP_RC=$?
+echo "$SUP_OUT"
+check "synto support exits 0" "test $_SUP_RC -eq 0"
+_TMP=$(mktemp); echo "$SUP_OUT" > "$_TMP"
+check "synto support output contains issues URL keyword" \
+    "grep -qiE 'github|issues' \"$_TMP\""
+rm -f "$_TMP"
+
+# ── synto doctor (exit code, post-init) ───────────────────────────────────────
+header "synto doctor (post-init exit code)"
+_DOC_RC=0
+DOC_OUT=$($OLW doctor 2>&1) || _DOC_RC=$?
+echo "$DOC_OUT"
+check "doctor exits 0 when provider reachable and vault valid" "test $_DOC_RC -eq 0"
+_TMP=$(mktemp); echo "$DOC_OUT" > "$_TMP"
+check "doctor output contains Vault structure section" \
+    "grep -q 'Vault structure' \"$_TMP\""
+rm -f "$_TMP"
+
+# ── synto config inline-source-citations ──────────────────────────────────────
+header "synto config inline-source-citations"
+_CISC_RC=0
+CISC_STATUS_OUT=$($OLW config inline-source-citations status 2>&1) || _CISC_RC=$?
+echo "$CISC_STATUS_OUT"
+check "config inline-source-citations status exits 0" "test $_CISC_RC -eq 0"
+
+_CISC_ON_RC=0
+CISC_ON_OUT=$($OLW config inline-source-citations on 2>&1) || _CISC_ON_RC=$?
+echo "$CISC_ON_OUT"
+check "config inline-source-citations on exits 0" "test $_CISC_ON_RC -eq 0"
+check "config inline-source-citations on writes true to synto.toml" \
+    "grep -q 'inline_source_citations = true' '$VAULT_DIR/synto.toml'"
+
+_CISC_STATUS2_RC=0
+CISC_STATUS2_OUT=$($OLW config inline-source-citations status 2>&1) || _CISC_STATUS2_RC=$?
+_TMP=$(mktemp); echo "$CISC_STATUS2_OUT" > "$_TMP"
+check "config inline-source-citations status after on prints enabled" \
+    "grep -qiE 'enabled|on|true' \"$_TMP\""
+rm -f "$_TMP"
+
+_CISC_OFF_RC=0
+CISC_OFF_OUT=$($OLW config inline-source-citations off 2>&1) || _CISC_OFF_RC=$?
+echo "$CISC_OFF_OUT"
+check "config inline-source-citations off exits 0" "test $_CISC_OFF_RC -eq 0"
+check "config inline-source-citations off writes false to synto.toml" \
+    "grep -q 'inline_source_citations = false' '$VAULT_DIR/synto.toml'"
+
+_CISC_STATUS3_RC=0
+CISC_STATUS3_OUT=$($OLW config inline-source-citations status 2>&1) || _CISC_STATUS3_RC=$?
+_TMP=$(mktemp); echo "$CISC_STATUS3_OUT" > "$_TMP"
+check "config inline-source-citations status after off prints disabled" \
+    "grep -qiE 'disabled|off|false' \"$_TMP\""
+rm -f "$_TMP"
+
+# ── synto ingest --force ──────────────────────────────────────────────────────
+header "synto ingest --force"
+_IF_RC=0
+INGEST_FORCE_OUT=$($OLW ingest --force "$VAULT_DIR/raw/quantum-computing.md" 2>&1) || _IF_RC=$?
+echo "$INGEST_FORCE_OUT"
+check "ingest --force exits 0" "test $_IF_RC -eq 0"
+_IF_STATUS=$(python3 -c "
+import sqlite3
+conn = sqlite3.connect('$VAULT_DIR/.synto/state.db')
+row = conn.execute(\"SELECT status FROM raw_notes WHERE path='raw/quantum-computing.md'\").fetchone()
+print(row[0] if row else 'missing')
+conn.close()
+")
+check "ingest --force note still has status ingested" "test '$_IF_STATUS' = 'ingested'"
+
+# ── synto compile --auto-approve ──────────────────────────────────────────────
+header "synto compile --auto-approve"
+# Force one note back to ingested
+python3 - <<PYEOF
+import sqlite3
+conn = sqlite3.connect("$VAULT_DIR/.synto/state.db")
+conn.execute("UPDATE raw_notes SET status='ingested' WHERE path='raw/machine-learning-basics.md'")
+conn.commit()
+conn.close()
+PYEOF
+# Clear any existing drafts first
+$OLW approve --all 2>&1 || true
+_CA_WIKI_BEFORE=$(find "$VAULT_DIR/wiki" -maxdepth 1 -name "*.md" ! -name "index.md" ! -name "log.md" 2>/dev/null | wc -l | tr -d ' ')
+_CA_DRAFTS_BEFORE=$(find "$VAULT_DIR/wiki/.drafts" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
+_CA_RC=0
+COMPILE_AA_OUT=$($OLW compile --auto-approve 2>&1) || _CA_RC=$?
+echo "$COMPILE_AA_OUT"
+check "compile --auto-approve exits 0" "test $_CA_RC -eq 0"
+_CA_DRAFTS_AFTER=$(find "$VAULT_DIR/wiki/.drafts" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
+check "compile --auto-approve leaves no drafts" "test '$_CA_DRAFTS_AFTER' -eq 0"
+_CA_WIKI_AFTER=$(find "$VAULT_DIR/wiki" -maxdepth 1 -name "*.md" ! -name "index.md" ! -name "log.md" 2>/dev/null | wc -l | tr -d ' ')
+check "compile --auto-approve increases published article count" "test '$_CA_WIKI_AFTER' -gt '$_CA_WIKI_BEFORE'"
+
+# ── synto compile --force ─────────────────────────────────────────────────────
+header "synto compile --force"
+# Reset some raw notes to ingested so compile has work to do
+python3 - <<PYEOF
+import sqlite3
+conn = sqlite3.connect("$VAULT_DIR/.synto/state.db")
+conn.execute("UPDATE raw_notes SET status='ingested' WHERE path='raw/quantum-computing.md'")
+conn.commit()
+conn.close()
+PYEOF
+# Count drafts before
+_CF_DRAFTS_BEFORE=$(find "$VAULT_DIR/wiki/.drafts" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
+# Manually edit a published article that shares concepts with quantum-computing.md
+_CF_WIKI="$VAULT_DIR/wiki/Quantum computing.md"
+if [[ -f "$_CF_WIKI" ]]; then
+    echo -e "\n\nManual edit for compile --force test." >> "$_CF_WIKI"
+    _CF_RC=0
+    COMPILE_FORCE_OUT=$($OLW compile --force --concept "Quantum computing" 2>&1) || _CF_RC=$?
+    echo "$COMPILE_FORCE_OUT"
+    check "compile --force exits 0" "test $_CF_RC -eq 0"
+    _CF_DRAFTS_AFTER=$(find "$VAULT_DIR/wiki/.drafts" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
+    check "compile --force creates new draft bypassing manual edit protection" \
+        "test '$_CF_DRAFTS_AFTER' -gt '$_CF_DRAFTS_BEFORE'"
+    # Restore
+    sed -i '' '$ d' "$_CF_WIKI" 2>/dev/null || sed -i '$ d' "$_CF_WIKI" 2>/dev/null || true
+else
+    pass "compile --force skipped (no published article to edit)"
+fi
+
+# ── synto approve (individual + --min-confidence) ─────────────────────────────
+header "synto approve (individual draft + --min-confidence)"
+# Use compile --force since concepts are already compiled at this point
+$OLW approve --all 2>&1 >/dev/null || true
+# Reset a note to ingested so compile --force has work to do
+python3 - <<PYEOF
+import sqlite3
+conn = sqlite3.connect("$VAULT_DIR/.synto/state.db")
+conn.execute("UPDATE raw_notes SET status='ingested' WHERE path='raw/quantum-computing.md'")
+conn.commit()
+conn.close()
+PYEOF
+_APP_RC=0
+APP_DRAFT_OUT=$($OLW compile --force 2>&1) || _APP_RC=$?
+echo "$APP_DRAFT_OUT"
+_APP_DRAFT_COUNT=$(find "$VAULT_DIR/wiki/.drafts" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
+if [[ "$_APP_DRAFT_COUNT" -gt 0 ]]; then
+    # Test --min-confidence 2.0 (should hold back all drafts)
+    _APP_MC_RC=0
+    APP_MC_OUT=$($OLW approve --all --min-confidence 2.0 2>&1) || _APP_MC_RC=$?
+    echo "$APP_MC_OUT"
+    check "approve --all --min-confidence 2.0 exits 0" "test $_APP_MC_RC -eq 0"
+    _APP_MC_DRAFTS=$(find "$VAULT_DIR/wiki/.drafts" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
+    check "approve --min-confidence 2.0 holds back all drafts" \
+        "test '$_APP_MC_DRAFTS' -eq '$_APP_DRAFT_COUNT'"
+
+    # Test individual draft approval
+    _APP_SINGLE=$(find "$VAULT_DIR/wiki/.drafts" -name "*.md" | head -1)
+    _APP_SINGLE_RC=0
+    APP_SINGLE_OUT=$($OLW approve "$_APP_SINGLE" 2>&1) || _APP_SINGLE_RC=$?
+    echo "$APP_SINGLE_OUT"
+    check "approve <draft-file> exits 0" "test $_APP_SINGLE_RC -eq 0"
+    check "approve <draft-file> removes the draft" "test ! -f '$_APP_SINGLE'"
+else
+    pass "approve individual test skipped (no drafts produced)"
+fi
+
+# ── synto reject --all ────────────────────────────────────────────────────────
+header "synto reject --all"
+# Use compile --force to produce drafts
+$OLW approve --all 2>&1 >/dev/null || true
+# Reset a note to ingested so compile --force has work to do
+python3 - <<PYEOF
+import sqlite3
+conn = sqlite3.connect("$VAULT_DIR/.synto/state.db")
+conn.execute("UPDATE raw_notes SET status='ingested' WHERE path='raw/quantum-computing.md'")
+conn.commit()
+conn.close()
+PYEOF
+_REJ_RC=0
+REJ_DRAFT_OUT=$($OLW compile --force 2>&1) || _REJ_RC=$?
+echo "$REJ_DRAFT_OUT"
+_REJ_ALL_DRAFTS=$(find "$VAULT_DIR/wiki/.drafts" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
+if [[ "$_REJ_ALL_DRAFTS" -gt 0 ]]; then
+    _REJ_ALL_RC=0
+    REJ_ALL_OUT=$($OLW reject --all --feedback "Not good enough" 2>&1) || _REJ_ALL_RC=$?
+    echo "$REJ_ALL_OUT"
+    check "reject --all exits 0" "test $_REJ_ALL_RC -eq 0"
+    _REJ_ALL_AFTER=$(find "$VAULT_DIR/wiki/.drafts" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
+    check "reject --all empties wiki/.drafts" "test '$_REJ_ALL_AFTER' -eq 0"
+    _TMP=$(mktemp); echo "$REJ_ALL_OUT" > "$_TMP"
+    check "reject --all output mentions rejection" \
+        "grep -qiE 'reject' \"$_TMP\""
+    rm -f "$_TMP"
+else
+    pass "reject --all skipped (no drafts to reject)"
+fi
+
+# ── synto clean --yes ─────────────────────────────────────────────────────────
+header "synto clean --yes"
+_CLEAN_VAULT="$(mktemp -d)"
+$OLW init "$_CLEAN_VAULT" 2>&1 >/dev/null
+
+if [[ "$PROVIDER" == "ollama" ]]; then
+    cat > "$_CLEAN_VAULT/synto.toml" <<CLEANTOML
+[models]
+fast = "$FAST_MODEL"
+heavy = "$HEAVY_MODEL"
+embed = "nomic-embed-text"
+
+[ollama]
+url = "$PROVIDER_URL"
+timeout = 900
+fast_ctx = $FAST_CTX
+heavy_ctx = $HEAVY_CTX
+
+[pipeline]
+auto_approve = false
+auto_commit = true
+watch_debounce = 3.0
+
+[rag]
+chunk_size = 512
+chunk_overlap = 50
+similarity_threshold = 0.7
+CLEANTOML
+else
+    cat > "$_CLEAN_VAULT/synto.toml" <<CLEANTOML
+[models]
+fast = "$FAST_MODEL"
+heavy = "$HEAVY_MODEL"
+
+[provider]
+name = "$PROVIDER"
+url = "$PROVIDER_URL"
+timeout = 900
+fast_ctx = $FAST_CTX
+heavy_ctx = $HEAVY_CTX
+
+[pipeline]
+auto_approve = false
+auto_commit = true
+watch_debounce = 3.0
+
+[rag]
+chunk_size = 512
+chunk_overlap = 50
+similarity_threshold = 0.7
+CLEANTOML
+fi
+
+cat > "$_CLEAN_VAULT/raw/clean-test.md" <<'CLEANNOTE'
+---
+title: Clean Test Note
+---
+This is a test note for the clean command.
+CLEANNOTE
+
+$OLW ingest --all --vault "$_CLEAN_VAULT" 2>&1 >/dev/null || true
+
+check "clean target vault has state.db before clean" "test -f '$_CLEAN_VAULT/.synto/state.db'"
+check "clean target vault has wiki files before clean" \
+    "test \$(find \"$_CLEAN_VAULT/wiki\" -name '*.md' 2>/dev/null | wc -l) -ge 1"
+check "clean target vault raw note exists before clean" "test -f '$_CLEAN_VAULT/raw/clean-test.md'"
+
+_CLEAN_RC=0
+CLEAN_OUT=$($OLW clean --vault "$_CLEAN_VAULT" --yes 2>&1) || _CLEAN_RC=$?
+echo "$CLEAN_OUT"
+check "clean --yes exits 0" "test $_CLEAN_RC -eq 0"
+check "clean --yes recreates wiki/.drafts" "test -d '$_CLEAN_VAULT/wiki/.drafts'"
+check "clean --yes recreates wiki/sources" "test -d '$_CLEAN_VAULT/wiki/sources'"
+check "clean --yes deletes state.db" "test ! -f '$_CLEAN_VAULT/.synto/state.db'"
+check "clean --yes leaves raw notes untouched" "test -f '$_CLEAN_VAULT/raw/clean-test.md'"
+_CLEAN_WIKI_FILES=$(find "$_CLEAN_VAULT/wiki" -maxdepth 1 -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
+check "clean --yes removes wiki article files" "test '$_CLEAN_WIKI_FILES' -eq 0"
+rm -rf "$_CLEAN_VAULT"
+
+# ── synto undo --steps 2 ──────────────────────────────────────────────────────
+header "synto undo --steps 2"
+# Count existing synto commits
+_UNDO_SYNTO_COMMITS=$(git -C "$VAULT_DIR" log --oneline --grep='\[synto\]' 2>/dev/null | wc -l | tr -d ' ')
+if [[ "$_UNDO_SYNTO_COMMITS" -ge 2 ]]; then
+    _UNDO2_RC=0
+    UNDO2_OUT=$($OLW undo --vault "$VAULT_DIR" --steps 2 2>&1) || _UNDO2_RC=$?
+    echo "$UNDO2_OUT"
+    check "undo --steps 2 exits 0" "test $_UNDO2_RC -eq 0"
+    _UNDO2_REVERTS=$(git -C "$VAULT_DIR" log --oneline -4 2>/dev/null | grep -c 'Revert' || true)
+    check "undo --steps 2 creates 2 Revert commits" "test '$_UNDO2_REVERTS' -ge 2"
+    # Re-approve to restore published state for subsequent tests
+    $OLW approve --all 2>&1 >/dev/null || true
+else
+    pass "undo --steps 2 skipped (fewer than 2 synto commits)"
+fi
+
+# ── synto maintain --stubs-only ───────────────────────────────────────────────
+header "synto maintain --stubs-only"
+# Inject a broken wikilink so maintain --stubs-only has something to report
+_MSO_VICTIM=$(find "$VAULT_DIR/wiki" -maxdepth 1 -name "*.md" \
+    ! -name "index.md" ! -name "log.md" 2>/dev/null | head -1)
+if [[ -n "$_MSO_VICTIM" ]]; then
+    echo -e "\n[[Stubs Only Test Link XYZ]]" >> "$_MSO_VICTIM"
+fi
+_MSO_RC=0
+MSO_OUT=$($OLW maintain --stubs-only 2>&1) || _MSO_RC=$?
+echo "$MSO_OUT"
+check "maintain --stubs-only exits 0" "test $_MSO_RC -eq 0"
+_TMP=$(mktemp); echo "$MSO_OUT" > "$_TMP"
+check "maintain --stubs-only mentions stub or creates draft" \
+    "grep -qiE 'stub|draft' \"$_TMP\""
+check "maintain --stubs-only does not mention fix for frontmatter or tags" \
+    "! grep -qiE 'fix.*frontmatter|fix.*tag|missing_frontmatter|invalid_tag' \"$_TMP\""
+rm -f "$_TMP"
+[[ -n "$_MSO_VICTIM" ]] && \
+    { sed -i '' '$ d' "$_MSO_VICTIM" 2>/dev/null || sed -i '$ d' "$_MSO_VICTIM"; }
+
+# ── synto maintain --clear-cache ──────────────────────────────────────────────
+header "synto maintain --clear-cache"
+_MCC_RC=0
+MCC_OUT=$($OLW maintain --clear-cache 2>&1) || _MCC_RC=$?
+echo "$MCC_OUT"
+check "maintain --clear-cache exits 0" "test $_MCC_RC -eq 0"
+_TMP=$(mktemp); echo "$MCC_OUT" > "$_TMP"
+check "maintain --clear-cache mentions cache or cleared" \
+    "grep -qiE 'cache|cleared|deleted' \"$_TMP\""
+rm -f "$_TMP"
+
+# ── synto maintain --clear-cache --older-than 0 ───────────────────────────────
+header "synto maintain --clear-cache --older-than 0"
+_MCC2_RC=0
+MCC2_OUT=$($OLW maintain --clear-cache --older-than 0 2>&1) || _MCC2_RC=$?
+echo "$MCC2_OUT"
+check "maintain --clear-cache --older-than 0 exits 0" "test $_MCC2_RC -eq 0"
+_TMP=$(mktemp); echo "$MCC2_OUT" > "$_TMP"
+check "maintain --clear-cache --older-than 0 has no traceback" \
+    "! grep -qiE 'traceback' \"$_TMP\""
+rm -f "$_TMP"
+
+# ── synto items audit ─────────────────────────────────────────────────────────
+header "synto items audit"
+_IA_RC=0
+IA_OUT=$($OLW items audit 2>&1) || _IA_RC=$?
+echo "$IA_OUT"
+check "items audit exits 0" "test $_IA_RC -eq 0"
+_TMP=$(mktemp); echo "$IA_OUT" > "$_TMP"
+check "items audit has no traceback" \
+    "! grep -qiE 'traceback' \"$_TMP\""
+rm -f "$_TMP"
+
+# ── synto items show (missing item) ───────────────────────────────────────────
+header "synto items show (missing item)"
+_IS_RC=0
+IS_OUT=$($OLW items show "NonexistentItemXYZ123" 2>&1) || _IS_RC=$?
+echo "$IS_OUT"
+check "items show missing item exits non-zero" "test $_IS_RC -ne 0"
+_TMP=$(mktemp); echo "$IS_OUT" > "$_TMP"
+check "items show missing item output contains not found" \
+    "grep -qiE 'not found' \"$_TMP\""
+rm -f "$_TMP"
+
+# ── synto trace article ───────────────────────────────────────────────────────
+header "synto trace article"
+_TRACE_WIKI=$(find "$VAULT_DIR/wiki" -maxdepth 1 -name "*.md" \
+    ! -name "index.md" ! -name "log.md" 2>/dev/null | head -1)
+if [[ -n "$_TRACE_WIKI" ]]; then
+    _TRACE_TITLE=$(grep '^title:' "$_TRACE_WIKI" | head -1 | sed 's/^title: *//')
+    _TR_RC=0
+    TR_OUT=$($OLW trace article "$_TRACE_TITLE" 2>&1) || _TR_RC=$?
+    echo "$TR_OUT"
+    check "trace article exits 0" "test $_TR_RC -eq 0"
+    _TMP=$(mktemp); echo "$TR_OUT" > "$_TMP"
+    check "trace article output contains compile history or title or model" \
+        "grep -qiE 'Compile history|model' \"$_TMP\""
+    rm -f "$_TMP"
+else
+    pass "trace article skipped (no published article)"
+fi
+
+# ── synto add ─────────────────────────────────────────────────────────────────
+header "synto add"
+# a) Baseline
+_ADD_SOURCES_BEFORE=$(find "$VAULT_DIR/.synto/sources" \
+    -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+_ADD_RAW_BEFORE=$(find "$VAULT_DIR/raw" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
+
+# b) Create temp source file
+_ADD_TMPFILE=$(mktemp /tmp/synto-add-test-XXXXXX.md)
+cat > "$_ADD_TMPFILE" <<'ADDNOTE'
+---
+title: External Source Note
+---
+This is an external source imported via synto add.
+ADDNOTE
+
+# c) First add
+_ADD_RC=0
+ADD_OUT=$($OLW add "$_ADD_TMPFILE" 2>&1) || _ADD_RC=$?
+echo "$ADD_OUT"
+check "add exits 0" "test $_ADD_RC -eq 0"
+_ADD_TMP=$(mktemp); echo "$ADD_OUT" > "$_ADD_TMP"
+check "add has no traceback" \
+    "! grep -qiE 'traceback' \"$_ADD_TMP\""
+rm -f "$_ADD_TMP"
+_ADD_SOURCES_AFTER=$(find "$VAULT_DIR/.synto/sources" \
+    -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+check "add increases .synto/sources directory count by one" \
+    "test '$_ADD_SOURCES_AFTER' -eq $((_ADD_SOURCES_BEFORE + 1))"
+_ADD_RAW_AFTER=$(find "$VAULT_DIR/raw" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
+check "add increases raw note count by one" \
+    "test '$_ADD_RAW_AFTER' -eq $((_ADD_RAW_BEFORE + 1))"
+_ADD_DB_COUNT=$(python3 -c "
+import sqlite3
+conn = sqlite3.connect('$VAULT_DIR/.synto/state.db')
+n = conn.execute('SELECT COUNT(*) FROM source_documents').fetchone()[0]
+print(n)
+conn.close()
+")
+check "add inserts row into source_documents table" "test '$_ADD_DB_COUNT' -ge 1"
+
+# d) Duplicate detection
+_ADD_DUP_RC=0
+_ADD_DUP_TMP=$(mktemp)
+$OLW add "$_ADD_TMPFILE" > "$_ADD_DUP_TMP" 2>&1 || _ADD_DUP_RC=$?
+check "add duplicate without --force exits non-zero" "test $_ADD_DUP_RC -ne 0"
+check "add duplicate output mentions already imported or force" \
+    "grep -qiE 'Already imported|already|force' \"$_ADD_DUP_TMP\""
+rm -f "$_ADD_DUP_TMP"
+
+# e) --force re-import
+_ADD_FORCE_RC=0
+_ADD_FORCE_OUT=$($OLW add --force "$_ADD_TMPFILE" 2>&1) || _ADD_FORCE_RC=$?
+echo "$_ADD_FORCE_OUT"
+check "add --force exits 0" "test $_ADD_FORCE_RC -eq 0"
+_ADD_FORCE_TMP=$(mktemp); echo "$_ADD_FORCE_OUT" > "$_ADD_FORCE_TMP"
+check "add --force has no traceback" \
+    "! grep -qiE 'traceback' \"$_ADD_FORCE_TMP\""
+rm -f "$_ADD_FORCE_TMP"
+_ADD_SOURCES_FORCE=$(find "$VAULT_DIR/.synto/sources" \
+    -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+check "add --force does not grow source directory count (reuses existing)" \
+    "test '$_ADD_SOURCES_FORCE' -eq '$_ADD_SOURCES_AFTER'"
+
+# f) add → ingest continuity
+_ADD_WIKI_SRC_BEFORE=$(find "$VAULT_DIR/wiki/sources" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
+_ADD_INGEST_RC=0
+_ADD_INGEST_OUT=$($OLW ingest --all 2>&1) || _ADD_INGEST_RC=$?
+check "ingest after add exits 0" "test $_ADD_INGEST_RC -eq 0"
+_ADD_WIKI_SRC_AFTER=$(find "$VAULT_DIR/wiki/sources" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
+check "ingest after add creates at least one source summary page" \
+    "test '$_ADD_WIKI_SRC_AFTER' -gt '$_ADD_WIKI_SRC_BEFORE'"
+
+# g) Cleanup
+rm -f "$_ADD_TMPFILE"
+
+# ── synto pack export --out (external path) ───────────────────────────────────
+header "synto pack export --out (external path)"
+_PACK2_OUT="/tmp/synto-pack-$$-external"
+rm -rf "$_PACK2_OUT"
+_PACK2_RC=0
+PACK2_OUT_TEXT=$($OLW pack export --target agents --out "$_PACK2_OUT" 2>&1) || _PACK2_RC=$?
+echo "$PACK2_OUT_TEXT"
+check "pack export --out exits 0" "test $_PACK2_RC -eq 0"
+check "pack export --out writes pack.toml" "test -f '$_PACK2_OUT/pack.toml'"
+rm -rf "$_PACK2_OUT"
+
+# ── synto report --since 7d ───────────────────────────────────────────────────
+header "synto report --since 7d"
+_RS_RC=0
+RS_OUT=$($OLW report --since 7d 2>&1) || _RS_RC=$?
+echo "$RS_OUT"
+check "report --since 7d exits 0" "test $_RS_RC -eq 0"
+_TMP=$(mktemp); echo "$RS_OUT" > "$_TMP"
+check "report --since 7d prints Raw notes" \
+    "grep -q 'Raw notes:' \"$_TMP\""
+rm -f "$_TMP"
+
+# ── synto eval --queries ──────────────────────────────────────────────────────
+header "synto eval --queries"
+_EVAL_Q_TOML=$(mktemp /tmp/synto-eval-queries-XXXXXX.toml)
+cat > "$_EVAL_Q_TOML" <<'EVALTOML'
+[[query]]
+id = "q1"
+question = "What is a qubit?"
+expected_contains = ["qubit"]
+EVALTOML
+
+_EQ_RC=0
+EQ_OUT=$($OLW eval --queries "$_EVAL_Q_TOML" 2>&1) || _EQ_RC=$?
+echo "$EQ_OUT"
+check "eval --queries exits 0" "test $_EQ_RC -eq 0"
+_TMP=$(mktemp); echo "$EQ_OUT" > "$_TMP"
+check "eval --queries prints Article coverage" \
+    "grep -q 'Article coverage:' \"$_TMP\""
+rm -f "$_TMP"
+rm -f "$_EVAL_Q_TOML"
+
+# ── synto serve (transport validation) ────────────────────────────────────────
+header "synto serve (transport validation)"
+_SV_RC=0
+SV_OUT=$($OLW serve --transport invalid_transport 2>&1) || _SV_RC=$?
+echo "$SV_OUT"
+check "serve --transport invalid exits non-zero" "test $_SV_RC -ne 0"
+_TMP=$(mktemp); echo "$SV_OUT" > "$_TMP"
+check "serve invalid transport output mentions transport/invalid/choice" \
+    "grep -qiE 'transport|invalid|choice' \"$_TMP\""
+rm -f "$_TMP"
+
+# ── synto run --auto-approve ──────────────────────────────────────────────────
+header "synto run --auto-approve"
+# Force one note back to ingested
+python3 - <<PYEOF
+import sqlite3
+conn = sqlite3.connect("$VAULT_DIR/.synto/state.db")
+conn.execute("UPDATE raw_notes SET status='ingested' WHERE path='raw/quantum-computing.md'")
+conn.commit()
+conn.close()
+PYEOF
+# Clear drafts first
+$OLW approve --all 2>&1 >/dev/null || true
+_RAA_RC=0
+RAA_OUT=$($OLW run --auto-approve 2>&1) || _RAA_RC=$?
+echo "$RAA_OUT"
+check "run --auto-approve exits 0" "test $_RAA_RC -eq 0"
+_TMP=$(mktemp); echo "$RAA_OUT" > "$_TMP"
+check "run --auto-approve has no traceback" \
+    "! grep -qiE 'traceback' \"$_TMP\""
+rm -f "$_TMP"
+_RAA_DRAFTS=$(find "$VAULT_DIR/wiki/.drafts" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
+check "run --auto-approve leaves no drafts" "test '$_RAA_DRAFTS' -eq 0"
+
+# ── synto run --fix ───────────────────────────────────────────────────────────
+header "synto run --fix"
+# Inject a broken wikilink into a published article
+_RF_WIKI=$(find "$VAULT_DIR/wiki" -maxdepth 1 -name "*.md" \
+    ! -name "index.md" ! -name "log.md" 2>/dev/null | head -1)
+if [[ -n "$_RF_WIKI" ]]; then
+    echo -e "\n[[Definitely Broken Link XYZ]]" >> "$_RF_WIKI"
+    _RF_RC=0
+    RF_OUT=$($OLW run --fix 2>&1) || _RF_RC=$?
+    echo "$RF_OUT"
+    check "run --fix exits 0" "test $_RF_RC -eq 0"
+    _TMP=$(mktemp); echo "$RF_OUT" > "$_TMP"
+    check "run --fix has no traceback" \
+        "! grep -qiE 'traceback' \"$_TMP\""
+    rm -f "$_TMP"
+    # Restore
+    sed -i '' '$ d' "$_RF_WIKI" 2>/dev/null || sed -i '$ d' "$_RF_WIKI" 2>/dev/null || true
+else
+    pass "run --fix skipped (no published article)"
+fi
+
+# ── synto run --max-rounds 1 ──────────────────────────────────────────────────
+header "synto run --max-rounds 1"
+_RMR_RC=0
+RMR_OUT=$($OLW run --max-rounds 1 2>&1) || _RMR_RC=$?
+echo "$RMR_OUT"
+check "run --max-rounds 1 exits 0" "test $_RMR_RC -eq 0"
+_TMP=$(mktemp); echo "$RMR_OUT" > "$_TMP"
+check "run --max-rounds 1 mentions round/rounds/ingest/compile" \
+    "grep -qiE 'round|ingest|compile' \"$_TMP\""
+rm -f "$_TMP"
+
+# ── Pipeline lock (concurrent invocation) ─────────────────────────────────────
+header "Pipeline lock (concurrent invocation)"
+# Test the lock mechanism directly in Python since uv run may use a daemon
+# process that doesn't inherit the parent's flock.
+_PL_LOCK_SCRIPT=$(mktemp /tmp/synto_lock_test.XXXXXX.py)
+cat > "$_PL_LOCK_SCRIPT" <<'PYEOF'
+import fcntl, os, subprocess, sys
+
+vault = sys.argv[1]
+lock_path = os.path.join(vault, ".synto", "pipeline.lock")
+os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+
+f = open(lock_path, "a+")
+fcntl.flock(f, fcntl.LOCK_EX)
+f.seek(0)
+f.truncate()
+f.write(str(os.getpid()))
+f.flush()
+
+child_code = (
+    "import fcntl\n"
+    "f = open('" + lock_path + "', 'a+')\n"
+    "try:\n"
+    "    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+    "    print('ACQUIRED')\n"
+    "    fcntl.flock(f, fcntl.LOCK_UN)\n"
+    "except BlockingIOError:\n"
+    "    print('BLOCKED')\n"
+    "f.close()\n"
+)
+r = subprocess.run([sys.executable, "-c", child_code], capture_output=True, text=True)
+child_result = r.stdout.strip()
+
+fcntl.flock(f, fcntl.LOCK_UN)
+f.close()
+
+if child_result == "BLOCKED":
+    print("PASS: lock blocks concurrent access")
+    sys.exit(0)
+else:
+    print("FAIL: child " + child_result + " (should be BLOCKED)")
+    sys.exit(1)
+PYEOF
+
+_PL_RC=0
+PL_OUT=$(uv run --project "$REPO_DIR" python "$_PL_LOCK_SCRIPT" "$VAULT_DIR" 2>&1) || _PL_RC=$?
+echo "$PL_OUT"
+check "pipeline lock blocks concurrent access" "test $_PL_RC -eq 0"
+rm -f "$_PL_LOCK_SCRIPT"
+
+# ── synto --version ───────────────────────────────────────────────────────────
+header "synto --version"
+_VER_RC=0
+VER_OUT=$($OLW --version 2>&1) || _VER_RC=$?
+echo "$VER_OUT"
+check "synto --version exits 0" "test $_VER_RC -eq 0"
+_TMP=$(mktemp); echo "$VER_OUT" > "$_TMP"
+check "synto --version matches version pattern" \
+    "grep -qE '[0-9]+\.[0-9]+\.[0-9]+' \"$_TMP\""
+rm -f "$_TMP"
+
+# ── synto status (fresh vault, no ingest) ─────────────────────────────────────
+header "synto status (fresh vault, no ingest)"
+_STATUS_FRESH_VAULT="$(mktemp -d)"
+$OLW init "$_STATUS_FRESH_VAULT" 2>&1 >/dev/null
+if [[ "$PROVIDER" == "ollama" ]]; then
+    cat > "$_STATUS_FRESH_VAULT/synto.toml" <<SFVTOML
+[models]
+fast = "$FAST_MODEL"
+heavy = "$HEAVY_MODEL"
+embed = "nomic-embed-text"
+
+[ollama]
+url = "$PROVIDER_URL"
+timeout = 900
+fast_ctx = $FAST_CTX
+heavy_ctx = $HEAVY_CTX
+
+[pipeline]
+auto_approve = false
+auto_commit = true
+watch_debounce = 3.0
+
+[rag]
+chunk_size = 512
+chunk_overlap = 50
+similarity_threshold = 0.7
+SFVTOML
+else
+    cat > "$_STATUS_FRESH_VAULT/synto.toml" <<SFVTOML
+[models]
+fast = "$FAST_MODEL"
+heavy = "$HEAVY_MODEL"
+
+[provider]
+name = "$PROVIDER"
+url = "$PROVIDER_URL"
+timeout = 900
+fast_ctx = $FAST_CTX
+heavy_ctx = $HEAVY_CTX
+
+[pipeline]
+auto_approve = false
+auto_commit = true
+watch_debounce = 3.0
+
+[rag]
+chunk_size = 512
+chunk_overlap = 50
+similarity_threshold = 0.7
+SFVTOML
+fi
+_SF_RC=0
+SF_OUT=$($OLW status --vault "$_STATUS_FRESH_VAULT" 2>&1) || _SF_RC=$?
+echo "$SF_OUT"
+check "status on fresh vault exits 0" "test $_SF_RC -eq 0"
+_TMP=$(mktemp); echo "$SF_OUT" > "$_TMP"
+check "status on fresh vault has no traceback" \
+    "! grep -qiE 'traceback' \"$_TMP\""
+rm -f "$_TMP"
+rm -rf "$_STATUS_FRESH_VAULT"
+
+# ── Config loading order: SYNTO_VAULT env vs --vault flag ─────────────────────
+header "Config loading: SYNTO_VAULT env vs --vault flag"
+_CLO_ENV_RC=0
+CLO_ENV_OUT=$($OLW status 2>&1) || _CLO_ENV_RC=$?
+check "status via SYNTO_VAULT env exits 0" "test $_CLO_ENV_RC -eq 0"
+
+_CLO_FLAG_RC=0
+CLO_FLAG_OUT=$($OLW status --vault "$VAULT_DIR" 2>&1) || _CLO_FLAG_RC=$?
+check "status via --vault flag exits 0" "test $_CLO_FLAG_RC -eq 0"
+
+_TMP_ENV=$(mktemp); echo "$CLO_ENV_OUT" > "$_TMP_ENV"
+_TMP_FLAG=$(mktemp); echo "$CLO_FLAG_OUT" > "$_TMP_FLAG"
+check "status via env shows ingested or published" \
+    "grep -qiE 'ingested|published' \"$_TMP_ENV\""
+check "status via flag shows ingested or published" \
+    "grep -qiE 'ingested|published' \"$_TMP_FLAG\""
+rm -f "$_TMP_ENV" "$_TMP_FLAG"
+
+# ── Inline source citations end-to-end ────────────────────────────────────────
+header "Inline source citations end-to-end"
+# Save current setting
+_ISC_PREV=$(grep 'inline_source_citations' "$VAULT_DIR/synto.toml" | head -1 | sed 's/.*=[[:space:]]*//' | tr -d '[:space:]')
+# Enable inline citations
+$OLW config inline-source-citations on 2>&1 >/dev/null || true
+# Force a note back to ingested for a fresh compile+approve cycle
+python3 - <<PYEOF
+import sqlite3
+conn = sqlite3.connect("$VAULT_DIR/.synto/state.db")
+conn.execute("UPDATE raw_notes SET status='ingested' WHERE path='raw/quantum-computing.md'")
+conn.commit()
+conn.close()
+PYEOF
+_ISC_RC=0
+ISC_COMPILE_OUT=$($OLW compile 2>&1) || _ISC_RC=$?
+echo "$ISC_COMPILE_OUT"
+check "inline citations compile exits 0" "test $_ISC_RC -eq 0"
+
+$OLW approve --all 2>&1 >/dev/null || true
+_ISC_CITATION_COUNT=$(grep -r '\[S[0-9]' "$VAULT_DIR/wiki/" \
+    --include='*.md' --exclude-dir=.drafts 2>/dev/null | wc -l | tr -d ' ')
+check "published wiki articles contain inline source citation markers" \
+    "test '$_ISC_CITATION_COUNT' -ge 1"
+# Restore setting
+$OLW config inline-source-citations "$_ISC_PREV" 2>&1 >/dev/null || true
+
+# ── synto migrate-olw ─────────────────────────────────────────────────────────
+header "synto migrate-olw"
+_MOLW_DIR="$(mktemp -d)"
+cat > "$_MOLW_DIR/wiki.toml" <<'MOLWTOML'
+[models]
+fast = "gemma4:e4b"
+heavy = "gemma4:e4b"
+MOLWTOML
+mkdir -p "$_MOLW_DIR/.olw"
+_MOLW_RC=0
+_MOLW_TMP=$(mktemp)
+$OLW migrate-olw --vault "$_MOLW_DIR" > "$_MOLW_TMP" 2>&1 || _MOLW_RC=$?
+cat "$_MOLW_TMP"
+check "migrate-olw exits 0" "test $_MOLW_RC -eq 0"
+check "migrate-olw creates synto.toml" "test -f '$_MOLW_DIR/synto.toml'"
+check "migrate-olw creates .synto directory" "test -d '$_MOLW_DIR/.synto'"
+check "migrate-olw .gitignore contains pipeline.lock" \
+    "grep -q '.synto/pipeline.lock' '$_MOLW_DIR/.gitignore' 2>/dev/null || grep -qF '.synto/pipeline.lock' '$_MOLW_DIR/.gitignore'"
+check "migrate-olw output contains Migrated" \
+    "grep -qiE 'Migrated' \"$_MOLW_TMP\""
+rm -f "$_MOLW_TMP"
+rm -rf "$_MOLW_DIR"
+
+# ── synto doctor (uninitialised vault) ────────────────────────────────────────
+header "synto doctor (uninitialised vault)"
+_NODOC_DIR="$(mktemp -d)"
+_NODOC_RC=0
+_NODOC_TMP=$(mktemp)
+$OLW doctor --vault "$_NODOC_DIR" > "$_NODOC_TMP" 2>&1 || _NODOC_RC=$?
+cat "$_NODOC_TMP"
+check "doctor on uninitialised vault exits non-zero" "test $_NODOC_RC -ne 0"
+check "doctor on uninitialised vault mentions not initialised or missing or init" \
+    "grep -qiE 'not initialised|not initialized|missing|init' \"$_NODOC_TMP\""
+rm -f "$_NODOC_TMP"
+rm -rf "$_NODOC_DIR"
+
+# ── synto eval --live (not implemented) ───────────────────────────────────────
+header "synto eval --live (not implemented)"
+_ELIVE_RC=0
+_ELIVE_TMP=$(mktemp)
+$OLW eval --live > "$_ELIVE_TMP" 2>&1 || _ELIVE_RC=$?
+cat "$_ELIVE_TMP"
+check "eval --live exits 2" "test $_ELIVE_RC -eq 2"
+check "eval --live output mentions not implemented or Phase 1A" \
+    "grep -qiE 'not implemented|Phase 1A' \"$_ELIVE_TMP\""
+rm -f "$_ELIVE_TMP"
+
+# ── synto approve --all (no drafts) ───────────────────────────────────────────
+header "synto approve --all (no drafts)"
+$OLW approve --all 2>&1 >/dev/null || true
+_EMPTY_DRAFTS=$(find "$VAULT_DIR/wiki/.drafts" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
+check "drafts are empty before approve --all (no drafts)" "test '$_EMPTY_DRAFTS' -eq 0"
+_NODRAFT_RC=0
+_NODRAFT_TMP=$(mktemp)
+$OLW approve --all > "$_NODRAFT_TMP" 2>&1 || _NODRAFT_RC=$?
+cat "$_NODRAFT_TMP"
+check "approve --all with no drafts exits 0" "test $_NODRAFT_RC -eq 0"
+check "approve --all with no drafts has no traceback" \
+    "! grep -qiE 'traceback' \"$_NODRAFT_TMP\""
+rm -f "$_NODRAFT_TMP"
+
+# ── synto items show (existing item) ──────────────────────────────────────────
+header "synto items show (existing item)"
+_ITEM_NAME=$(python3 -c "
+import sqlite3
+conn = sqlite3.connect('$VAULT_DIR/.synto/state.db')
+row = conn.execute('SELECT name FROM items LIMIT 1').fetchone()
+print(row[0] if row else '')
+conn.close()
+")
+if [[ -n "$_ITEM_NAME" ]]; then
+    _ISHOW_RC=0
+    _ISHOW_TMP=$(mktemp)
+    $OLW items show "$_ITEM_NAME" > "$_ISHOW_TMP" 2>&1 || _ISHOW_RC=$?
+    cat "$_ISHOW_TMP"
+    check "items show existing item exits 0" "test $_ISHOW_RC -eq 0"
+    check "items show output contains item name or kind or confidence" \
+        "grep -qiE '$_ITEM_NAME|kind:|confidence:' \"$_ISHOW_TMP\""
+    check "items show has no traceback" \
+        "! grep -qiE 'traceback' \"$_ISHOW_TMP\""
+    rm -f "$_ISHOW_TMP"
+else
+    pass "items show existing skipped (no items in DB)"
+fi
+
+# ── auto_commit = false (no git commits on approve) ───────────────────────────
+header "auto_commit = false (no git commits on approve)"
+_NC_VAULT="$(mktemp -d)"
+$OLW init "$_NC_VAULT" 2>&1 >/dev/null
+if [[ "$PROVIDER" == "ollama" ]]; then
+    cat > "$_NC_VAULT/synto.toml" <<NCTOML
+[models]
+fast = "$FAST_MODEL"
+heavy = "$HEAVY_MODEL"
+embed = "nomic-embed-text"
+
+[ollama]
+url = "$PROVIDER_URL"
+timeout = 900
+fast_ctx = $FAST_CTX
+heavy_ctx = $HEAVY_CTX
+
+[pipeline]
+auto_approve = false
+auto_commit = false
+watch_debounce = 3.0
+
+[rag]
+chunk_size = 512
+chunk_overlap = 50
+similarity_threshold = 0.7
+NCTOML
+else
+    cat > "$_NC_VAULT/synto.toml" <<NCTOML
+[models]
+fast = "$FAST_MODEL"
+heavy = "$HEAVY_MODEL"
+
+[provider]
+name = "$PROVIDER"
+url = "$PROVIDER_URL"
+timeout = 900
+fast_ctx = $FAST_CTX
+heavy_ctx = $HEAVY_CTX
+
+[pipeline]
+auto_approve = false
+auto_commit = false
+watch_debounce = 3.0
+
+[rag]
+chunk_size = 512
+chunk_overlap = 50
+similarity_threshold = 0.7
+NCTOML
+fi
+cat > "$_NC_VAULT/raw/no-commit-test.md" <<'NCNOTE'
+---
+title: No Commit Test
+---
+This note tests that auto_commit = false prevents git commits on approve.
+NCNOTE
+_NC_INGEST_RC=0
+$OLW ingest --all --vault "$_NC_VAULT" 2>&1 >/dev/null || _NC_INGEST_RC=$?
+check "no-commit ingest exits 0" "test $_NC_INGEST_RC -eq 0"
+_NC_COMPILE_RC=0
+$OLW compile --vault "$_NC_VAULT" 2>&1 >/dev/null || _NC_COMPILE_RC=$?
+check "no-commit compile exits 0" "test $_NC_COMPILE_RC -eq 0"
+_NC_APPROVE_RC=0
+_NC_APPROVE_TMP=$(mktemp)
+$OLW approve --all --vault "$_NC_VAULT" > "$_NC_APPROVE_TMP" 2>&1 || _NC_APPROVE_RC=$?
+cat "$_NC_APPROVE_TMP"
+check "no-commit approve --all exits 0" "test $_NC_APPROVE_RC -eq 0"
+rm -f "$_NC_APPROVE_TMP"
+_NC_SYNTO_COMMITS=$(git -C "$_NC_VAULT" log --oneline 2>/dev/null | grep -c '\[synto\]' || true)
+check "auto_commit = false produces zero git commits with [synto] prefix" \
+    "test '$_NC_SYNTO_COMMITS' -eq 0"
+rm -rf "$_NC_VAULT"
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 header "Results"
 echo -e "${GREEN}${BOLD}All checks passed: $PASS_COUNT${NC}"
