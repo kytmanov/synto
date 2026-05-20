@@ -75,14 +75,22 @@ else
 fi
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-GREEN='\033[0;32m'
-RED='\033[0;31m'
-YELLOW='\033[1;33m'
-BOLD='\033[1m'
-NC='\033[0m'
+if [ -t 1 ]; then
+    GREEN='\033[0;32m' RED='\033[0;31m' YELLOW='\033[1;33m' BOLD='\033[1m' NC='\033[0m'
+else
+    GREEN='' RED='' YELLOW='' BOLD='' NC=''
+fi
+
+_RESULTS=()
+_T0=$(date +%s)
 
 pass() { echo -e "${GREEN}✓${NC} $1"; }
-fail() { echo -e "${RED}✗ FAIL: $1${NC}"; exit 1; }
+fail() {
+    local desc="$1" detail="${2:-}"
+    echo -e "  ${RED}✗ FAIL: $desc${NC}${detail:+$'\n'    ${detail:0:400}}"
+    echo -e "  ${YELLOW}▶ Re-run with VAULT_DIR=/tmp/keep-vault to inspect state after failure${NC}"
+    exit 1
+}
 info() { echo -e "${YELLOW}▶${NC} $1"; }
 header() { echo -e "\n${BOLD}$1${NC}"; }
 
@@ -90,17 +98,55 @@ PASS_COUNT=0
 check() {
     local desc="$1"
     shift
-    local rc=0
-    ( set +o pipefail; eval "$@" ) > /dev/null 2>&1 || rc=$?
+    local out rc=0
+    out=$(set +o pipefail; eval "$@" 2>&1) || rc=$?
     if [[ $rc -eq 0 ]]; then
         pass "$desc"
         PASS_COUNT=$((PASS_COUNT + 1))
+        _RESULTS+=("PASS|$desc|")
     else
-        fail "$desc"
+        _RESULTS+=("FAIL|$desc|${out:0:200}")
+        fail "$desc" "$out"
     fi
 }
 
+soft_check() {
+    local desc="$1"
+    shift
+    local out rc=0
+    out=$(set +o pipefail; eval "$@" 2>&1) || rc=$?
+    if [[ $rc -eq 0 ]]; then
+        pass "$desc"
+        PASS_COUNT=$((PASS_COUNT + 1))
+        _RESULTS+=("PASS|$desc|")
+    else
+        echo -e "  ${RED}✗ SOFT FAIL:${NC} $desc${out:+ — ${out:0:200}}"
+        _RESULTS+=("FAIL|$desc|${out:0:200}")
+    fi
+}
+
+_write_report() {
+    [[ -z "${REPORT_FILE:-}" ]] && return
+    local passed=0 failed=0 elapsed r status label detail
+    elapsed=$(( $(date +%s) - _T0 ))
+    declare -a checks=()
+    for r in "${_RESULTS[@]}"; do
+        IFS='|' read -r status label detail <<< "$r"
+        if [[ "$status" == "PASS" ]]; then
+            ((passed++))
+            checks+=("{\"passed\":true,\"name\":$(printf '%s' "$label" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))'),\"detail\":null}")
+        else
+            ((failed++))
+            checks+=("{\"passed\":false,\"name\":$(printf '%s' "$label" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))'),\"detail\":$(printf '%s' "$detail" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))')}")
+        fi
+    done
+    printf '{"passed":%d,"failed":%d,"duration_s":%d,"checks":[%s]}\n' \
+        "$passed" "$failed" "$elapsed" "$(IFS=,; printf '%s' "${checks[*]}")" \
+        > "$REPORT_FILE"
+}
+
 cleanup() {
+    _write_report
     if [[ "$KEEP_VAULT" == "0" ]]; then
         rm -rf "$VAULT_DIR"
         rm -rf "${UNDO_VAULT_DIR:-}"

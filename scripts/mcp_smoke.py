@@ -10,12 +10,23 @@ Exit 1 = at least one check failed.
 NOTE: Use the direct synto binary (not `uv run synto`).  When launched via
 `uv run`, uv routes child stderr through its own stdout, injecting log lines
 into the JSON-RPC stream and causing parse errors on the client side.
+
+Environment variables:
+  REPORT_FILE  Path to write a JSON results file (written even on failure).
+               stdout remains human-readable when this is set.
+
+Flags:
+  --json       Print a single JSON results object to stdout (suppresses
+               streaming output).
+  --suite NAME Run only the named suite (use --suite list to show available).
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -26,25 +37,47 @@ from pathlib import Path
 
 # ── Output helpers ────────────────────────────────────────────────────────────
 
-PASS = "\033[32m✓\033[0m"
-FAIL = "\033[31m✗\033[0m"
-HEAD = "\033[1m"
-RST = "\033[0m"
+_COLOR = sys.stdout.isatty()
+
+
+def _c(code: str) -> str:
+    return code if _COLOR else ""
+
+
+_GREEN = "\033[32m"
+_RED   = "\033[31m"
+_HEAD  = "\033[1m"
+_RST   = "\033[0m"
+
+PASS_SYM = f"{_c(_GREEN)}✓{_c(_RST)}" if _COLOR else "PASS"
+FAIL_SYM = f"{_c(_RED)}✗{_c(_RST)}" if _COLOR else "FAIL"
 
 _failures: list[str] = []
+_results: list[dict] = []
+_current_suite: str = ""
+_JSON_MODE: bool = False
 
 
 def check(label: str, ok: bool, detail: str = "") -> None:
+    _results.append({
+        "suite": _current_suite,
+        "name": label,
+        "passed": ok,
+        "detail": detail or None,
+    })
     if ok:
-        print(f"  {PASS} {label}")
+        if not _JSON_MODE:
+            print(f"  {PASS_SYM} {label}")
     else:
         msg = label + (f": {detail}" if detail else "")
-        print(f"  {FAIL} {msg}")
         _failures.append(msg)
+        if not _JSON_MODE:
+            print(f"  {FAIL_SYM} {msg}")
 
 
 def header(title: str) -> None:
-    print(f"\n{HEAD}{title}{RST}")
+    if not _JSON_MODE:
+        print(f"\n{_c(_HEAD)}{title}{_c(_RST)}")
 
 
 # ── Vault bootstrap ───────────────────────────────────────────────────────────
@@ -200,8 +233,6 @@ def _sc(res, key: str | None = None):
 # ── Test suites ───────────────────────────────────────────────────────────────
 
 async def suite_list_articles(vault: Path) -> None:
-    header("list_articles")
-
     from mcp import ClientSession
     from mcp.client.stdio import stdio_client
 
@@ -268,8 +299,6 @@ async def suite_list_articles(vault: Path) -> None:
 
 
 async def suite_read_article(vault: Path) -> None:
-    header("read_article")
-
     from mcp import ClientSession
     from mcp.client.stdio import stdio_client
 
@@ -320,8 +349,6 @@ async def suite_read_article(vault: Path) -> None:
 
 
 async def suite_find_concept(vault: Path) -> None:
-    header("find_concept")
-
     from mcp import ClientSession
     from mcp.client.stdio import stdio_client
 
@@ -375,8 +402,6 @@ async def suite_find_concept(vault: Path) -> None:
 
 
 async def suite_exclude_tags(vault: Path) -> None:
-    header("exclude_tags filtering")
-
     from mcp import ClientSession
     from mcp.client.stdio import stdio_client
 
@@ -414,8 +439,6 @@ async def suite_exclude_tags(vault: Path) -> None:
 
 
 async def suite_default_visibility_private(vault: Path) -> None:
-    header("default_visibility = private")
-
     from mcp import ClientSession
     from mcp.client.stdio import stdio_client
 
@@ -443,8 +466,6 @@ async def suite_default_visibility_private(vault: Path) -> None:
 
 
 async def suite_audit(vault: Path) -> None:
-    header("Audit logging (enabled)")
-
     from mcp import ClientSession
     from mcp.client.stdio import stdio_client
 
@@ -512,8 +533,6 @@ async def suite_audit(vault: Path) -> None:
 
 async def suite_audit_disabled(vault: Path) -> None:
     """Verify that audit=false (the default) writes zero metric rows."""
-    header("Audit disabled by default")
-
     from mcp import ClientSession
     from mcp.client.stdio import stdio_client
 
@@ -541,41 +560,124 @@ async def suite_audit_disabled(vault: Path) -> None:
         check("audit=false: no state DB created by server (audit writes skipped)", True)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Suite registry ────────────────────────────────────────────────────────────
 
-async def run_all() -> None:
+_VAULT_FACTORIES = {
+    "main":    make_main_vault,
+    "exclude": make_exclude_tags_vault,
+    "private": make_private_default_vault,
+    "audit":   make_audit_vault,
+}
+
+SUITES: dict[str, tuple] = {
+    "list_articles":              (suite_list_articles,              "main"),
+    "read_article":               (suite_read_article,               "main"),
+    "find_concept":               (suite_find_concept,               "main"),
+    "exclude_tags":               (suite_exclude_tags,               "exclude"),
+    "default_visibility_private": (suite_default_visibility_private, "private"),
+    "audit":                      (suite_audit,                      "audit"),
+    "audit_disabled":             (suite_audit_disabled,             "main"),
+}
+
+
+# ── Runner ────────────────────────────────────────────────────────────────────
+
+async def _run(name: str, coro) -> None:
+    """Run one suite with timeout, converting exceptions to FAIL checks."""
+    global _current_suite
+    _current_suite = name
+    header(name)
+    try:
+        await asyncio.wait_for(coro, timeout=30.0)
+    except TimeoutError:
+        check("suite timed out after 30s", False)
+    except Exception as exc:
+        check("suite raised exception", False, type(exc).__name__ + ": " + str(exc))
+
+
+async def run_all(suite_filter: str | None = None) -> None:
     with tempfile.TemporaryDirectory(prefix="mcp-smoke-") as tmp:
         tmp_path = Path(tmp)
 
-        main_vault = make_main_vault(tmp_path)
-        excl_vault = make_exclude_tags_vault(tmp_path)
-        priv_vault = make_private_default_vault(tmp_path)
-        audit_vault = make_audit_vault(tmp_path)
+        if suite_filter is not None:
+            fn, vault_key = SUITES[suite_filter]
+            vault = _VAULT_FACTORIES[vault_key](tmp_path)
+            await _run(suite_filter, fn(vault))
+            return
 
-        await asyncio.wait_for(suite_list_articles(main_vault), timeout=30.0)
-        await asyncio.wait_for(suite_read_article(main_vault), timeout=30.0)
-        await asyncio.wait_for(suite_find_concept(main_vault), timeout=30.0)
-        await asyncio.wait_for(suite_exclude_tags(excl_vault), timeout=30.0)
-        await asyncio.wait_for(suite_default_visibility_private(priv_vault), timeout=30.0)
-        await asyncio.wait_for(suite_audit(audit_vault), timeout=30.0)
-        await asyncio.wait_for(suite_audit_disabled(main_vault), timeout=30.0)
+        # Full run — build each vault once, reuse across suites that share it
+        vaults = {key: factory(tmp_path) for key, factory in _VAULT_FACTORIES.items()}
+        for name, (fn, vault_key) in SUITES.items():
+            await _run(name, fn(vaults[vault_key]))
 
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> int:
-    try:
-        asyncio.run(run_all())
-    except Exception:
-        traceback.print_exc()
+    global _JSON_MODE
+
+    parser = argparse.ArgumentParser(
+        description="MCP protocol smoke tests for synto serve.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--json", dest="json_out", action="store_true",
+        help="Print results as a single JSON object to stdout (suppresses streaming output).",
+    )
+    parser.add_argument(
+        "--suite", metavar="NAME",
+        help="Run a single named suite. Use 'list' to print available names.",
+    )
+    args = parser.parse_args()
+
+    if args.suite == "list":
+        print("\n".join(SUITES))
+        return 0
+
+    if args.suite and args.suite not in SUITES:
+        print(
+            f"Unknown suite {args.suite!r}.\nAvailable: {', '.join(SUITES)}",
+            file=sys.stderr,
+        )
         return 1
+
+    _JSON_MODE = args.json_out
+    t0 = time.monotonic()
+
+    try:
+        asyncio.run(run_all(args.suite))
+    except Exception:
+        if not _JSON_MODE:
+            traceback.print_exc()
+        return 1
+
+    duration = int(time.monotonic() - t0)
+    passed = sum(1 for r in _results if r["passed"])
+    failed = len(_results) - passed
+
+    report = {
+        "passed": passed,
+        "failed": failed,
+        "duration_s": duration,
+        "checks": _results,
+    }
+
+    report_file = os.environ.get("REPORT_FILE")
+    if report_file:
+        Path(report_file).write_text(json.dumps(report, indent=2))
+
+    if _JSON_MODE:
+        print(json.dumps(report))
+        return 1 if failed else 0
 
     print(f"\n{'─' * 50}")
     if _failures:
-        print(f"\033[31m{len(_failures)} FAILED:\033[0m")
+        print(f"{_c(_RED)}{len(_failures)} FAILED:{_c(_RST)}")
         for f in _failures:
             print(f"  • {f}")
         return 1
 
-    print(f"\033[32mAll checks passed.\033[0m")
+    print(f"{_c(_GREEN)}All checks passed.{_c(_RST)}")
     return 0
 
 
