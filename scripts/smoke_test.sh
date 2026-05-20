@@ -1589,7 +1589,7 @@ if [[ "$_APP_DRAFT_COUNT" -gt 0 ]]; then
     APP_SINGLE_OUT=$($OLW approve "$_APP_SINGLE" 2>&1) || _APP_SINGLE_RC=$?
     echo "$APP_SINGLE_OUT"
     check "approve <draft-file> exits 0" "test $_APP_SINGLE_RC -eq 0"
-    check "approve <draft-file> removes the draft" "test ! -f '$_APP_SINGLE'"
+    check "approve <draft-file> removes the draft" "test ! -f \"$_APP_SINGLE\""
 else
     pass "approve individual test skipped (no drafts produced)"
 fi
