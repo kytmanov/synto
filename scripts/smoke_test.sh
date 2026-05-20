@@ -1490,17 +1490,17 @@ PYEOF
 # Count drafts before
 _CF_DRAFTS_BEFORE=$(find "$VAULT_DIR/wiki/.drafts" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
 # Manually edit a published article that shares concepts with quantum-computing.md
-_CF_WIKI="$VAULT_DIR/wiki/Quantum computing.md"
-if [[ -f "$_CF_WIKI" ]]; then
+_CF_WIKI=$(find "$VAULT_DIR/wiki" -maxdepth 1 -name "*.md" \
+    ! -name "index.md" ! -name "log.md" 2>/dev/null | head -1)
+if [[ -n "$_CF_WIKI" ]]; then
     echo -e "\n\nManual edit for compile --force test." >> "$_CF_WIKI"
     _CF_RC=0
-    COMPILE_FORCE_OUT=$($OLW compile --force --concept "Quantum computing" 2>&1) || _CF_RC=$?
+    COMPILE_FORCE_OUT=$($OLW compile --force 2>&1) || _CF_RC=$?
     echo "$COMPILE_FORCE_OUT"
     check "compile --force exits 0" "test $_CF_RC -eq 0"
     _CF_DRAFTS_AFTER=$(find "$VAULT_DIR/wiki/.drafts" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
     check "compile --force creates new draft bypassing manual edit protection" \
         "test '$_CF_DRAFTS_AFTER' -gt '$_CF_DRAFTS_BEFORE'"
-    # Restore
     sed -i '' '$ d' "$_CF_WIKI" 2>/dev/null || sed -i '$ d' "$_CF_WIKI" 2>/dev/null || true
 else
     pass "compile --force skipped (no published article to edit)"
@@ -1688,8 +1688,10 @@ check "maintain --stubs-only mentions stub or creates draft" \
 check "maintain --stubs-only does not mention fix for frontmatter or tags" \
     "! grep -qiE 'fix.*frontmatter|fix.*tag|missing_frontmatter|invalid_tag' \"$_TMP\""
 rm -f "$_TMP"
-[[ -n "$_MSO_VICTIM" ]] && \
-    { sed -i '' '$ d' "$_MSO_VICTIM" 2>/dev/null || sed -i '$ d' "$_MSO_VICTIM"; }
+[[ -n "$_MSO_VICTIM" ]] && {
+    sed -i '' -e '$ d' -e '$ d' "$_MSO_VICTIM" 2>/dev/null || \
+    sed -i -e '$ d' -e '$ d' "$_MSO_VICTIM" 2>/dev/null || true
+}
 
 # ── synto maintain --clear-cache ──────────────────────────────────────────────
 header "synto maintain --clear-cache"
@@ -2080,7 +2082,11 @@ rm -f "$_TMP_ENV" "$_TMP_FLAG"
 # ── Inline source citations end-to-end ────────────────────────────────────────
 header "Inline source citations end-to-end"
 # Save current setting
-_ISC_PREV=$(grep 'inline_source_citations' "$VAULT_DIR/synto.toml" | head -1 | sed 's/.*=[[:space:]]*//' | tr -d '[:space:]')
+if grep -q 'inline_source_citations = true' "$VAULT_DIR/synto.toml" 2>/dev/null; then
+    _ISC_PREV="on"
+else
+    _ISC_PREV="off"
+fi
 # Enable inline citations
 $OLW config inline-source-citations on 2>&1 >/dev/null || true
 # Force a note back to ingested for a fresh compile+approve cycle
