@@ -1707,6 +1707,9 @@ rm -rf "$_CLEAN_VAULT"
 
 # ── synto undo --steps 2 ──────────────────────────────────────────────────────
 header "synto undo --steps 2"
+# wiki/log.md accumulates uncommitted entries (auto_commit=false); restore it so
+# git revert can proceed without "would be overwritten by merge" errors.
+git -C "$VAULT_DIR" restore wiki/log.md 2>/dev/null || true
 # Count existing synto commits
 _UNDO_SYNTO_COMMITS=$(git -C "$VAULT_DIR" log --oneline --grep='\[synto\]' 2>/dev/null | wc -l | tr -d ' ')
 if [[ "$_UNDO_SYNTO_COMMITS" -ge 2 ]]; then
