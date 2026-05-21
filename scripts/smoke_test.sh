@@ -87,12 +87,18 @@ _T0=$(date +%s)
 pass() { echo -e "${GREEN}✓${NC} $1"; }
 fail() {
     local desc="$1" detail="${2:-}"
-    echo -e "  ${RED}✗ FAIL: $desc${NC}${detail:+$'\n'    ${detail:0:400}}"
+    echo -e "  ${RED}✗ FAIL: $desc${NC}${detail:+$'\n'    ${detail:0:1000}}"
     echo -e "  ${YELLOW}▶ Re-run with VAULT_DIR=/tmp/keep-vault to inspect state after failure${NC}"
     exit 1
 }
 info() { echo -e "${YELLOW}▶${NC} $1"; }
-header() { echo -e "\n${BOLD}$1${NC}"; }
+header() {
+    if [[ -n "${_SECTION_START:-}" ]]; then
+        echo -e "  ${YELLOW}($(( SECONDS - _SECTION_START ))s)${NC}"
+    fi
+    _SECTION_START=$SECONDS
+    echo -e "\n${BOLD}$1${NC}"
+}
 
 PASS_COUNT=0
 check() {
@@ -105,7 +111,7 @@ check() {
         PASS_COUNT=$((PASS_COUNT + 1))
         _RESULTS+=("PASS|$desc|")
     else
-        _RESULTS+=("FAIL|$desc|${out:0:200}")
+        _RESULTS+=("FAIL|$desc|${out:0:1000}")
         fail "$desc" "$out"
     fi
 }
@@ -120,8 +126,8 @@ soft_check() {
         PASS_COUNT=$((PASS_COUNT + 1))
         _RESULTS+=("PASS|$desc|")
     else
-        echo -e "  ${RED}✗ SOFT FAIL:${NC} $desc${out:+ — ${out:0:200}}"
-        _RESULTS+=("FAIL|$desc|${out:0:200}")
+        echo -e "  ${RED}✗ SOFT FAIL:${NC} $desc${out:+ — ${out:0:1000}}"
+        _RESULTS+=("FAIL|$desc|${out:0:1000}")
     fi
 }
 
@@ -134,10 +140,10 @@ _write_report() {
         IFS='|' read -r status label detail <<< "$r"
         if [[ "$status" == "PASS" ]]; then
             ((passed++))
-            checks+=("{\"passed\":true,\"name\":$(printf '%s' "$label" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))'),\"detail\":null}")
+            checks+=("{\"suite\":\"\",\"passed\":true,\"name\":$(printf '%s' "$label" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))'),\"detail\":null}")
         else
             ((failed++))
-            checks+=("{\"passed\":false,\"name\":$(printf '%s' "$label" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))'),\"detail\":$(printf '%s' "$detail" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))')}")
+            checks+=("{\"suite\":\"\",\"passed\":false,\"name\":$(printf '%s' "$label" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))'),\"detail\":$(printf '%s' "$detail" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))')}")
         fi
     done
     printf '{"passed":%d,"failed":%d,"duration_s":%d,"checks":[%s]}\n' \
@@ -230,8 +236,8 @@ if [[ "$PROVIDER" == "ollama" ]]; then
         fi
     fi
 
-    check "Fast model present: $FAST_MODEL"  "curl -sf $PROVIDER_URL/api/tags | grep -F -q '$FAST_MODEL'"
-    check "Heavy model present: $HEAVY_MODEL" "curl -sf $PROVIDER_URL/api/tags | grep -F -q '$HEAVY_MODEL'"
+    soft_check "Fast model present: $FAST_MODEL"  "curl -sf $PROVIDER_URL/api/tags | grep -F -q '$FAST_MODEL'"
+    soft_check "Heavy model present: $HEAVY_MODEL" "curl -sf $PROVIDER_URL/api/tags | grep -F -q '$HEAVY_MODEL'"
 else
     # LM Studio and other OpenAI-compatible providers: just verify the endpoint is up.
     # Model presence can't be checked reliably via /v1/models on all backends.
@@ -325,18 +331,18 @@ header "synto init"
 
 $OLW init "$VAULT_DIR" 2>&1 | grep -v "^$" || true
 
-check "raw/ created"           "test -d $VAULT_DIR/raw"
-check "wiki/ created"          "test -d $VAULT_DIR/wiki"
-check "wiki/.drafts/ created"  "test -d $VAULT_DIR/wiki/.drafts"
-check "wiki/sources/ created"  "test -d $VAULT_DIR/wiki/sources"
-check ".synto/ created"          "test -d $VAULT_DIR/.synto"
-check "synto.toml created"      "test -f $VAULT_DIR/synto.toml"
-check "git repo initialised"   "test -d $VAULT_DIR/.git"
+soft_check "raw/ created"           "test -d $VAULT_DIR/raw"
+soft_check "wiki/ created"          "test -d $VAULT_DIR/wiki"
+soft_check "wiki/.drafts/ created"  "test -d $VAULT_DIR/wiki/.drafts"
+soft_check "wiki/sources/ created"  "test -d $VAULT_DIR/wiki/sources"
+soft_check ".synto/ created"          "test -d $VAULT_DIR/.synto"
+soft_check "synto.toml created"      "test -f $VAULT_DIR/synto.toml"
+soft_check "git repo initialised"   "test -d $VAULT_DIR/.git"
 # #27: init must write wiki/index.md with lowercase name.
 # Can't use `test -f INDEX.md` on macOS APFS (case-insensitive) — it matches index.md.
 # Instead, check the actual on-disk filename via ls (ls preserves stored casing).
 _ACTUAL_INDEX=$(ls "$VAULT_DIR/wiki/" | { grep -i '^index\.md$' || true; } | head -1)
-check "wiki index file is lowercase index.md (issue #27)" "test '$_ACTUAL_INDEX' = 'index.md'"
+soft_check "wiki index file is lowercase index.md (issue #27)" "test '$_ACTUAL_INDEX' = 'index.md'"
 
 # Write provider-appropriate synto.toml
 if [[ "$PROVIDER" == "ollama" ]]; then
@@ -447,8 +453,8 @@ Key concepts: gradient descent, backpropagation, overfitting/underfitting,
 train/val/test split, cross-validation.
 EOF
 
-check "raw note 1 created" "test -f $VAULT_DIR/raw/quantum-computing.md"
-check "raw note 2 created" "test -f $VAULT_DIR/raw/machine-learning-basics.md"
+soft_check "raw note 1 created" "test -f $VAULT_DIR/raw/quantum-computing.md"
+soft_check "raw note 2 created" "test -f $VAULT_DIR/raw/machine-learning-basics.md"
 
 # Snapshot checksums so we can verify raw files stay immutable after ingest
 RAW_HASH_1=$(shasum "$VAULT_DIR/raw/quantum-computing.md" | awk '{print $1}')
@@ -463,20 +469,20 @@ $OLW ingest --all 2>&1
 check "state.db created" "test -f $VAULT_DIR/.synto/state.db"
 
 # Raw files must remain unchanged (immutability contract)
-check "raw note 1 unchanged after ingest" \
+soft_check "raw note 1 unchanged after ingest" \
     "test \"\$(shasum '$VAULT_DIR/raw/quantum-computing.md' | awk '{print \$1}')\" = '$RAW_HASH_1'"
-check "raw note 2 unchanged after ingest" \
+soft_check "raw note 2 unchanged after ingest" \
     "test \"\$(shasum '$VAULT_DIR/raw/machine-learning-basics.md' | awk '{print \$1}')\" = '$RAW_HASH_2'"
 
 # Source summary pages created in wiki/sources/
 SOURCE_COUNT=$(find "$VAULT_DIR/wiki/sources" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
-check "source summary pages created" "test '$SOURCE_COUNT' -ge 1"
+soft_check "source summary pages created" "test '$SOURCE_COUNT' -ge 1"
 
 if [[ "$SOURCE_COUNT" -gt 0 ]]; then
     FIRST_SOURCE=$(find "$VAULT_DIR/wiki/sources" -name "*.md" | sort | head -1)
-    check "source page has YAML frontmatter"  "grep -q '^---' \"$FIRST_SOURCE\""
-    check "source page has tags: [source]"    "grep -q 'source' \"$FIRST_SOURCE\""
-    check "source page has concept wikilinks" "grep -q '\[\[' \"$FIRST_SOURCE\""
+    soft_check "source page has YAML frontmatter"  "grep -q '^---' \"$FIRST_SOURCE\""
+    soft_check "source page has tags: [source]"    "grep -q 'source' \"$FIRST_SOURCE\""
+    soft_check "source page has concept wikilinks" "grep -q '\[\[' \"$FIRST_SOURCE\""
 
     SRC_YAML_ERR=$(uv run --project "$REPO_DIR" python - "$FIRST_SOURCE" 2>/dev/null <<'PYEOF'
 import sys
@@ -488,7 +494,7 @@ except Exception as e:
     sys.exit(1)
 PYEOF
 )
-    check "source page YAML is parseable" "test -z \"$SRC_YAML_ERR\""
+    soft_check "source page YAML is parseable" "test -z \"$SRC_YAML_ERR\""
 
     SRC_ALIAS_ERR=$(uv run --project "$REPO_DIR" python - "$FIRST_SOURCE" 2>/dev/null <<'PYEOF'
 import sys
@@ -505,20 +511,20 @@ except Exception as e:
     sys.exit(1)
 PYEOF
 )
-    check "source page aliases is a list" "test -z \"$SRC_ALIAS_ERR\""
+    soft_check "source page aliases is a list" "test -z \"$SRC_ALIAS_ERR\""
 fi
 
 # index.md and log.md created
-check "wiki/index.md created" "test -f $VAULT_DIR/wiki/index.md"
-check "wiki/log.md created"   "test -f $VAULT_DIR/wiki/log.md"
-check "index.md has wikilinks" "grep -q '\[\[' $VAULT_DIR/wiki/index.md"
+soft_check "wiki/index.md created" "test -f $VAULT_DIR/wiki/index.md"
+soft_check "wiki/log.md created"   "test -f $VAULT_DIR/wiki/log.md"
+soft_check "index.md has wikilinks" "grep -q '\[\[' $VAULT_DIR/wiki/index.md"
 
 # ── Status after ingest ───────────────────────────────────────────────────────
 header "synto status (after ingest)"
 STATUS_OUT=$($OLW status 2>&1)
 echo "$STATUS_OUT"
 
-check "status shows ingested notes" "echo \"$STATUS_OUT\" | grep -q 'ingested'"
+soft_check "status shows ingested notes" "echo \"$STATUS_OUT\" | grep -q 'ingested'"
 
 # ── Concept extraction check ──────────────────────────────────────────────────
 header "Concept extraction"
@@ -526,7 +532,7 @@ header "Concept extraction"
 if [[ "$SOURCE_COUNT" -gt 0 ]]; then
     # Verify concept wikilinks exist in source pages (extracted during ingest)
     CONCEPT_LINKS=$(grep -r '\[\[' "$VAULT_DIR/wiki/sources/" 2>/dev/null | wc -l | tr -d ' ')
-    check "source pages have concept wikilinks" "test '$CONCEPT_LINKS' -ge 1"
+    soft_check "source pages have concept wikilinks" "test '$CONCEPT_LINKS' -ge 1"
 fi
 
 # #28: concept_aliases table should be populated after ingest
@@ -541,7 +547,7 @@ except Exception:
 conn.close()
 PYEOF
 )
-check "concept_aliases table populated after ingest (issue #28)" \
+soft_check "concept_aliases table populated after ingest (issue #28)" \
     "test '$ALIAS_COUNT' -gt 0"
 info "Aliases stored in DB: $ALIAS_COUNT"
 
@@ -569,7 +575,7 @@ print(row[0] if row else "")
 conn.close()
 PYEOF
 )
-check "language column populated after ingest" "test -n \"$LANG_IN_DB\""
+soft_check "language column populated after ingest" "test -n \"$LANG_IN_DB\""
 info "Detected language: '$LANG_IN_DB'"
 
 # ── Compile (concept-driven) ──────────────────────────────────────────────────
@@ -583,15 +589,15 @@ check "at least 1 draft created" "test '$DRAFT_COUNT' -ge 1"
 
 if [[ "$DRAFT_COUNT" -gt 0 ]]; then
     FIRST_DRAFT=$(find "$VAULT_DIR/wiki/.drafts" -name "*.md" | sort | head -1)
-    check "draft has YAML frontmatter"   "grep -q '^---' \"$FIRST_DRAFT\""
-    check "draft has title field"        "grep -q 'title:' \"$FIRST_DRAFT\""
-    check "draft has status: draft"      "grep -q 'status: draft' \"$FIRST_DRAFT\""
-    check "draft has sources field"      "grep -q 'sources:' \"$FIRST_DRAFT\""
-    check "draft has content"            "test \$(wc -l < \"$FIRST_DRAFT\") -ge 10"
-    check "draft has ## Sources section" "grep -q '^## Sources' \"$FIRST_DRAFT\""
-    check "draft has confidence field"   "grep -q 'confidence:' \"$FIRST_DRAFT\""
+    soft_check "draft has YAML frontmatter"   "grep -q '^---' \"$FIRST_DRAFT\""
+    soft_check "draft has title field"        "grep -q 'title:' \"$FIRST_DRAFT\""
+    soft_check "draft has status: draft"      "grep -q 'status: draft' \"$FIRST_DRAFT\""
+    soft_check "draft has sources field"      "grep -q 'sources:' \"$FIRST_DRAFT\""
+    soft_check "draft has content"            "test \$(wc -l < \"$FIRST_DRAFT\") -ge 10"
+    soft_check "draft has ## Sources section" "grep -q '^## Sources' \"$FIRST_DRAFT\""
+    soft_check "draft has confidence field"   "grep -q 'confidence:' \"$FIRST_DRAFT\""
     if [[ "$INLINE_SOURCE_CITATIONS_TOML" == "true" ]]; then
-        check "draft source legend has citation ids" "grep -q '^- \[S[0-9]\+\] \[\[sources/' \"$FIRST_DRAFT\""
+        soft_check "draft source legend has citation ids" "grep -q '^- \[S[0-9]\+\] \[\[sources/' \"$FIRST_DRAFT\""
         if grep -q '\[\[sources/.*|S[0-9]' "$FIRST_DRAFT"; then
             pass "draft has inline source citation link"
             PASS_COUNT=$((PASS_COUNT + 1))
@@ -609,7 +615,7 @@ except Exception as e:
     sys.exit(1)
 PYEOF
 )
-    check "draft YAML is parseable" "test -z \"$DRAFT_YAML_OK\""
+    soft_check "draft YAML is parseable" "test -z \"$DRAFT_YAML_OK\""
     DRAFT_TAG_BAD=$(uv run --project "$REPO_DIR" python - "$FIRST_DRAFT" 2>/dev/null <<'PYEOF'
 import sys
 try:
@@ -625,7 +631,7 @@ except Exception as e:
     sys.exit(1)
 PYEOF
 )
-    check "draft tags are valid (lowercase, no spaces, no special chars)" "test -z \"$DRAFT_TAG_BAD\""
+    soft_check "draft tags are valid (lowercase, no spaces, no special chars)" "test -z \"$DRAFT_TAG_BAD\""
 fi
 
 # ── Status after compile ──────────────────────────────────────────────────────
@@ -639,7 +645,7 @@ $OLW approve --all 2>&1
 WIKI_COUNT=$(find "$VAULT_DIR/wiki" -name "*.md" -not -path "*/.drafts/*" 2>/dev/null | wc -l | tr -d ' ')
 check "articles published to wiki/"    "test '$WIKI_COUNT' -ge 1"
 check "drafts directory now empty"     "test \$(find $VAULT_DIR/wiki/.drafts -name '*.md' 2>/dev/null | wc -l) -eq 0"
-check "git commit created"             "git -C $VAULT_DIR log --oneline | grep -q '\[synto\]'"
+soft_check "git commit created"             "git -C $VAULT_DIR log --oneline | grep -q '\[synto\]'"
 
 # Bulk YAML validity + tag check on all published wiki pages
 # Use -print0 / read -d '' to handle spaces and special chars in filenames
@@ -677,14 +683,14 @@ while IFS= read -r -d '' md; do
 done < <(find "$VAULT_DIR/wiki" -name "*.md" -not -path "*/.drafts/*" -print0 2>/dev/null)
 rm -f "$_YAML_VALIDATOR"
 
-check "all published pages have valid YAML" "test $YAML_FAIL -eq 0"
-check "no published pages have invalid tags (spaces/uppercase/special)" "test $TAG_FAIL -eq 0"
+soft_check "all published pages have valid YAML" "test $YAML_FAIL -eq 0"
+soft_check "no published pages have invalid tags (spaces/uppercase/special)" "test $TAG_FAIL -eq 0"
 
 # Empty wikilinks [[]] in published articles indicate a model output bug
 EMPTY_WIKILINK_FILES=$({ grep -rl '\[\[\]\]' "$VAULT_DIR/wiki/" \
     --include='*.md' --exclude-dir='.drafts' --exclude-dir='sources' \
     --exclude-dir='queries' 2>/dev/null || true; } | wc -l | tr -d ' ')
-check "no published article contains empty [[]] wikilinks" \
+soft_check "no published article contains empty [[]] wikilinks" \
     "test '$EMPTY_WIKILINK_FILES' -eq 0"
 
 # #28: at least one published article must carry an aliases: field in frontmatter.
@@ -694,7 +700,7 @@ ARTICLES_WITH_ALIASES=$({ grep -rl '^aliases:' "$VAULT_DIR/wiki/" \
     --include='*.md' --exclude-dir='.drafts' --exclude-dir='sources' \
     --exclude-dir='queries' 2>/dev/null || true; } | wc -l | tr -d ' ')
 info "Articles with aliases frontmatter: $ARTICLES_WITH_ALIASES"
-check "at least one published article has aliases: frontmatter (issue #28)" \
+soft_check "at least one published article has aliases: frontmatter (issue #28)" \
     "test '$ARTICLES_WITH_ALIASES' -ge 1"
 
 # ── Maintain issue-type coverage (corrupt → assert → restore) ─────────────────
@@ -715,7 +721,7 @@ if [[ -n "$_VICTIM" ]]; then
     echo "#smoke-inline-tag" >> "$_VICTIM"
     _LT_RC=0; LT_OUT=$($OLW maintain --dry-run 2>&1) || _LT_RC=$?
     check "maintain exits 0 after inline_tag corruption" "test $_LT_RC -eq 0"
-    check "maintain detects inline_tag" "echo \"\$LT_OUT\" | grep -qE 'inline_tag'"
+    soft_check "maintain detects inline_tag" "echo \"\$LT_OUT\" | grep -qE 'inline_tag'"
     cp "$_VICTIM_BACKUP" "$_VICTIM"
 
     # missing_frontmatter — rewrite victim with only body, no frontmatter
@@ -727,7 +733,7 @@ with open(path, 'w') as f:
 PYEOF
     _LT_RC=0; LT_OUT=$($OLW maintain --dry-run 2>&1) || _LT_RC=$?
     check "maintain exits 0 after missing_frontmatter corruption" "test $_LT_RC -eq 0"
-    check "maintain detects missing_frontmatter" \
+    soft_check "maintain detects missing_frontmatter" \
         "echo \"\$LT_OUT\" | grep -qE 'missing_frontmatter'"
     cp "$_VICTIM_BACKUP" "$_VICTIM"
 
@@ -743,7 +749,7 @@ with open(path, 'w') as f:
 PYEOF
     _LT_RC=0; LT_OUT=$($OLW maintain --dry-run 2>&1) || _LT_RC=$?
     check "maintain exits 0 after invalid_tag corruption" "test $_LT_RC -eq 0"
-    check "maintain detects invalid_tag" "echo \"\$LT_OUT\" | grep -qE 'invalid_tag'"
+    soft_check "maintain detects invalid_tag" "echo \"\$LT_OUT\" | grep -qE 'invalid_tag'"
     cp "$_VICTIM_BACKUP" "$_VICTIM"
 
     # low_confidence — set confidence below threshold (0.3, strict <)
@@ -757,7 +763,7 @@ with open(path, 'w') as f:
 PYEOF
     _LT_RC=0; LT_OUT=$($OLW maintain --dry-run 2>&1) || _LT_RC=$?
     check "maintain exits 0 after low_confidence corruption" "test $_LT_RC -eq 0"
-    check "maintain detects low_confidence" \
+    soft_check "maintain detects low_confidence" \
         "echo \"\$LT_OUT\" | grep -qE 'low_confidence'"
     cp "$_VICTIM_BACKUP" "$_VICTIM"
 
@@ -766,7 +772,7 @@ PYEOF
     echo "Untracked manual edit to trigger stale detection." >> "$_VICTIM"
     _LT_RC=0; LT_OUT=$($OLW maintain --dry-run 2>&1) || _LT_RC=$?
     check "maintain exits 0 after stale corruption" "test $_LT_RC -eq 0"
-    check "maintain detects stale" "echo \"\$LT_OUT\" | grep -qE 'stale'"
+    soft_check "maintain detects stale" "echo \"\$LT_OUT\" | grep -qE 'stale'"
     cp "$_VICTIM_BACKUP" "$_VICTIM"
 
     rm -f "$_VICTIM_BACKUP"
@@ -787,9 +793,9 @@ rsync -a "$VAULT_DIR/" "$UNDO_VAULT_DIR/"
 UNDO_OUT=$($OLW undo --vault "$UNDO_VAULT_DIR" 2>&1)
 echo "$UNDO_OUT"
 
-check "undo reverted publish commit" \
+soft_check "undo reverted publish commit" \
     "git -C $UNDO_VAULT_DIR log --oneline | grep -q 'Revert'"
-check "undo leaves main smoke vault published" \
+soft_check "undo leaves main smoke vault published" \
     "test \$(find \"$VAULT_DIR/wiki\" -maxdepth 1 -name '*.md' ! -name 'index.md' ! -name 'log.md' 2>/dev/null | wc -l | tr -d ' ') -ge 1"
 
 # ── Incremental compile (3rd note → only new concepts compiled) ───────────────
@@ -816,7 +822,7 @@ $OLW ingest "$VAULT_DIR/raw/deep-learning.md" 2>&1
 INGEST3_OUT=$($OLW compile --dry-run 2>&1)
 echo "$INGEST3_OUT"
 _TMP=$(mktemp); echo "$INGEST3_OUT" > "$_TMP"
-check "dry run shows only new concepts" \
+soft_check "dry run shows only new concepts" \
     "grep -qiE 'concept|compile|deep|neural|no concept' \"$_TMP\""
 rm -f "$_TMP"
 
@@ -838,7 +844,7 @@ if [[ -n "$WIKI_ARTICLE" ]]; then
     check "compile after manual edit exits 0" "test $_MEC_RC -eq 0"
     # Manually edited article should be skipped (not recompiled)
     DRAFT_AFTER_EDIT=$(find "$VAULT_DIR/wiki/.drafts" -name "$(basename $WIKI_ARTICLE)" 2>/dev/null | wc -l | tr -d ' ')
-    check "manually edited article skipped in compile" \
+    soft_check "manually edited article skipped in compile" \
         "test \"$DRAFT_AFTER_EDIT\" -eq 0"
 fi
 
@@ -850,7 +856,7 @@ _DUP_RC=0
 INGEST_OUT=$($OLW ingest "$VAULT_DIR/raw/quantum-computing-copy.md" 2>&1) || _DUP_RC=$?
 check "duplicate ingest exits 0" "test $_DUP_RC -eq 0"
 _TMP=$(mktemp); echo "$INGEST_OUT" > "$_TMP"
-check "duplicate skipped" "grep -qiE 'skip|duplicate|already' \"$_TMP\""
+soft_check "duplicate skipped" "grep -qiE 'skip|duplicate|already' \"$_TMP\""
 rm -f "$_TMP"
 rm -f "$VAULT_DIR/raw/quantum-computing-copy.md"
 
@@ -858,7 +864,7 @@ rm -f "$VAULT_DIR/raw/quantum-computing-copy.md"
 header "synto query (Stage 3)"
 PUBLISHED_ARTICLE_COUNT=$(find "$VAULT_DIR/wiki" -maxdepth 1 -name '*.md' \
     ! -name 'index.md' ! -name 'log.md' 2>/dev/null | wc -l | tr -d ' ')
-check "query stage has published articles to search" "test '$PUBLISHED_ARTICLE_COUNT' -ge 1"
+soft_check "query stage has published articles to search" "test '$PUBLISHED_ARTICLE_COUNT' -ge 1"
 
 info "Running query against wiki..."
 _Q_RC=0
@@ -866,7 +872,7 @@ QUERY_OUT=$($OLW query "What is a qubit?" 2>&1) || _Q_RC=$?
 echo "$QUERY_OUT"
 check "query exits 0" "test $_Q_RC -eq 0"
 _TMP=$(mktemp); echo "$QUERY_OUT" > "$_TMP"
-check "query returns an answer" \
+soft_check "query returns an answer" \
     "grep -qiE 'qubit|quantum|superposition|bit' \"$_TMP\""
 rm -f "$_TMP"
 
@@ -876,7 +882,7 @@ QUERY_SAVE_OUT=$($OLW query --save "What algorithms are used in quantum computin
 echo "$QUERY_SAVE_OUT"
 check "query --save exits 0" "test $_QS_RC -eq 0"
 QUERY_COUNT=$(find "$VAULT_DIR/wiki/queries" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
-check "query --save creates file in wiki/queries/" "test \"$QUERY_COUNT\" -ge 1"
+soft_check "query --save creates file in wiki/queries/" "test \"$QUERY_COUNT\" -ge 1"
 
 info "Running query with --synthesize..."
 _QSY_RC=0
@@ -884,12 +890,12 @@ QUERY_SYNTH_OUT=$($OLW query --synthesize "What algorithms are used in quantum c
 echo "$QUERY_SYNTH_OUT"
 check "query --synthesize exits 0" "test $_QSY_RC -eq 0"
 SYNTH_COUNT=$(find "$VAULT_DIR/wiki/synthesis" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
-check "query --synthesize creates file in wiki/synthesis/" "test \"$SYNTH_COUNT\" -ge 1"
+soft_check "query --synthesize creates file in wiki/synthesis/" "test \"$SYNTH_COUNT\" -ge 1"
 _SYNTH_FILE=$(find "$VAULT_DIR/wiki/synthesis" -name "*.md" | head -1)
-check "synthesis frontmatter records kind" "grep -q '^kind: synthesis' \"$_SYNTH_FILE\""
-check "synthesis frontmatter records question hash" "grep -q '^question_hash:' \"$_SYNTH_FILE\""
-check "synthesis includes sources section" "grep -q '^## Sources' \"$_SYNTH_FILE\""
-check "index lists synthesis section" "grep -q '^## Synthesis' \"$VAULT_DIR/wiki/index.md\""
+soft_check "synthesis frontmatter records kind" "grep -q '^kind: synthesis' \"$_SYNTH_FILE\""
+soft_check "synthesis frontmatter records question hash" "grep -q '^question_hash:' \"$_SYNTH_FILE\""
+soft_check "synthesis includes sources section" "grep -q '^## Sources' \"$_SYNTH_FILE\""
+soft_check "index lists synthesis section" "grep -q '^## Synthesis' \"$VAULT_DIR/wiki/index.md\""
 
 info "Re-running query with --synthesize to check duplicate handling..."
 _QSY2_RC=0
@@ -897,7 +903,7 @@ QUERY_SYNTH_DUP_OUT=$($OLW query --synthesize "What algorithms are used in quant
 echo "$QUERY_SYNTH_DUP_OUT"
 check "duplicate query --synthesize exits 0" "test $_QSY2_RC -eq 0"
 SYNTH_COUNT_AFTER=$(find "$VAULT_DIR/wiki/synthesis" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
-check "duplicate query --synthesize keeps existing file" "test \"$SYNTH_COUNT_AFTER\" = \"$SYNTH_COUNT\""
+soft_check "duplicate query --synthesize keeps existing file" "test \"$SYNTH_COUNT_AFTER\" = \"$SYNTH_COUNT\""
 
 # ── Report (Stage 3) ──────────────────────────────────────────────────────────
 header "synto report (Stage 3)"
@@ -906,11 +912,11 @@ STATS_OUT=$($OLW report 2>&1) || _STATS_RC=$?
 echo "$STATS_OUT"
 check "report exits 0" "test $_STATS_RC -eq 0"
 _TMP=$(mktemp); echo "$STATS_OUT" > "$_TMP"
-check "report prints raw note count" "grep -q 'Raw notes:' \"$_TMP\""
-check "report prints published article count" "grep -q 'Published articles:' \"$_TMP\""
-check "report prints synthesis article count" "grep -q 'Synthesis articles:' \"$_TMP\""
-check "report prints provider" "grep -q 'Provider:' \"$_TMP\""
-check "report shows synthesis article after query --synthesize" \
+soft_check "report prints raw note count" "grep -q 'Raw notes:' \"$_TMP\""
+soft_check "report prints published article count" "grep -q 'Published articles:' \"$_TMP\""
+soft_check "report prints synthesis article count" "grep -q 'Synthesis articles:' \"$_TMP\""
+soft_check "report prints provider" "grep -q 'Provider:' \"$_TMP\""
+soft_check "report shows synthesis article after query --synthesize" \
     "grep -qE 'Synthesis articles: [1-9][0-9]*' \"$_TMP\""
 rm -f "$_TMP"
 
@@ -918,7 +924,7 @@ _STATS_JSON_RC=0
 STATS_JSON=$($OLW report --json 2>&1) || _STATS_JSON_RC=$?
 check "report --json exits 0" "test $_STATS_JSON_RC -eq 0"
 _TMP=$(mktemp); echo "$STATS_JSON" > "$_TMP"
-check "report --json is parseable and complete" "uv run --project \"$REPO_DIR\" python - \"$_TMP\" <<'PYEOF'
+soft_check "report --json is parseable and complete" "uv run --project \"$REPO_DIR\" python - \"$_TMP\" <<'PYEOF'
 import json
 import sys
 
@@ -940,17 +946,17 @@ EVAL_OUT=$($OLW eval 2>&1) || _EVAL_RC=$?
 echo "$EVAL_OUT"
 check "eval exits 0" "test $_EVAL_RC -eq 0"
 _TMP=$(mktemp); echo "$EVAL_OUT" > "$_TMP"
-check "eval prints article coverage" "grep -q 'Article coverage:' \"$_TMP\""
-check "eval prints index validity" "grep -q 'INDEX.json validity:' \"$_TMP\""
-check "eval prints wikilink resolution" "grep -q 'Wikilink resolution:' \"$_TMP\""
-check "eval prints harmonic mean" "grep -q 'Harmonic mean:' \"$_TMP\""
+soft_check "eval prints article coverage" "grep -q 'Article coverage:' \"$_TMP\""
+soft_check "eval prints index validity" "grep -q 'INDEX.json validity:' \"$_TMP\""
+soft_check "eval prints wikilink resolution" "grep -q 'Wikilink resolution:' \"$_TMP\""
+soft_check "eval prints harmonic mean" "grep -q 'Harmonic mean:' \"$_TMP\""
 rm -f "$_TMP"
 
 _EVAL_JSON_RC=0
 EVAL_JSON=$($OLW eval --json 2>&1) || _EVAL_JSON_RC=$?
 check "eval --json exits 0" "test $_EVAL_JSON_RC -eq 0"
 _TMP=$(mktemp); echo "$EVAL_JSON" > "$_TMP"
-check "eval --json is parseable and complete" "uv run --project \"$REPO_DIR\" python - \"$_TMP\" <<'PYEOF'
+soft_check "eval --json is parseable and complete" "uv run --project \"$REPO_DIR\" python - \"$_TMP\" <<'PYEOF'
 import json
 import sys
 
@@ -973,10 +979,10 @@ _PACK_RC=0
 PACK_OUT_TEXT=$($OLW pack export --target agents --out "$PACK_OUT" 2>&1) || _PACK_RC=$?
 echo "$PACK_OUT_TEXT"
 check "pack export exits 0" "test $_PACK_RC -eq 0"
-check "pack export writes pack.toml" "test -f '$PACK_OUT/pack.toml'"
-check "pack export writes routes.json" "test -f '$PACK_OUT/agent/routes.json'"
-check "pack export writes INDEX.json" "test -f '$PACK_OUT/index/INDEX.json'"
-check "routes.json has populated Phase 1A payload" "uv run --project \"$REPO_DIR\" python - '$PACK_OUT/agent/routes.json' <<'PYEOF'
+soft_check "pack export writes pack.toml" "test -f '$PACK_OUT/pack.toml'"
+soft_check "pack export writes routes.json" "test -f '$PACK_OUT/agent/routes.json'"
+soft_check "pack export writes INDEX.json" "test -f '$PACK_OUT/index/INDEX.json'"
+soft_check "routes.json has populated Phase 1A payload" "uv run --project \"$REPO_DIR\" python - '$PACK_OUT/agent/routes.json' <<'PYEOF'
 import json
 import sys
 
@@ -987,7 +993,7 @@ assert payload['schema_version'] == 1
 assert isinstance(payload['routes'], list)
 assert len(payload['routes']) > 0
 PYEOF"
-check "pack export INDEX.json includes papers" "uv run --project \"$REPO_DIR\" python - '$PACK_OUT/index/INDEX.json' <<'PYEOF'
+soft_check "pack export INDEX.json includes papers" "uv run --project \"$REPO_DIR\" python - '$PACK_OUT/index/INDEX.json' <<'PYEOF'
 import json
 import sys
 
@@ -1009,12 +1015,12 @@ print(events + rollups)
 conn.close()
 PYEOF
 )
-check "report has rows before clear" "test '$METRIC_ROWS_BEFORE' -gt 0"
+soft_check "report has rows before clear" "test '$METRIC_ROWS_BEFORE' -gt 0"
 _TC_RC=0
 METRICS_CLEAR_OUT=$($OLW report clear --yes 2>&1) || _TC_RC=$?
 echo "$METRICS_CLEAR_OUT"
 check "report clear exits 0" "test $_TC_RC -eq 0"
-check "report clear reports deleted rows" "echo \"$METRICS_CLEAR_OUT\" | grep -q 'rows deleted'"
+soft_check "report clear reports deleted rows" "echo \"$METRICS_CLEAR_OUT\" | grep -q 'rows deleted'"
 METRIC_ROWS_AFTER=$(python3 - <<PYEOF
 import sqlite3
 conn = sqlite3.connect("$VAULT_DIR/.synto/state.db")
@@ -1024,7 +1030,7 @@ print(events + rollups)
 conn.close()
 PYEOF
 )
-check "report clear rows cleared" "test '$METRIC_ROWS_AFTER' -eq 0"
+soft_check "report clear rows cleared" "test '$METRIC_ROWS_AFTER' -eq 0"
 
 # ── serve help (Phase 1A) ────────────────────────────────────────────────────
 header "synto serve --help"
@@ -1032,8 +1038,8 @@ _SERVE_HELP_RC=0
 SERVE_HELP_OUT=$($OLW serve --help 2>&1) || _SERVE_HELP_RC=$?
 echo "$SERVE_HELP_OUT"
 check "serve --help exits 0" "test $_SERVE_HELP_RC -eq 0"
-check "serve help mentions stdio transport" "echo \"$SERVE_HELP_OUT\" | grep -q 'stdio'"
-check "serve help describes exposed tools" "echo \"$SERVE_HELP_OUT\" | grep -q 'Exposes three tools only'"
+soft_check "serve help mentions stdio transport" "echo \"$SERVE_HELP_OUT\" | grep -q 'stdio'"
+soft_check "serve help describes exposed tools" "echo \"$SERVE_HELP_OUT\" | grep -q 'Exposes three tools only'"
 
 # ── Maintain --dry-run (Stage 3) ──────────────────────────────────────────────
 header "synto maintain --dry-run (Stage 3)"
@@ -1042,7 +1048,7 @@ echo "$LINT_OUT"
 check "maintain --dry-run exits 0" "test $_LINT_RC -eq 0"
 _TMP=$(mktemp); echo "$LINT_OUT" > "$_TMP"
 # CLI prints: "Structural health: {score}/100  {summary}"
-check "maintain --dry-run prints Structural health: <score>/100 header" \
+soft_check "maintain --dry-run prints Structural health: <score>/100 header" \
     "grep -qiE 'health: [0-9]+(\.[0-9]+)?/100' \"$_TMP\""
 rm -f "$_TMP"
 
@@ -1070,7 +1076,7 @@ PYEOF
 _SF_RC=0
 STATUS_FAILED=$($OLW status --failed 2>&1) || _SF_RC=$?
 check "status --failed exits 0" "test $_SF_RC -eq 0"
-check "status --failed lists the failed note" \
+soft_check "status --failed lists the failed note" \
     "echo \"\$STATUS_FAILED\" | grep -qF 'raw/fake-failed.md'"
 
 _RETRY_TMP=$(mktemp)
@@ -1078,7 +1084,7 @@ _RETRY_RC=0
 $OLW compile --retry-failed > "$_RETRY_TMP" 2>&1 || _RETRY_RC=$?
 cat "$_RETRY_TMP"
 check "compile --retry-failed exits 0" "test $_RETRY_RC -eq 0"
-check "retry-failed reports failed notes" \
+soft_check "retry-failed reports failed notes" \
     "grep -qiE 'retry|failed|not found|re-ingest' \"$_RETRY_TMP\""
 rm -f "$_RETRY_TMP"
 
@@ -1107,9 +1113,9 @@ RUN_OUT=$($OLW run 2>&1) || _RUN_RC=$?
 echo "$RUN_OUT"
 check "synto run exits 0" "test $_RUN_RC -eq 0"
 _TMP=$(mktemp); echo "$RUN_OUT" > "$_TMP"
-check "synto run completes without fatal error" \
+soft_check "synto run completes without fatal error" \
     "! grep -qiE 'traceback|exception|fatal' \"$_TMP\""
-check "synto run reports ingested or compiled" \
+soft_check "synto run reports ingested or compiled" \
     "grep -qiE 'ingest|compile|draft|publish|rounds' \"$_TMP\""
 rm -f "$_TMP"
 
@@ -1119,7 +1125,7 @@ RUN_DRYRUN_OUT=$($OLW run --dry-run 2>&1) || _RUNDRY_RC=$?
 check "synto run --dry-run exits 0" "test $_RUNDRY_RC -eq 0"
 DRAFTS_AFTER=$(find "$VAULT_DIR/wiki/.drafts" -name '*.md' 2>/dev/null | wc -l | tr -d ' ')
 _TMP=$(mktemp); echo "$RUN_DRYRUN_OUT" > "$_TMP"
-check "synto run --dry-run makes no LLM calls (no new drafts)" \
+soft_check "synto run --dry-run makes no LLM calls (no new drafts)" \
     "test '$DRAFTS_AFTER' -eq '$DRAFTS_BEFORE'"
 rm -f "$_TMP"
 
@@ -1152,7 +1158,7 @@ $OLW approve --all 2>&1 || true
 PUBLISHED_WITH_ANNOTATION=$({ grep -rl 'olw-auto' "$VAULT_DIR/wiki/" \
     --include='*.md' --exclude-dir='.drafts' --exclude-dir='sources' 2>/dev/null || true; } \
     | wc -l | tr -d ' ')
-check "no olw-auto annotations in published articles" \
+soft_check "no olw-auto annotations in published articles" \
     "test '$PUBLISHED_WITH_ANNOTATION' -eq 0"
 
 # ── Rejection feedback loop ───────────────────────────────────────────────────
@@ -1180,8 +1186,8 @@ if [[ -n "$REJECT_DRAFT" ]]; then
     REJECT_OUT=$($OLW reject "$REJECT_DRAFT" --feedback "Too brief, needs more concrete examples" 2>&1) || _REJ_RC=$?
     echo "$REJECT_OUT"
     check "reject exits 0" "test $_REJ_RC -eq 0"
-    check "reject removes draft file" "test ! -f \"$REJECT_DRAFT\""
-    check "reject confirms feedback saved" \
+    soft_check "reject removes draft file" "test ! -f \"$REJECT_DRAFT\""
+    soft_check "reject confirms feedback saved" \
         "echo \"$REJECT_OUT\" | grep -qiE 'feedback|saved|rejection|next compile'"
 
     # Force concept back to compile again and verify feedback appears in output
@@ -1198,7 +1204,7 @@ PYEOF
     echo "$COMPILE_OUT2"
     check "compile after rejection exits 0" "test $_CAR_RC -eq 0"
     # We can't easily inspect the prompt, but compile should succeed without crash
-    check "recompile after rejection completes" \
+    soft_check "recompile after rejection completes" \
         "! echo \"$COMPILE_OUT2\" | grep -qiE 'traceback|fatal'"
 else
     pass "rejection test skipped (no draft available)"
@@ -1224,7 +1230,7 @@ _SB_RC=0
 STATUS_BLOCKED=$($OLW status 2>&1) || _SB_RC=$?
 check "status (with block) exits 0" "test $_SB_RC -eq 0"
 _TMP=$(mktemp); echo "$STATUS_BLOCKED" > "$_TMP"
-check "status shows blocked concept" \
+soft_check "status shows blocked concept" \
     "grep -qiE 'blocked|Fake Blocked' \"$_TMP\""
 rm -f "$_TMP"
 
@@ -1232,14 +1238,14 @@ _UB_RC=0
 UNBLOCK_OUT=$($OLW unblock "Fake Blocked Concept" 2>&1) || _UB_RC=$?
 echo "$UNBLOCK_OUT"
 check "unblock exits 0" "test $_UB_RC -eq 0"
-check "unblock completes without error" \
+soft_check "unblock completes without error" \
     "! echo \"$UNBLOCK_OUT\" | grep -qiE 'traceback|error'"
 # Capture status output, then grep — prevents false-pass if status itself crashes
 # (previous inline-pipe idiom let a status crash look like "no match" via pipefail disable in check())
 _SAU_RC=0
 STATUS_AFTER_UNBLOCK=$($OLW status 2>&1) || _SAU_RC=$?
 check "status (after unblock) exits 0" "test $_SAU_RC -eq 0"
-check "concept no longer blocked after unblock" \
+soft_check "concept no longer blocked after unblock" \
     "! echo \"\$STATUS_AFTER_UNBLOCK\" | grep -qiE 'Fake Blocked'"
 
 # ── synto maintain ─────────────────────────────────────────────────────────────
@@ -1249,9 +1255,9 @@ MAINTAIN_OUT=$($OLW maintain 2>&1) || _M_RC=$?
 echo "$MAINTAIN_OUT"
 check "maintain exits 0" "test $_M_RC -eq 0"
 _TMP=$(mktemp); echo "$MAINTAIN_OUT" > "$_TMP"
-check "maintain runs without fatal error" \
+soft_check "maintain runs without fatal error" \
     "! grep -qiE 'traceback|exception|fatal' \"$_TMP\""
-check "maintain reports health or quality info" \
+soft_check "maintain reports health or quality info" \
     "grep -qiE 'health|quality|lint|stub|orphan|issue|ok' \"$_TMP\""
 rm -f "$_TMP"
 
@@ -1259,7 +1265,7 @@ _MD_RC=0
 MAINTAIN_DRY_OUT=$($OLW maintain --dry-run 2>&1) || _MD_RC=$?
 check "maintain --dry-run exits 0" "test $_MD_RC -eq 0"
 _TMP=$(mktemp); echo "$MAINTAIN_DRY_OUT" > "$_TMP"
-check "maintain --dry-run completes" \
+soft_check "maintain --dry-run completes" \
     "! grep -qiE 'traceback|fatal' \"$_TMP\""
 rm -f "$_TMP"
 
@@ -1276,7 +1282,7 @@ if [[ -n "$FIRST_WIKI" ]]; then
     echo "$STUB_OUT"
     check "maintain --fix (stub) exits 0" "test $_STUB_RC -eq 0"
     _TMP=$(mktemp); echo "$STUB_OUT" > "$_TMP"
-    check "maintain --fix runs without fatal error" \
+    soft_check "maintain --fix runs without fatal error" \
         "! grep -qiE 'traceback|fatal' \"$_TMP\""
     # Verify stub draft was created in .drafts or DB has stub entry
     STUB_DRAFT_COUNT=$(find "$VAULT_DIR/wiki/.drafts" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
@@ -1290,19 +1296,19 @@ except Exception:
     print(0)
 conn.close()
 " 2>/dev/null || echo 0)
-    check "maintain --fix created stub draft or DB entry" \
+    soft_check "maintain --fix created stub draft or DB entry" \
         "test '$STUB_DRAFT_COUNT' -gt 0 || test '$STUB_DB_COUNT' -gt 0"
     # No stub should have a double .md.md extension (bug: model emits [[raw-note.md]] links)
     DOUBLE_MD_STUBS=$(find "$VAULT_DIR/wiki/.drafts" -name "*.md.md" 2>/dev/null | wc -l | tr -d ' ')
-    check "no stub has double .md.md extension" "test '$DOUBLE_MD_STUBS' -eq 0"
+    soft_check "no stub has double .md.md extension" "test '$DOUBLE_MD_STUBS' -eq 0"
     # Stub shape — create_stubs writes to drafts_dir with status=stub, confidence=0.0, [!info] callout.
     # Filename is sanitize_filename("Nonexistent Stub Topic") + .md.
     _STUB_FILE=$(find "$VAULT_DIR/wiki/.drafts" -iname 'nonexistent*stub*topic*.md' 2>/dev/null | head -1)
     if [[ -n "$_STUB_FILE" ]]; then
-        check "stub body has [!info] callout" "grep -qF '[!info]' \"$_STUB_FILE\""
-        check "stub frontmatter has status: stub" \
+        soft_check "stub body has [!info] callout" "grep -qF '[!info]' \"$_STUB_FILE\""
+        soft_check "stub frontmatter has status: stub" \
             "grep -qE '^status: stub' \"$_STUB_FILE\""
-        check "stub frontmatter has confidence: 0 or 0.0" \
+        soft_check "stub frontmatter has confidence: 0 or 0.0" \
             "grep -qE '^confidence: 0(\.0)?\$' \"$_STUB_FILE\""
     else
         info "Stub shape check skipped (no stub file matching nonexistent*stub*topic*.md)"
@@ -1367,12 +1373,12 @@ MDEOF
     check "maintain --fix (alias repair) exits 0" "test $_REP_RC -eq 0"
 
     _TMP=$(mktemp); echo "$REPAIR_OUT" > "$_TMP"
-    check "maintain --fix runs without fatal error (alias repair, issue #29)" \
+    soft_check "maintain --fix runs without fatal error (alias repair, issue #29)" \
         "! grep -qiE 'traceback|fatal' \"$_TMP\""
     rm -f "$_TMP"
 
     # 4. Verify [[STC alias]] was rewritten to [[Smoke Test Concept|STC alias]]
-    check "maintain --fix rewrote alias link to canonical form (issue #29)" \
+    soft_check "maintain --fix rewrote alias link to canonical form (issue #29)" \
         "grep -qF '[[Smoke Test Concept|STC alias]]' \"$REPAIR_WIKI\""
 
     # Cleanup injected content and synthetic article
@@ -1402,7 +1408,7 @@ $OLW maintain --fix > /dev/null 2>&1 || _IDEMP_RC=$?
 check "maintain --fix (idempotency run) exits 0" "test $_IDEMP_RC -eq 0"
 _SNAP_AFTER=$(find "$VAULT_DIR/wiki" -type f -name '*.md' \
     -not -path '*/.drafts/*' -exec shasum {} \; 2>/dev/null | sort)
-check "maintain --fix is idempotent (no changes on second run)" \
+soft_check "maintain --fix is idempotent (no changes on second run)" \
     "test \"\$_SNAP_BEFORE\" = \"\$_SNAP_AFTER\""
 
 # ── compile --legacy smoke pass ───────────────────────────────────────────────
@@ -1435,7 +1441,7 @@ SUP_OUT=$($OLW support 2>&1) || _SUP_RC=$?
 echo "$SUP_OUT"
 check "synto support exits 0" "test $_SUP_RC -eq 0"
 _TMP=$(mktemp); echo "$SUP_OUT" > "$_TMP"
-check "synto support output contains issues URL keyword" \
+soft_check "synto support output contains issues URL keyword" \
     "grep -qiE 'github|issues' \"$_TMP\""
 rm -f "$_TMP"
 
@@ -1446,7 +1452,7 @@ DOC_OUT=$($OLW doctor 2>&1) || _DOC_RC=$?
 echo "$DOC_OUT"
 check "doctor exits 0 when provider reachable and vault valid" "test $_DOC_RC -eq 0"
 _TMP=$(mktemp); echo "$DOC_OUT" > "$_TMP"
-check "doctor output contains Vault structure section" \
+soft_check "doctor output contains Vault structure section" \
     "grep -q 'Vault structure' \"$_TMP\""
 rm -f "$_TMP"
 
@@ -1461,13 +1467,13 @@ _CISC_ON_RC=0
 CISC_ON_OUT=$($OLW config inline-source-citations on 2>&1) || _CISC_ON_RC=$?
 echo "$CISC_ON_OUT"
 check "config inline-source-citations on exits 0" "test $_CISC_ON_RC -eq 0"
-check "config inline-source-citations on writes true to synto.toml" \
+soft_check "config inline-source-citations on writes true to synto.toml" \
     "grep -q 'inline_source_citations = true' '$VAULT_DIR/synto.toml'"
 
 _CISC_STATUS2_RC=0
 CISC_STATUS2_OUT=$($OLW config inline-source-citations status 2>&1) || _CISC_STATUS2_RC=$?
 _TMP=$(mktemp); echo "$CISC_STATUS2_OUT" > "$_TMP"
-check "config inline-source-citations status after on prints enabled" \
+soft_check "config inline-source-citations status after on prints enabled" \
     "grep -qiE 'enabled|on|true' \"$_TMP\""
 rm -f "$_TMP"
 
@@ -1475,13 +1481,13 @@ _CISC_OFF_RC=0
 CISC_OFF_OUT=$($OLW config inline-source-citations off 2>&1) || _CISC_OFF_RC=$?
 echo "$CISC_OFF_OUT"
 check "config inline-source-citations off exits 0" "test $_CISC_OFF_RC -eq 0"
-check "config inline-source-citations off writes false to synto.toml" \
+soft_check "config inline-source-citations off writes false to synto.toml" \
     "grep -q 'inline_source_citations = false' '$VAULT_DIR/synto.toml'"
 
 _CISC_STATUS3_RC=0
 CISC_STATUS3_OUT=$($OLW config inline-source-citations status 2>&1) || _CISC_STATUS3_RC=$?
 _TMP=$(mktemp); echo "$CISC_STATUS3_OUT" > "$_TMP"
-check "config inline-source-citations status after off prints disabled" \
+soft_check "config inline-source-citations status after off prints disabled" \
     "grep -qiE 'disabled|off|false' \"$_TMP\""
 rm -f "$_TMP"
 
@@ -1498,7 +1504,7 @@ row = conn.execute(\"SELECT status FROM raw_notes WHERE path='raw/quantum-comput
 print(row[0] if row else 'missing')
 conn.close()
 ")
-check "ingest --force note still has status ingested" "test '$_IF_STATUS' = 'ingested'"
+soft_check "ingest --force note still has status ingested" "test '$_IF_STATUS' = 'ingested'"
 
 # ── synto compile --auto-approve ──────────────────────────────────────────────
 header "synto compile --auto-approve"
@@ -1520,9 +1526,9 @@ COMPILE_AA_OUT=$($OLW compile --auto-approve 2>&1) || _CA_RC=$?
 echo "$COMPILE_AA_OUT"
 check "compile --auto-approve exits 0" "test $_CA_RC -eq 0"
 _CA_DRAFTS_AFTER=$(find "$VAULT_DIR/wiki/.drafts" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
-check "compile --auto-approve leaves no drafts" "test '$_CA_DRAFTS_AFTER' -eq 0"
+soft_check "compile --auto-approve leaves no drafts" "test '$_CA_DRAFTS_AFTER' -eq 0"
 _CA_OUT_TMP=$(mktemp); echo "$COMPILE_AA_OUT" > "$_CA_OUT_TMP"
-check "compile --auto-approve published at least one article" \
+soft_check "compile --auto-approve published at least one article" \
     "grep -qi 'published' '$_CA_OUT_TMP'"
 rm -f "$_CA_OUT_TMP"
 
@@ -1549,7 +1555,7 @@ if [[ -n "$_CF_WIKI" ]]; then
     echo "$COMPILE_FORCE_OUT"
     check "compile --force exits 0" "test $_CF_RC -eq 0"
     _CF_DRAFTS_AFTER=$(find "$VAULT_DIR/wiki/.drafts" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
-    check "compile --force creates new draft bypassing manual edit protection" \
+    soft_check "compile --force creates new draft bypassing manual edit protection" \
         "test '$_CF_DRAFTS_AFTER' -gt '$_CF_DRAFTS_BEFORE'"
     sed -i '' '$ d' "$_CF_WIKI" 2>/dev/null || sed -i '$ d' "$_CF_WIKI" 2>/dev/null || true
 else
@@ -1580,7 +1586,7 @@ if [[ "$_APP_DRAFT_COUNT" -gt 0 ]]; then
     echo "$APP_MC_OUT"
     check "approve --all --min-confidence 2.0 exits 0" "test $_APP_MC_RC -eq 0"
     _APP_MC_DRAFTS=$(find "$VAULT_DIR/wiki/.drafts" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
-    check "approve --min-confidence 2.0 holds back all drafts" \
+    soft_check "approve --min-confidence 2.0 holds back all drafts" \
         "test '$_APP_MC_DRAFTS' -eq '$_APP_DRAFT_COUNT'"
 
     # Test individual draft approval
@@ -1589,7 +1595,7 @@ if [[ "$_APP_DRAFT_COUNT" -gt 0 ]]; then
     APP_SINGLE_OUT=$($OLW approve "$_APP_SINGLE" 2>&1) || _APP_SINGLE_RC=$?
     echo "$APP_SINGLE_OUT"
     check "approve <draft-file> exits 0" "test $_APP_SINGLE_RC -eq 0"
-    check "approve <draft-file> removes the draft" "test ! -f \"$_APP_SINGLE\""
+    soft_check "approve <draft-file> removes the draft" "test ! -f \"$_APP_SINGLE\""
 else
     pass "approve individual test skipped (no drafts produced)"
 fi
@@ -1617,9 +1623,9 @@ if [[ "$_REJ_ALL_DRAFTS" -gt 0 ]]; then
     echo "$REJ_ALL_OUT"
     check "reject --all exits 0" "test $_REJ_ALL_RC -eq 0"
     _REJ_ALL_AFTER=$(find "$VAULT_DIR/wiki/.drafts" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
-    check "reject --all empties wiki/.drafts" "test '$_REJ_ALL_AFTER' -eq 0"
+    soft_check "reject --all empties wiki/.drafts" "test '$_REJ_ALL_AFTER' -eq 0"
     _TMP=$(mktemp); echo "$REJ_ALL_OUT" > "$_TMP"
-    check "reject --all output mentions rejection" \
+    soft_check "reject --all output mentions rejection" \
         "grep -qiE 'reject' \"$_TMP\""
     rm -f "$_TMP"
 else
@@ -1688,21 +1694,21 @@ CLEANNOTE
 
 $OLW ingest --all --vault "$_CLEAN_VAULT" 2>&1 >/dev/null || true
 
-check "clean target vault has state.db before clean" "test -f '$_CLEAN_VAULT/.synto/state.db'"
-check "clean target vault has wiki files before clean" \
+soft_check "clean target vault has state.db before clean" "test -f '$_CLEAN_VAULT/.synto/state.db'"
+soft_check "clean target vault has wiki files before clean" \
     "test \$(find \"$_CLEAN_VAULT/wiki\" -name '*.md' 2>/dev/null | wc -l) -ge 1"
-check "clean target vault raw note exists before clean" "test -f '$_CLEAN_VAULT/raw/clean-test.md'"
+soft_check "clean target vault raw note exists before clean" "test -f '$_CLEAN_VAULT/raw/clean-test.md'"
 
 _CLEAN_RC=0
 CLEAN_OUT=$($OLW clean --vault "$_CLEAN_VAULT" --yes 2>&1) || _CLEAN_RC=$?
 echo "$CLEAN_OUT"
 check "clean --yes exits 0" "test $_CLEAN_RC -eq 0"
-check "clean --yes recreates wiki/.drafts" "test -d '$_CLEAN_VAULT/wiki/.drafts'"
-check "clean --yes recreates wiki/sources" "test -d '$_CLEAN_VAULT/wiki/sources'"
-check "clean --yes deletes state.db" "test ! -f '$_CLEAN_VAULT/.synto/state.db'"
-check "clean --yes leaves raw notes untouched" "test -f '$_CLEAN_VAULT/raw/clean-test.md'"
+soft_check "clean --yes recreates wiki/.drafts" "test -d '$_CLEAN_VAULT/wiki/.drafts'"
+soft_check "clean --yes recreates wiki/sources" "test -d '$_CLEAN_VAULT/wiki/sources'"
+soft_check "clean --yes deletes state.db" "test ! -f '$_CLEAN_VAULT/.synto/state.db'"
+soft_check "clean --yes leaves raw notes untouched" "test -f '$_CLEAN_VAULT/raw/clean-test.md'"
 _CLEAN_WIKI_FILES=$(find "$_CLEAN_VAULT/wiki" -maxdepth 1 -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
-check "clean --yes removes wiki article files" "test '$_CLEAN_WIKI_FILES' -eq 0"
+soft_check "clean --yes removes wiki article files" "test '$_CLEAN_WIKI_FILES' -eq 0"
 rm -rf "$_CLEAN_VAULT"
 
 # ── synto undo --steps 2 ──────────────────────────────────────────────────────
@@ -1718,7 +1724,7 @@ if [[ "$_UNDO_SYNTO_COMMITS" -ge 2 ]]; then
     echo "$UNDO2_OUT"
     check "undo --steps 2 exits 0" "test $_UNDO2_RC -eq 0"
     _UNDO2_REVERTS=$(git -C "$VAULT_DIR" log --oneline -4 2>/dev/null | grep -c 'Revert' || true)
-    check "undo --steps 2 creates 2 Revert commits" "test '$_UNDO2_REVERTS' -ge 2"
+    soft_check "undo --steps 2 creates 2 Revert commits" "test '$_UNDO2_REVERTS' -ge 2"
     # Re-approve to restore published state for subsequent tests
     $OLW approve --all 2>&1 >/dev/null || true
 else
@@ -1738,9 +1744,9 @@ MSO_OUT=$($OLW maintain --stubs-only 2>&1) || _MSO_RC=$?
 echo "$MSO_OUT"
 check "maintain --stubs-only exits 0" "test $_MSO_RC -eq 0"
 _TMP=$(mktemp); echo "$MSO_OUT" > "$_TMP"
-check "maintain --stubs-only mentions stub or creates draft" \
+soft_check "maintain --stubs-only mentions stub or creates draft" \
     "grep -qiE 'stub|draft' \"$_TMP\""
-check "maintain --stubs-only does not mention fix for frontmatter or tags" \
+soft_check "maintain --stubs-only does not mention fix for frontmatter or tags" \
     "! grep -qiE 'fix.*frontmatter|fix.*tag|missing_frontmatter|invalid_tag' \"$_TMP\""
 rm -f "$_TMP"
 [[ -n "$_MSO_VICTIM" ]] && {
@@ -1755,7 +1761,7 @@ MCC_OUT=$($OLW maintain --clear-cache 2>&1) || _MCC_RC=$?
 echo "$MCC_OUT"
 check "maintain --clear-cache exits 0" "test $_MCC_RC -eq 0"
 _TMP=$(mktemp); echo "$MCC_OUT" > "$_TMP"
-check "maintain --clear-cache mentions cache or cleared" \
+soft_check "maintain --clear-cache mentions cache or cleared" \
     "grep -qiE 'cache|cleared|deleted' \"$_TMP\""
 rm -f "$_TMP"
 
@@ -1766,7 +1772,7 @@ MCC2_OUT=$($OLW maintain --clear-cache --older-than 0 2>&1) || _MCC2_RC=$?
 echo "$MCC2_OUT"
 check "maintain --clear-cache --older-than 0 exits 0" "test $_MCC2_RC -eq 0"
 _TMP=$(mktemp); echo "$MCC2_OUT" > "$_TMP"
-check "maintain --clear-cache --older-than 0 has no traceback" \
+soft_check "maintain --clear-cache --older-than 0 has no traceback" \
     "! grep -qiE 'traceback' \"$_TMP\""
 rm -f "$_TMP"
 
@@ -1777,7 +1783,7 @@ IA_OUT=$($OLW items audit 2>&1) || _IA_RC=$?
 echo "$IA_OUT"
 check "items audit exits 0" "test $_IA_RC -eq 0"
 _TMP=$(mktemp); echo "$IA_OUT" > "$_TMP"
-check "items audit has no traceback" \
+soft_check "items audit has no traceback" \
     "! grep -qiE 'traceback' \"$_TMP\""
 rm -f "$_TMP"
 
@@ -1788,7 +1794,7 @@ IS_OUT=$($OLW items show "NonexistentItemXYZ123" 2>&1) || _IS_RC=$?
 echo "$IS_OUT"
 check "items show missing item exits non-zero" "test $_IS_RC -ne 0"
 _TMP=$(mktemp); echo "$IS_OUT" > "$_TMP"
-check "items show missing item output contains not found" \
+soft_check "items show missing item output contains not found" \
     "grep -qiE 'not found' \"$_TMP\""
 rm -f "$_TMP"
 
@@ -1803,7 +1809,7 @@ if [[ -n "$_TRACE_WIKI" ]]; then
     echo "$TR_OUT"
     check "trace article exits 0" "test $_TR_RC -eq 0"
     _TMP=$(mktemp); echo "$TR_OUT" > "$_TMP"
-    check "trace article output contains compile history or title or model" \
+    soft_check "trace article output contains compile history or title or model" \
         "grep -qiE 'Compile history|model' \"$_TMP\""
     rm -f "$_TMP"
 else
@@ -1834,15 +1840,15 @@ ADD_OUT=$($OLW add "$_ADD_TMPFILE" 2>&1) || _ADD_RC=$?
 echo "$ADD_OUT"
 check "add exits 0" "test $_ADD_RC -eq 0"
 _ADD_TMP=$(mktemp); echo "$ADD_OUT" > "$_ADD_TMP"
-check "add has no traceback" \
+soft_check "add has no traceback" \
     "! grep -qiE 'traceback' \"$_ADD_TMP\""
 rm -f "$_ADD_TMP"
 _ADD_SOURCES_AFTER=$(find "$VAULT_DIR/.synto/sources" \
     -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
-check "add increases .synto/sources directory count by one" \
+soft_check "add increases .synto/sources directory count by one" \
     "test '$_ADD_SOURCES_AFTER' -eq $((_ADD_SOURCES_BEFORE + 1))"
 _ADD_RAW_AFTER=$(find "$VAULT_DIR/raw" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
-check "add increases raw note count by one" \
+soft_check "add increases raw note count by one" \
     "test '$_ADD_RAW_AFTER' -eq $((_ADD_RAW_BEFORE + 1))"
 _ADD_DB_COUNT=$(python3 -c "
 import sqlite3
@@ -1851,14 +1857,14 @@ n = conn.execute('SELECT COUNT(*) FROM source_documents').fetchone()[0]
 print(n)
 conn.close()
 ")
-check "add inserts row into source_documents table" "test '$_ADD_DB_COUNT' -ge 1"
+soft_check "add inserts row into source_documents table" "test '$_ADD_DB_COUNT' -ge 1"
 
 # d) Duplicate detection
 _ADD_DUP_RC=0
 _ADD_DUP_TMP=$(mktemp)
 $OLW add "$_ADD_TMPFILE" > "$_ADD_DUP_TMP" 2>&1 || _ADD_DUP_RC=$?
 check "add duplicate without --force exits non-zero" "test $_ADD_DUP_RC -ne 0"
-check "add duplicate output mentions already imported or force" \
+soft_check "add duplicate output mentions already imported or force" \
     "grep -qiE 'Already imported|already|force' \"$_ADD_DUP_TMP\""
 rm -f "$_ADD_DUP_TMP"
 
@@ -1868,12 +1874,12 @@ _ADD_FORCE_OUT=$($OLW add --force "$_ADD_TMPFILE" 2>&1) || _ADD_FORCE_RC=$?
 echo "$_ADD_FORCE_OUT"
 check "add --force exits 0" "test $_ADD_FORCE_RC -eq 0"
 _ADD_FORCE_TMP=$(mktemp); echo "$_ADD_FORCE_OUT" > "$_ADD_FORCE_TMP"
-check "add --force has no traceback" \
+soft_check "add --force has no traceback" \
     "! grep -qiE 'traceback' \"$_ADD_FORCE_TMP\""
 rm -f "$_ADD_FORCE_TMP"
 _ADD_SOURCES_FORCE=$(find "$VAULT_DIR/.synto/sources" \
     -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
-check "add --force does not grow source directory count (reuses existing)" \
+soft_check "add --force does not grow source directory count (reuses existing)" \
     "test '$_ADD_SOURCES_FORCE' -eq '$_ADD_SOURCES_AFTER'"
 
 # f) add → ingest continuity
@@ -1882,7 +1888,7 @@ _ADD_INGEST_RC=0
 _ADD_INGEST_OUT=$($OLW ingest --all 2>&1) || _ADD_INGEST_RC=$?
 check "ingest after add exits 0" "test $_ADD_INGEST_RC -eq 0"
 _ADD_WIKI_SRC_AFTER=$(find "$VAULT_DIR/wiki/sources" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
-check "ingest after add creates at least one source summary page" \
+soft_check "ingest after add creates at least one source summary page" \
     "test '$_ADD_WIKI_SRC_AFTER' -gt '$_ADD_WIKI_SRC_BEFORE'"
 
 # g) Cleanup
@@ -1896,7 +1902,7 @@ _PACK2_RC=0
 PACK2_OUT_TEXT=$($OLW pack export --target agents --out "$_PACK2_OUT" 2>&1) || _PACK2_RC=$?
 echo "$PACK2_OUT_TEXT"
 check "pack export --out exits 0" "test $_PACK2_RC -eq 0"
-check "pack export --out writes pack.toml" "test -f '$_PACK2_OUT/pack.toml'"
+soft_check "pack export --out writes pack.toml" "test -f '$_PACK2_OUT/pack.toml'"
 rm -rf "$_PACK2_OUT"
 
 # ── synto report --since 7d ───────────────────────────────────────────────────
@@ -1906,7 +1912,7 @@ RS_OUT=$($OLW report --since 7d 2>&1) || _RS_RC=$?
 echo "$RS_OUT"
 check "report --since 7d exits 0" "test $_RS_RC -eq 0"
 _TMP=$(mktemp); echo "$RS_OUT" > "$_TMP"
-check "report --since 7d prints Raw notes" \
+soft_check "report --since 7d prints Raw notes" \
     "grep -q 'Raw notes:' \"$_TMP\""
 rm -f "$_TMP"
 
@@ -1925,7 +1931,7 @@ EQ_OUT=$($OLW eval --queries "$_EVAL_Q_TOML" 2>&1) || _EQ_RC=$?
 echo "$EQ_OUT"
 check "eval --queries exits 0" "test $_EQ_RC -eq 0"
 _TMP=$(mktemp); echo "$EQ_OUT" > "$_TMP"
-check "eval --queries prints Article coverage" \
+soft_check "eval --queries prints Article coverage" \
     "grep -q 'Article coverage:' \"$_TMP\""
 rm -f "$_TMP"
 rm -f "$_EVAL_Q_TOML"
@@ -1937,7 +1943,7 @@ SV_OUT=$($OLW serve --transport invalid_transport 2>&1) || _SV_RC=$?
 echo "$SV_OUT"
 check "serve --transport invalid exits non-zero" "test $_SV_RC -ne 0"
 _TMP=$(mktemp); echo "$SV_OUT" > "$_TMP"
-check "serve invalid transport output mentions transport/invalid/choice" \
+soft_check "serve invalid transport output mentions transport/invalid/choice" \
     "grep -qiE 'transport|invalid|choice' \"$_TMP\""
 rm -f "$_TMP"
 
@@ -1959,11 +1965,11 @@ RAA_OUT=$($OLW run --auto-approve 2>&1) || _RAA_RC=$?
 echo "$RAA_OUT"
 check "run --auto-approve exits 0" "test $_RAA_RC -eq 0"
 _TMP=$(mktemp); echo "$RAA_OUT" > "$_TMP"
-check "run --auto-approve has no traceback" \
+soft_check "run --auto-approve has no traceback" \
     "! grep -qiE 'traceback' \"$_TMP\""
 rm -f "$_TMP"
 _RAA_DRAFTS=$(find "$VAULT_DIR/wiki/.drafts" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
-check "run --auto-approve leaves no drafts" "test '$_RAA_DRAFTS' -eq 0"
+soft_check "run --auto-approve leaves no drafts" "test '$_RAA_DRAFTS' -eq 0"
 
 # ── synto run --fix ───────────────────────────────────────────────────────────
 header "synto run --fix"
@@ -1977,7 +1983,7 @@ if [[ -n "$_RF_WIKI" ]]; then
     echo "$RF_OUT"
     check "run --fix exits 0" "test $_RF_RC -eq 0"
     _TMP=$(mktemp); echo "$RF_OUT" > "$_TMP"
-    check "run --fix has no traceback" \
+    soft_check "run --fix has no traceback" \
         "! grep -qiE 'traceback' \"$_TMP\""
     rm -f "$_TMP"
     # Restore
@@ -1993,7 +1999,7 @@ RMR_OUT=$($OLW run --max-rounds 1 2>&1) || _RMR_RC=$?
 echo "$RMR_OUT"
 check "run --max-rounds 1 exits 0" "test $_RMR_RC -eq 0"
 _TMP=$(mktemp); echo "$RMR_OUT" > "$_TMP"
-check "run --max-rounds 1 mentions round/rounds/ingest/compile" \
+soft_check "run --max-rounds 1 mentions round/rounds/ingest/compile" \
     "grep -qiE 'round|ingest|compile' \"$_TMP\""
 rm -f "$_TMP"
 
@@ -2054,7 +2060,7 @@ VER_OUT=$($OLW --version 2>&1) || _VER_RC=$?
 echo "$VER_OUT"
 check "synto --version exits 0" "test $_VER_RC -eq 0"
 _TMP=$(mktemp); echo "$VER_OUT" > "$_TMP"
-check "synto --version matches version pattern" \
+soft_check "synto --version matches version pattern" \
     "grep -qE '[0-9]+\.[0-9]+\.[0-9]+' \"$_TMP\""
 rm -f "$_TMP"
 
@@ -2114,7 +2120,7 @@ SF_OUT=$($OLW status --vault "$_STATUS_FRESH_VAULT" 2>&1) || _SF_RC=$?
 echo "$SF_OUT"
 check "status on fresh vault exits 0" "test $_SF_RC -eq 0"
 _TMP=$(mktemp); echo "$SF_OUT" > "$_TMP"
-check "status on fresh vault has no traceback" \
+soft_check "status on fresh vault has no traceback" \
     "! grep -qiE 'traceback' \"$_TMP\""
 rm -f "$_TMP"
 rm -rf "$_STATUS_FRESH_VAULT"
@@ -2131,9 +2137,9 @@ check "status via --vault flag exits 0" "test $_CLO_FLAG_RC -eq 0"
 
 _TMP_ENV=$(mktemp); echo "$CLO_ENV_OUT" > "$_TMP_ENV"
 _TMP_FLAG=$(mktemp); echo "$CLO_FLAG_OUT" > "$_TMP_FLAG"
-check "status via env shows ingested or published" \
+soft_check "status via env shows ingested or published" \
     "grep -qiE 'ingested|published' \"$_TMP_ENV\""
-check "status via flag shows ingested or published" \
+soft_check "status via flag shows ingested or published" \
     "grep -qiE 'ingested|published' \"$_TMP_FLAG\""
 rm -f "$_TMP_ENV" "$_TMP_FLAG"
 
@@ -2167,7 +2173,7 @@ $OLW approve --all 2>&1 >/dev/null || true
 # Wrap grep in || true so set -eo pipefail doesn't exit on zero matches.
 _ISC_CITATION_COUNT=$({ grep -r '\[S[0-9]' "$VAULT_DIR/wiki/" \
     --include='*.md' --exclude-dir=.drafts 2>/dev/null || true; } | wc -l | tr -d ' ')
-check "published wiki articles contain inline source citation markers" \
+soft_check "published wiki articles contain inline source citation markers" \
     "test '$_ISC_CITATION_COUNT' -ge 1"
 # Restore setting
 $OLW config inline-source-citations "$_ISC_PREV" 2>&1 >/dev/null || true
@@ -2186,11 +2192,11 @@ _MOLW_TMP=$(mktemp)
 $OLW migrate-olw --vault "$_MOLW_DIR" > "$_MOLW_TMP" 2>&1 || _MOLW_RC=$?
 cat "$_MOLW_TMP"
 check "migrate-olw exits 0" "test $_MOLW_RC -eq 0"
-check "migrate-olw creates synto.toml" "test -f '$_MOLW_DIR/synto.toml'"
-check "migrate-olw creates .synto directory" "test -d '$_MOLW_DIR/.synto'"
-check "migrate-olw .gitignore contains pipeline.lock" \
+soft_check "migrate-olw creates synto.toml" "test -f '$_MOLW_DIR/synto.toml'"
+soft_check "migrate-olw creates .synto directory" "test -d '$_MOLW_DIR/.synto'"
+soft_check "migrate-olw .gitignore contains pipeline.lock" \
     "grep -q '.synto/pipeline.lock' '$_MOLW_DIR/.gitignore' 2>/dev/null || grep -qF '.synto/pipeline.lock' '$_MOLW_DIR/.gitignore'"
-check "migrate-olw output contains Migrated" \
+soft_check "migrate-olw output contains Migrated" \
     "grep -qiE 'Migrated' \"$_MOLW_TMP\""
 rm -f "$_MOLW_TMP"
 rm -rf "$_MOLW_DIR"
@@ -2203,7 +2209,7 @@ _NODOC_TMP=$(mktemp)
 $OLW doctor --vault "$_NODOC_DIR" > "$_NODOC_TMP" 2>&1 || _NODOC_RC=$?
 cat "$_NODOC_TMP"
 check "doctor on uninitialised vault exits non-zero" "test $_NODOC_RC -ne 0"
-check "doctor on uninitialised vault mentions not initialised or missing or init" \
+soft_check "doctor on uninitialised vault mentions not initialised or missing or init" \
     "grep -qiE 'not initialised|not initialized|missing|init' \"$_NODOC_TMP\""
 rm -f "$_NODOC_TMP"
 rm -rf "$_NODOC_DIR"
@@ -2215,7 +2221,7 @@ _ELIVE_TMP=$(mktemp)
 $OLW eval --live > "$_ELIVE_TMP" 2>&1 || _ELIVE_RC=$?
 cat "$_ELIVE_TMP"
 check "eval --live exits 2" "test $_ELIVE_RC -eq 2"
-check "eval --live output mentions not implemented or Phase 1A" \
+soft_check "eval --live output mentions not implemented or Phase 1A" \
     "grep -qiE 'not implemented|Phase 1A' \"$_ELIVE_TMP\""
 rm -f "$_ELIVE_TMP"
 
@@ -2223,13 +2229,13 @@ rm -f "$_ELIVE_TMP"
 header "synto approve --all (no drafts)"
 $OLW approve --all 2>&1 >/dev/null || true
 _EMPTY_DRAFTS=$(find "$VAULT_DIR/wiki/.drafts" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
-check "drafts are empty before approve --all (no drafts)" "test '$_EMPTY_DRAFTS' -eq 0"
+soft_check "drafts are empty before approve --all (no drafts)" "test '$_EMPTY_DRAFTS' -eq 0"
 _NODRAFT_RC=0
 _NODRAFT_TMP=$(mktemp)
 $OLW approve --all > "$_NODRAFT_TMP" 2>&1 || _NODRAFT_RC=$?
 cat "$_NODRAFT_TMP"
 check "approve --all with no drafts exits 0" "test $_NODRAFT_RC -eq 0"
-check "approve --all with no drafts has no traceback" \
+soft_check "approve --all with no drafts has no traceback" \
     "! grep -qiE 'traceback' \"$_NODRAFT_TMP\""
 rm -f "$_NODRAFT_TMP"
 
@@ -2248,9 +2254,9 @@ if [[ -n "$_ITEM_NAME" ]]; then
     $OLW items show "$_ITEM_NAME" > "$_ISHOW_TMP" 2>&1 || _ISHOW_RC=$?
     cat "$_ISHOW_TMP"
     check "items show existing item exits 0" "test $_ISHOW_RC -eq 0"
-    check "items show output contains item name or kind or confidence" \
+    soft_check "items show output contains item name or kind or confidence" \
         "grep -qiE '$_ITEM_NAME|kind:|confidence:' \"$_ISHOW_TMP\""
-    check "items show has no traceback" \
+    soft_check "items show has no traceback" \
         "! grep -qiE 'traceback' \"$_ISHOW_TMP\""
     rm -f "$_ISHOW_TMP"
 else

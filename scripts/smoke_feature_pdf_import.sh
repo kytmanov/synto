@@ -149,11 +149,17 @@ PASS_COUNT=0
 pass()   { echo -e "${GREEN}✓${NC} $1"; }
 fail() {
     local desc="$1" detail="${2:-}"
-    echo -e "  ${RED}✗ FAIL: $desc${NC}${detail:+$'\n'    ${detail:0:400}}"
+    echo -e "  ${RED}✗ FAIL: $desc${NC}${detail:+$'\n'    ${detail:0:1000}}"
     echo -e "  ${YELLOW}▶ Vault left at: $VAULT_DIR${NC}"
     exit 1
 }
-header() { echo -e "\n${BOLD}$1${NC}"; }
+header() {
+    if [[ -n "${_SECTION_START:-}" ]]; then
+        echo -e "  ${YELLOW}($(( SECONDS - _SECTION_START ))s)${NC}"
+    fi
+    _SECTION_START=$SECONDS
+    echo -e "\n${BOLD}$1${NC}"
+}
 
 check() {
     local desc="$1"; shift
@@ -163,7 +169,7 @@ check() {
         pass "$desc"; PASS_COUNT=$((PASS_COUNT + 1))
         _RESULTS+=("PASS|$desc|")
     else
-        _RESULTS+=("FAIL|$desc|${out:0:200}")
+        _RESULTS+=("FAIL|$desc|${out:0:1000}")
         fail "$desc" "$out"
     fi
 }
@@ -176,8 +182,8 @@ soft_check() {
         pass "$desc"; PASS_COUNT=$((PASS_COUNT + 1))
         _RESULTS+=("PASS|$desc|")
     else
-        echo -e "  ${RED}✗ SOFT FAIL:${NC} $desc${out:+ — ${out:0:200}}"
-        _RESULTS+=("FAIL|$desc|${out:0:200}")
+        echo -e "  ${RED}✗ SOFT FAIL:${NC} $desc${out:+ — ${out:0:1000}}"
+        _RESULTS+=("FAIL|$desc|${out:0:1000}")
     fi
 }
 
@@ -190,10 +196,10 @@ _write_report() {
         IFS='|' read -r status label detail <<< "$r"
         if [[ "$status" == "PASS" ]]; then
             ((passed++))
-            checks+=("{\"passed\":true,\"name\":$(printf '%s' "$label" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))'),\"detail\":null}")
+            checks+=("{\"suite\":\"\",\"passed\":true,\"name\":$(printf '%s' "$label" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))'),\"detail\":null}")
         else
             ((failed++))
-            checks+=("{\"passed\":false,\"name\":$(printf '%s' "$label" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))'),\"detail\":$(printf '%s' "$detail" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))')}")
+            checks+=("{\"suite\":\"\",\"passed\":false,\"name\":$(printf '%s' "$label" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))'),\"detail\":$(printf '%s' "$detail" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))')}")
         fi
     done
     printf '{"passed":%d,"failed":%d,"duration_s":%d,"checks":[%s]}\n' \
