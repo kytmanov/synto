@@ -1812,7 +1812,9 @@ fi
 
 # ── synto add ─────────────────────────────────────────────────────────────────
 header "synto add"
-# a) Baseline
+# a) Baseline — .synto/sources is created lazily by synto add; ensure it exists
+# so that find doesn't return non-zero and trigger set -e before the first add.
+mkdir -p "$VAULT_DIR/.synto/sources"
 _ADD_SOURCES_BEFORE=$(find "$VAULT_DIR/.synto/sources" \
     -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
 _ADD_RAW_BEFORE=$(find "$VAULT_DIR/raw" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
