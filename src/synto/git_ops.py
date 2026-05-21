@@ -90,7 +90,13 @@ def git_undo(vault: Path, steps: int = 1) -> list[str]:
     """
     Revert last N synto/legacy auto-commits using git revert (safe — creates new commits).
     Returns list of reverted commit messages.
+    Raises RuntimeError if the working tree has uncommitted changes (git revert would abort).
     """
+    status = _run(["git", "status", "--porcelain"], cwd=vault)
+    if status.stdout.strip():
+        raise RuntimeError(
+            "Working tree has uncommitted changes — commit or discard them before running undo."
+        )
     commits = git_log_auto(vault, n=steps)
     if not commits:
         return []

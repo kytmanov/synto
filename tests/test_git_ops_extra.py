@@ -98,7 +98,10 @@ def test_git_undo_stops_on_revert_failure(monkeypatch):
     def mock_run(args, cwd, check=True):
         nonlocal call_count
         call_count += 1
-        if call_count == 2:
+        # call 1: git status --porcelain (dirty-tree guard) → clean
+        # call 2: revert aaa → succeeds
+        # call 3: revert bbb → fails
+        if call_count == 3:
             raise subprocess.CalledProcessError(1, "git", stderr="conflict")
         r = MagicMock()
         r.stdout = ""
