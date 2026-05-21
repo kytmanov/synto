@@ -2238,7 +2238,7 @@ header "synto items show (existing item)"
 _ITEM_NAME=$(python3 -c "
 import sqlite3
 conn = sqlite3.connect('$VAULT_DIR/.synto/state.db')
-row = conn.execute('SELECT name FROM items LIMIT 1').fetchone()
+row = conn.execute('SELECT name FROM knowledge_items LIMIT 1').fetchone()
 print(row[0] if row else '')
 conn.close()
 ")
