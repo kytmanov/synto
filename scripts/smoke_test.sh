@@ -2157,13 +2157,16 @@ conn.commit()
 conn.close()
 PYEOF
 _ISC_RC=0
-ISC_COMPILE_OUT=$($OLW compile 2>&1) || _ISC_RC=$?
+# Use --force: by this stage articles are flagged as manually edited from
+# earlier test sections, so a plain compile skips them all.
+ISC_COMPILE_OUT=$($OLW compile --force 2>&1) || _ISC_RC=$?
 echo "$ISC_COMPILE_OUT"
 check "inline citations compile exits 0" "test $_ISC_RC -eq 0"
 
 $OLW approve --all 2>&1 >/dev/null || true
-_ISC_CITATION_COUNT=$(grep -r '\[S[0-9]' "$VAULT_DIR/wiki/" \
-    --include='*.md' --exclude-dir=.drafts 2>/dev/null | wc -l | tr -d ' ')
+# Wrap grep in || true so set -eo pipefail doesn't exit on zero matches.
+_ISC_CITATION_COUNT=$({ grep -r '\[S[0-9]' "$VAULT_DIR/wiki/" \
+    --include='*.md' --exclude-dir=.drafts 2>/dev/null || true; } | wc -l | tr -d ' ')
 check "published wiki articles contain inline source citation markers" \
     "test '$_ISC_CITATION_COUNT' -ge 1"
 # Restore setting
