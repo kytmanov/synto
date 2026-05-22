@@ -111,6 +111,14 @@ def run_server(vault: Path, transport: str = "stdio") -> None:
 
     _check_mcp_available()
 
+    # The CLI group callback installs a RichHandler pointing at sys.stdout for
+    # interactive use.  In stdio mode stdout is the JSON-RPC channel, so any
+    # log line written there corrupts the protocol.  Suppress the mcp library's
+    # INFO request tracing — it is noise to end users and not safe on this fd.
+    import logging as _logging
+
+    _logging.getLogger("mcp").setLevel(_logging.WARNING)
+
     from mcp.server.fastmcp import FastMCP
     from mcp.server.fastmcp.exceptions import ToolError
 

@@ -103,3 +103,62 @@ def test_git_commit_not_blocked_when_nothing_pre_staged(tmp_path, monkeypatch):
 
     monkeypatch.setattr(git_ops, "_run", mock_run)
     assert git_commit(tmp_path, "msg") == "committed"
+
+
+# ── git_undo dirty-tree guard ─────────────────────────────────────────────────
+
+
+def test_git_undo_raises_when_working_tree_dirty(tmp_path, monkeypatch):
+    """Raises RuntimeError when tracked files have uncommitted changes."""
+
+    def mock_run(args, cwd, check=True):
+        r = MagicMock()
+        r.stdout = " M wiki/Article.md\n"  # modified tracked file
+        return r
+
+    monkeypatch.setattr(git_ops, "_run", mock_run)
+    import pytest
+
+    with pytest.raises(RuntimeError, match="uncommitted changes"):
+        git_ops.git_undo(tmp_path)
+
+
+def test_git_undo_ignores_untracked_files(tmp_path, monkeypatch):
+    """Untracked files (e.g. .gitignore) don't block undo — git revert works fine with them."""
+    call_log: list[list[str]] = []
+
+    def mock_run(args, cwd, check=True):
+        call_log.append(list(args))
+        r = MagicMock()
+        if "porcelain" in args:
+            r.stdout = "?? .gitignore\n"  # untracked only — should not block
+        elif args[:2] == ["git", "log"]:
+            r.stdout = "abc123 [synto] ingest: 1 note\n"
+        else:
+            r.stdout = ""
+        return r
+
+    monkeypatch.setattr(git_ops, "_run", mock_run)
+    reverted = git_ops.git_undo(tmp_path, steps=1)
+    assert reverted == ["[synto] ingest: 1 note"]
+
+
+def test_git_undo_proceeds_when_working_tree_clean(tmp_path, monkeypatch):
+    """Reverts the target commit when the working tree is clean."""
+    call_log: list[list[str]] = []
+
+    def mock_run(args, cwd, check=True):
+        call_log.append(list(args))
+        r = MagicMock()
+        if "porcelain" in args:
+            r.stdout = ""  # clean
+        elif args[:2] == ["git", "log"]:
+            r.stdout = "abc123 [synto] ingest: 1 note\n"
+        else:
+            r.stdout = ""
+        return r
+
+    monkeypatch.setattr(git_ops, "_run", mock_run)
+    reverted = git_ops.git_undo(tmp_path, steps=1)
+    assert reverted == ["[synto] ingest: 1 note"]
+    assert any("revert" in " ".join(c) for c in call_log)

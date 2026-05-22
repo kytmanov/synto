@@ -1767,7 +1767,10 @@ def undo(vault_str, steps):
     from .git_ops import git_undo
 
     config = _load_config(vault_str)
-    reverted = git_undo(config.vault, steps=steps)
+    try:
+        reverted = git_undo(config.vault, steps=steps)
+    except RuntimeError as e:
+        raise click.ClickException(str(e)) from e
     if reverted:
         console.print(f"[green]Reverted {len(reverted)} commit(s):[/green]")
         for msg in reverted:
