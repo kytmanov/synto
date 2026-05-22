@@ -116,6 +116,7 @@ def run_server(vault: Path, transport: str = "stdio") -> None:
     # log line written there corrupts the protocol.  Suppress the mcp library's
     # INFO request tracing — it is noise to end users and not safe on this fd.
     import logging as _logging
+
     _logging.getLogger("mcp").setLevel(_logging.WARNING)
 
     from mcp.server.fastmcp import FastMCP
