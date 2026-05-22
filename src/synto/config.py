@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import tomllib
 from pathlib import Path
 
@@ -85,6 +86,18 @@ def default_wiki_toml(
         f'# draft_media = "reference"  # reference | embed | omit\n'
         f"graph_quality_checks = true\n"
         f'# language = "en"  # ISO 639-1 output language; autodetects from notes if unset\n'
+        f"#\n"
+        f"# Per-source-type ingest overrides. Raises the concept-extraction ceiling for\n"
+        f"# long-form sources. Quality-based reduction (medium -> 4, low -> 2) still\n"
+        f"# applies within this ceiling, so the override only lifts the high-quality cap.\n"
+        f"# Editing this only affects newly-ingested sources; run `synto ingest --force`\n"
+        f"# to re-apply it to sources already ingested.\n"
+        f"#\n"
+        f"# [pipeline.source_overrides.textbook]\n"
+        f"# max_concepts_per_source = 25  # default: 8\n"
+        f"#\n"
+        f"# [pipeline.source_overrides.paper]\n"
+        f"# max_concepts_per_source = 15  # default: 8\n"
     )
 
 
@@ -112,11 +125,16 @@ class ProviderConfig(BaseModel):
     azure_api_version: str = "2024-02-15-preview"
 
 
+class SourceTypeOverride(BaseModel):
+    max_concepts_per_source: int | None = Field(default=None, ge=1)
+
+
 class PipelineConfig(BaseModel):
     auto_approve: bool = False
     auto_commit: bool = True
     watch_debounce: float = 3.0
     max_concepts_per_source: int = 8
+    source_overrides: dict[str, SourceTypeOverride] = Field(default_factory=dict)
     auto_maintain: bool = False
     ingest_parallel: bool = False  # parallel chunk analysis (needs OLLAMA_NUM_PARALLEL≥4)
     article_max_tokens: int = 16384
@@ -167,6 +185,35 @@ class PipelineConfig(BaseModel):
         if value not in allowed:
             raise ValueError(f"draft_media must be one of {sorted(allowed)}")
         return value
+
+    @field_validator("source_overrides")
+    @classmethod
+    def warn_unknown_source_types(
+        cls, value: dict[str, SourceTypeOverride]
+    ) -> dict[str, SourceTypeOverride]:
+        known = {
+            "notes",
+            "textbook",
+            "paper",
+            "spec",
+            "api_docs",
+            "web_article",
+            "corp_docs",
+            "transcript",
+            "unknown_text",
+        }
+        for key in value:
+            if key not in known:
+                logging.getLogger(__name__).warning(
+                    "source_overrides: unknown source type %r — override will not apply", key
+                )
+        return value
+
+    def effective_max_concepts(self, source_type: str) -> int:
+        override = self.source_overrides.get(source_type)
+        if override is not None and override.max_concepts_per_source is not None:
+            return override.max_concepts_per_source
+        return self.max_concepts_per_source
 
 
 class RagConfig(BaseModel):
