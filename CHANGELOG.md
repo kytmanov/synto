@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-05-22
+
+### Fixed
+
+- `synto undo` now exits with a clear error when the working tree has uncommitted
+  changes to tracked files, instead of silently returning nothing. Untracked files
+  (e.g. `.gitignore`) are correctly ignored.
+- MCP server (`synto serve`) no longer emits INFO-level log lines on stdout, which
+  corrupted the JSON-RPC protocol stream.
+
+### Internal
+
+- Smoke test suite overhauled: agent-usable output, `soft_check` / `check`
+  distinction, JSON report files, per-section timing, and a new `mcp_smoke.py`
+  integration suite.
+
 ## [0.2.1] - 2026-05-19
 
 ### Fixed
