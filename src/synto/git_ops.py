@@ -93,7 +93,11 @@ def git_undo(vault: Path, steps: int = 1) -> list[str]:
     Raises RuntimeError if the working tree has uncommitted changes (git revert would abort).
     """
     status = _run(["git", "status", "--porcelain"], cwd=vault)
-    if status.stdout.strip():
+    tracked_changes = [
+        line for line in status.stdout.splitlines()
+        if line.strip() and not line.startswith("??")
+    ]
+    if tracked_changes:
         raise RuntimeError(
             "Working tree has uncommitted changes — commit or discard them before running undo."
         )
