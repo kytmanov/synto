@@ -111,10 +111,13 @@ def _make_vault(base: Path) -> Path:
 def _ingest_count(vault_dir, source_type, pipeline_cfg, concepts, quality):
     config = Config(vault=vault_dir, pipeline=pipeline_cfg)
     db = StateDB(config.state_db_path)
+    # Concept names must appear in the body: at medium/low quality
+    # _filter_concept_candidates drops evidence-free concepts before the cap applies.
+    body = "\n".join(concepts)
     path = _write_raw(
         vault_dir,
         f"{source_type}.md",
-        f"---\nsource_type: {source_type}\n---\n# {source_type}\n\nBody text.",
+        f"---\nsource_type: {source_type}\n---\n# {source_type}\n\n{body}",
     )
     client = _make_client(_analysis_json(concepts=concepts, quality=quality))
     ingest_note(path, config, client, db)
@@ -133,7 +136,7 @@ def test_ingest_textbook_override_lifts_high_quality_cap(tmp_path):
         _TWENTY,
         "high",
     )
-    assert count > 8
+    assert count == 20
 
 
 def test_ingest_notes_unaffected_by_override(tmp_path):
@@ -145,7 +148,7 @@ def test_ingest_notes_unaffected_by_override(tmp_path):
         _TWENTY,
         "high",
     )
-    assert count <= 8
+    assert count == 8
 
 
 def test_ingest_medium_quality_still_clamped_within_override(tmp_path):
@@ -157,4 +160,4 @@ def test_ingest_medium_quality_still_clamped_within_override(tmp_path):
         _TWENTY,
         "medium",
     )
-    assert count <= 4
+    assert count == 4

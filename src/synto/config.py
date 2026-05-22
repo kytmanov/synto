@@ -210,6 +210,13 @@ class PipelineConfig(BaseModel):
         return value
 
     def effective_max_concepts(self, source_type: str) -> int:
+        """Return max_concepts_per_source for source_type, or the global default.
+
+        Quality-based reduction still applies *after* this returns: high keeps the
+        ceiling, medium clamps to min(ceiling, 4), low to 2. The override only lifts
+        the high-quality ceiling -- a medium-quality textbook with an override of 25
+        still caps at 4. Per-quality-tier overrides are out of scope.
+        """
         override = self.source_overrides.get(source_type)
         if override is not None and override.max_concepts_per_source is not None:
             return override.max_concepts_per_source
