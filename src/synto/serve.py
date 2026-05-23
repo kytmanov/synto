@@ -153,6 +153,10 @@ def run_server(vault: Path, transport: str = "stdio") -> None:
                     "path": ref.path,
                     "summary": ref.summary,
                     "tags": list(ref.tags),
+                    "confidence": ref.confidence_score,
+                    "source_count": ref.source_count,
+                    "single_source": ref.single_source,
+                    "source_quality": ref.source_quality,
                 }
                 for ref in visible
             ]

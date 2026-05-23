@@ -4,6 +4,15 @@
 
 ### Added
 
+- Article frontmatter now includes three machine-readable quality signals emitted
+  at compile time: `source_count` (int), `single_source` (bool), and
+  `source_quality` ("high" | "medium" | "low"). These let file readers, Obsidian
+  plugins, MCP tools, and AI agents assess corroboration needs without DB access.
+  `single_source: true` is derived from unique source-document identity where
+  available, falling back to path uniqueness. Synthesis articles carry
+  `source_count` and `single_source` on the same basis. `read_article` in the MCP
+  server inherits all three fields; `list_articles` now includes them in its
+  projection.
 - Per-source-type ingest overrides: `[pipeline.source_overrides.<type>]` sections in
   `synto.toml` let you raise the `max_concepts_per_source` ceiling for long-form source
   types (e.g. `textbook`, `paper`) without changing the global default. Quality-based

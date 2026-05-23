@@ -364,17 +364,22 @@ def _gather_sources(
     return _truncate_to_budget(combined, max_chars), resolved
 
 
-def _compute_confidence(source_paths: list[str], db: StateDB) -> float:
-    """Compute confidence: 0.25 per source + quality bonus from best source."""
+def _source_quality_summary(source_paths: list[str], db: StateDB) -> str:
+    """Return best quality (high > medium > low) across all source paths."""
     best = "low"
     for sp in source_paths:
         rec = db.get_raw(sp)
         if rec and rec.quality:
             if rec.quality == "high":
-                best = "high"
-                break
-            elif rec.quality == "medium":
+                return "high"
+            if rec.quality == "medium" and best != "high":
                 best = "medium"
+    return best
+
+
+def _compute_confidence(source_paths: list[str], db: StateDB) -> float:
+    """Compute confidence: 0.25 per source + quality bonus from best source."""
+    best = _source_quality_summary(source_paths, db)
     return min(1.0, len(source_paths) * 0.25 + _QUALITY_BONUS.get(best, 0.0))
 
 
@@ -722,6 +727,25 @@ def _write_draft(
                 "timestamp": datetime.now().isoformat(),
             }
         ]
+    # Derive quality signals from source paths.
+    # `single_source` reflects *document* identity (via raw_notes.origin_uri):
+    # five chunks of one imported book are a single source. When any source
+    # lacks an origin_uri (e.g., free-form user notes), fall back to path
+    # uniqueness so the predicate still degrades sensibly.
+    if source_paths:
+        source_count = len(source_paths)
+        source_quality = _source_quality_summary(source_paths, db)
+
+        origin_map = db.get_origin_uris(source_paths)
+        if all(origin_map.get(sp) for sp in source_paths):
+            single_source = len({origin_map[sp] for sp in source_paths}) == 1
+        else:
+            single_source = len(set(source_paths)) == 1
+    else:
+        source_count = 0
+        single_source = False
+        source_quality = None
+
     meta = build_wiki_frontmatter(
         title=article_title,
         tags=content_result.tags,
@@ -731,6 +755,9 @@ def _write_draft(
         existing_meta=existing_meta,
         aliases=concept_aliases or [],
         lineage=lineage_entry if lineage_entry else None,
+        source_count=source_count,
+        single_source=single_source,
+        source_quality=source_quality,
     )
 
     post = fm_lib.Post(body, **meta)
