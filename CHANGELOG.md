@@ -4,6 +4,14 @@
 
 ### Added
 
+- Query vocabulary bridge: `synto query` now augments the routing prompt with
+  a hint naming the concepts whose aliases match whole words in the user's
+  question (e.g., "ML" → "Machine Learning"). This helps the fast model pick
+  the right wiki article when the user types an acronym or surface form
+  instead of the canonical title. Ambiguous aliases (claimed by ≥2 concepts)
+  are filtered. All-caps acronyms of length ≥2 bypass the length floor.
+  Pure-CJK aliases are a silent no-op (v1 limitation: Python's `\b` requires
+  word boundaries). No new dependencies, no public-API changes.
 - Article frontmatter now includes three machine-readable quality signals emitted
   at compile time: `source_count` (int), `single_source` (bool), and
   `source_quality` ("high" | "medium" | "low"). These let file readers, Obsidian
