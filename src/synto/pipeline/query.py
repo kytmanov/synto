@@ -47,11 +47,60 @@ from ..vault import (
 
 MAX_PAGES = 5
 MAX_CHARS_PER_PAGE = 8_000
+_MIN_ALIAS_LEN = 3  # filters stop-noise ("in", "of", "to")
+_MAX_BRIDGE_MATCHES = 10  # caps routing-hint token cost
 
 log = logging.getLogger(__name__)
 
 
 _WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)(#[^\]|]*)?(?:\|([^\]]*))?\]\]")
+
+
+def _expand_query(
+    question: str,
+    alias_map: dict[str, list[str]],
+    known_titles: set[str] | None = None,
+) -> str:
+    """Augment the routing question with concept names whose aliases appear as
+    whole words in the question.
+
+    `known_titles` filters to concepts with a published article — avoids
+    hinting the LLM toward titles the index doesn't contain.
+
+    Word-boundary matching uses Python's \\b; silently no-ops on CJK/Thai
+    (no inter-word spaces). Documented limitation for v1.
+
+    Pure function: no DB, no LLM, no state mutation.
+    """
+    if not question or not alias_map:
+        return question
+
+    surface_lookup: dict[str, set[str]] = {}
+    for concept_name, aliases in alias_map.items():
+        if known_titles is not None and concept_name not in known_titles:
+            continue
+        for surface in (concept_name, *aliases):
+            surface_lower = surface.lower()
+            if len(surface_lower) < _MIN_ALIAS_LEN:
+                continue
+            surface_lookup.setdefault(surface_lower, set()).add(concept_name)
+
+    if not surface_lookup:
+        return question
+
+    pattern = re.compile(
+        r"\b(?:" + "|".join(re.escape(s) for s in surface_lookup) + r")\b",
+        re.IGNORECASE,
+    )
+    matched_concepts: set[str] = set()
+    for hit in pattern.findall(question):
+        matched_concepts.update(surface_lookup.get(hit.lower(), ()))
+
+    if not matched_concepts:
+        return question
+
+    related = ", ".join(sorted(matched_concepts)[:_MAX_BRIDGE_MATCHES])
+    return f"{question}\n\n(Routing hint — related wiki concepts: {related})"
 
 
 @dataclass
@@ -610,10 +659,17 @@ def _query_core(
             index_found=False,
         )
 
+    known_title_list = [title for title, _ in list_wiki_articles(config.wiki_dir)[:80]]
+    known_titles_set = set(known_title_list)
+    known_titles = ", ".join(known_title_list)
+
+    alias_map = db.load_concept_alias_map() if db is not None else {}
+    routing_question = _expand_query(question, alias_map, known_titles=known_titles_set)
+
     selection_prompt = (
         "You are a routing agent for a personal knowledge wiki.\n\n"
         f"Wiki index:\n{index_content}\n\n"
-        f"User question: {question}\n\n"
+        f"User question: {routing_question}\n\n"
         "Synthesis pages capture prior answers; consider them when relevant "
         "but never prefer them over a fresh concept page. "
         f"Select 1-{max_pages} page titles from the index that are most relevant "
@@ -634,9 +690,6 @@ def _query_core(
     context = _load_pages(config, selection.pages, db=db, max_pages=max_pages)
     if not context:
         context = "(No matching wiki pages found.)"
-
-    known_title_list = [title for title, _ in list_wiki_articles(config.wiki_dir)[:80]]
-    known_titles = ", ".join(known_title_list)
     answer_prompt = (
         "You are answering a question using a personal knowledge wiki.\n\n"
         f"Relevant wiki content:\n{context}\n\n"
