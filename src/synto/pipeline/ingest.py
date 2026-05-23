@@ -1262,7 +1262,7 @@ def ingest_note(
     )
 
     # Normalize concept names against existing canonical names, store linkages
-    max_concepts = config.pipeline.max_concepts_per_source
+    max_concepts = config.pipeline.effective_max_concepts(source_type)
     existing_names = db.list_all_concept_names()
     if seed_concepts:
         seen_seed = {name.casefold() for name in seed_concepts}
