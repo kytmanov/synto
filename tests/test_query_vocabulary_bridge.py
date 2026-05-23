@@ -115,6 +115,33 @@ def test_load_alias_map_no_table(db):
     assert result == {}
 
 
+def test_load_alias_map_skips_ambiguous_aliases(db):
+    # "cache" is claimed by both concepts — must be filtered from the map.
+    _seed_aliases(db, "Caching", ["cache"])
+    _seed_aliases(db, "CDN", ["cache"])
+    result = db.load_concept_alias_map()
+    assert "cache" not in result.get("Caching", [])
+    assert "cache" not in result.get("CDN", [])
+
+
+def test_load_alias_map_keeps_unambiguous_aliases(db):
+    _seed_aliases(db, "Caching", ["caching-layer"])
+    _seed_aliases(db, "CDN", ["edge-cache"])
+    result = db.load_concept_alias_map()
+    assert result["Caching"] == ["caching-layer"]
+    assert result["CDN"] == ["edge-cache"]
+
+
+def test_load_alias_map_partial_filter(db):
+    # "cache" is ambiguous (both concepts), "caching-layer" is unique to Caching.
+    # Caching keeps the unique alias; the ambiguous one is dropped.
+    _seed_aliases(db, "Caching", ["cache", "caching-layer"])
+    _seed_aliases(db, "CDN", ["cache"])
+    result = db.load_concept_alias_map()
+    assert result.get("Caching") == ["caching-layer"]
+    assert "CDN" not in result  # CDN had only the ambiguous alias
+
+
 # ── Stage 2: _expand_query() ──────────────────────────────────────────────────
 
 
@@ -124,10 +151,21 @@ def test_expand_query_alias_hit():
     assert "Idempotency" in result
 
 
-def test_expand_query_concept_name_hit():
+def test_expand_query_concept_name_alone_does_not_hint():
+    # Concept names are not matchable surfaces — the LLM sees them in the index
+    # already, so re-hinting them is redundant and eats cap slots.
     alias_map = {"Idempotency": ["ack"]}
-    result = _expand_query("explain idempotency please", alias_map)
-    assert "Idempotency" in result
+    q = "explain idempotency please"
+    assert _expand_query(q, alias_map) == q
+
+
+def test_expand_query_concept_name_plus_alias_hints_once():
+    # When the question contains BOTH the concept name and an alias, the
+    # alias triggers the hint and the concept is listed exactly once.
+    alias_map = {"Idempotency": ["ack"]}
+    result = _expand_query("explain idempotency and ack semantics", alias_map)
+    assert result.count("Idempotency") == 1
+    assert "(Routing hint" in result
 
 
 def test_expand_query_no_match():
@@ -212,6 +250,70 @@ def test_expand_query_hint_on_separate_line():
     alias_map = {"Idempotency": ["ack"]}
     result = _expand_query("how does ack work?", alias_map)
     assert "\n\n(Routing hint — related wiki concepts:" in result
+
+
+def test_expand_query_occurrence_order_preserved():
+    # Z-concept matched first; alphabetical sort would push it last. The hint
+    # must list Zeitgeist before Caching.
+    alias_map = {
+        "Zeitgeist": ["zeitgeist-term"],
+        "Caching": ["caching-term"],
+    }
+    result = _expand_query("zeitgeist-term then caching-term", alias_map)
+    z_idx = result.index("Zeitgeist")
+    c_idx = result.index("Caching")
+    assert z_idx < c_idx
+
+
+def test_expand_query_caps_drops_later_occurrences():
+    # Build 15 concepts and a question that mentions them in known order
+    # (term0 ... term14). After cap=10, the first 10 (by occurrence) survive;
+    # term10..term14 are dropped.
+    alias_map = {f"Concept{i:02d}": [f"term{i:02d}"] for i in range(15)}
+    q = " ".join(f"term{i:02d}" for i in range(15))
+    result = _expand_query(q, alias_map)
+    hint_line = next(line for line in result.splitlines() if "Routing hint" in line)
+    for i in range(10):
+        assert f"Concept{i:02d}" in hint_line
+    for i in range(10, 15):
+        assert f"Concept{i:02d}" not in hint_line
+
+
+def test_expand_query_multi_word_alias():
+    alias_map = {"Eventual Consistency": ["exactly once", "at least once"]}
+    result = _expand_query("we need exactly once delivery", alias_map)
+    assert "Eventual Consistency" in result
+
+
+def test_expand_query_multi_word_alias_word_boundary():
+    # "exactly oncestop" should NOT match "exactly once" — \b anchor on the
+    # trailing edge of the alias keeps this honest.
+    alias_map = {"Eventual Consistency": ["exactly once"]}
+    q = "exactly oncestop"
+    assert _expand_query(q, alias_map) == q
+
+
+def test_expand_query_uppercase_two_letter_acronym_hits():
+    # "AI" (all-caps, len 2) bypasses the length-3 floor.
+    alias_map = {"Artificial Intelligence": ["AI"]}
+    result = _expand_query("use AI for routing", alias_map)
+    assert "Artificial Intelligence" in result
+
+
+def test_expand_query_lowercase_two_letter_still_filtered():
+    # Lowercase "ai" is NOT the all-caps acronym path — length-3 floor applies.
+    # Pins that the exception is uppercase-only.
+    alias_map = {"Artificial Intelligence": ["ai"]}
+    q = "use ai for routing"
+    assert _expand_query(q, alias_map) == q
+
+
+def test_expand_query_uppercase_one_letter_filtered():
+    # The acronym exception requires len >= 2. A single uppercase letter is
+    # still filtered (would match too aggressively otherwise).
+    alias_map = {"Existential": ["X"]}
+    q = "explain X to me"
+    assert _expand_query(q, alias_map) == q
 
 
 def test_expand_query_cjk_silent_noop():
@@ -322,3 +424,56 @@ def test_query_passes_question_to_answer_prompt_verbatim(vault, config, db):
     prompt = _answer_prompt(heavy)
     assert original in prompt
     assert "Routing hint" not in prompt
+
+
+def test_query_hints_concepts_past_80_article_cap(vault, config, db):
+    # Pin Fix A: vault with 90 articles, bridge alias on the 85th — the answer-
+    # prompt wikilink whitelist is still capped at 80, but expansion sees all
+    # titles. Without the fix, this concept would be silently invisible.
+    titles = [f"Concept{i:03d}" for i in range(90)]
+    bridge_concept = titles[85]
+    index_lines = ["# Index", ""] + [f"- [[{t}]]" for t in titles]
+    _write_index(config, "\n".join(index_lines) + "\n")
+    for t in titles:
+        _write_concept_page(config, t)
+    _seed_aliases(db, bridge_concept, ["wibbletron"])
+
+    fast = _fast_client([bridge_concept])
+    heavy = _heavy_client()
+
+    _query_core(config, fast, heavy, db, "what is a wibbletron?")
+
+    prompt = _routing_prompt(fast)
+    assert bridge_concept in prompt
+    assert "(Routing hint" in prompt
+
+
+def test_query_logs_routing_hint_when_fired(vault, config, db, caplog):
+    _write_index(config, "# Index\n\n- [[Idempotency]]\n")
+    _write_concept_page(config, "Idempotency")
+    _seed_aliases(db, "Idempotency", ["ack"])
+
+    fast = _fast_client(["Idempotency"])
+    heavy = _heavy_client()
+
+    with caplog.at_level("INFO", logger="synto.pipeline.query"):
+        _query_core(config, fast, heavy, db, "how does ack work?")
+
+    hint_records = [r for r in caplog.records if "query.routing_hint" in r.getMessage()]
+    assert len(hint_records) == 1
+    assert "Idempotency" in hint_records[0].getMessage()
+
+
+def test_query_does_not_log_routing_hint_when_no_match(vault, config, db, caplog):
+    _write_index(config, "# Index\n\n- [[Idempotency]]\n")
+    _write_concept_page(config, "Idempotency")
+    _seed_aliases(db, "Idempotency", ["ack"])
+
+    fast = _fast_client(["Idempotency"])
+    heavy = _heavy_client()
+
+    with caplog.at_level("INFO", logger="synto.pipeline.query"):
+        _query_core(config, fast, heavy, db, "how do I bake bread?")
+
+    hint_records = [r for r in caplog.records if "query.routing_hint" in r.getMessage()]
+    assert hint_records == []

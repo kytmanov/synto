@@ -946,6 +946,74 @@ check "duplicate query --synthesize exits 0" "test $_QSY2_RC -eq 0"
 SYNTH_COUNT_AFTER=$(find "$VAULT_DIR/wiki/synthesis" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
 soft_check "duplicate query --synthesize keeps existing file" "test \"$SYNTH_COUNT_AFTER\" = \"$SYNTH_COUNT\""
 
+# ── Query vocabulary bridge (feature #35) ────────────────────────────────────
+# Verifies the alias-driven routing-hint injection end-to-end:
+#   1. We seed an alias on an extracted concept ("wibbletron"). The user is
+#      unlikely to type the alias by accident — proves the bridge is what's
+#      connecting, not a direct title match.
+#   2. The query uses ONLY the alias, never the concept name. Routing must
+#      hop from alias -> concept via the bridge.
+#   3. We assert the routing-hint log line fired (deterministic code path)
+#      and the right page was selected (soft — depends on the LLM).
+header "Query vocabulary bridge (alias-driven routing)"
+
+BRIDGE_CONCEPT=$(python3 - <<PYEOF
+import sqlite3
+conn = sqlite3.connect("$VAULT_DIR/.synto/state.db")
+row = conn.execute(
+    "SELECT name FROM concepts WHERE lower(name) LIKE '%qubit%' LIMIT 1"
+).fetchone()
+print(row[0] if row else "")
+conn.close()
+PYEOF
+)
+
+if [[ -z "$BRIDGE_CONCEPT" ]]; then
+    info "Skipping bridge smoke: no 'qubit' concept extracted"
+else
+    info "Bridge concept: $BRIDGE_CONCEPT"
+
+    # The alias is contrived so a direct title-match can't explain a hit.
+    BRIDGE_ALIAS="wibbletron"
+    python3 - <<PYEOF
+import sqlite3
+conn = sqlite3.connect("$VAULT_DIR/.synto/state.db")
+conn.execute(
+    "INSERT OR IGNORE INTO concept_aliases (concept_name, alias) VALUES (?, ?)",
+    ("$BRIDGE_CONCEPT", "$BRIDGE_ALIAS"),
+)
+conn.commit()
+conn.close()
+PYEOF
+
+    _BR_RC=0
+    BRIDGE_OUT=$($OLW query "what are ${BRIDGE_ALIAS}s used for?" 2>&1) || _BR_RC=$?
+    echo "$BRIDGE_OUT"
+    check "bridge query exits 0" "test $_BR_RC -eq 0"
+
+    _BR_TMP=$(mktemp); echo "$BRIDGE_OUT" > "$_BR_TMP"
+    # Hard check: the routing-hint log line is a deterministic code path. If
+    # the alias is in the DB and matched as a whole word, this MUST fire.
+    check "routing hint logged with matched concept" \
+        "grep -qE 'query.routing_hint.*${BRIDGE_CONCEPT}' \"$_BR_TMP\""
+    # Soft check: page selection depends on LLM judgment. The hint dramatically
+    # improves the odds (it literally names the right concept), but isn't
+    # deterministic.
+    soft_check "bridge query selected the concept page" \
+        "grep -qE 'Sources:.*${BRIDGE_CONCEPT}' \"$_BR_TMP\""
+    rm -f "$_BR_TMP"
+
+    # Negative control: a question with no alias hit must NOT log a hint.
+    _NEG_RC=0
+    NEG_OUT=$($OLW query "how do I bake sourdough bread?" 2>&1) || _NEG_RC=$?
+    echo "$NEG_OUT"
+    check "negative-control query exits 0" "test $_NEG_RC -eq 0"
+    _NEG_TMP=$(mktemp); echo "$NEG_OUT" > "$_NEG_TMP"
+    check "no routing hint when query has no alias match" \
+        "! grep -q 'query.routing_hint' \"$_NEG_TMP\""
+    rm -f "$_NEG_TMP"
+fi
+
 # ── Report (Stage 3) ──────────────────────────────────────────────────────────
 header "synto report (Stage 3)"
 _STATS_RC=0
