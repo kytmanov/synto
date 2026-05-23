@@ -1234,6 +1234,35 @@ class StateDB:
             mapping[al] = canonical
         return {al: canonical for al, canonical in mapping.items() if counts[al] == 1}
 
+    def load_concept_alias_map(self) -> dict[str, list[str]]:
+        """Return {concept_name: [aliases]} for all concepts with aliases.
+
+        Used by query routing to bridge task-vocabulary questions to source-vocabulary
+        page titles. Empty dict on missing table (older DBs predate v4).
+
+        Excludes ambiguous aliases (claimed by >= 2 distinct concepts) — hinting
+        multiple concepts from one surface dilutes the routing signal.
+        """
+        if not self._has_table("concept_aliases"):
+            return {}
+        rows = self._conn.execute(
+            """
+            SELECT concept_name, alias
+            FROM concept_aliases
+            WHERE lower(alias) NOT IN (
+                SELECT lower(alias)
+                FROM concept_aliases
+                GROUP BY lower(alias)
+                HAVING count(DISTINCT lower(concept_name)) >= 2
+            )
+            ORDER BY concept_name, alias
+            """
+        ).fetchall()
+        result: dict[str, list[str]] = {}
+        for concept_name, alias in rows:
+            result.setdefault(concept_name, []).append(alias)
+        return result
+
     def list_frequent_aliases(self, threshold: int = 2) -> list[str]:
         """Aliases (lower-cased) claimed by >= threshold distinct concepts.
 
