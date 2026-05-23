@@ -312,6 +312,8 @@ def _build_synthesis_file_text(
         "content_hash": content_hash,
         "created": created,
         "status": "published",
+        "source_count": len(source_pages),
+        "single_source": len(set(source_pages)) == 1,
     }
     return frontmatter.dumps(frontmatter.Post(body, **meta))
 

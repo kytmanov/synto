@@ -271,6 +271,9 @@ def build_wiki_frontmatter(
     existing_meta: dict | None = None,
     aliases: list[str] | None = None,
     lineage: list[dict] | None = None,
+    source_count: int | None = None,
+    single_source: bool | None = None,
+    source_quality: str | None = None,
 ) -> dict[str, Any]:
     now = datetime.now().strftime("%Y-%m-%d")
     sanitized_tags = sanitize_tags(tags)
@@ -286,6 +289,12 @@ def build_wiki_frontmatter(
         "status": "draft" if is_draft else "published",
         "updated": now,
     }
+    if source_count is not None:
+        meta["source_count"] = source_count
+    if single_source is not None:
+        meta["single_source"] = single_source
+    if source_quality is not None:
+        meta["source_quality"] = source_quality
     if aliases:
         meta["aliases"] = aliases
     if existing_meta and "created" in existing_meta:

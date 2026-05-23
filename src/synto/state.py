@@ -1038,6 +1038,27 @@ class StateDB:
             rows = self._conn.execute("SELECT * FROM raw_notes").fetchall()
         return [_row_to_raw(r) for r in rows]
 
+    def get_origin_uris(self, paths: list[str]) -> dict[str, str | None]:
+        """Return {path: origin_uri} for each input path.
+
+        Maps every input path to its `raw_notes.origin_uri`, or `None` if the
+        row is missing the column value or the row doesn't exist. Used to
+        derive document-level identity for the `single_source` frontmatter
+        flag — two raw notes sharing an `origin_uri` came from the same
+        imported document, even if they are different chunks.
+        """
+        result: dict[str, str | None] = {p: None for p in paths}
+        if not paths:
+            return result
+        placeholders = ",".join("?" * len(paths))
+        rows = self._conn.execute(
+            f"SELECT path, origin_uri FROM raw_notes WHERE path IN ({placeholders})",
+            tuple(paths),
+        ).fetchall()
+        for row in rows:
+            result[row[0]] = row[1]
+        return result
+
     def get_note_language(self, path: str) -> str | None:
         row = self._conn.execute(
             "SELECT language FROM raw_notes WHERE path = ?", (path,)

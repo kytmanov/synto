@@ -87,6 +87,9 @@ class ArticleRef:
     tags: tuple[str, ...] = ()
     confidence: str | None = None
     confidence_score: float | None = None
+    source_count: int | None = None
+    single_source: bool | None = None
+    source_quality: str | None = None
 
 
 @dataclass(frozen=True)
@@ -567,6 +570,21 @@ class VaultReader:
                 confidence_score: float | None = float(raw_conf) if raw_conf is not None else None
             except (TypeError, ValueError):
                 confidence_score = None
+
+            raw_sc = metadata.get("source_count")
+            try:
+                source_count: int | None = int(raw_sc) if raw_sc is not None else None
+            except (TypeError, ValueError):
+                source_count = None
+
+            raw_ss = metadata.get("single_source")
+            single_source: bool | None = raw_ss if isinstance(raw_ss, bool) else None
+
+            raw_sq = metadata.get("source_quality")
+            source_quality: str | None = (
+                raw_sq if isinstance(raw_sq, str) and raw_sq in {"high", "medium", "low"} else None
+            )
+
             refs.append(
                 ArticleRef(
                     id=record.article_id or record.path,
@@ -576,6 +594,9 @@ class VaultReader:
                     tags=tuple(str(tag) for tag in tags),
                     confidence=_confidence_category(raw_conf),
                     confidence_score=confidence_score,
+                    source_count=source_count,
+                    single_source=single_source,
+                    source_quality=source_quality,
                 )
             )
 

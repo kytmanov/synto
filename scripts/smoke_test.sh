@@ -616,6 +616,47 @@ except Exception as e:
 PYEOF
 )
     soft_check "draft YAML is parseable" "test -z \"$DRAFT_YAML_OK\""
+
+    # Feature 33: quality signals in frontmatter. Shape is written by
+    # build_wiki_frontmatter (not the LLM) — deterministic, so hard-check.
+    # bool is a subclass of int in Python, hence the explicit isinstance
+    # guard on source_count.
+    DRAFT_QUALITY_BAD=$(uv run --project "$REPO_DIR" python - "$FIRST_DRAFT" 2>/dev/null <<'PYEOF'
+import sys
+try:
+    import frontmatter
+    m = frontmatter.load(sys.argv[1])
+    errors = []
+
+    if "source_count" not in m.keys():
+        errors.append("missing source_count")
+    elif not isinstance(m["source_count"], int) or isinstance(m["source_count"], bool):
+        errors.append(f"source_count not int: {m['source_count']!r}")
+
+    if "single_source" not in m.keys():
+        errors.append("missing single_source")
+    elif not isinstance(m["single_source"], bool):
+        errors.append(f"single_source not bool: {m['single_source']!r}")
+
+    sc = m.get("source_count")
+    if isinstance(sc, int) and not isinstance(sc, bool) and sc > 0:
+        sq = m.get("source_quality")
+        if sq is None:
+            errors.append("source_quality absent on non-zero-source draft")
+        elif sq not in {"high", "medium", "low"}:
+            errors.append(f"source_quality not in enum: {sq!r}")
+
+    if errors:
+        print("; ".join(errors))
+        sys.exit(1)
+except Exception as e:
+    # Fail loud: any unexpected error must surface to the smoke runner.
+    print(f"error: {e}")
+    sys.exit(1)
+PYEOF
+)
+    check "draft frontmatter has correct quality field types" "test -z \"$DRAFT_QUALITY_BAD\""
+
     DRAFT_TAG_BAD=$(uv run --project "$REPO_DIR" python - "$FIRST_DRAFT" 2>/dev/null <<'PYEOF'
 import sys
 try:
@@ -1132,83 +1173,100 @@ rm -f "$_TMP"
 # ── Draft annotations ────────────────────────────────────────────────────────
 header "Draft annotations"
 info "Compiling with low-quality source to trigger annotation..."
-# Force a concept to recompile by inserting low quality + low confidence source
 $OLW approve --all 2>&1 || true   # clear drafts first
 
-# Inject a single-source, low-confidence concept by direct DB manipulation
+# Target a concept with EXACTLY ONE source so the single-source annotation
+# fires deterministically. "Quantum Fourier Transform" is only mentioned in
+# quantum-computing.md, while "Reinforcement learning" picks up a second
+# source (reinforcement-learning.md) during the source-type-policy section,
+# which would defeat single-source on recompile.
+#
+# Setting quality='low' on the source drops the quality bonus to 0, so
+# _compute_confidence returns 1 * 0.25 + 0 = 0.25, below the 0.4 threshold
+# (compile.py:_ANNOTATION_CONFIDENCE_THRESHOLD). All three annotation kinds
+# fire: low-confidence, single-source, all-low-quality.
 python3 - <<PYEOF
 import sqlite3
 db_path = "$VAULT_DIR/.synto/state.db"
 conn = sqlite3.connect(db_path)
-# Update one raw note to low quality so annotation triggers
-conn.execute("UPDATE raw_notes SET status='ingested', quality='low' WHERE path='raw/reinforcement-learning.md'")
+conn.execute("UPDATE raw_notes SET quality='low' WHERE path='raw/quantum-computing.md'")
 conn.commit()
 conn.close()
 PYEOF
 
-$OLW compile 2>&1 || true
-# Model may or may not annotate (confidence-dependent). The load-bearing assertion is that
-# approve strips any annotations that did land — covered below.
-DRAFTS_WITH_ANNOTATION=$({ grep -rl 'olw-auto' "$VAULT_DIR/wiki/.drafts/" 2>/dev/null || true; } \
+# Force a recompile of a specific concept via the public CLI. `--force`
+# overwrites the already-published article; `--concept` bypasses the
+# needing-compile gate (concept_compile_state). This is the smoke's
+# load-bearing call: if compile doesn't produce a draft here, the assertion
+# below fires.
+$OLW compile --force --concept "Quantum Fourier Transform" 2>&1 || true
+# Annotation triggering is deterministic under the forced setup above: with
+# one source at quality='low', _compute_confidence returns 0.25, which is
+# below _ANNOTATION_CONFIDENCE_THRESHOLD=0.4 — the low-confidence,
+# single-source, and all-low-quality annotations must all fire.
+DRAFTS_WITH_ANNOTATION=$({ grep -rl 'synto-auto' "$VAULT_DIR/wiki/.drafts/" 2>/dev/null || true; } \
     | wc -l | tr -d ' ')
 info "Annotated drafts before approve: $DRAFTS_WITH_ANNOTATION"
+check "compile produced at least one annotated draft" \
+    "test '$DRAFTS_WITH_ANNOTATION' -ge 1"
 
-# Verify annotations are stripped on approve
+# Per-annotation-kind checks: catches a silent break in any single branch
+# of _build_draft_annotations (compile.py).
+ANNOTATED_DRAFT=$({ grep -rl 'synto-auto' "$VAULT_DIR/wiki/.drafts/" 2>/dev/null \
+    | head -1; } || true)
+if [[ -n "$ANNOTATED_DRAFT" ]]; then
+    check "low-confidence annotation present"  "grep -q 'synto-auto: low-confidence' \"$ANNOTATED_DRAFT\""
+    check "single-source annotation present"   "grep -q 'synto-auto: single-source' \"$ANNOTATED_DRAFT\""
+    check "low-quality annotation present"     "grep -q 'synto-auto: all sources low-quality' \"$ANNOTATED_DRAFT\""
+fi
+
+# Verify annotations are stripped on approve. Match both prefixes because
+# _strip_draft_annotations removes both — the check must be at least as
+# strict as the function it validates.
 $OLW approve --all 2>&1 || true
-PUBLISHED_WITH_ANNOTATION=$({ grep -rl 'olw-auto' "$VAULT_DIR/wiki/" \
+PUBLISHED_WITH_ANNOTATION=$({ grep -rlE '(synto|olw)-auto' "$VAULT_DIR/wiki/" \
     --include='*.md' --exclude-dir='.drafts' --exclude-dir='sources' 2>/dev/null || true; } \
     | wc -l | tr -d ' ')
-soft_check "no olw-auto annotations in published articles" \
+check "no annotations leak into published articles" \
     "test '$PUBLISHED_WITH_ANNOTATION' -eq 0"
 
 # ── Rejection feedback loop ───────────────────────────────────────────────────
 header "Rejection feedback loop"
 info "Recompiling to produce a draft to reject..."
 
-# Force one concept back to needing compile
-python3 - <<PYEOF
-import sqlite3
-db_path = "$VAULT_DIR/.synto/state.db"
-conn = sqlite3.connect(db_path)
-conn.execute("UPDATE raw_notes SET status='ingested' WHERE path='raw/quantum-computing.md'")
-conn.commit()
-conn.close()
-PYEOF
-
-$OLW compile 2>&1 || true
+# Use the public CLI to force a recompile of a specific concept. Mutating
+# raw_notes.status to 'ingested' would be a no-op: the recompile gate is
+# concept_compile_state, not raw_notes.status.
+$OLW compile --force --concept "Quantum computing" 2>&1 || true
 
 REJECT_DRAFT=$(find "$VAULT_DIR/wiki/.drafts" -name "*.md" | head -1)
-if [[ -n "$REJECT_DRAFT" ]]; then
-    DRAFT_TITLE=$(grep '^title:' "$REJECT_DRAFT" | head -1 | sed 's/title: *//')
-    info "Rejecting draft: $DRAFT_TITLE"
+# Hard-check that the prior --force --concept compile produced a draft —
+# otherwise the rest of the rejection flow runs in a silent skip, which is
+# the masking pattern this section's earlier `else: pass "...skipped"` used
+# to hide.
+check "rejection-feedback recompile produced a draft" "test -n \"$REJECT_DRAFT\""
 
-    _REJ_RC=0
-    REJECT_OUT=$($OLW reject "$REJECT_DRAFT" --feedback "Too brief, needs more concrete examples" 2>&1) || _REJ_RC=$?
-    echo "$REJECT_OUT"
-    check "reject exits 0" "test $_REJ_RC -eq 0"
-    soft_check "reject removes draft file" "test ! -f \"$REJECT_DRAFT\""
-    soft_check "reject confirms feedback saved" \
-        "echo \"$REJECT_OUT\" | grep -qiE 'feedback|saved|rejection|next compile'"
+DRAFT_TITLE=$(grep '^title:' "$REJECT_DRAFT" | head -1 | sed 's/title: *//')
+info "Rejecting draft: $DRAFT_TITLE"
 
-    # Force concept back to compile again and verify feedback appears in output
-    python3 - <<PYEOF
-import sqlite3
-db_path = "$VAULT_DIR/.synto/state.db"
-conn = sqlite3.connect(db_path)
-conn.execute("UPDATE raw_notes SET status='ingested' WHERE path='raw/quantum-computing.md'")
-conn.commit()
-conn.close()
-PYEOF
-    _CAR_RC=0
-    COMPILE_OUT2=$($OLW compile 2>&1) || _CAR_RC=$?
-    echo "$COMPILE_OUT2"
-    check "compile after rejection exits 0" "test $_CAR_RC -eq 0"
-    # We can't easily inspect the prompt, but compile should succeed without crash
-    soft_check "recompile after rejection completes" \
-        "! echo \"$COMPILE_OUT2\" | grep -qiE 'traceback|fatal'"
-else
-    pass "rejection test skipped (no draft available)"
-fi
+_REJ_RC=0
+REJECT_OUT=$($OLW reject "$REJECT_DRAFT" --feedback "Too brief, needs more concrete examples" 2>&1) || _REJ_RC=$?
+echo "$REJECT_OUT"
+check "reject exits 0" "test $_REJ_RC -eq 0"
+soft_check "reject removes draft file" "test ! -f \"$REJECT_DRAFT\""
+soft_check "reject confirms feedback saved" \
+    "echo \"$REJECT_OUT\" | grep -qiE 'feedback|saved|rejection|next compile'"
+
+# Force a recompile of the rejected concept via the public CLI so the
+# rejection-feedback prompt path is exercised. Direct raw_notes.status
+# mutation would be a no-op (see comment above).
+_CAR_RC=0
+COMPILE_OUT2=$($OLW compile --force --concept "Quantum computing" 2>&1) || _CAR_RC=$?
+echo "$COMPILE_OUT2"
+check "compile after rejection exits 0" "test $_CAR_RC -eq 0"
+# We can't easily inspect the prompt, but compile should succeed without crash
+soft_check "recompile after rejection completes" \
+    "! echo \"$COMPILE_OUT2\" | grep -qiE 'traceback|fatal'"
 
 # ── synto unblock ──────────────────────────────────────────────────────────────
 header "synto unblock"

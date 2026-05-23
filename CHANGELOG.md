@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Added
+
+- Article frontmatter now includes three machine-readable quality signals emitted
+  at compile time: `source_count` (int), `single_source` (bool), and
+  `source_quality` ("high" | "medium" | "low"). These let file readers, Obsidian
+  plugins, MCP tools, and AI agents assess corroboration needs without DB access.
+  `single_source: true` is derived from unique source-document identity where
+  available, falling back to path uniqueness. Synthesis articles carry
+  `source_count` and `single_source` on the same basis. `read_article` in the MCP
+  server inherits all three fields; `list_articles` now includes them in its
+  projection.
+
 ## [0.2.2] - 2026-05-22
 
 ### Fixed
