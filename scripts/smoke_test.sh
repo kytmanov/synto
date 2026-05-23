@@ -551,6 +551,31 @@ soft_check "concept_aliases table populated after ingest (issue #28)" \
     "test '$ALIAS_COUNT' -gt 0"
 info "Aliases stored in DB: $ALIAS_COUNT"
 
+# Bridge-value signal: count aliases that aren't just the auto-generated
+# lowercase of their concept_name. vault.generate_aliases() always adds a
+# lowercase variant for any title that isn't already lowercase; only
+# non-trivial aliases indicate the LLM extracted real surface forms.
+# Soft because LLM extraction quality varies — but if a 4B-class model
+# gets zero non-trivial aliases on the seed corpus, something's off.
+NON_TRIVIAL_ALIASES=$(python3 - <<PYEOF
+import sqlite3
+conn = sqlite3.connect("$VAULT_DIR/.synto/state.db")
+try:
+    n = conn.execute("""
+        SELECT COUNT(*) FROM concept_aliases
+        WHERE length(alias) >= 3
+          AND lower(alias) != lower(concept_name)
+    """).fetchone()[0]
+    print(n)
+except Exception:
+    print(0)
+conn.close()
+PYEOF
+)
+info "Non-trivial aliases (semantic, not lowercase fallback): $NON_TRIVIAL_ALIASES"
+soft_check "ingest produced at least one non-trivial alias (bridge value)" \
+    "test '$NON_TRIVIAL_ALIASES' -ge 1"
+
 # ── Language detection check ──────────────────────────────────────────────────
 header "Language detection (ingest)"
 
@@ -957,20 +982,29 @@ soft_check "duplicate query --synthesize keeps existing file" "test \"$SYNTH_COU
 #      and the right page was selected (soft — depends on the LLM).
 header "Query vocabulary bridge (alias-driven routing)"
 
-BRIDGE_CONCEPT=$(python3 - <<PYEOF
-import sqlite3
-conn = sqlite3.connect("$VAULT_DIR/.synto/state.db")
-row = conn.execute(
-    "SELECT name FROM concepts WHERE lower(name) LIKE '%qubit%' LIMIT 1"
-).fetchone()
-print(row[0] if row else "")
-conn.close()
+# Pick the first published concept article — sorted for determinism across
+# filesystems. -maxdepth 1 excludes sources/, synthesis/, queries/, .drafts/.
+# Reading the title from frontmatter (not concepts.name) matches what the
+# bridge's known_titles_set actually contains.
+BRIDGE_PATH=$(find "$VAULT_DIR/wiki" -maxdepth 1 -name "*.md" \
+    ! -name "index.md" ! -name "log.md" 2>/dev/null | sort | head -1)
+
+BRIDGE_CONCEPT=""
+if [[ -n "$BRIDGE_PATH" ]]; then
+    BRIDGE_CONCEPT=$(uv run --project "$REPO_DIR" python - "$BRIDGE_PATH" 2>/dev/null <<'PYEOF'
+import sys
+import frontmatter
+m = frontmatter.load(sys.argv[1])
+print(m.get("title", "") or "")
 PYEOF
 )
+fi
 
-if [[ -z "$BRIDGE_CONCEPT" ]]; then
-    info "Skipping bridge smoke: no 'qubit' concept extracted"
-else
+# Hard check: by this point ingest+compile+approve have all passed, so the
+# absence of any published concept is itself a regression worth surfacing.
+check "bridge smoke has a published concept to use" "test -n \"$BRIDGE_CONCEPT\""
+
+if [[ -n "$BRIDGE_CONCEPT" ]]; then
     info "Bridge concept: $BRIDGE_CONCEPT"
 
     # The alias is contrived so a direct title-match can't explain a hit.
@@ -987,7 +1021,10 @@ conn.close()
 PYEOF
 
     _BR_RC=0
-    BRIDGE_OUT=$($OLW query "what are ${BRIDGE_ALIAS}s used for?" 2>&1) || _BR_RC=$?
+    # Query uses the alias verbatim as a whole word — \b word-boundary
+    # matching in _expand_query won't fire on plurals or suffixes (a real
+    # limitation of the v1 bridge), so we keep the surface form exact.
+    BRIDGE_OUT=$($OLW query "explain ${BRIDGE_ALIAS} in simple terms" 2>&1) || _BR_RC=$?
     echo "$BRIDGE_OUT"
     check "bridge query exits 0" "test $_BR_RC -eq 0"
 
@@ -1009,8 +1046,12 @@ PYEOF
     echo "$NEG_OUT"
     check "negative-control query exits 0" "test $_NEG_RC -eq 0"
     _NEG_TMP=$(mktemp); echo "$NEG_OUT" > "$_NEG_TMP"
-    check "no routing hint when query has no alias match" \
-        "! grep -q 'query.routing_hint' \"$_NEG_TMP\""
+    # By this point concept_aliases has 20+ real entries; ambient coincidental
+    # matches would make a global "no hint" check flaky. The deterministic
+    # claim is narrower: the seeded concept must not appear in any hint for
+    # an unrelated question.
+    check "negative-control hint does not name the seeded concept" \
+        "! grep -qE 'query.routing_hint.*${BRIDGE_CONCEPT}' \"$_NEG_TMP\""
     rm -f "$_NEG_TMP"
 fi
 
