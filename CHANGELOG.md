@@ -28,6 +28,32 @@
   warning at load time. Re-run `synto ingest --force` to apply changes to already-ingested
   sources.
 
+### Fixed
+
+- `synto compile` now reads document identity from `source_documents` (the
+  canonical store since schema v9) instead of from a duplicate set of columns
+  on `raw_notes` that were never populated. The `single_source` frontmatter
+  field is unchanged for every current ingestion scenario (each source is its
+  own raw file, so path-uniqueness gives the correct answer either way); the
+  change is structural and makes the doc-identity branch alive and tested.
+
+### Changed
+
+- Schema v14: drop the five v8 metadata columns from `raw_notes`
+  (`source_type`, `origin_uri`, `imported_at`, `normalized_hash`,
+  `extractor_version`) that were superseded by `source_documents` in v9.
+  These columns held NULL on every row in every released version except
+  `source_type` (which had `DEFAULT 'notes'` but was never read). Vaults
+  migrate automatically on next open. External tooling querying those
+  columns directly must JOIN through `source_documents.id = stem(raw_notes.path)`.
+- `synto` now requires SQLite ≥ 3.35.0 (for the v14 migration's
+  `DROP COLUMN`). Modern Python stdlib distributions on macOS and Linux
+  already meet this. The error message at startup names the required
+  version if the check fails.
+- A downgrade guard now blocks opening a vault whose on-disk schema
+  version is newer than the installed `synto` binary, with a clear
+  upgrade-required error.
+
 ## [0.2.2] - 2026-05-22
 
 ### Fixed

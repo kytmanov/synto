@@ -15,6 +15,12 @@ Schema versioning: schema_version table tracks migration level.
   v8 — source metadata columns on raw_notes
   v9 — source segmenting, generated assets, and pre-public telemetry tables
   v10 — public metrics tables; drops old telemetry tables without preserving rows
+  v11 — compile_runs lineage tracking
+  v12 — llm_cache for semantic cache
+  v13 — concept_occurrences for term extraction
+  v14 — drop dead v8 metadata columns from raw_notes (superseded by
+         source_documents in v9): source_type, origin_uri, imported_at,
+         normalized_hash, extractor_version
 """
 
 from __future__ import annotations
@@ -30,7 +36,7 @@ from pathlib import Path
 
 from .models import ItemMentionRecord, KnowledgeItemRecord, RawNoteRecord, WikiArticleRecord
 
-_CURRENT_SCHEMA_VERSION = 13
+_CURRENT_SCHEMA_VERSION = 14
 _CHECKPOINT_SCHEMA_VERSION = 2
 
 _CROCKFORD32_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
@@ -53,11 +59,6 @@ CREATE TABLE IF NOT EXISTS raw_notes (
     ingested_at       TEXT,
     compiled_at       TEXT,
     error             TEXT,
-    source_type       TEXT NOT NULL DEFAULT 'notes',
-    origin_uri        TEXT,
-    imported_at       TEXT,
-    normalized_hash   TEXT,
-    extractor_version TEXT,
     prompt_version    TEXT
 );
 
@@ -591,6 +592,7 @@ _VERSIONED_MIGRATIONS: dict[int, list[str]] = {
         "CREATE INDEX IF NOT EXISTS idx_concept_occurrences_concept "
         "ON concept_occurrences(concept_name)",
     ],
+    14: [],  # all v14 work happens in the post-hook below for atomicity
 }
 
 
@@ -670,6 +672,14 @@ class StateDB:
 
     def _migrate(self) -> None:
         """Apply schema migrations in version order. Idempotent."""
+        # SQLite >= 3.35 is required for the v14 migration's DROP COLUMN.
+        # Modern Python stdlib on macOS/Linux ships ≥ 3.40; this guard turns a
+        # mid-migration SQL error into a clear startup message.
+        if sqlite3.sqlite_version_info < (3, 35, 0):
+            raise RuntimeError(
+                f"synto requires SQLite >= 3.35.0 (found {sqlite3.sqlite_version}). "
+                f"Upgrade Python or system SQLite."
+            )
         # Upgrade schema_version table if it lacks the id column (pre-v0.2 DBs).
         sv_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(schema_version)").fetchall()}
         if sv_cols and "id" not in sv_cols:
@@ -725,6 +735,11 @@ class StateDB:
         else:
             current_version = row[0]
 
+        if current_version > _CURRENT_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"On-disk DB schema_version={current_version} is newer than this "
+                f"synto binary (supports v{_CURRENT_SCHEMA_VERSION}). Upgrade synto."
+            )
         if current_version >= _CURRENT_SCHEMA_VERSION:
             return
 
@@ -748,6 +763,8 @@ class StateDB:
                 self._backfill_article_ids_v9()
             if version == 10:
                 self._drop_legacy_telemetry_tables_v10()
+            if version == 14:
+                self._drop_zombie_v8_columns_v14()
             with self._tx():
                 self._conn.execute(
                     "INSERT OR REPLACE INTO schema_version (id, version) VALUES (1, ?)",
@@ -779,6 +796,34 @@ class StateDB:
                 self._conn.execute(f"DROP INDEX IF EXISTS {index_name}")
             self._conn.execute("DROP TABLE IF EXISTS telemetry_events")
             self._conn.execute("DROP TABLE IF EXISTS telemetry_daily_rollups")
+
+    def _drop_zombie_v8_columns_v14(self) -> None:
+        """Drop the v8 source-metadata columns from raw_notes.
+
+        These columns were duplicated by source_documents (v9) and never
+        populated on raw_notes. The cleanup was missed at v9 and the dead
+        columns lured PR #11 into reading raw_notes.origin_uri (always
+        NULL) instead of source_documents.origin_uri (the real store).
+
+        Atomic via _tx(); idempotent via PRAGMA table_info probe so a
+        re-run after partial failure is a no-op rather than an error.
+        DROP COLUMN requires SQLite >= 3.35.0; the version guard at the
+        top of _migrate enforces this.
+        """
+        existing = {r[1] for r in self._conn.execute("PRAGMA table_info(raw_notes)").fetchall()}
+        targets = [
+            "origin_uri",
+            "imported_at",
+            "normalized_hash",
+            "extractor_version",
+            "source_type",
+        ]
+        to_drop = [c for c in targets if c in existing]
+        if not to_drop:
+            return
+        with self._tx():
+            for col in to_drop:
+                self._conn.execute(f"ALTER TABLE raw_notes DROP COLUMN {col}")
 
     def _validate_v6_tables(self) -> None:
         expected_ingest = {
@@ -1038,25 +1083,35 @@ class StateDB:
             rows = self._conn.execute("SELECT * FROM raw_notes").fetchall()
         return [_row_to_raw(r) for r in rows]
 
-    def get_origin_uris(self, paths: list[str]) -> dict[str, str | None]:
-        """Return {path: origin_uri} for each input path.
+    def get_origin_uris_for_raw_notes(self, paths: list[str]) -> dict[str, str | None]:
+        """Return {raw_note_path: origin_uri} via source_documents JOIN.
 
-        Maps every input path to its `raw_notes.origin_uri`, or `None` if the
-        row is missing the column value or the row doesn't exist. Used to
-        derive document-level identity for the `single_source` frontmatter
-        flag — two raw notes sharing an `origin_uri` came from the same
-        imported document, even if they are different chunks.
+        Source of truth is source_documents (the v9 canonical store for
+        document metadata). Link is by filename convention:
+        `raw_notes.path` is `"raw/<source_id>.md"` where `<source_id>`
+        matches `source_documents.id` — `synto add` writes the raw file
+        at exactly this path.
+
+        Returns None for raw notes with no matching source_documents row
+        (e.g., notes the user dropped into raw/ manually, without going
+        through `synto add`). Callers should fall back to path uniqueness
+        in that case.
         """
         result: dict[str, str | None] = {p: None for p in paths}
         if not paths:
             return result
         placeholders = ",".join("?" * len(paths))
         rows = self._conn.execute(
-            f"SELECT path, origin_uri FROM raw_notes WHERE path IN ({placeholders})",
+            f"""
+            SELECT 'raw/' || sd.id || '.md' AS raw_path, sd.origin_uri
+            FROM source_documents sd
+            WHERE 'raw/' || sd.id || '.md' IN ({placeholders})
+            """,
             tuple(paths),
         ).fetchall()
         for row in rows:
-            result[row[0]] = row[1]
+            if row[1] is not None:
+                result[row[0]] = row[1]
         return result
 
     def get_note_language(self, path: str) -> str | None:

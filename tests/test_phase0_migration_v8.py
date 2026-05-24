@@ -28,13 +28,16 @@ def _table_indexes(conn: sqlite3.Connection, table: str) -> set[str]:
     return {row[0] for row in rows if not row[0].startswith("sqlite_")}
 
 
-V8_NEW_COLUMNS = {
+# Of the six v8-added raw_notes columns, only prompt_version remains after
+# v14 (which dropped the others — they were superseded by source_documents
+# in v9 but lingered as zombies until v14).
+V8_SURVIVING_COLUMNS = {"prompt_version"}
+V14_DROPPED_COLUMNS = {
     "source_type",
     "origin_uri",
     "imported_at",
     "normalized_hash",
     "extractor_version",
-    "prompt_version",
 }
 
 V7_ERA_TABLES = {
@@ -70,7 +73,7 @@ V7_ERA_INDEXES = {
 }
 
 
-def test_fresh_db_is_at_v8(tmp_path: Path) -> None:
+def test_fresh_db_is_at_current_version(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
     StateDB(db_path)
 
@@ -79,7 +82,13 @@ def test_fresh_db_is_at_v8(tmp_path: Path) -> None:
     assert version == _CURRENT_SCHEMA_VERSION
 
     cols = _table_columns(conn, "raw_notes")
-    assert V8_NEW_COLUMNS.issubset(cols), f"missing columns: {V8_NEW_COLUMNS - cols}"
+    # Only prompt_version survives from the v8 additions; the rest were
+    # dropped in v14 as zombies (superseded by source_documents in v9).
+    assert V8_SURVIVING_COLUMNS.issubset(cols), (
+        f"missing v8 survivors: {V8_SURVIVING_COLUMNS - cols}"
+    )
+    leaked = V14_DROPPED_COLUMNS & cols
+    assert not leaked, f"v14 should have dropped these columns: {leaked}"
     conn.close()
 
 
@@ -96,22 +105,18 @@ def test_fresh_db_has_all_v7_tables(tmp_path: Path) -> None:
     conn.close()
 
 
-def test_fresh_db_default_source_type(tmp_path: Path) -> None:
+def test_fresh_db_raw_notes_has_no_zombie_columns(tmp_path: Path) -> None:
+    """After v14 cleanup, raw_notes must not expose source_type / origin_uri /
+    imported_at / normalized_hash / extractor_version. Source metadata lives
+    in source_documents only.
+    """
     db_path = tmp_path / "state.db"
     StateDB(db_path)
 
     conn = sqlite3.connect(db_path)
-    conn.execute(
-        "INSERT INTO raw_notes (path, content_hash, status) VALUES (?, ?, ?)",
-        ("raw/note.md", "abc123", "new"),
-    )
-    conn.commit()
-
-    row = conn.execute(
-        "SELECT source_type, origin_uri FROM raw_notes WHERE path = 'raw/note.md'"
-    ).fetchone()
-    assert row[0] == "notes"
-    assert row[1] is None
+    cols = _table_columns(conn, "raw_notes")
+    for col in V14_DROPPED_COLUMNS:
+        assert col not in cols, f"{col} should have been dropped in v14"
     conn.close()
 
 
@@ -234,8 +239,11 @@ def _build_v7_db(db_path: Path) -> None:
     conn.close()
 
 
-def test_v7_to_v8_upgrade_preserves_rows(tmp_path: Path) -> None:
-    """Simulate a realistic v7 DB, then verify v8 upgrade preserves rows."""
+def test_v7_to_current_upgrade_preserves_rows(tmp_path: Path) -> None:
+    """Simulate a realistic v7 DB, then verify the full upgrade chain preserves
+    rows. Post-v14 the source_type column no longer exists; raw_notes rows
+    survive with their non-zombie data intact.
+    """
     db_path = tmp_path / "state.db"
     _build_v7_db(db_path)
 
@@ -246,13 +254,13 @@ def test_v7_to_v8_upgrade_preserves_rows(tmp_path: Path) -> None:
     assert version == _CURRENT_SCHEMA_VERSION
 
     cols = _table_columns(conn, "raw_notes")
-    assert V8_NEW_COLUMNS.issubset(cols)
+    # Only prompt_version remains from the v8-era additions.
+    assert V8_SURVIVING_COLUMNS.issubset(cols)
+    leaked = V14_DROPPED_COLUMNS & cols
+    assert not leaked
 
-    row = conn.execute(
-        "SELECT source_type, summary FROM raw_notes WHERE path = 'raw/old.md'"
-    ).fetchone()
-    assert row[0] == "notes"
-    assert row[1] == "pre-existing note"
+    row = conn.execute("SELECT summary FROM raw_notes WHERE path = 'raw/old.md'").fetchone()
+    assert row[0] == "pre-existing note"
 
     n_concepts = conn.execute("SELECT COUNT(*) FROM concepts").fetchone()[0]
     assert n_concepts == 1

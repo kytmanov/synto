@@ -680,3 +680,145 @@ def test_ingest_chunk_crud(db):
 
     db.delete_ingest_chunks("raw/a.md", "hash", 3, 100)
     assert db.list_ingest_chunks("raw/a.md", "hash", 3, 100) == []
+
+
+# ── v14 migration tests: drop dead v8 columns + downgrade guard ──────────
+
+
+def _seed_source_document(db, source_id: str, origin_uri: str) -> None:
+    import hashlib as _hashlib
+
+    db._conn.execute(
+        """INSERT OR REPLACE INTO source_documents
+           (id, source_type, origin_uri, raw_hash, redistribution)
+           VALUES (?, 'notes', ?, ?, 'unknown')""",
+        (source_id, origin_uri, _hashlib.sha256(source_id.encode()).hexdigest()),
+    )
+    db._conn.commit()
+
+
+def test_get_origin_uris_for_raw_notes_via_source_documents(db):
+    _seed_source_document(db, "abc123", "file:///foo.pdf")
+    result = db.get_origin_uris_for_raw_notes(["raw/abc123.md"])
+    assert result == {"raw/abc123.md": "file:///foo.pdf"}
+
+
+def test_get_origin_uris_for_raw_notes_returns_none_when_no_source_document(db):
+    result = db.get_origin_uris_for_raw_notes(["raw/manual-note.md"])
+    assert result == {"raw/manual-note.md": None}
+
+
+def test_get_origin_uris_for_raw_notes_empty_input(db):
+    assert db.get_origin_uris_for_raw_notes([]) == {}
+
+
+def test_get_origin_uris_for_raw_notes_mixed(db):
+    _seed_source_document(db, "imported1", "file:///book.pdf")
+    result = db.get_origin_uris_for_raw_notes(["raw/imported1.md", "raw/manual-note.md"])
+    assert result == {
+        "raw/imported1.md": "file:///book.pdf",
+        "raw/manual-note.md": None,
+    }
+
+
+def _build_pre_v14_raw_notes_db(path):
+    """Construct a DB at schema_version=13 with the five zombie v8 columns,
+    using raw sqlite3 so we don't depend on the live `_SCHEMA` (which no
+    longer declares them) or live migrations.
+    """
+    import sqlite3 as _sqlite
+
+    conn = _sqlite.connect(str(path))
+    conn.executescript(
+        """
+        CREATE TABLE schema_version (
+            id      INTEGER PRIMARY KEY CHECK(id = 1),
+            version INTEGER NOT NULL
+        );
+        INSERT INTO schema_version (id, version) VALUES (1, 13);
+        CREATE TABLE raw_notes (
+            path              TEXT PRIMARY KEY,
+            content_hash      TEXT NOT NULL,
+            status            TEXT NOT NULL DEFAULT 'new',
+            summary           TEXT,
+            quality           TEXT,
+            language          TEXT,
+            ingested_at       TEXT,
+            compiled_at       TEXT,
+            error             TEXT,
+            source_type       TEXT NOT NULL DEFAULT 'notes',
+            origin_uri        TEXT,
+            imported_at       TEXT,
+            normalized_hash   TEXT,
+            extractor_version TEXT,
+            prompt_version    TEXT
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_schema_migration_v14_drops_five_columns(tmp_path):
+    db_path = tmp_path / ".synto" / "state.db"
+    db_path.parent.mkdir(parents=True)
+    _build_pre_v14_raw_notes_db(db_path)
+
+    # Opening via StateDB triggers _migrate.
+    db = StateDB(db_path)
+
+    cols = {row[1] for row in db._conn.execute("PRAGMA table_info(raw_notes)").fetchall()}
+    for col in ["source_type", "origin_uri", "imported_at", "normalized_hash", "extractor_version"]:
+        assert col not in cols, f"{col} should be dropped"
+    # 10 surviving columns
+    expected = {
+        "path",
+        "content_hash",
+        "status",
+        "summary",
+        "quality",
+        "language",
+        "ingested_at",
+        "compiled_at",
+        "error",
+        "prompt_version",
+    }
+    assert cols == expected
+
+    version_row = db._conn.execute("SELECT version FROM schema_version WHERE id=1").fetchone()
+    assert version_row[0] == _CURRENT_SCHEMA_VERSION
+
+
+def test_schema_migration_v14_idempotent(tmp_path):
+    """A second open is a no-op (re-opening a v14 DB should not re-run drops)."""
+    db_path = tmp_path / ".synto" / "state.db"
+    db_path.parent.mkdir(parents=True)
+    _build_pre_v14_raw_notes_db(db_path)
+
+    StateDB(db_path)  # migrates to v14
+    # Second open: must not raise (the post-hook probes table_info first).
+    StateDB(db_path)
+
+
+def test_open_raises_on_db_newer_than_binary(tmp_path):
+    """Downgrade guard: opening a DB with schema_version greater than
+    _CURRENT_SCHEMA_VERSION must raise a clear error, not silently run."""
+    import sqlite3 as _sqlite
+
+    db_path = tmp_path / ".synto" / "state.db"
+    db_path.parent.mkdir(parents=True)
+    conn = _sqlite.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE schema_version (
+            id      INTEGER PRIMARY KEY CHECK(id = 1),
+            version INTEGER NOT NULL
+        );
+        INSERT INTO schema_version (id, version) VALUES (1, 999);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(RuntimeError, match="newer than this synto binary"):
+        StateDB(db_path)
