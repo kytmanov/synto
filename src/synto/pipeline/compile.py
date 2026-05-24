@@ -728,15 +728,17 @@ def _write_draft(
             }
         ]
     # Derive quality signals from source paths.
-    # `single_source` reflects *document* identity (via raw_notes.origin_uri):
-    # five chunks of one imported book are a single source. When any source
-    # lacks an origin_uri (e.g., free-form user notes), fall back to path
-    # uniqueness so the predicate still degrades sensibly.
+    # `single_source` reflects *document* identity, sourced from source_documents
+    # (the v9 canonical store). Maps each raw_notes.path through filename
+    # convention to source_documents.id. Falls back to path uniqueness when
+    # any source is a manually-dropped raw note (no source_documents row),
+    # which is also the correct answer in the current one-raw-file-per-source
+    # ingest design.
     if source_paths:
         source_count = len(source_paths)
         source_quality = _source_quality_summary(source_paths, db)
 
-        origin_map = db.get_origin_uris(source_paths)
+        origin_map = db.get_origin_uris_for_raw_notes(source_paths)
         if all(origin_map.get(sp) for sp in source_paths):
             single_source = len({origin_map[sp] for sp in source_paths}) == 1
         else:

@@ -13,6 +13,7 @@ heavier transport.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from unittest.mock import MagicMock
 
@@ -590,37 +591,42 @@ def test_vault_reader_rejects_invalid_source_quality(vault, config, db):
     assert ref.source_quality is None
 
 
-# ── compile.py: single_source via origin_uri ──────────────────────────────
+# ── compile.py: single_source via source_documents ────────────────────────
 
 
-def _set_origin_uri(db, path: str, origin_uri: str | None) -> None:
-    """Set raw_notes.origin_uri directly. The live ingest path doesn't
-    populate this column today (see follow-up note in compile.py); the column
-    exists for extractor paths that will write it. We seed it directly so the
-    `single_source` logic can be exercised end-to-end."""
+def _seed_source_document(db, source_id: str, origin_uri: str) -> None:
+    """Seed a source_documents row. Tests use this together with a raw note
+    at `raw/<source_id>.md` to simulate a `synto add` import — the live
+    code path that compile.py reads when computing single_source identity.
+    """
     db._conn.execute(
-        "UPDATE raw_notes SET origin_uri = ? WHERE path = ?",
-        (origin_uri, path),
+        """INSERT OR REPLACE INTO source_documents
+           (id, source_type, origin_uri, raw_hash, redistribution)
+           VALUES (?, 'notes', ?, ?, 'unknown')""",
+        (source_id, origin_uri, hashlib.sha256(source_id.encode()).hexdigest()),
     )
     db._conn.commit()
 
 
 def test_compile_single_source_from_one_document(vault, config, db):
-    """Two raw notes from the same imported document (same origin_uri) →
-    single_source: true, even though source_count == 2. This is the dobryakov
-    corroboration check: chunks of one book are one source."""
+    """Two raw notes from the same imported document (same source_documents
+    origin_uri) → single_source: true, even though source_count == 2. This
+    is the dobryakov corroboration check: chunks of one book are one source.
+    """
     for i in range(2):
-        p = vault / "raw" / f"chunk{i}.md"
+        source_id = f"chunk{i}"
+        p = vault / "raw" / f"{source_id}.md"
         p.write_text(f"---\ntitle: Chunk {i}\n---\n\nContent {i}.")
         db.upsert_raw(
             RawNoteRecord(
-                path=f"raw/chunk{i}.md",
+                path=f"raw/{source_id}.md",
                 content_hash=f"h{i}",
                 quality="high",
                 status="ingested",
             )
         )
-        _set_origin_uri(db, f"raw/chunk{i}.md", "file:///books/tanenbaum.pdf")
+        # Same origin_uri across both chunks — they're from the same document.
+        _seed_source_document(db, source_id, "file:///books/tanenbaum.pdf")
 
     for p in ["raw/chunk0.md", "raw/chunk1.md"]:
         db.upsert_concepts(p, ["Test Concept"])
@@ -632,19 +638,21 @@ def test_compile_single_source_from_one_document(vault, config, db):
 
 
 def test_compile_multi_source_from_two_documents(vault, config, db):
-    """Two raw notes with different origin_uri → single_source: false."""
+    """Two raw notes with different source_documents origin_uri →
+    single_source: false."""
     for i, origin in enumerate(["file:///books/tanenbaum.pdf", "file:///books/kleppmann.pdf"]):
-        p = vault / "raw" / f"chunk{i}.md"
+        source_id = f"chunk{i}"
+        p = vault / "raw" / f"{source_id}.md"
         p.write_text(f"---\ntitle: Chunk {i}\n---\n\nContent {i}.")
         db.upsert_raw(
             RawNoteRecord(
-                path=f"raw/chunk{i}.md",
+                path=f"raw/{source_id}.md",
                 content_hash=f"h{i}",
                 quality="high",
                 status="ingested",
             )
         )
-        _set_origin_uri(db, f"raw/chunk{i}.md", origin)
+        _seed_source_document(db, source_id, origin)
 
     for p in ["raw/chunk0.md", "raw/chunk1.md"]:
         db.upsert_concepts(p, ["Test Concept"])
@@ -656,9 +664,11 @@ def test_compile_multi_source_from_two_documents(vault, config, db):
 
 
 def test_compile_falls_back_to_path_uniqueness_when_origin_uri_missing(vault, config, db):
-    """If any source lacks origin_uri (free-form user notes, current
-    production state), fall back to path-uniqueness. Two distinct paths with
-    no origin info → single_source: false."""
+    """If any source lacks a source_documents row (free-form user notes,
+    current production state for non-`synto add` ingest), fall back to
+    path-uniqueness. Two distinct paths with no doc-identity → single_source:
+    false.
+    """
     for i in range(2):
         p = vault / "raw" / f"note{i}.md"
         p.write_text(f"---\ntitle: Note {i}\n---\n\nContent {i}.")
@@ -670,7 +680,7 @@ def test_compile_falls_back_to_path_uniqueness_when_origin_uri_missing(vault, co
                 status="ingested",
             )
         )
-        # No origin_uri set — production default.
+        # No source_documents row — manually-dropped raw note.
 
     for p in ["raw/note0.md", "raw/note1.md"]:
         db.upsert_concepts(p, ["Test Concept"])
@@ -681,27 +691,29 @@ def test_compile_falls_back_to_path_uniqueness_when_origin_uri_missing(vault, co
     assert meta["single_source"] is False
 
 
-def test_compile_fallback_path_uniqueness_when_partial_origin_uri(vault, config, db):
-    """If some sources have origin_uri and others don't, we cannot trust
-    document identity (mixed signal), so fall back to path uniqueness."""
+def test_compile_fallback_when_some_sources_lack_source_documents_row(vault, config, db):
+    """If some sources have a source_documents row and others don't, we
+    cannot trust document identity (mixed signal), so fall back to path
+    uniqueness."""
     for i in range(2):
-        p = vault / "raw" / f"note{i}.md"
+        source_id = f"note{i}"
+        p = vault / "raw" / f"{source_id}.md"
         p.write_text(f"---\ntitle: Note {i}\n---\n\nContent {i}.")
         db.upsert_raw(
             RawNoteRecord(
-                path=f"raw/note{i}.md",
+                path=f"raw/{source_id}.md",
                 content_hash=f"h{i}",
                 quality="medium",
                 status="ingested",
             )
         )
-    # Only one source gets an origin_uri — mixed signal.
-    _set_origin_uri(db, "raw/note0.md", "file:///books/tanenbaum.pdf")
+    # Only one source has a source_documents row — mixed signal.
+    _seed_source_document(db, "note0", "file:///books/tanenbaum.pdf")
 
     for p in ["raw/note0.md", "raw/note1.md"]:
         db.upsert_concepts(p, ["Test Concept"])
 
     drafts, _, _ = compile_concepts(config=config, client=_mock_client(ARTIFACT_JSON), db=db)
     meta, _ = parse_note(drafts[0])
-    # Two distinct raw paths, mixed origin_uri → path-uniqueness fallback says false.
+    # Mixed source_documents coverage → path-uniqueness fallback says false.
     assert meta["single_source"] is False
