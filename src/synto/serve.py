@@ -1,4 +1,4 @@
-"""Minimal read-only MCP server wrapping VaultReader."""
+"""Read-only MCP server wrapping VaultReader plus a query-through tool."""
 
 from __future__ import annotations
 
@@ -6,24 +6,35 @@ import asyncio
 import hashlib
 import logging
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from .config import Config, McpConfig
-from .readers import Article, ArticleFilter, ArticleNotFound, ArticleRef, VaultReader
+from .readers import (
+    Article,
+    ArticleFilter,
+    ArticleNotFound,
+    ArticleRef,
+    VaultReader,
+    _extract_first_paragraph,
+)
 from .state import StateDB
 
 log = logging.getLogger(__name__)
 
+_DEFAULT_MIN_STATUS = "published"
+_SEARCH_LIMIT_CAP = 50
 
-def _check_mcp_available() -> None:
-    try:
-        import mcp  # noqa: F401
-    except ImportError as exc:
-        raise RuntimeError(
-            "mcp library not installed. Install with: pip install synto[mcp]"
-        ) from exc
+_SERVER_INSTRUCTIONS = (
+    "Read-only access to wiki articles from one Synto vault. "
+    "Visibility filtering and optional audit logging are applied server-side. "
+    "By default only status='published' articles are returned; pass "
+    "min_status='verified' or 'draft' to opt in to lower-trust material. "
+    "`answer_question` triggers fast+heavy LLM calls (may incur cost on "
+    "paid providers); all other tools are filesystem-only."
+)
 
 
 def _vault_id(vault: Path) -> str:
@@ -76,6 +87,22 @@ def _read_visible_article(reader: VaultReader, name_or_id: str, mcp_config: McpC
     return article
 
 
+def _ref_to_dict(ref: ArticleRef) -> dict[str, object]:
+    return {
+        "id": ref.id,
+        "name": ref.name,
+        "path": ref.path,
+        "summary": ref.summary,
+        "tags": list(ref.tags),
+        "confidence": ref.confidence_score,
+        "source_count": ref.source_count,
+        "single_source": ref.single_source,
+        "source_quality": ref.source_quality,
+        "status": ref.status,
+        "kind": ref.kind,
+    }
+
+
 def _audit(
     db: StateDB | None,
     *,
@@ -105,61 +132,64 @@ def _server_name(vault: Path) -> str:
     return f"synto:{hashlib.sha256(str(vault.resolve()).encode()).hexdigest()[:8]}"
 
 
-def run_server(vault: Path, transport: str = "stdio") -> None:
-    if transport != "stdio":
-        raise RuntimeError("Phase 1A supports only stdio transport")
+def _resolve_min_status(value: str | None) -> str:
+    # Tool handlers expose `min_status: str | None = None`. None means
+    # "the caller did not set it" → apply the agent-safe default. Empty
+    # string means "no filter" — agent must opt in explicitly.
+    if value is None:
+        return _DEFAULT_MIN_STATUS
+    return value
 
-    _check_mcp_available()
 
-    # The CLI group callback installs a RichHandler pointing at sys.stdout for
-    # interactive use.  In stdio mode stdout is the JSON-RPC channel, so any
-    # log line written there corrupts the protocol.  Suppress the mcp library's
-    # INFO request tracing — it is noise to end users and not safe on this fd.
-    import logging as _logging
+class _DefaultToolError(RuntimeError):
+    """Placeholder exception type used when handlers are built outside FastMCP."""
 
-    _logging.getLogger("mcp").setLevel(_logging.WARNING)
 
-    from mcp.server.fastmcp import FastMCP
-    from mcp.server.fastmcp.exceptions import ToolError
+def build_tool_handlers(
+    reader: VaultReader,
+    config: Config,
+    db: StateDB | None,
+    vault_key: str,
+    *,
+    tool_error_cls: type[Exception] = _DefaultToolError,
+) -> dict[str, Callable[..., Any]]:
+    """Construct the MCP tool handlers and return them keyed by tool name.
 
-    config = Config.from_vault(vault)
-    reader = VaultReader(vault)
-    db = StateDB(config.state_db_path) if config.mcp.audit else None
-    server = FastMCP(
-        _server_name(vault),
-        instructions=(
-            "Read-only access to published wiki articles from one Synto vault. "
-            "Visibility filtering and optional audit logging are applied server-side."
-        ),
-        json_response=True,
-    )
-    vault_key = _vault_id(vault)
+    Used by `run_server` to register against a FastMCP instance, and by tests
+    to drive each handler directly without spinning up STDIO.
+    `tool_error_cls` lets callers map "not found" errors to FastMCP's
+    `ToolError` when running for real.
+    """
 
-    @server.tool()
     def list_articles(
-        tag: str | None = None, contains: str | None = None
+        tag: str | None = None,
+        contains: str | None = None,
+        min_status: str | None = None,
+        kind: str | None = None,
+        exclude_single_source: bool = False,
     ) -> list[dict[str, object]]:
         started = time.monotonic()
         success = False
-        arguments = {"tag": tag, "contains": contains}
+        arguments = {
+            "tag": tag,
+            "contains": contains,
+            "min_status": min_status,
+            "kind": kind,
+            "exclude_single_source": exclude_single_source,
+        }
         try:
-            refs = reader.list_articles(filter=ArticleFilter(tag=tag, contains=contains))
+            refs = reader.list_articles(
+                filter=ArticleFilter(
+                    tag=tag,
+                    contains=contains,
+                    min_status=_resolve_min_status(min_status),
+                    kind=kind,
+                    exclude_single_source=exclude_single_source,
+                )
+            )
             visible = _filter_visible_refs(reader, refs, config.mcp)
             success = True
-            return [
-                {
-                    "id": ref.id,
-                    "name": ref.name,
-                    "path": ref.path,
-                    "summary": ref.summary,
-                    "tags": list(ref.tags),
-                    "confidence": ref.confidence_score,
-                    "source_count": ref.source_count,
-                    "single_source": ref.single_source,
-                    "source_quality": ref.source_quality,
-                }
-                for ref in visible
-            ]
+            return [_ref_to_dict(ref) for ref in visible]
         finally:
             _audit(
                 db,
@@ -171,7 +201,6 @@ def run_server(vault: Path, transport: str = "stdio") -> None:
                 mcp_config=config.mcp,
             )
 
-    @server.tool()
     def read_article(name_or_id: str) -> dict[str, object]:
         started = time.monotonic()
         success = False
@@ -180,7 +209,7 @@ def run_server(vault: Path, transport: str = "stdio") -> None:
             try:
                 article = _read_visible_article(reader, name_or_id, config.mcp)
             except ArticleNotFound as exc:
-                raise ToolError(f"No article: {name_or_id!r}") from exc
+                raise tool_error_cls(f"No article: {name_or_id!r}") from exc
             success = True
             return {
                 "id": article.id,
@@ -200,7 +229,6 @@ def run_server(vault: Path, transport: str = "stdio") -> None:
                 mcp_config=config.mcp,
             )
 
-    @server.tool()
     def find_concept(query: str) -> dict[str, object] | None:
         started = time.monotonic()
         success = False
@@ -231,6 +259,243 @@ def run_server(vault: Path, transport: str = "stdio") -> None:
                 latency_ms=int((time.monotonic() - started) * 1000),
                 mcp_config=config.mcp,
             )
+
+    def search_articles(
+        query: str,
+        limit: int = 10,
+        min_status: str | None = None,
+        kind: str | None = None,
+        exclude_single_source: bool = False,
+    ) -> list[dict[str, object]]:
+        started = time.monotonic()
+        success = False
+        arguments = {
+            "query": query,
+            "limit": limit,
+            "min_status": min_status,
+            "kind": kind,
+            "exclude_single_source": exclude_single_source,
+        }
+        try:
+            if not query:
+                success = True
+                return []
+            capped_limit = max(0, min(int(limit), _SEARCH_LIMIT_CAP))
+            refs = reader.list_articles(
+                filter=ArticleFilter(
+                    contains=query,
+                    min_status=_resolve_min_status(min_status),
+                    kind=kind,
+                    exclude_single_source=exclude_single_source,
+                )
+            )
+            visible = _filter_visible_refs(reader, refs, config.mcp)
+            needle = query.casefold()
+            scored: list[tuple[int, ArticleRef]] = []
+            for ref in visible:
+                haystack = f"{ref.name}\n{ref.summary or ''}".casefold()
+                score = haystack.count(needle)
+                if score == 0:
+                    continue
+                scored.append((score, ref))
+            scored.sort(key=lambda item: item[0], reverse=True)
+            success = True
+            results: list[dict[str, object]] = []
+            for score, ref in scored[:capped_limit]:
+                payload = _ref_to_dict(ref)
+                payload["score"] = score
+                results.append(payload)
+            return results
+        finally:
+            _audit(
+                db,
+                vault_id=vault_key,
+                tool="search_articles",
+                arguments=arguments,
+                success=success,
+                latency_ms=int((time.monotonic() - started) * 1000),
+                mcp_config=config.mcp,
+            )
+
+    def get_concept(name: str) -> dict[str, object]:
+        started = time.monotonic()
+        success = False
+        arguments = {"name": name}
+        empty: dict[str, object] = {
+            "name": name,
+            "aliases": [],
+            "canonical_article_id": None,
+            "definition": "",
+            "body": "",
+            "frontmatter": {},
+        }
+        try:
+            concept = reader.find_concept(name)
+            if concept is None:
+                success = True
+                return empty
+            payload: dict[str, object] = {
+                "name": concept.name,
+                "aliases": list(concept.aliases),
+                "canonical_article_id": concept.canonical_article_id,
+                "definition": "",
+                "body": "",
+                "frontmatter": {},
+            }
+            if concept.canonical_article_id:
+                try:
+                    article = _read_visible_article(
+                        reader, concept.canonical_article_id, config.mcp
+                    )
+                    payload["body"] = article.body
+                    payload["frontmatter"] = article.frontmatter
+                    payload["definition"] = _extract_first_paragraph(article.body) or ""
+                except ArticleNotFound:
+                    pass
+            success = True
+            return payload
+        finally:
+            _audit(
+                db,
+                vault_id=vault_key,
+                tool="get_concept",
+                arguments=arguments,
+                success=success,
+                latency_ms=int((time.monotonic() - started) * 1000),
+                mcp_config=config.mcp,
+            )
+
+    def list_sources() -> list[dict[str, object]]:
+        started = time.monotonic()
+        success = False
+        try:
+            sources = reader.list_sources()
+            success = True
+            return [
+                {
+                    "id": src.id,
+                    "title": src.title,
+                    "source_type": src.source_type,
+                }
+                for src in sources
+            ]
+        finally:
+            _audit(
+                db,
+                vault_id=vault_key,
+                tool="list_sources",
+                arguments={},
+                success=success,
+                latency_ms=int((time.monotonic() - started) * 1000),
+                mcp_config=config.mcp,
+            )
+
+    def trace_lineage(name_or_id: str) -> dict[str, object]:
+        started = time.monotonic()
+        success = False
+        arguments = {"name_or_id": name_or_id}
+        try:
+            try:
+                article = _read_visible_article(reader, name_or_id, config.mcp)
+            except ArticleNotFound as exc:
+                raise tool_error_cls(f"No article: {name_or_id!r}") from exc
+            raw = article.frontmatter.get("lineage", [])
+            lineage = raw if isinstance(raw, list) else []
+            success = True
+            return {"article": article.name, "lineage": lineage}
+        finally:
+            _audit(
+                db,
+                vault_id=vault_key,
+                tool="trace_lineage",
+                arguments=arguments,
+                success=success,
+                latency_ms=int((time.monotonic() - started) * 1000),
+                mcp_config=config.mcp,
+            )
+
+    def answer_question(question: str, max_pages: int = 5) -> dict[str, object]:
+        started = time.monotonic()
+        success = False
+        arguments = {"question": question, "max_pages": max_pages}
+        try:
+            from .client_factory import build_client
+            from .engines import QueryConfig, QueryEngine
+
+            client = build_client(config)
+            engine = QueryEngine(
+                reader=reader,
+                fast_client=client,
+                heavy_client=client,
+                config=config,
+                db=db,
+                query_config=QueryConfig(max_pages=max(1, int(max_pages))),
+            )
+            answer = engine.query(question)
+            visible_pages: list[str] = []
+            for page_name in engine.last_selected_pages:
+                try:
+                    _read_visible_article(reader, page_name, config.mcp)
+                except ArticleNotFound:
+                    continue
+                visible_pages.append(page_name)
+            success = True
+            return {
+                "answer": answer.text,
+                "title": answer.title,
+                "selected_pages": visible_pages,
+                "index_found": engine.last_index_found,
+            }
+        finally:
+            _audit(
+                db,
+                vault_id=vault_key,
+                tool="answer_question",
+                arguments=arguments,
+                success=success,
+                latency_ms=int((time.monotonic() - started) * 1000),
+                mcp_config=config.mcp,
+            )
+
+    return {
+        "list_articles": list_articles,
+        "read_article": read_article,
+        "find_concept": find_concept,
+        "search_articles": search_articles,
+        "get_concept": get_concept,
+        "list_sources": list_sources,
+        "trace_lineage": trace_lineage,
+        "answer_question": answer_question,
+    }
+
+
+def run_server(vault: Path, transport: str = "stdio") -> None:
+    if transport != "stdio":
+        raise RuntimeError("Phase 1A supports only stdio transport")
+
+    # The CLI group callback installs a RichHandler pointing at sys.stdout for
+    # interactive use.  In stdio mode stdout is the JSON-RPC channel, so any
+    # log line written there corrupts the protocol.  Suppress the mcp library's
+    # INFO request tracing — it is noise to end users and not safe on this fd.
+    import logging as _logging
+
+    _logging.getLogger("mcp").setLevel(_logging.WARNING)
+
+    from mcp.server.fastmcp import FastMCP
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    config = Config.from_vault(vault)
+    reader = VaultReader(vault)
+    db = StateDB(config.state_db_path) if config.mcp.audit else None
+    server = FastMCP(
+        _server_name(vault),
+        instructions=_SERVER_INSTRUCTIONS,
+        json_response=True,
+    )
+    vault_key = _vault_id(vault)
+    handlers = build_tool_handlers(reader, config, db, vault_key, tool_error_cls=ToolError)
+    for handler in handlers.values():
+        server.tool()(handler)
 
     try:
         server.run(transport="stdio")

@@ -167,6 +167,17 @@ def is_concept_article_path(relative_path: str) -> bool:
     return name not in {"index.md", "log.md"}
 
 
+def is_synthesis_article_path(relative_path: str) -> bool:
+    parts = Path(relative_path).parts
+    if ".drafts" in parts:
+        return False
+    lowered_parts = {part.casefold() for part in parts}
+    if "synthesis" not in lowered_parts:
+        return False
+    name = Path(relative_path).name.casefold()
+    return name not in {"index.md", "log.md"}
+
+
 # ── Wikilink target safety ────────────────────────────────────────────────────
 
 _WIKILINK_UNSAFE = re.compile(r"[\[\]|#^]")

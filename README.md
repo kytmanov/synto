@@ -156,7 +156,7 @@ Works today with Markdown. Drop notes in `raw/`, run `synto run`, and get a cros
 
 **Pack export.** `synto pack export --target agents` produces a portable directory any file-aware agent can read: articles, `INDEX.json` for fast concept lookup, source provenance, and agent-readable entry points.
 
-**MCP server.** `synto serve` exposes your wiki as a local MCP server with three tools: `list_articles`, `read_article`, and `find_concept`. Wire it into Claude Code, Cursor, or any MCP-compatible client in one command.
+**MCP server.** `synto serve` exposes your wiki as a local MCP server with eight tools: `list_articles`, `read_article`, `find_concept`, `search_articles`, `get_concept`, `list_sources`, `trace_lineage`, and `answer_question`. Wire it into Claude Code, Cursor, or any MCP-compatible client in one command. Drafts are hidden by default; `answer_question` runs a full vocabulary-bridged query through the fast and heavy models, so be aware of provider cost when wiring it to paid models.
 
 **Self-maintenance.** `synto maintain` repairs broken wikilinks and creates stubs for missing targets. `synto lint` reports orphans, stale articles, and missing frontmatter.
 
@@ -210,11 +210,7 @@ pip install synto
 uv tool install synto
 ```
 
-For MCP server support:
-
-```bash
-pip install "synto[mcp]"
-```
+The MCP server (`synto serve`) ships in the base install — no extras flag needed.
 
 ---
 
@@ -364,7 +360,7 @@ Any OpenAI-compatible endpoint works. Use `synto setup` to configure interactive
 
 - Full ingest → compile → approve pipeline; supports Markdown notes and Obsidian vaults
 - `synto pack export --target agents` — portable knowledge pack with `INDEX.json` and agent metadata
-- `synto serve` — read-only MCP server (`list_articles`, `read_article`, `find_concept`)
+- `synto serve` — MCP server with 8 tools: `list_articles`, `read_article`, `find_concept`, `search_articles`, `get_concept`, `list_sources`, `trace_lineage`, `answer_question`. Quality signals (`status`, `confidence`, `source_count`, `single_source`) are surfaced on every article ref so agents can self-filter; `min_status` defaults to `"published"` to keep drafts out of agent context.
 - `synto query` — index-routed Q&A with optional synthesis to `wiki/synthesis/`
 - `synto review` — interactive draft review: approve, reject, edit, or diff before publishing
 - `synto watch` — file watcher: auto-ingest and compile on every save
@@ -401,7 +397,7 @@ pack/
   CLAUDE.md           Claude Code context file
 ```
 
-Any file-aware agent can read the articles directly. `INDEX.json` enables fast concept lookup without a database. `synto serve` exposes `list_articles`, `read_article`, and `find_concept` as MCP tools.
+Any file-aware agent can read the articles directly. `INDEX.json` enables fast concept lookup without a database. `synto serve` exposes 8 MCP tools — browse (`list_articles`), read (`read_article`, `get_concept`, `trace_lineage`, `list_sources`), search (`search_articles`, `find_concept`), and answer (`answer_question`, which runs the full query pipeline).
 
 ---
 

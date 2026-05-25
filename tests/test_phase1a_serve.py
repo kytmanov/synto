@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 from click.testing import CliRunner
@@ -11,7 +10,7 @@ from click.testing import CliRunner
 from synto.cli import cli
 from synto.models import WikiArticleRecord
 from synto.readers import ArticleNotFound
-from synto.serve import _audit, _filter_visible_refs, _read_visible_article, run_server
+from synto.serve import _audit, _filter_visible_refs, _read_visible_article
 from synto.state import StateDB
 from synto.vault import atomic_write
 
@@ -45,22 +44,12 @@ def _insert_article(db: StateDB, rel_path: str, title: str):
     )
 
 
-def test_serve_help_works_without_mcp_installed():
+def test_serve_help_works():
     result = CliRunner().invoke(cli, ["serve", "--help"])
 
     assert result.exit_code == 0
     assert "stdio" in result.output
     assert "list_articles" in result.output
-
-
-def test_run_server_reports_missing_mcp_dependency(tmp_path: Path):
-    with patch("builtins.__import__", side_effect=ImportError("no mcp")):
-        try:
-            run_server(tmp_path)
-        except RuntimeError as exc:
-            assert "mcp library not installed" in str(exc)
-        else:
-            raise AssertionError("expected RuntimeError")
 
 
 def test_mcp_sdk_fastmcp_api_is_compatible_when_installed():
