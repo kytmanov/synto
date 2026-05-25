@@ -30,7 +30,7 @@ def test_generate_index_json_is_schema_valid_and_deterministic(vault, config, db
             title="Topic",
             sources=["raw/a.md"],
             content_hash="h1",
-            is_draft=False,
+            status="published",
         )
     )
     db.upsert_article(
@@ -39,7 +39,7 @@ def test_generate_index_json_is_schema_valid_and_deterministic(vault, config, db
             title="Second",
             sources=["raw/a.md"],
             content_hash="h2",
-            is_draft=False,
+            status="published",
         )
     )
 
@@ -104,7 +104,7 @@ def test_generate_index_json_includes_synthesis_and_drafts_in_stats(vault, confi
             title="Draft",
             sources=["raw/a.md"],
             content_hash="h1",
-            is_draft=True,
+            status="draft",
         )
     )
     db.upsert_article(
@@ -113,7 +113,7 @@ def test_generate_index_json_includes_synthesis_and_drafts_in_stats(vault, confi
             title="Synth",
             sources=[],
             content_hash="h2",
-            is_draft=False,
+            status="published",
             kind="synthesis",
             question_hash="qh-1",
         )

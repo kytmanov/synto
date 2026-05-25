@@ -1689,7 +1689,7 @@ def status(vault_str, show_failed):
                     title=title,
                     sources=sources,
                     content_hash="",
-                    is_draft=True,
+                    status="draft",
                 )
             )
     if drafts:

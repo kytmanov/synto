@@ -171,7 +171,7 @@ def test_approve_moves_draft_to_wiki(vault, config, db):
             title="Article",
             sources=[],
             content_hash="h",
-            is_draft=True,
+            status="draft",
         )
     )
 
@@ -199,7 +199,7 @@ def test_reject_deletes_draft(vault, config, db):
             title="Bad",
             sources=[],
             content_hash="h",
-            is_draft=True,
+            status="draft",
         )
     )
 
@@ -296,7 +296,7 @@ def test_compile_concepts_manual_edit_protection(vault, config, db, fixtures_dir
             title="Quantum Entanglement",
             sources=["raw/note.md"],
             content_hash="original_hash_before_edit",  # differs from file on disk
-            is_draft=False,
+            status="published",
         )
     )
 
@@ -331,7 +331,7 @@ def test_compile_concepts_force_overrides_edit_protection(vault, config, db, fix
             title="Quantum Entanglement",
             sources=["raw/note.md"],
             content_hash="old_hash",
-            is_draft=False,
+            status="published",
         )
     )
 
@@ -501,7 +501,7 @@ def test_approve_drafts_holds_back_below_min_confidence(vault, config, db):
                 title=title,
                 sources=[],
                 content_hash="h",
-                is_draft=True,
+                status="draft",
             )
         )
 
@@ -523,7 +523,7 @@ def test_approve_drafts_zero_min_confidence_publishes_all(vault, config, db):
             title="Any",
             sources=[],
             content_hash="h",
-            is_draft=True,
+            status="draft",
         )
     )
 
@@ -546,7 +546,7 @@ def test_approve_db_updated_before_draft_removed(vault, config, db, monkeypatch)
             title="Article",
             sources=[],
             content_hash="h",
-            is_draft=True,
+            status="draft",
         )
     )
     target = config.wiki_dir / "article.md"

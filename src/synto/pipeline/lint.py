@@ -333,7 +333,7 @@ def _update_article_hash(db: StateDB, rel_path: str, meta: dict, body: str) -> N
             title=art.title or str(meta.get("title", Path(rel_path).stem)),
             sources=art.sources,
             content_hash=_body_hash(body),
-            is_draft=art.is_draft,
+            status=art.status,
             created_at=art.created_at,
             updated_at=art.updated_at,
             approved_at=art.approved_at,

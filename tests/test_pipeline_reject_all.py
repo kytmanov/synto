@@ -61,7 +61,7 @@ def _register_draft_and_source(db: StateDB, vault: Path, draft: Path, source: st
             title=draft.stem,
             sources=[source],
             content_hash="dh",
-            is_draft=True,
+            status="draft",
         )
     )
 

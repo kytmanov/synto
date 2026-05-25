@@ -191,7 +191,7 @@ def test_find_page_prefers_concept_over_synthesis(vault, config, db):
             title="Topic",
             sources=[],
             content_hash="hash",
-            is_draft=False,
+            status="published",
             kind="synthesis",
             question_hash="qh",
         )
@@ -219,7 +219,7 @@ def test_generate_index_lists_synthesis_from_db_only(vault, config, db):
             title="Tracked",
             sources=[],
             content_hash="hash",
-            is_draft=False,
+            status="published",
             kind="synthesis",
             question_hash="qh",
         )
@@ -248,7 +248,7 @@ def test_generate_index_caps_synthesis_section(vault, config, db):
                 title=title,
                 sources=[],
                 content_hash=f"hash-{i}",
-                is_draft=False,
+                status="published",
                 kind="synthesis",
                 question_hash=f"qh-{i}",
             )

@@ -280,7 +280,7 @@ def test_approve_preserves_new_fields(vault, config, db):
             title="Article",
             sources=["raw/a.md"],
             content_hash="h",
-            is_draft=True,
+            status="draft",
         )
     )
 
@@ -323,7 +323,7 @@ def test_synthesis_has_source_count_and_single_source(vault, config, db):
             title="Alpha",
             sources=[],
             content_hash="h1",
-            is_draft=False,
+            status="published",
         )
     )
     db.upsert_article(
@@ -332,7 +332,7 @@ def test_synthesis_has_source_count_and_single_source(vault, config, db):
             title="Beta",
             sources=[],
             content_hash="h2",
-            is_draft=False,
+            status="published",
         )
     )
 
@@ -368,7 +368,7 @@ def test_synthesis_update_in_place_preserves_fields(vault, config, db):
             title="Alpha",
             sources=[],
             content_hash="h1",
-            is_draft=False,
+            status="published",
         )
     )
 
@@ -395,7 +395,7 @@ def test_synthesis_update_in_place_preserves_fields(vault, config, db):
             title="Synth",
             sources=[],
             content_hash=content_hash,
-            is_draft=False,
+            status="published",
             kind="synthesis",
             question_hash=qhash,
             synthesis_sources=["wiki/Alpha.md"],
@@ -442,7 +442,7 @@ def test_read_article_includes_quality_fields(vault, config, db):
             title="Test Article",
             sources=["raw/a.md"],
             content_hash="h",
-            is_draft=False,
+            status="published",
         )
     )
 
@@ -468,7 +468,7 @@ def test_read_article_legacy_returns_none_for_missing_fields(vault, config, db):
             title="Legacy",
             sources=[],
             content_hash="h",
-            is_draft=False,
+            status="published",
         )
     )
 
@@ -494,7 +494,7 @@ def test_lint_does_not_flag_missing_quality_fields(vault, config, db):
             title="Legacy",
             sources=[],
             content_hash="h",
-            is_draft=False,
+            status="published",
         )
     )
 
@@ -529,7 +529,7 @@ def test_vault_reader_list_articles_carries_quality_fields(vault, config, db):
             title="Full",
             sources=["raw/a.md"],
             content_hash="h1",
-            is_draft=False,
+            status="published",
         )
     )
 
@@ -542,7 +542,7 @@ def test_vault_reader_list_articles_carries_quality_fields(vault, config, db):
             title="Legacy",
             sources=[],
             content_hash="h2",
-            is_draft=False,
+            status="published",
         )
     )
 
@@ -580,7 +580,7 @@ def test_vault_reader_rejects_invalid_source_quality(vault, config, db):
             title="Junk",
             sources=[],
             content_hash="h",
-            is_draft=False,
+            status="published",
         )
     )
 

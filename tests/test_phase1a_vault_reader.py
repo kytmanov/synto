@@ -93,7 +93,7 @@ def test_vault_reader_lists_published_concept_articles_only(vault, config, db) -
             title="Topic",
             sources=["raw/a.md"],
             content_hash="h1",
-            is_draft=False,
+            status="published",
         )
     )
     db.upsert_article(
@@ -102,7 +102,7 @@ def test_vault_reader_lists_published_concept_articles_only(vault, config, db) -
             title="Synth",
             sources=[],
             content_hash="h2",
-            is_draft=False,
+            status="published",
             kind="synthesis",
             question_hash="qh1",
         )
@@ -113,7 +113,7 @@ def test_vault_reader_lists_published_concept_articles_only(vault, config, db) -
             title="Draft",
             sources=["raw/a.md"],
             content_hash="h3",
-            is_draft=True,
+            status="draft",
         )
     )
 
@@ -132,7 +132,7 @@ def test_vault_reader_reads_article_by_title_path_stem_and_article_id(vault, con
             title="Nested Topic",
             sources=["raw/a.md"],
             content_hash="h1",
-            is_draft=False,
+            status="published",
         )
     )
     article = db.get_article("wiki/Nested-Topic.md")
@@ -154,7 +154,7 @@ def test_vault_reader_filters_by_tag(vault, config, db) -> None:
             title="Topic",
             sources=["raw/a.md"],
             content_hash="h1",
-            is_draft=False,
+            status="published",
         )
     )
     db.upsert_article(
@@ -163,7 +163,7 @@ def test_vault_reader_filters_by_tag(vault, config, db) -> None:
             title="Other",
             sources=["raw/a.md"],
             content_hash="h2",
-            is_draft=False,
+            status="published",
         )
     )
 
@@ -186,7 +186,7 @@ def test_vault_reader_normalizes_confidence_from_frontmatter(vault, config, db) 
                 title=title,
                 sources=[f"raw/{i}.md"],
                 content_hash=f"h{i}",
-                is_draft=False,
+                status="published",
             )
         )
 
@@ -208,7 +208,7 @@ def test_vault_reader_find_concept_resolution_priority(vault, config, db) -> Non
             title="Canonical",
             sources=["raw/a.md"],
             content_hash="h1",
-            is_draft=False,
+            status="published",
         )
     )
     db.upsert_concepts("raw/a.md", ["Canonical", "Substring Target"])
@@ -233,7 +233,7 @@ def test_vault_reader_article_cache_hits_db_once(vault, config, db) -> None:
             title="Topic",
             sources=["raw/a.md"],
             content_hash="h1",
-            is_draft=False,
+            status="published",
         )
     )
 
@@ -259,7 +259,7 @@ def test_vault_reader_duplicate_title_uses_first_match(vault, config, db) -> Non
             title="Shared",
             sources=["raw/a.md"],
             content_hash="h1",
-            is_draft=False,
+            status="published",
         )
     )
     db.upsert_article(
@@ -268,7 +268,7 @@ def test_vault_reader_duplicate_title_uses_first_match(vault, config, db) -> Non
             title="Shared",
             sources=["raw/b.md"],
             content_hash="h2",
-            is_draft=False,
+            status="published",
         )
     )
 
@@ -341,7 +341,7 @@ def test_vault_reader_ignores_stale_db_rows_with_missing_files(vault, config, db
             title="Missing",
             sources=["raw/a.md"],
             content_hash="h1",
-            is_draft=False,
+            status="published",
         )
     )
     write_note(config.wiki_dir / "Present.md", {"title": "Present"}, "Body")
@@ -351,7 +351,7 @@ def test_vault_reader_ignores_stale_db_rows_with_missing_files(vault, config, db
             title="Present",
             sources=["raw/a.md"],
             content_hash="h2",
-            is_draft=False,
+            status="published",
         )
     )
 
@@ -420,7 +420,7 @@ def test_vault_reader_list_articles_populates_summary(vault, config, db) -> None
             title="Concept",
             sources=["raw/a.md"],
             content_hash="h1",
-            is_draft=False,
+            status="published",
         )
     )
     reader = VaultReader(vault)

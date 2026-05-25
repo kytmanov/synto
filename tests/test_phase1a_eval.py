@@ -107,7 +107,7 @@ def test_eval_broken_wikilinks_reduce_resolution(tmp_path: Path, db) -> None:
             title="Topic",
             sources=["raw/a.md"],
             content_hash="h1",
-            is_draft=False,
+            status="published",
         )
     )
     write_note(
@@ -136,7 +136,7 @@ def test_eval_valid_sources_wikilinks_are_counted_as_resolved(tmp_path: Path) ->
             title="Topic",
             sources=["raw/a.md"],
             content_hash="h1",
-            is_draft=False,
+            status="published",
         )
     )
     write_note(
@@ -169,7 +169,7 @@ def test_eval_source_wikilink_title_match_is_case_insensitive(tmp_path: Path) ->
             title="Topic",
             sources=["raw/a.md"],
             content_hash="h1",
-            is_draft=False,
+            status="published",
         )
     )
     write_note(
@@ -202,7 +202,7 @@ def test_eval_bare_source_wikilink_title_is_counted_as_resolved(tmp_path: Path) 
             title="Topic",
             sources=["raw/a.md"],
             content_hash="h1",
-            is_draft=False,
+            status="published",
         )
     )
     write_note(
@@ -235,7 +235,7 @@ def test_eval_valid_index_and_article_coverage(tmp_path: Path) -> None:
             title="Topic",
             sources=["raw/a.md"],
             content_hash="h1",
-            is_draft=False,
+            status="published",
         )
     )
     write_note(config.wiki_dir / "Topic.md", {"title": "Topic", "sources": ["raw/a.md"]}, "Body")

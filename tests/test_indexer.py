@@ -37,7 +37,7 @@ def test_generate_index_caps_and_orders_synthesis_entries(tmp_path):
                 content_hash=f"hash-{i}",
                 created_at=created_at,
                 updated_at=created_at,
-                is_draft=False,
+                status="published",
                 kind="synthesis",
                 question_hash=f"qh-{i}",
             )
@@ -82,7 +82,7 @@ def test_generate_index_uses_synthesis_path_for_duplicate_titles(tmp_path):
                 title=title,
                 sources=[],
                 content_hash=f"hash-{question_hash}",
-                is_draft=False,
+                status="published",
                 kind="synthesis",
                 question_hash=question_hash,
             )

@@ -771,7 +771,7 @@ def _write_draft(
             title=article_title,
             sources=source_paths,
             content_hash=_content_hash(body),
-            is_draft=True,
+            status="draft",
         )
     )
 
@@ -1534,7 +1534,7 @@ def approve_drafts(
                 title=str(meta.get("title", target.stem)),
                 sources=meta.get("sources", []) if isinstance(meta.get("sources"), list) else [],
                 content_hash="",
-                is_draft=False,
+                status="published",
             )
         if art:
             try:
@@ -1547,7 +1547,7 @@ def approve_drafts(
                         content_hash=_content_hash(pub_body),
                         created_at=art.created_at,
                         updated_at=art.updated_at,
-                        is_draft=False,
+                        status="published",
                     )
                 )
             except Exception:

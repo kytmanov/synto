@@ -36,7 +36,7 @@ from pathlib import Path
 
 from .models import ItemMentionRecord, KnowledgeItemRecord, RawNoteRecord, WikiArticleRecord
 
-_CURRENT_SCHEMA_VERSION = 14
+_CURRENT_SCHEMA_VERSION = 15
 _CHECKPOINT_SCHEMA_VERSION = 2
 
 _CROCKFORD32_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
@@ -75,7 +75,8 @@ CREATE TABLE IF NOT EXISTS wiki_articles (
     content_hash   TEXT NOT NULL,
     created_at     TEXT NOT NULL,
     updated_at     TEXT NOT NULL,
-    is_draft       INTEGER NOT NULL DEFAULT 1,
+    status         TEXT NOT NULL DEFAULT 'draft'
+                       CHECK (status IN ('draft','verified','published')),
     approved_at    TEXT,
     approval_notes TEXT,
     kind           TEXT NOT NULL DEFAULT 'concept',
@@ -593,6 +594,7 @@ _VERSIONED_MIGRATIONS: dict[int, list[str]] = {
         "ON concept_occurrences(concept_name)",
     ],
     14: [],  # all v14 work happens in the post-hook below for atomicity
+    15: [],  # all v15 work happens in the post-hook below for atomicity
 }
 
 
@@ -765,6 +767,8 @@ class StateDB:
                 self._drop_legacy_telemetry_tables_v10()
             if version == 14:
                 self._drop_zombie_v8_columns_v14()
+            if version == 15:
+                self._apply_status_column_v15()
             with self._tx():
                 self._conn.execute(
                     "INSERT OR REPLACE INTO schema_version (id, version) VALUES (1, ?)",
@@ -824,6 +828,31 @@ class StateDB:
         with self._tx():
             for col in to_drop:
                 self._conn.execute(f"ALTER TABLE raw_notes DROP COLUMN {col}")
+
+    def _apply_status_column_v15(self) -> None:
+        """Add wiki_articles.status, backfill from is_draft, drop is_draft.
+
+        Atomic via _tx(); idempotent via PRAGMA probe so a re-run after a
+        partial failure is a no-op. DROP COLUMN requires SQLite >= 3.35
+        (enforced at the top of _migrate). The CHECK constraint from the
+        fresh CREATE TABLE is not added here — SQLite cannot add CHECK via
+        ALTER. The Pydantic model is the enforcement point for migrated DBs.
+        """
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(wiki_articles)").fetchall()}
+        if "status" in cols and "is_draft" not in cols:
+            return
+        with self._tx():
+            if "status" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE wiki_articles "
+                    "ADD COLUMN status TEXT NOT NULL DEFAULT 'draft'"
+                )
+            if "is_draft" in cols:
+                self._conn.execute(
+                    "UPDATE wiki_articles SET status = "
+                    "CASE WHEN is_draft = 1 THEN 'draft' ELSE 'published' END"
+                )
+                self._conn.execute("ALTER TABLE wiki_articles DROP COLUMN is_draft")
 
     def _validate_v6_tables(self) -> None:
         expected_ingest = {
@@ -1636,13 +1665,13 @@ class StateDB:
         self._conn.execute(
             """INSERT INTO wiki_articles
                    (
-                        path, title, sources, content_hash, created_at, updated_at, is_draft,
+                        path, title, sources, content_hash, created_at, updated_at, status,
                         approved_at, approval_notes, kind, question_hash,
                         synthesis_sources, synthesis_source_hashes, article_id,
                         last_compile_pipeline
                     )
                 VALUES (:path, :title, :sources, :content_hash,
-                        :created_at, :updated_at, :is_draft,
+                        :created_at, :updated_at, :status,
                         :approved_at, :approval_notes, :kind, :question_hash,
                         :synthesis_sources, :synthesis_source_hashes, :article_id,
                         :last_compile_pipeline)
@@ -1651,7 +1680,7 @@ class StateDB:
                     sources=excluded.sources,
                     content_hash=excluded.content_hash,
                    updated_at=excluded.updated_at,
-                   is_draft=excluded.is_draft,
+                   status=excluded.status,
                    approved_at=excluded.approved_at,
                     approval_notes=excluded.approval_notes,
                     kind=excluded.kind,
@@ -1670,7 +1699,7 @@ class StateDB:
                 "content_hash": record.content_hash,
                 "created_at": record.created_at.isoformat(),
                 "updated_at": record.updated_at.isoformat(),
-                "is_draft": int(record.is_draft),
+                "status": record.status,
                 "approved_at": record.approved_at.isoformat() if record.approved_at else None,
                 "approval_notes": record.approval_notes,
                 "kind": record.kind,
@@ -1708,7 +1737,7 @@ class StateDB:
                     """INSERT INTO wiki_articles
                            (
                                 path, title, sources, content_hash, created_at, updated_at,
-                                is_draft,
+                                status,
                                 approved_at, approval_notes, kind, question_hash,
                                 synthesis_sources, synthesis_source_hashes, article_id,
                                 last_compile_pipeline
@@ -1721,7 +1750,7 @@ class StateDB:
                         record.content_hash,
                         record.created_at.isoformat(),
                         record.updated_at.isoformat(),
-                        int(record.is_draft),
+                        record.status,
                         record.approved_at.isoformat() if record.approved_at else None,
                         record.approval_notes,
                         record.kind,
@@ -1746,7 +1775,9 @@ class StateDB:
 
     def list_articles(self, drafts_only: bool = False) -> list[WikiArticleRecord]:
         if drafts_only:
-            rows = self._conn.execute("SELECT * FROM wiki_articles WHERE is_draft = 1").fetchall()
+            rows = self._conn.execute(
+                "SELECT * FROM wiki_articles WHERE status = 'draft'"
+            ).fetchall()
         else:
             rows = self._conn.execute("SELECT * FROM wiki_articles").fetchall()
         return [_row_to_article(r) for r in rows]
@@ -1777,15 +1808,44 @@ class StateDB:
             if old_path != new_path:
                 self._conn.execute("DELETE FROM wiki_articles WHERE path = ?", (new_path,))
             self._conn.execute(
-                "UPDATE wiki_articles SET path=?, is_draft=0, updated_at=? WHERE path=?",
+                "UPDATE wiki_articles SET path=?, status='published', updated_at=? WHERE path=?",
                 (new_path, datetime.now().isoformat(), old_path),
             )
 
+    def verify_article(self, path: str, notes: str = "") -> None:
+        """Mark a draft as human-verified in place. Does not move the file.
+
+        approved_at / approval_notes are set only when NULL so a later
+        publish does not overwrite the first-approval audit trail.
+        """
+        with self._tx():
+            # Parity with publish_article: silent no-op if the row is missing.
+            if not self._conn.execute(
+                "SELECT 1 FROM wiki_articles WHERE path = ?", (path,)
+            ).fetchone():
+                return
+            now = datetime.now().isoformat()
+            self._conn.execute(
+                "UPDATE wiki_articles SET status='verified', "
+                "approved_at=COALESCE(approved_at, ?), "
+                "approval_notes=COALESCE(approval_notes, ?), "
+                "updated_at=? WHERE path=?",
+                (now, notes or None, now, path),
+            )
+
     def approve_article(self, path: str, notes: str = "") -> None:
-        """Record approval timestamp and optional notes on a published article."""
+        """Record approval timestamp on a published article.
+
+        COALESCE preserves the first-approval timestamp when an article
+        was previously verified — the verify→publish path must not lose
+        audit history.
+        """
         with self._tx():
             self._conn.execute(
-                "UPDATE wiki_articles SET approved_at=?, approval_notes=? WHERE path=?",
+                "UPDATE wiki_articles SET "
+                "approved_at=COALESCE(approved_at, ?), "
+                "approval_notes=COALESCE(approval_notes, ?) "
+                "WHERE path=?",
                 (datetime.now().isoformat(), notes or None, path),
             )
         art = self.get_article(path)
@@ -1997,7 +2057,7 @@ class StateDB:
                 if untracked_raw:
                     raw_counts["new"] = raw_counts.get("new", 0) + untracked_raw
         db_draft_count = self._conn.execute(
-            "SELECT COUNT(*) FROM wiki_articles WHERE is_draft=1"
+            "SELECT COUNT(*) FROM wiki_articles WHERE status='draft'"
         ).fetchone()[0]
         disk_draft_count = 0
         if vault is not None:
@@ -2005,7 +2065,7 @@ class StateDB:
             if drafts_dir.exists():
                 disk_draft_count = sum(1 for _ in drafts_dir.rglob("*.md"))
         pub_count = self._conn.execute(
-            "SELECT COUNT(*) FROM wiki_articles WHERE is_draft=0"
+            "SELECT COUNT(*) FROM wiki_articles WHERE status='published'"
         ).fetchone()[0]
         return {
             "raw": raw_counts,
@@ -2502,7 +2562,7 @@ def _row_to_article(row: sqlite3.Row) -> WikiArticleRecord:
         content_hash=row["content_hash"],
         created_at=datetime.fromisoformat(row["created_at"]),
         updated_at=datetime.fromisoformat(row["updated_at"]),
-        is_draft=bool(row["is_draft"]),
+        status=row["status"],
         approved_at=(
             datetime.fromisoformat(row["approved_at"])
             if "approved_at" in keys and row["approved_at"]
