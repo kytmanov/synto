@@ -120,7 +120,11 @@ def test_vault_reader_lists_published_concept_articles_only(vault, config, db) -
     reader = VaultReader(vault)
     refs = reader.list_articles()
 
-    assert [ref.name for ref in refs] == ["Topic"]
+    # Drafts stay hidden; synthesis articles are surfaced alongside concept
+    # articles so MCP agents can read prior synthesized answers.
+    assert sorted(ref.name for ref in refs) == ["Synth", "Topic"]
+    kinds = {ref.name: ref.kind for ref in refs}
+    assert kinds == {"Topic": "concept", "Synth": "synthesis"}
 
 
 def test_vault_reader_reads_article_by_title_path_stem_and_article_id(vault, config, db) -> None:

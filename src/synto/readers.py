@@ -22,7 +22,7 @@ import frontmatter
 
 from .paths import effective_app_dir
 from .state import StateDB
-from .vault import is_concept_article_path, parse_note
+from .vault import is_concept_article_path, is_synthesis_article_path, parse_note
 
 
 def _confidence_category(value: object) -> str:
@@ -78,6 +78,15 @@ def _extract_first_paragraph(body: str) -> str | None:
     return None
 
 
+_STATUS_RANK = {"draft": 0, "verified": 1, "published": 2}
+
+
+def _status_rank(value: object) -> int | None:
+    if not isinstance(value, str):
+        return None
+    return _STATUS_RANK.get(value)
+
+
 @dataclass(frozen=True)
 class ArticleRef:
     id: str
@@ -90,6 +99,14 @@ class ArticleRef:
     source_count: int | None = None
     single_source: bool | None = None
     source_quality: str | None = None
+    status: str | None = None
+    kind: str = "concept"
+    # Aliases the concept goes by (from frontmatter, written at compile time).
+    # PackReader currently returns () — pack-export INDEX.json has no aliases
+    # field; revisit when pack-serve lands. Source-of-truth for the routing-
+    # time vocabulary bridge is the DB (concept_aliases); frontmatter is a
+    # snapshot and can drift if aliases were added after the last compile.
+    aliases: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -184,6 +201,64 @@ class ArticleFilter:
     tag: str | None = None
     min_confidence: str | None = None
     contains: str | None = None
+    min_status: str | None = None
+    kind: str | None = None
+    exclude_single_source: bool = False
+
+
+def _apply_filter(refs: list[ArticleRef], filt: ArticleFilter) -> list[ArticleRef]:
+    """Apply ArticleFilter to a ref list. Shared by VaultReader and PackReader.
+
+    Legacy-safe: refs without `status`/`single_source` are treated as
+    `published` / corroborated so a min_status='published' filter does not
+    silently empty a pre-v15 vault.
+    """
+    if filt.contains is not None:
+        query = filt.contains.casefold()
+        refs = [
+            ref
+            for ref in refs
+            if query in ref.name.casefold() or query in (ref.summary or "").casefold()
+        ]
+    if filt.tag is not None:
+        refs = [ref for ref in refs if filt.tag in ref.tags]
+    if filt.kind is not None:
+        refs = [ref for ref in refs if ref.kind == filt.kind]
+    if filt.min_status is not None:
+        threshold = _status_rank(filt.min_status)
+        if threshold is None and filt.min_status != "":
+            import logging as _logging
+
+            _logging.getLogger(__name__).warning(
+                "ArticleFilter.min_status=%r is not one of %s; filter ignored",
+                filt.min_status,
+                sorted(_STATUS_RANK),
+            )
+        if threshold is not None:
+            refs = [
+                ref
+                for ref in refs
+                if (
+                    _status_rank(ref.status)
+                    if ref.status is not None
+                    else _STATUS_RANK["published"]
+                )
+                >= threshold
+            ]
+    if filt.min_confidence is not None:
+        try:
+            min_score = float(filt.min_confidence)
+        except (TypeError, ValueError):
+            min_score = None
+        if min_score is not None:
+            refs = [
+                ref
+                for ref in refs
+                if ref.confidence_score is None or ref.confidence_score >= min_score
+            ]
+    if filt.exclude_single_source:
+        refs = [ref for ref in refs if ref.single_source is not True]
+    return refs
 
 
 # ── Reader protocol ────────────────────────────────────────────────────────
@@ -310,17 +385,7 @@ class PackReader:
         refs = list(self.index.articles)
         if filter is None:
             return refs
-
-        if filter.tag is not None:
-            refs = [ref for ref in refs if filter.tag in ref.tags]
-        if filter.contains is not None:
-            query = filter.contains.casefold()
-            refs = [
-                ref
-                for ref in refs
-                if query in ref.name.casefold() or query in (ref.summary or "").casefold()
-            ]
-        return refs
+        return _apply_filter(refs, filter)
 
     def read_article(self, name_or_id: str) -> Article:
         ref = self._lookup_article(name_or_id)
@@ -541,7 +606,8 @@ class VaultReader:
             [
                 record
                 for record in db.list_articles()
-                if record.is_published and is_concept_article_path(record.path)
+                if record.is_published
+                and (is_concept_article_path(record.path) or is_synthesis_article_path(record.path))
             ]
             if db is not None
             else []
@@ -585,6 +651,20 @@ class VaultReader:
                 raw_sq if isinstance(raw_sq, str) and raw_sq in {"high", "medium", "low"} else None
             )
 
+            raw_status = metadata.get("status")
+            status: str | None = (
+                raw_status if isinstance(raw_status, str) and raw_status in _STATUS_RANK else None
+            )
+
+            raw_aliases = metadata.get("aliases")
+            aliases: tuple[str, ...] = (
+                tuple(str(a) for a in raw_aliases if isinstance(a, str))
+                if isinstance(raw_aliases, list)
+                else ()
+            )
+
+            kind = "synthesis" if is_synthesis_article_path(record.path) else "concept"
+
             refs.append(
                 ArticleRef(
                     id=record.article_id or record.path,
@@ -597,21 +677,15 @@ class VaultReader:
                     source_count=source_count,
                     single_source=single_source,
                     source_quality=source_quality,
+                    status=status,
+                    kind=kind,
+                    aliases=aliases,
                 )
             )
 
         if filter is None:
             return refs
-        if filter.contains is not None:
-            query = filter.contains.casefold()
-            refs = [
-                ref
-                for ref in refs
-                if query in ref.name.casefold() or query in (ref.summary or "").casefold()
-            ]
-        if filter.tag is not None:
-            refs = [ref for ref in refs if filter.tag in ref.tags]
-        return refs
+        return _apply_filter(refs, filter)
 
     def read_article(self, name_or_id: str) -> Article:
         self._ensure_article_cache()

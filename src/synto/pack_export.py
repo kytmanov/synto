@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Literal
 
 from .config import Config
-from .readers import ArticleRef, VaultReader
+from .readers import ArticleFilter, ArticleRef, VaultReader
 from .state import StateDB
 from .vault import atomic_write, is_concept_article_path, parse_note
 
@@ -46,7 +46,14 @@ def export_pack(config: Config, target: ExportTarget, out: Path | None = None) -
     db = StateDB.open_readonly(config.state_db_path)
     try:
         reader = VaultReader(config.vault)
-        article_refs = sorted(reader.list_articles(), key=lambda ref: (ref.id, ref.path.casefold()))
+        # Pack exports keep concept articles in articles/ and synthesis articles
+        # under synthesis/ via _copy_rewritten_markdown_tree below. Including
+        # synthesis in this ref list would double-copy them and inflate
+        # n_articles, so we filter here even though VaultReader can return both.
+        article_refs = sorted(
+            reader.list_articles(filter=ArticleFilter(kind="concept")),
+            key=lambda ref: (ref.id, ref.path.casefold()),
+        )
         source_refs = _export_source_refs(config, db, article_refs)
 
         _write_pack_toml(out_dir / "pack.toml", reader)
@@ -590,7 +597,7 @@ _CONTENTS_CAP = 30
 def _render_generated_blocks(
     reader: VaultReader, db: StateDB, source_refs: list[dict[str, object]]
 ) -> dict[str, str]:
-    articles = reader.list_articles()
+    articles = reader.list_articles(filter=ArticleFilter(kind="concept"))
     article_count = len(articles)
     capabilities = ", ".join(sorted(reader.capabilities))
     detected_langs = _detect_languages(db)

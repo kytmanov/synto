@@ -1,6 +1,6 @@
 [project]
 name = "synto"
-version = "0.2.2"
+version = "0.3.0"
 description = "Turn private notes into local knowledge packs and synthesized wikis"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -30,10 +30,8 @@ dependencies = [
     "python-frontmatter>=1.1",
     "python-ulid>=2.0",
     "pymupdf4llm>=0.0.5",
+    "mcp>=1.0,<2.0",
 ]
-
-[project.optional-dependencies]
-mcp = ["mcp>=1.0,<2.0"]
 
 [project.urls]
 Homepage = "https://github.com/kytmanov/synto"

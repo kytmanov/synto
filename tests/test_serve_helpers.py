@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -149,6 +149,5 @@ def test_run_server_rejects_non_stdio_transport():
     """run_server raises RuntimeError for non-stdio transport."""
     from synto.serve import run_server
 
-    with patch("synto.serve._check_mcp_available"):
-        with pytest.raises(RuntimeError, match="only stdio"):
-            run_server(Path("/tmp/vault"), transport="http")
+    with pytest.raises(RuntimeError, match="only stdio"):
+        run_server(Path("/tmp/vault"), transport="http")

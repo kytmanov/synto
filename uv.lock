@@ -1164,12 +1164,13 @@ wheels = [
 
 [[package]]
 name = "synto"
-version = "0.2.2"
+version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "click" },
     { name = "httpx" },
     { name = "jsonschema" },
+    { name = "mcp" },
     { name = "pydantic" },
     { name = "pymupdf4llm" },
     { name = "python-frontmatter" },
@@ -1177,11 +1178,6 @@ dependencies = [
     { name = "pyyaml" },
     { name = "rich" },
     { name = "watchdog" },
-]
-
-[package.optional-dependencies]
-mcp = [
-    { name = "mcp" },
 ]
 
 [package.dev-dependencies]
@@ -1197,7 +1193,7 @@ requires-dist = [
     { name = "click", specifier = ">=8.1" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "jsonschema", specifier = ">=4.0" },
-    { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.0,<2.0" },
+    { name = "mcp", specifier = ">=1.0,<2.0" },
     { name = "pydantic", specifier = ">=2.0" },
     { name = "pymupdf4llm", specifier = ">=0.0.5" },
     { name = "python-frontmatter", specifier = ">=1.1" },
@@ -1206,7 +1202,6 @@ requires-dist = [
     { name = "rich", specifier = ">=13.0" },
     { name = "watchdog", specifier = ">=4.0" },
 ]
-provides-extras = ["mcp"]
 
 [package.metadata.requires-dev]
 dev = [
