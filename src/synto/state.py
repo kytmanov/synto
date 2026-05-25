@@ -1817,6 +1817,10 @@ class StateDB:
 
         approved_at / approval_notes are set only when NULL so a later
         publish does not overwrite the first-approval audit trail.
+
+        Also transitions concept_compile_state to "compiled" so the next
+        `synto compile` run does not regenerate (and clobber) a draft a
+        human has already signed off on.
         """
         with self._tx():
             # Parity with publish_article: silent no-op if the row is missing.
@@ -1832,6 +1836,9 @@ class StateDB:
                 "updated_at=? WHERE path=?",
                 (now, notes or None, now, path),
             )
+        art = self.get_article(path)
+        if art:
+            self.mark_concept_compile_state(art.title, art.sources, "compiled")
 
     def approve_article(self, path: str, notes: str = "") -> None:
         """Record approval timestamp on a published article.

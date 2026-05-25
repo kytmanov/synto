@@ -1526,9 +1526,15 @@ def compile(
     default=0.0,
     help="Skip drafts below this confidence score (0–1).",
 )
+@click.option(
+    "--publish",
+    "do_publish",
+    is_flag=True,
+    help="Promote verified article(s) to wiki/ (default: only mark verified).",
+)
 @click.argument("files", nargs=-1, type=click.Path())
-def approve(vault_str, approve_all, min_confidence, files):
-    """Publish draft(s) from wiki/.drafts/ to wiki/."""
+def approve(vault_str, approve_all, min_confidence, do_publish, files):
+    """Verify draft(s) — with --publish, promote to wiki/."""
     from .git_ops import git_commit
     from .pipeline.compile import approve_drafts
 
@@ -1544,29 +1550,47 @@ def approve(vault_str, approve_all, min_confidence, files):
         sys.exit(1)
 
     all_paths = list((config.drafts_dir).glob("*.md")) if paths is None else paths
-    published = approve_drafts(config, db, paths, min_confidence=min_confidence)
-    if not published:
-        console.print("[yellow]No drafts to approve.[/yellow]")
+    affected = approve_drafts(
+        config, db, paths, min_confidence=min_confidence, publish=do_publish
+    )
+    if not affected:
+        if do_publish:
+            console.print("[yellow]No drafts to publish.[/yellow]")
+        else:
+            console.print("[yellow]No drafts to verify.[/yellow]")
         return
 
-    held_back = len(all_paths) - len(published)
+    held_back = len(all_paths) - len(affected)
     if held_back > 0:
         console.print(
             f"[yellow]Held back {held_back} draft(s) below confidence "
             f"{min_confidence:.2f}.[/yellow]"
         )
-    console.print(f"[green]Published {len(published)} article(s).[/green]")
+
+    if do_publish:
+        console.print(f"[green]Published {len(affected)} article(s).[/green]")
+    else:
+        console.print(
+            f"[green]Verified {len(affected)} article(s).[/green] "
+            f"Re-run with [bold]--publish[/bold] to promote to wiki/."
+        )
 
     # Update index and log
     from .indexer import append_log, generate_index
 
     generate_index(config, db)
-    append_log(config, f"approve | {len(published)} articles published")
+    action = "publish" if do_publish else "verify"
+    append_log(config, f"approve | {len(affected)} articles {action}")
 
     if config.pipeline.auto_commit:
+        commit_msg = (
+            f"approve: {len(affected)} articles published"
+            if do_publish
+            else f"verify: {len(affected)} articles verified"
+        )
         outcome = git_commit(
             config.vault,
-            f"approve: {len(published)} articles published",
+            commit_msg,
             paths=["wiki/", ".synto/"],
         )
         if outcome == "committed":

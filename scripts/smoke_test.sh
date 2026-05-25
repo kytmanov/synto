@@ -705,8 +705,9 @@ header "synto status (after compile)"
 $OLW status 2>&1
 
 # ── Approve ───────────────────────────────────────────────────────────────────
-header "synto approve --all"
-$OLW approve --all 2>&1
+# --publish required after Feature 34: default approve verifies in place.
+header "synto approve --all --publish"
+$OLW approve --all --publish 2>&1
 
 WIKI_COUNT=$(find "$VAULT_DIR/wiki" -name "*.md" -not -path "*/.drafts/*" 2>/dev/null | wc -l | tr -d ' ')
 check "articles published to wiki/"    "test '$WIKI_COUNT' -ge 1"
@@ -1282,7 +1283,7 @@ rm -f "$_TMP"
 # ── Draft annotations ────────────────────────────────────────────────────────
 header "Draft annotations"
 info "Compiling with low-quality source to trigger annotation..."
-$OLW approve --all 2>&1 || true   # clear drafts first
+$OLW approve --all --publish 2>&1 || true   # clear drafts first
 
 # Target a concept with EXACTLY ONE source so the single-source annotation
 # fires deterministically. "Quantum Fourier Transform" is only mentioned in
@@ -1331,8 +1332,8 @@ fi
 
 # Verify annotations are stripped on approve. Match both prefixes because
 # _strip_draft_annotations removes both — the check must be at least as
-# strict as the function it validates.
-$OLW approve --all 2>&1 || true
+# strict as the function it validates. --publish required after Feature 34.
+$OLW approve --all --publish 2>&1 || true
 PUBLISHED_WITH_ANNOTATION=$({ grep -rlE '(synto|olw)-auto' "$VAULT_DIR/wiki/" \
     --include='*.md' --exclude-dir='.drafts' --exclude-dir='sources' 2>/dev/null || true; } \
     | wc -l | tr -d ' ')
