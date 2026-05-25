@@ -89,12 +89,12 @@ def _base_toml() -> str:
     )
 
 
-def _insert(db, path: str, title: str, is_draft: bool = False) -> None:
+def _insert(db, path: str, title: str, status: str = "published") -> None:
     from synto.models import WikiArticleRecord
     db.upsert_article(WikiArticleRecord(
         path=path, title=title, sources=["raw/note.md"],
         content_hash=f"h-{title}", created_at=datetime.now(),
-        updated_at=datetime.now(), is_draft=is_draft,
+        updated_at=datetime.now(), status=status,
     ))
 
 
@@ -243,8 +243,12 @@ async def suite_list_articles(vault: Path) -> None:
             # ── tool list sanity ───────────────────────────────────────────
             tools = await s.list_tools()
             names = {t.name for t in tools.tools}
-            check("tool list has exactly 3 expected names",
-                  names == {"list_articles", "read_article", "find_concept"}, str(names))
+            check("tool list has 8 expected names (v0.3.0)",
+                  names == {
+                      "list_articles", "read_article", "find_concept",
+                      "search_articles", "get_concept", "list_sources",
+                      "trace_lineage", "answer_question",
+                  }, str(names))
 
             # ── no filter: visibility ──────────────────────────────────────
             res = await s.call_tool("list_articles", {})
@@ -521,12 +525,15 @@ async def suite_audit(vault: Path) -> None:
         check("audit row 2: failed call logged with success=0",
               rows[2]["success"] == 0, f"got {rows[2]['success']!r}")
 
-        # All rows: args are hashed not plaintext
+        # All rows: string args are hashed; scalars (bool/int/float) pass through.
+        # v0.3.0 change: _hash_args no longer hashes low-cardinality scalars.
         for i, row in enumerate(rows):
             payload = json.loads(row["metadata_json"])
-            check(f"audit row {i}: args hashed (8-char hex or None)",
+            check(f"audit row {i}: args hashed or scalar",
                   all(
-                      v is None or (isinstance(v, str) and len(v) == 8)
+                      v is None
+                      or isinstance(v, (bool, int, float))
+                      or (isinstance(v, str) and len(v) == 8)
                       for v in payload.get("args", {}).values()
                   ), str(payload.get("args")))
 
