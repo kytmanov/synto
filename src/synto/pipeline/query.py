@@ -284,7 +284,8 @@ def _strip_unknown_wikilinks(content: str, known_titles: list[str]) -> str:
 def _sanitize_query_answer(answer: str, source_pages: list[str], known_titles: list[str]) -> str:
     """Strip invented wikilinks from query answers before returning or saving."""
     allowed_titles = [*known_titles, *source_pages]
-    return _strip_unknown_wikilinks(sanitize_obsidian_math(answer), allowed_titles)
+    sanitized = answer.replace("\\r\\n", "\n").replace("\\n", "\n")
+    return _strip_unknown_wikilinks(sanitize_obsidian_math(sanitized), allowed_titles)
 
 
 def _body_hash(body: str) -> str:
@@ -421,7 +422,7 @@ def _save_synthesis_new(
             content_hash=content_hash,
             created_at=created_at,
             updated_at=datetime.now(),
-            is_draft=False,
+            status="published",
             kind="synthesis",
             question_hash=question_hash,
             synthesis_sources=source_paths,
@@ -536,7 +537,7 @@ def _update_existing_synthesis(
         content_hash=content_hash,
         created_at=existing.created_at,
         updated_at=datetime.now(),
-        is_draft=False,
+        status="published",
         kind="synthesis",
         question_hash=existing.question_hash or _question_hash(question),
         synthesis_sources=source_paths,

@@ -151,7 +151,7 @@ def test_query_cli_prompts_when_duplicate_exists(tmp_path, monkeypatch):
             title="Topic",
             sources=[],
             content_hash="hash",
-            is_draft=False,
+            status="published",
             kind="synthesis",
             question_hash=_question_hash("What is Topic?"),
         )

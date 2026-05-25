@@ -215,7 +215,7 @@ def test_fresh_db_is_at_v10(tmp_path: Path) -> None:
 
     conn = sqlite3.connect(db_path)
     version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
-    assert version == _CURRENT_SCHEMA_VERSION == 14
+    assert version == _CURRENT_SCHEMA_VERSION == 15
     conn.close()
 
 
@@ -286,7 +286,7 @@ def test_v8_to_v10_upgrade_preserves_rows(tmp_path: Path) -> None:
 
     conn = sqlite3.connect(db_path)
     version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
-    assert version == 14
+    assert version == 15
     assert conn.execute("SELECT COUNT(*) FROM raw_notes").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM wiki_articles").fetchone()[0] == 1
     conn.close()
@@ -399,7 +399,7 @@ def test_article_id_is_ulid_unique(tmp_path: Path) -> None:
                 title=f"A {i}",
                 sources=["raw/x.md"],
                 content_hash=f"hash-{i}",
-                is_draft=False,
+                status="published",
             )
         )
 
@@ -418,7 +418,7 @@ def test_article_id_persists_across_reopens(tmp_path: Path) -> None:
             title="A",
             sources=["raw/x.md"],
             content_hash="hash",
-            is_draft=False,
+            status="published",
         )
     )
     first = db.get_article("wiki/A.md")
@@ -439,7 +439,7 @@ def test_article_id_unique_index_enforces(tmp_path: Path) -> None:
         (
             "INSERT INTO wiki_articles "
             "(path, title, sources, content_hash, created_at, updated_at, "
-            "is_draft, kind, article_id) "
+            "status, kind, article_id) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
         ),
         (
@@ -449,7 +449,7 @@ def test_article_id_unique_index_enforces(tmp_path: Path) -> None:
             "h1",
             "2024-01-01T00:00:00",
             "2024-01-01T00:00:00",
-            0,
+            "published",
             "concept",
             "01TESTULID0000000000000001",
         ),
@@ -460,7 +460,7 @@ def test_article_id_unique_index_enforces(tmp_path: Path) -> None:
             (
                 "INSERT INTO wiki_articles "
                 "(path, title, sources, content_hash, created_at, updated_at, "
-                "is_draft, kind, article_id) "
+                "status, kind, article_id) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
             ),
             (
@@ -514,7 +514,7 @@ def test_wiki_article_record_loads_from_v10_schema(tmp_path: Path) -> None:
             title="A",
             sources=["raw/x.md"],
             content_hash="hash",
-            is_draft=False,
+            status="published",
             last_compile_pipeline='{"version": 1}',
         )
     )

@@ -138,7 +138,7 @@ def compute_stats_from_db(config: Config, db: StateDB, *, since: str | None = No
     except Exception:
         low_confidence_articles = 0
     single_source_articles = sum(
-        1 for record in db.list_articles() if not record.is_draft and len(record.sources) == 1
+        1 for record in db.list_articles() if record.is_published and len(record.sources) == 1
     )
 
     from .cache import LLMCache

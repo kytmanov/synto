@@ -53,7 +53,7 @@ def _register_draft(db: StateDB, vault: Path, draft: Path, source: str = "raw/no
             title=draft.stem,
             sources=[source],
             content_hash="dh1",
-            is_draft=True,
+            status="draft",
         )
     )
 

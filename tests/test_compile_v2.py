@@ -522,7 +522,7 @@ def test_annotations_stripped_on_approve(config, db, tmp_path):
             title="Test Article",
             sources=[],
             content_hash="h",
-            is_draft=True,
+            status="draft",
         )
     )
 
@@ -577,7 +577,7 @@ def test_reject_draft_stores_feedback(config, db, tmp_path):
             title="Test Topic",
             sources=[],
             content_hash="h",
-            is_draft=True,
+            status="draft",
         )
     )
 
@@ -604,7 +604,7 @@ def test_reject_draft_no_feedback_no_rejection(config, db):
             title="Test",
             sources=[],
             content_hash="h",
-            is_draft=True,
+            status="draft",
         )
     )
 
@@ -637,7 +637,7 @@ def test_reject_draft_blocks_after_cap(config, db):
             title="Blocked Topic",
             sources=[],
             content_hash="h",
-            is_draft=True,
+            status="draft",
         )
     )
 
@@ -730,7 +730,7 @@ def test_compile_concepts_preserves_existing_tags_when_model_returns_none(config
             title="Template Catalog",
             sources=["raw/a.md"],
             content_hash=hashlib.sha256(existing_body.encode("utf-8")).hexdigest(),
-            is_draft=False,
+            status="published",
         )
     )
 
@@ -913,7 +913,7 @@ def test_compile_concepts_force_clears_manual_edit_defer(config, db):
             title="Alpha",
             sources=["raw/a.md"],
             content_hash="old-hash",
-            is_draft=False,
+            status="published",
         )
     )
 
@@ -946,7 +946,7 @@ def test_approve_and_reject_update_compile_state(config, db):
             title="Alpha",
             sources=["raw/a.md"],
             content_hash="h",
-            is_draft=True,
+            status="draft",
         )
     )
     db.mark_concept_compile_state("Alpha", ["raw/a.md"], "deferred_draft")
@@ -962,7 +962,7 @@ def test_approve_and_reject_update_compile_state(config, db):
             title="Alpha",
             sources=["raw/a.md"],
             content_hash="h2",
-            is_draft=True,
+            status="draft",
         )
     )
     reject_draft(draft_path, config, db, feedback="Nope")
@@ -986,7 +986,7 @@ def test_approve_drafts_sets_approved_at(config, db):
             title="Article",
             sources=[],
             content_hash="h",
-            is_draft=True,
+            status="draft",
         )
     )
 

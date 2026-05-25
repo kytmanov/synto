@@ -377,7 +377,7 @@ def test_lint_fix_updates_synthesis_frontmatter_hash_for_malformed_latex(vault, 
             title="Topic",
             sources=[],
             content_hash="wrong",
-            is_draft=False,
+            status="published",
             kind="synthesis",
             question_hash="qh",
         )
@@ -439,7 +439,7 @@ def test_lint_fix_updates_article_hash(vault, config, db):
             title="Alpha",
             sources=[],
             content_hash=_body_hash(body),
-            is_draft=False,
+            status="published",
         )
     )
 
@@ -585,7 +585,7 @@ def test_stale_detected_on_hash_mismatch(vault, config, db):
             title="Edited",
             sources=[],
             content_hash="wrong_hash",
-            is_draft=False,
+            status="published",
         )
     )
 
@@ -609,7 +609,7 @@ def test_not_stale_when_hash_matches(vault, config, db):
             title="Fresh",
             sources=[],
             content_hash=correct_hash,
-            is_draft=False,
+            status="published",
         )
     )
 
@@ -702,7 +702,7 @@ def test_lint_flags_missing_synthesis_source_page(vault, config, db):
             title="Topic",
             sources=[],
             content_hash="hash",
-            is_draft=False,
+            status="published",
             kind="synthesis",
             question_hash="qh",
         )
@@ -735,7 +735,7 @@ def test_lint_flags_synthesis_source_hash_drift(vault, config, db):
             title="Topic",
             sources=[],
             content_hash="hash",
-            is_draft=False,
+            status="published",
             kind="synthesis",
             question_hash="qh",
         )
@@ -759,7 +759,7 @@ def test_lint_flags_synthesis_chain(vault, config, db):
             title="Parent",
             sources=[],
             content_hash="hash-parent",
-            is_draft=False,
+            status="published",
             kind="synthesis",
             question_hash="qh-parent",
         )
@@ -782,7 +782,7 @@ def test_lint_flags_synthesis_chain(vault, config, db):
             title="Child",
             sources=[],
             content_hash="hash-child",
-            is_draft=False,
+            status="published",
             kind="synthesis",
             question_hash="qh-child",
         )
@@ -802,7 +802,7 @@ def test_lint_flags_synthesis_title_shadowing_concept(vault, config, db):
             title="Topic",
             sources=[],
             content_hash="hash-concept",
-            is_draft=False,
+            status="published",
         )
     )
     write_note(
@@ -823,7 +823,7 @@ def test_lint_flags_synthesis_title_shadowing_concept(vault, config, db):
             title="Topic",
             sources=[],
             content_hash="hash-synthesis",
-            is_draft=False,
+            status="published",
             kind="synthesis",
             question_hash="qh",
         )

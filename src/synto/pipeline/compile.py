@@ -771,7 +771,7 @@ def _write_draft(
             title=article_title,
             sources=source_paths,
             content_hash=_content_hash(body),
-            is_draft=True,
+            status="draft",
         )
     )
 
@@ -1474,15 +1474,32 @@ def approve_drafts(
     notes: str = "",
     min_confidence: float = 0.0,
 ) -> list[Path]:
+    return publish_drafts(
+        config,
+        db,
+        paths=paths,
+        notes=notes,
+        min_confidence=min_confidence,
+    )
+
+
+def verify_drafts(
+    config: Config,
+    db: StateDB,
+    paths: list[Path] | None = None,
+    notes: str = "",
+    min_confidence: float = 0.0,
+) -> list[Path]:
     """
-    Move draft(s) from wiki/.drafts/ to wiki/.
-    Returns list of published paths. Drafts below min_confidence are skipped (stay in .drafts/).
+    Mark draft(s) verified in place.
+
+    Re-running on an already-verified draft is a no-op so the operation is
+    safe to script. Drafts below min_confidence are skipped.
     """
     if paths is None:
-        # Approve all drafts
         paths = list(config.drafts_dir.rglob("*.md")) if config.drafts_dir.exists() else []
 
-    published = []
+    affected: list[Path] = []
     held_back = 0
     for draft_path in paths:
         draft_path = draft_path.resolve()
@@ -1491,16 +1508,12 @@ def approve_drafts(
             log.warning("Draft not found: %s", draft_path)
             continue
 
-        # Target: wiki/ with same relative structure
         try:
-            rel_to_drafts = draft_path.relative_to(config.drafts_dir.resolve())
+            draft_path.relative_to(config.drafts_dir.resolve())
         except ValueError:
             log.warning("Draft is outside wiki/.drafts/: %s", draft_path)
             continue
-        target = config.wiki_dir / rel_to_drafts
-        target.parent.mkdir(parents=True, exist_ok=True)
 
-        # Write to target with updated status — don't touch draft until target is written
         meta, body = parse_note(draft_path)
         if min_confidence > 0.0 and float(meta.get("confidence", 1.0)) < min_confidence:
             held_back += 1
@@ -1511,22 +1524,96 @@ def approve_drafts(
                 draft_path.name,
             )
             continue
-        meta["status"] = "published"
+
+        draft_rel = str(draft_path.relative_to(vault_root))
+        existing = db.get_article(draft_rel)
+        if existing is not None and existing.status == "verified":
+            log.debug("Already verified, skipping: %s", draft_path.name)
+            continue
+        if existing is None:
+            db.upsert_article(
+                WikiArticleRecord(
+                    path=draft_rel,
+                    title=str(meta.get("title", draft_path.stem)),
+                    sources=(
+                        meta.get("sources", []) if isinstance(meta.get("sources"), list) else []
+                    ),
+                    content_hash=_content_hash(body),
+                    status="draft",
+                )
+            )
+
+        meta["status"] = "verified"
         meta["updated"] = datetime.now().strftime("%Y-%m-%d")
-        # Sanitize tags defensively — covers old drafts written before sanitization was added
         if isinstance(meta.get("tags"), list):
             meta["tags"] = sanitize_tags([str(t) for t in meta["tags"] if t is not None])
-        # Strip synto/legacy auto annotations before publishing.
+        write_note(draft_path, meta, body)
+        db.verify_article(draft_rel, notes=notes)
+        affected.append(draft_path)
+        log.info("Verified: %s", draft_path.name)
+
+    if held_back:
+        log.info("Held back %d draft(s) below confidence %.2f", held_back, min_confidence)
+    return affected
+
+
+def publish_drafts(
+    config: Config,
+    db: StateDB,
+    paths: list[Path] | None = None,
+    notes: str = "",
+    min_confidence: float = 0.0,
+) -> list[Path]:
+    """
+    Move draft(s) from wiki/.drafts/ to wiki/.
+
+    Returns list of published paths. Drafts below min_confidence are skipped
+    and remain in .drafts/.
+    """
+    if paths is None:
+        paths = list(config.drafts_dir.rglob("*.md")) if config.drafts_dir.exists() else []
+
+    affected: list[Path] = []
+    held_back = 0
+    for draft_path in paths:
+        draft_path = draft_path.resolve()
+        vault_root = config.vault.resolve()
+        if not draft_path.exists():
+            log.warning("Draft not found: %s", draft_path)
+            continue
+
+        try:
+            rel_to_drafts = draft_path.relative_to(config.drafts_dir.resolve())
+        except ValueError:
+            log.warning("Draft is outside wiki/.drafts/: %s", draft_path)
+            continue
+
+        meta, body = parse_note(draft_path)
+        if min_confidence > 0.0 and float(meta.get("confidence", 1.0)) < min_confidence:
+            held_back += 1
+            log.info(
+                "Held back (confidence %.2f < %.2f): %s",
+                meta.get("confidence"),
+                min_confidence,
+                draft_path.name,
+            )
+            continue
+
+        target = config.wiki_dir / rel_to_drafts
+        target.parent.mkdir(parents=True, exist_ok=True)
+        meta["status"] = "published"
+        meta["updated"] = datetime.now().strftime("%Y-%m-%d")
+        if isinstance(meta.get("tags"), list):
+            meta["tags"] = sanitize_tags([str(t) for t in meta["tags"] if t is not None])
         body = _strip_draft_annotations(body)
         write_note(target, meta, body)  # write to destination first
 
         # Update state DB before removing the draft — if the process crashes between
         # these two steps the draft is a dangling orphan but the DB is consistent.
-        draft_rel = str(draft_path.relative_to(vault_root))
         target_rel = str(target.resolve().relative_to(vault_root))
+        draft_rel = str(draft_path.relative_to(vault_root))
         db.publish_article(draft_rel, target_rel)
 
-        # Store content_hash of published body and record approval
         art = db.get_article(target_rel)
         if art is None:
             art = WikiArticleRecord(
@@ -1534,7 +1621,7 @@ def approve_drafts(
                 title=str(meta.get("title", target.stem)),
                 sources=meta.get("sources", []) if isinstance(meta.get("sources"), list) else [],
                 content_hash="",
-                is_draft=False,
+                status="published",
             )
         if art:
             try:
@@ -1547,7 +1634,12 @@ def approve_drafts(
                         content_hash=_content_hash(pub_body),
                         created_at=art.created_at,
                         updated_at=art.updated_at,
-                        is_draft=False,
+                        status="published",
+                        # Carry the verify-time audit fields forward so the
+                        # upsert does not blank them and force approve_article
+                        # to re-stamp with the publish timestamp.
+                        approved_at=art.approved_at,
+                        approval_notes=art.approval_notes,
                     )
                 )
             except Exception:
@@ -1555,12 +1647,12 @@ def approve_drafts(
             db.approve_article(target_rel, notes=notes)
 
         draft_path.unlink()  # remove draft only after DB is consistent
-        published.append(target)
+        affected.append(target)
         log.info("Published: %s", target.name)
 
     if held_back:
         log.info("Held back %d draft(s) below confidence %.2f", held_back, min_confidence)
-    return published
+    return affected
 
 
 def reject_draft(

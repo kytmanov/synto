@@ -216,7 +216,7 @@ class WikiArticleRecord(BaseModel):
     content_hash: str
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
-    is_draft: bool = True
+    status: Literal["draft", "verified", "published"] = "draft"
     approved_at: datetime | None = None
     approval_notes: str | None = None
     kind: Literal["concept", "synthesis"] = "concept"
@@ -225,6 +225,25 @@ class WikiArticleRecord(BaseModel):
     synthesis_source_hashes: list[list[str]] = Field(default_factory=list)
     article_id: str | None = None
     last_compile_pipeline: str | None = None
+
+    @property
+    def is_draft(self) -> bool:
+        # Compat shim for read sites (indexer, lint, readers, pack_export,
+        # stats). Plain @property — not @computed_field — to stay out of
+        # model_dump() now that the SQL column is gone.
+        return self.status == "draft"
+
+    @property
+    def is_verified(self) -> bool:
+        return self.status == "verified"
+
+    @property
+    def is_published(self) -> bool:
+        return self.status == "published"
+
+    @property
+    def is_trusted(self) -> bool:
+        return self.status in {"verified", "published"}
 
 
 class KnowledgeItemRecord(BaseModel):

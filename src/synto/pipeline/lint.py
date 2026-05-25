@@ -333,7 +333,7 @@ def _update_article_hash(db: StateDB, rel_path: str, meta: dict, body: str) -> N
             title=art.title or str(meta.get("title", Path(rel_path).stem)),
             sources=art.sources,
             content_hash=_body_hash(body),
-            is_draft=art.is_draft,
+            status=art.status,
             created_at=art.created_at,
             updated_at=art.updated_at,
             approved_at=art.approved_at,
@@ -607,7 +607,7 @@ def run_lint(config: Config, db: StateDB, fix: bool = False) -> LintResult:
     inbound_index = _build_inbound_index(config)
 
     # DB records keyed by vault-relative path
-    db_articles = {a.path: a for a in db.list_articles(drafts_only=False) if not a.is_draft}
+    db_articles = {a.path: a for a in db.list_articles(drafts_only=False) if a.is_published}
 
     pages = _concept_pages(config)
     all_pages = _all_wiki_pages(config)
@@ -809,12 +809,12 @@ def run_lint(config: Config, db: StateDB, fix: bool = False) -> LintResult:
     concept_titles = {
         article.title.casefold()
         for article in db_articles.values()
-        if article.kind == "concept" and not article.is_draft
+        if article.kind == "concept" and article.is_published
     }
     synthesis_db_paths = {
         path
         for path, article in db_articles.items()
-        if article.kind == "synthesis" and not article.is_draft
+        if article.kind == "synthesis" and article.is_published
     }
 
     # Scan raw/ for missing media (outside wiki denominator → advisory)

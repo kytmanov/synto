@@ -351,7 +351,7 @@ def test_run_query_synthesize_race_duplicate_can_save_with_suffix(tmp_path, monk
                     title="Existing Topic",
                     sources=[],
                     content_hash="existing-hash",
-                    is_draft=False,
+                    status="published",
                     kind="synthesis",
                     question_hash=record.question_hash,
                 )
@@ -391,7 +391,7 @@ def test_run_query_synthesize_stale_db_row_missing_file_uses_suffix_without_loop
             title="Topic Overview",
             sources=[],
             content_hash="missing-file-hash",
-            is_draft=False,
+            status="published",
             kind="synthesis",
             question_hash=None,
         )
@@ -496,7 +496,7 @@ def test_run_query_synthesize_race_duplicate_can_update_in_place(tmp_path, monke
                     title="Existing Topic",
                     sources=[],
                     content_hash=_body_hash(existing_body),
-                    is_draft=False,
+                    status="published",
                     kind="synthesis",
                     question_hash=record.question_hash,
                 )
@@ -547,7 +547,7 @@ def test_run_query_synthesize_rejects_synthesis_source_chain(tmp_path):
             title="Old Synthesis",
             sources=[],
             content_hash="hash",
-            is_draft=False,
+            status="published",
             kind="synthesis",
             question_hash="old-hash",
         )

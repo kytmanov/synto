@@ -541,7 +541,7 @@ class VaultReader:
             [
                 record
                 for record in db.list_articles()
-                if not record.is_draft and is_concept_article_path(record.path)
+                if record.is_published and is_concept_article_path(record.path)
             ]
             if db is not None
             else []
@@ -648,7 +648,7 @@ class VaultReader:
         name, aliases = result
         article_id = None
         for candidate in db.find_article_candidates(name):
-            if not candidate.is_draft and is_concept_article_path(candidate.path):
+            if candidate.is_published and is_concept_article_path(candidate.path):
                 article_id = candidate.article_id
                 break
         return ConceptRef(name=name, canonical_article_id=article_id, aliases=tuple(aliases))

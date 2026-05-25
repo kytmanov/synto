@@ -22,6 +22,7 @@ log = logging.getLogger(__name__)
 class DraftSummary:
     path: Path
     title: str
+    status: str
     confidence: float
     source_count: int
     rejection_count: int
@@ -43,6 +44,7 @@ def list_drafts(config: Config, db: StateDB) -> list[DraftSummary]:
             continue
 
         title = meta.get("title", draft_path.stem)
+        status = meta.get("status") if meta.get("status") in {"draft", "verified"} else "draft"
         confidence = float(meta.get("confidence", 0.0))
         sources = meta.get("sources", [])
         source_count = len(sources) if isinstance(sources, list) else 0
@@ -60,6 +62,7 @@ def list_drafts(config: Config, db: StateDB) -> list[DraftSummary]:
             DraftSummary(
                 path=draft_path,
                 title=title,
+                status=status,
                 confidence=confidence,
                 source_count=source_count,
                 rejection_count=rejection_count,

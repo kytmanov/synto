@@ -33,7 +33,7 @@ def generate_index(config: Config, db: StateDB) -> Path:
 
     # Gather published articles (not drafts, not sources/ or INDEX.md)
     articles = db.list_articles(drafts_only=False)
-    published = [a for a in articles if not a.is_draft]
+    published = [a for a in articles if a.is_published]
 
     # Separate concepts from source summaries and synthesis pages
     concept_articles = []
@@ -155,7 +155,7 @@ def _build_index_payload(config: Config, db: StateDB) -> dict[str, object]:
         [
             record
             for record in db.list_articles()
-            if not record.is_draft
+            if record.is_published
             and record.kind == "concept"
             and is_concept_article_path(record.path)
         ],
@@ -169,7 +169,7 @@ def _build_index_payload(config: Config, db: StateDB) -> dict[str, object]:
             "summary": None,
             "tags": [],
             "aliases": db.aliases_for_concept(record.title),
-            "confidence": "medium" if record.is_draft else "high",
+            "confidence": "high",
         }
         for record in records
     ]
@@ -233,7 +233,7 @@ def _list_synthesis(db: StateDB) -> list[dict[str, str]]:
 
 def _compute_stats(db: StateDB) -> dict[str, object]:
     article_records = db.list_articles()
-    article_count = sum(1 for record in article_records if not record.is_draft)
+    article_count = sum(1 for record in article_records if record.is_published)
     draft_count = sum(1 for record in article_records if record.is_draft)
     return {
         "article_count": article_count,

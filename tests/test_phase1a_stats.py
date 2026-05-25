@@ -63,7 +63,7 @@ def test_stats_reports_known_model_cost_and_since_filter(tmp_path):
             title="Draft",
             sources=["raw/b.md"],
             content_hash="drafthash",
-            is_draft=True,
+            status="draft",
         )
     )
     db.insert_synthesis_atomic(
@@ -72,7 +72,7 @@ def test_stats_reports_known_model_cost_and_since_filter(tmp_path):
             title="Answer",
             sources=[],
             content_hash="synthhash",
-            is_draft=False,
+            status="published",
             kind="synthesis",
             question_hash="qhash",
         )
@@ -204,7 +204,7 @@ def test_stats_reports_low_confidence_and_single_source_articles(tmp_path):
             title="Topic",
             sources=["raw/a.md"],
             content_hash="h1",
-            is_draft=False,
+            status="published",
         )
     )
 

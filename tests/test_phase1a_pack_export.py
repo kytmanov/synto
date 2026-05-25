@@ -149,7 +149,7 @@ def test_export_pack_round_trips_nested_articles_and_duplicate_basenames(vault, 
             title="Nested Topic",
             sources=["raw/a.md"],
             content_hash="h1",
-            is_draft=False,
+            status="published",
         )
     )
     db.upsert_article(
@@ -158,7 +158,7 @@ def test_export_pack_round_trips_nested_articles_and_duplicate_basenames(vault, 
             title="Other Topic",
             sources=["raw/a.md"],
             content_hash="h2",
-            is_draft=False,
+            status="published",
         )
     )
     db.upsert_article(
@@ -167,7 +167,7 @@ def test_export_pack_round_trips_nested_articles_and_duplicate_basenames(vault, 
             title="Synth",
             sources=[],
             content_hash="h3",
-            is_draft=False,
+            status="published",
             kind="synthesis",
             question_hash="qh-1",
         )
@@ -178,7 +178,7 @@ def test_export_pack_round_trips_nested_articles_and_duplicate_basenames(vault, 
             title="Draft",
             sources=["raw/a.md"],
             content_hash="h4",
-            is_draft=True,
+            status="draft",
         )
     )
 
@@ -268,7 +268,7 @@ def test_export_pack_is_deterministic_and_preserves_user_agents_text(vault, conf
             title="Topic",
             sources=["raw/a.md"],
             content_hash="h1",
-            is_draft=False,
+            status="published",
         )
     )
 
@@ -314,7 +314,7 @@ def test_pack_export_cli_invokes_agents_export(vault, config, db) -> None:
             title="Topic",
             sources=["raw/a.md"],
             content_hash="h1",
-            is_draft=False,
+            status="published",
         )
     )
 
@@ -349,7 +349,7 @@ def test_export_pack_rejects_symlinked_optional_tree(vault, config, db) -> None:
             title="Topic",
             sources=["raw/a.md"],
             content_hash="h1",
-            is_draft=False,
+            status="published",
         )
     )
     outside = vault.parent / "outside.txt"
@@ -418,7 +418,7 @@ def _setup_two_article_vault(vault, config, db):
                 title=title,
                 sources=["raw/a.md"],
                 content_hash=f"h-{title}",
-                is_draft=False,
+                status="published",
             )
         )
 
@@ -481,7 +481,7 @@ def test_pack_export_frequent_alias_filtered(vault, config, db):
                 title=title,
                 sources=["raw/a.md"],
                 content_hash=f"h-{title}",
-                is_draft=False,
+                status="published",
             )
         )
     db.upsert_concepts("raw/a.md", ["Alpha"])
@@ -521,7 +521,7 @@ def test_pack_export_first_word_cross_language_related_names(vault, config, db):
                 title=title,
                 sources=["raw/a.md"],
                 content_hash=f"h-{title}",
-                is_draft=False,
+                status="published",
             )
         )
     db.upsert_concepts("raw/a.md", ["Precession"])
@@ -562,7 +562,7 @@ def test_pack_export_agents_md_has_workflow_and_languages(vault, config, db):
             title="Topic",
             sources=["raw/a.md"],
             content_hash="h1",
-            is_draft=False,
+            status="published",
         )
     )
     db.upsert_raw(

@@ -72,7 +72,7 @@ def test_article_upsert_and_draft(db):
         title="Test Article",
         sources=["raw/note.md"],
         content_hash="contenthash",
-        is_draft=True,
+        status="draft",
     )
     db.upsert_article(a)
     got = db.get_article("wiki/.drafts/test.md")
@@ -96,7 +96,7 @@ def test_publish_article(db):
         title="Test",
         sources=[],
         content_hash="h",
-        is_draft=True,
+        status="draft",
     )
     db.upsert_article(a)
     db.publish_article("wiki/.drafts/test.md", "wiki/test.md")
@@ -113,7 +113,7 @@ def test_publish_article_republish_no_unique_violation(db):
         title="Test",
         sources=[],
         content_hash="old",
-        is_draft=False,
+        status="published",
     )
     db.upsert_article(existing)
     # New draft for same concept
@@ -122,7 +122,7 @@ def test_publish_article_republish_no_unique_violation(db):
         title="Test",
         sources=[],
         content_hash="new",
-        is_draft=True,
+        status="draft",
     )
     db.upsert_article(draft)
     # Should not raise sqlite3.IntegrityError
@@ -232,7 +232,7 @@ def test_stats(db):
     db.upsert_raw(RawNoteRecord(path="raw/b.md", content_hash="h2", status="new"))
     db.upsert_article(
         WikiArticleRecord(
-            path="wiki/.drafts/x.md", title="X", sources=[], content_hash="hx", is_draft=True
+            path="wiki/.drafts/x.md", title="X", sources=[], content_hash="hx", status="draft"
         )
     )
     s = db.stats()
@@ -408,7 +408,7 @@ def test_quality_stats(db):
 def test_approve_article_sets_timestamp(db):
     db.upsert_article(
         WikiArticleRecord(
-            path="wiki/test.md", title="Test", sources=[], content_hash="h", is_draft=False
+            path="wiki/test.md", title="Test", sources=[], content_hash="h", status="published"
         )
     )
     db.approve_article("wiki/test.md", notes="Looks great")
@@ -424,7 +424,7 @@ def test_synthesis_article_round_trips_extended_fields(db):
         title="Topic",
         sources=[],
         content_hash="hash",
-        is_draft=False,
+        status="published",
         kind="synthesis",
         question_hash="abc123def4567890",
         synthesis_sources=["wiki/Alpha.md", "wiki/Beta.md"],
@@ -448,7 +448,7 @@ def test_find_synthesis_by_question_hash(db):
             title="Topic",
             sources=[],
             content_hash="hash",
-            is_draft=False,
+            status="published",
             kind="synthesis",
             question_hash="dup-hash",
         )
@@ -465,7 +465,7 @@ def test_insert_synthesis_atomic_rejects_duplicate_question_hash(db):
         title="Topic",
         sources=[],
         content_hash="hash1",
-        is_draft=False,
+        status="published",
         kind="synthesis",
         question_hash="same-hash",
     )
@@ -474,7 +474,7 @@ def test_insert_synthesis_atomic_rejects_duplicate_question_hash(db):
         title="Topic 2",
         sources=[],
         content_hash="hash2",
-        is_draft=False,
+        status="published",
         kind="synthesis",
         question_hash="same-hash",
     )
@@ -495,7 +495,7 @@ def test_insert_synthesis_atomic_is_standalone_atomic(db):
         title="Topic",
         sources=[],
         content_hash="hash1",
-        is_draft=False,
+        status="published",
         kind="synthesis",
         question_hash="same-hash",
     )
@@ -504,7 +504,7 @@ def test_insert_synthesis_atomic_is_standalone_atomic(db):
         title="Topic 2",
         sources=[],
         content_hash="hash2",
-        is_draft=False,
+        status="published",
         kind="synthesis",
         question_hash="same-hash",
     )

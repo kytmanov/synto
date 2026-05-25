@@ -77,6 +77,28 @@ def test_list_drafts_returns_summaries(config, db):
     assert len(summaries) == 2
     titles = {s.title for s in summaries}
     assert titles == {"Alpha", "Beta"}
+    assert {s.status for s in summaries} == {"draft"}
+
+
+def test_list_drafts_reports_verified_status(config, db):
+    import frontmatter as fm_lib
+
+    from synto.vault import atomic_write
+
+    post = fm_lib.Post(
+        "Body.",
+        title="Reviewed",
+        status="verified",
+        tags=[],
+        sources=[],
+        confidence=0.7,
+        created="2024-01-01",
+        updated="2024-01-01",
+    )
+    atomic_write(config.drafts_dir / "Reviewed.md", fm_lib.dumps(post))
+
+    summaries = list_drafts(config, db)
+    assert summaries[0].status == "verified"
 
 
 def test_list_drafts_confidence_and_sources(config, db):

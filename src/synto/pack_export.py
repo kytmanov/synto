@@ -171,7 +171,7 @@ def _concepts_payload(db: StateDB) -> dict[str, object]:
         canonical_article_id = None
         article_path = None
         for article in db.find_article_candidates(name):
-            if article.is_draft or not is_concept_article_path(article.path):
+            if not article.is_published or not is_concept_article_path(article.path):
                 continue
             canonical_article_id = article.article_id
             article_path = _pack_article_path(article.path)
@@ -200,7 +200,7 @@ def _routes_payload(db: StateDB, source_refs: list[dict[str, object]]) -> dict[s
     for name in db.list_all_concept_names():
         article_path = None
         for article in db.find_article_candidates(name):
-            if article.is_draft or not is_concept_article_path(article.path):
+            if not article.is_published or not is_concept_article_path(article.path):
                 continue
             article_path = _pack_article_path(article.path)
             break

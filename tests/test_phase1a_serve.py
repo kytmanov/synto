@@ -40,7 +40,7 @@ def _insert_article(db: StateDB, rel_path: str, title: str):
             content_hash=f"hash-{title}",
             created_at=datetime.now(),
             updated_at=datetime.now(),
-            is_draft=False,
+            status="published",
         )
     )
 

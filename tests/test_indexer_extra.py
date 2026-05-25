@@ -54,7 +54,7 @@ def test_generate_index_with_concept_articles(tmp_path):
             content_hash="h1",
             created_at=datetime.now(),
             updated_at=datetime.now(),
-            is_draft=False,
+            status="published",
         )
     )
     text = generate_index(config, db).read_text()
