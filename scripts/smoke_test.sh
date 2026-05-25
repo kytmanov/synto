@@ -704,10 +704,31 @@ fi
 header "synto status (after compile)"
 $OLW status 2>&1
 
+# ── Verify ────────────────────────────────────────────────────────────────────
+VERIFY_DRAFT_COUNT_BEFORE=$(find "$VAULT_DIR/wiki/.drafts" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
+header "synto verify --all"
+_VERIFY_RC=0; VERIFY_OUT=$($OLW verify --all 2>&1) || _VERIFY_RC=$?
+check "verify exits 0" "test $_VERIFY_RC -eq 0"
+echo "$VERIFY_OUT"
+
+VERIFY_DRAFT_COUNT_AFTER=$(find "$VAULT_DIR/wiki/.drafts" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
+VERIFIED_DRAFT_COUNT=$({ grep -rl '^status: verified' "$VAULT_DIR/wiki/.drafts/" \
+    --include='*.md' 2>/dev/null || true; } | wc -l | tr -d ' ')
+check "verify keeps drafts in wiki/.drafts/" \
+    "test '$VERIFY_DRAFT_COUNT_AFTER' -eq '$VERIFY_DRAFT_COUNT_BEFORE'"
+check "verify marks all drafts as verified" \
+    "test '$VERIFIED_DRAFT_COUNT' -eq '$VERIFY_DRAFT_COUNT_AFTER'"
+
+header "synto status (after verify)"
+_SAV_RC=0; STATUS_AFTER_VERIFY=$($OLW status 2>&1) || _SAV_RC=$?
+check "status after verify exits 0" "test $_SAV_RC -eq 0"
+echo "$STATUS_AFTER_VERIFY"
+soft_check "status shows verified pending" "echo \"$STATUS_AFTER_VERIFY\" | grep -q 'Verified pending'"
+
 # ── Approve ───────────────────────────────────────────────────────────────────
-# --publish required after Feature 34: default approve verifies in place.
-header "synto approve --all --publish"
-$OLW approve --all --publish 2>&1
+# approve publishes by default; verify is the explicit in-place review step.
+header "synto approve --all"
+$OLW approve --all 2>&1
 
 WIKI_COUNT=$(find "$VAULT_DIR/wiki" -name "*.md" -not -path "*/.drafts/*" 2>/dev/null | wc -l | tr -d ' ')
 check "articles published to wiki/"    "test '$WIKI_COUNT' -ge 1"
@@ -1283,7 +1304,7 @@ rm -f "$_TMP"
 # ── Draft annotations ────────────────────────────────────────────────────────
 header "Draft annotations"
 info "Compiling with low-quality source to trigger annotation..."
-$OLW approve --all --publish 2>&1 || true   # clear drafts first
+$OLW approve --all 2>&1 || true   # clear drafts first
 
 # Target a concept with EXACTLY ONE source so the single-source annotation
 # fires deterministically. "Quantum Fourier Transform" is only mentioned in
@@ -1332,8 +1353,8 @@ fi
 
 # Verify annotations are stripped on approve. Match both prefixes because
 # _strip_draft_annotations removes both — the check must be at least as
-# strict as the function it validates. --publish required after Feature 34.
-$OLW approve --all --publish 2>&1 || true
+# strict as the function it validates.
+$OLW approve --all 2>&1 || true
 PUBLISHED_WITH_ANNOTATION=$({ grep -rlE '(synto|olw)-auto' "$VAULT_DIR/wiki/" \
     --include='*.md' --exclude-dir='.drafts' --exclude-dir='sources' 2>/dev/null || true; } \
     | wc -l | tr -d ' ')
