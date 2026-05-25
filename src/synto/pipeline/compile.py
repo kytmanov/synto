@@ -1473,23 +1473,102 @@ def approve_drafts(
     paths: list[Path] | None = None,
     notes: str = "",
     min_confidence: float = 0.0,
-    publish: bool = False,
+) -> list[Path]:
+    return publish_drafts(
+        config,
+        db,
+        paths=paths,
+        notes=notes,
+        min_confidence=min_confidence,
+    )
+
+
+def verify_drafts(
+    config: Config,
+    db: StateDB,
+    paths: list[Path] | None = None,
+    notes: str = "",
+    min_confidence: float = 0.0,
 ) -> list[Path]:
     """
-    Mark draft(s) verified, or (with publish=True) publish them to wiki/.
+    Mark draft(s) verified in place.
 
-    Default (publish=False): rewrite the draft frontmatter status field to
-    "verified" in place and stamp wiki_articles.status='verified'. The file
-    stays in wiki/.drafts/. Re-running on an already-verified draft is a
-    no-op so the operation is safe to script.
+    Re-running on an already-verified draft is a no-op so the operation is
+    safe to script. Drafts below min_confidence are skipped.
+    """
+    if paths is None:
+        paths = list(config.drafts_dir.rglob("*.md")) if config.drafts_dir.exists() else []
 
-    publish=True: today's flow — write the draft to wiki/, stamp
-    status='published', move the DB row, delete the source draft.
-    approved_at is preserved from a prior verify via COALESCE in
-    state.publish/approve_article.
+    affected: list[Path] = []
+    held_back = 0
+    for draft_path in paths:
+        draft_path = draft_path.resolve()
+        vault_root = config.vault.resolve()
+        if not draft_path.exists():
+            log.warning("Draft not found: %s", draft_path)
+            continue
 
-    Returns the list of affected paths. Drafts below min_confidence are
-    skipped (stay in .drafts/).
+        try:
+            draft_path.relative_to(config.drafts_dir.resolve())
+        except ValueError:
+            log.warning("Draft is outside wiki/.drafts/: %s", draft_path)
+            continue
+
+        meta, body = parse_note(draft_path)
+        if min_confidence > 0.0 and float(meta.get("confidence", 1.0)) < min_confidence:
+            held_back += 1
+            log.info(
+                "Held back (confidence %.2f < %.2f): %s",
+                meta.get("confidence"),
+                min_confidence,
+                draft_path.name,
+            )
+            continue
+
+        draft_rel = str(draft_path.relative_to(vault_root))
+        existing = db.get_article(draft_rel)
+        if existing is not None and existing.status == "verified":
+            log.debug("Already verified, skipping: %s", draft_path.name)
+            continue
+        if existing is None:
+            db.upsert_article(
+                WikiArticleRecord(
+                    path=draft_rel,
+                    title=str(meta.get("title", draft_path.stem)),
+                    sources=(
+                        meta.get("sources", []) if isinstance(meta.get("sources"), list) else []
+                    ),
+                    content_hash=_content_hash(body),
+                    status="draft",
+                )
+            )
+
+        meta["status"] = "verified"
+        meta["updated"] = datetime.now().strftime("%Y-%m-%d")
+        if isinstance(meta.get("tags"), list):
+            meta["tags"] = sanitize_tags([str(t) for t in meta["tags"] if t is not None])
+        write_note(draft_path, meta, body)
+        db.verify_article(draft_rel, notes=notes)
+        affected.append(draft_path)
+        log.info("Verified: %s", draft_path.name)
+
+    if held_back:
+        log.info("Held back %d draft(s) below confidence %.2f", held_back, min_confidence)
+    return affected
+
+
+def publish_drafts(
+    config: Config,
+    db: StateDB,
+    paths: list[Path] | None = None,
+    notes: str = "",
+    min_confidence: float = 0.0,
+) -> list[Path]:
+    """
+    Move draft(s) from wiki/.drafts/ to wiki/.
+
+    Returns list of published paths. Drafts below min_confidence are skipped
+    and remain in .drafts/.
     """
     if paths is None:
         paths = list(config.drafts_dir.rglob("*.md")) if config.drafts_dir.exists() else []
@@ -1520,27 +1599,6 @@ def approve_drafts(
             )
             continue
 
-        draft_rel = str(draft_path.relative_to(vault_root))
-
-        if not publish:
-            # Verify-in-place: re-running on a verified draft is a no-op so
-            # scripts that call approve repeatedly don't churn the DB.
-            existing = db.get_article(draft_rel)
-            if existing is not None and existing.status == "verified":
-                log.debug("Already verified, skipping: %s", draft_path.name)
-                continue
-
-            meta["status"] = "verified"
-            meta["updated"] = datetime.now().strftime("%Y-%m-%d")
-            if isinstance(meta.get("tags"), list):
-                meta["tags"] = sanitize_tags([str(t) for t in meta["tags"] if t is not None])
-            write_note(draft_path, meta, body)
-            db.verify_article(draft_rel, notes=notes)
-            affected.append(draft_path)
-            log.info("Verified: %s", draft_path.name)
-            continue
-
-        # publish=True — full promotion flow.
         target = config.wiki_dir / rel_to_drafts
         target.parent.mkdir(parents=True, exist_ok=True)
         meta["status"] = "published"
@@ -1553,6 +1611,7 @@ def approve_drafts(
         # Update state DB before removing the draft — if the process crashes between
         # these two steps the draft is a dangling orphan but the DB is consistent.
         target_rel = str(target.resolve().relative_to(vault_root))
+        draft_rel = str(draft_path.relative_to(vault_root))
         db.publish_article(draft_rel, target_rel)
 
         art = db.get_article(target_rel)

@@ -372,7 +372,8 @@ def test_orchestrator_auto_approve(config, db):
     orch = PipelineOrchestrator(config, client, db)
     report = orch.run(paths=[], auto_approve=True)
 
-    assert report.published >= 0  # may be 0 if compile skipped but no crash
+    assert report.published >= 1
+    assert any((config.wiki_dir).glob("*.md"))
 
 
 def test_orchestrator_reports_post_publish_lint_count(config, db):

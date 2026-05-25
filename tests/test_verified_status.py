@@ -15,7 +15,7 @@ from pydantic import ValidationError
 
 from synto.cli import cli
 from synto.models import WikiArticleRecord
-from synto.pipeline.compile import approve_drafts
+from synto.pipeline.compile import approve_drafts, verify_drafts
 from synto.state import StateDB
 from synto.vault import parse_note
 
@@ -211,13 +211,13 @@ def test_verify_then_publish_preserves_first_approval_timestamp(
         )
     )
 
-    approve_drafts(config, db, [draft_path])  # verify
+    verify_drafts(config, db, [draft_path])
     verified = db.get_article(str(draft_path.relative_to(vault)))
     assert verified is not None
     first_approval = verified.approved_at
     assert first_approval is not None
 
-    approve_drafts(config, db, [draft_path], publish=True)  # promote
+    approve_drafts(config, db, [draft_path])
     published = db.get_article("wiki/Article.md")
     assert published is not None
     assert published.status == "published"
@@ -241,7 +241,7 @@ def test_publish_without_prior_verify_stamps_approved_at_at_publish_time(
         )
     )
 
-    approve_drafts(config, db, [draft_path], publish=True)
+    approve_drafts(config, db, [draft_path])
     published = db.get_article("wiki/Direct.md")
     assert published is not None
     assert published.approved_at is not None
@@ -250,7 +250,7 @@ def test_publish_without_prior_verify_stamps_approved_at_at_publish_time(
 # ── approve_drafts: verify branch ─────────────────────────────────────────────
 
 
-def test_approve_default_verifies_in_place_to_enable_batch_review(
+def test_verify_default_verifies_in_place_to_enable_batch_review(
     vault: Path, config, db: StateDB
 ) -> None:
     """A curator must be able to verify drafts one-by-one without each
@@ -270,7 +270,7 @@ def test_approve_default_verifies_in_place_to_enable_batch_review(
         )
     )
 
-    affected = approve_drafts(config, db, [draft_path])
+    affected = verify_drafts(config, db, [draft_path])
 
     assert affected == [draft_path]
     assert draft_path.exists()
@@ -284,7 +284,7 @@ def test_approve_default_verifies_in_place_to_enable_batch_review(
     assert record.status == "verified"
 
 
-def test_approve_publish_promotes_to_wiki_and_strips_draft_file(
+def test_approve_default_promotes_to_wiki_and_strips_draft_file(
     vault: Path, config, db: StateDB
 ) -> None:
     from synto.vault import write_note
@@ -301,7 +301,7 @@ def test_approve_publish_promotes_to_wiki_and_strips_draft_file(
         )
     )
 
-    affected = approve_drafts(config, db, [draft_path], publish=True)
+    affected = approve_drafts(config, db, [draft_path])
     target = config.wiki_dir / "Article.md"
     assert affected == [target]
     assert target.exists()
@@ -312,7 +312,7 @@ def test_approve_publish_promotes_to_wiki_and_strips_draft_file(
     assert record.status == "published"
 
 
-def test_reverify_is_noop_so_approve_is_safe_to_rerun_in_scripts(
+def test_reverify_is_noop_so_verify_is_safe_to_rerun_in_scripts(
     vault: Path, config, db: StateDB
 ) -> None:
     """A curator script that runs `synto approve --all` on every tick
@@ -331,13 +331,13 @@ def test_reverify_is_noop_so_approve_is_safe_to_rerun_in_scripts(
         )
     )
 
-    approve_drafts(config, db, [draft_path])
+    verify_drafts(config, db, [draft_path])
     first = db.get_article(str(draft_path.relative_to(vault)))
     assert first is not None
     first_approved = first.approved_at
     first_updated = first.updated_at
 
-    affected = approve_drafts(config, db, [draft_path])
+    affected = verify_drafts(config, db, [draft_path])
     assert affected == []  # nothing to do
 
     second = db.get_article(str(draft_path.relative_to(vault)))
@@ -365,7 +365,7 @@ def test_reject_works_on_verified_article_so_curators_can_change_their_mind(
             status="draft",
         )
     )
-    approve_drafts(config, db, [draft_path])  # verify
+    verify_drafts(config, db, [draft_path])
     assert db.get_article(str(draft_path.relative_to(vault))).status == "verified"
 
     reject_draft(draft_path, config, db, feedback="changed my mind")
@@ -393,7 +393,7 @@ def test_list_articles_drafts_only_excludes_verified(vault: Path, config, db: St
                 status="draft",
             )
         )
-    approve_drafts(config, db, [verified])
+    verify_drafts(config, db, [verified])
 
     draft_paths = [a.path for a in db.list_articles(drafts_only=True)]
     assert str(draft.relative_to(vault)) in draft_paths
@@ -421,7 +421,7 @@ def test_verify_marks_concept_compiled_so_next_compile_skips_verified_draft(
     )
     db.mark_concept_compile_state("Alpha", ["raw/a.md"], "deferred_draft")
 
-    approve_drafts(config, db, [draft_path])
+    verify_drafts(config, db, [draft_path])
 
     state = db.get_compile_state("Alpha", "raw/a.md")
     assert state["status"] == "compiled"
@@ -447,17 +447,26 @@ def _seed_draft(vault: Path, config, db: StateDB, name: str) -> Path:
     return draft_path
 
 
-def test_cli_approve_default_prints_next_step_hint(vault: Path, config, db: StateDB) -> None:
+def test_cli_approve_default_publishes(vault: Path, config, db: StateDB) -> None:
     _seed_draft(vault, config, db, "Article")
     runner = CliRunner()
     result = runner.invoke(cli, ["approve", "--vault", str(vault), "--all"])
     assert result.exit_code == 0, result.output
-    assert "Verified" in result.output
-    assert "--publish" in result.output
+    assert "Published" in result.output
 
 
-def test_cli_approve_help_documents_publish_flag(vault: Path) -> None:
+def test_cli_verify_command_marks_reviewed(vault: Path, config, db: StateDB) -> None:
+    draft_path = _seed_draft(vault, config, db, "VerifiedArticle")
     runner = CliRunner()
-    result = runner.invoke(cli, ["approve", "--help"])
+    result = runner.invoke(cli, ["verify", "--vault", str(vault), str(draft_path)])
+    assert result.exit_code == 0, result.output
+    assert "Verified" in result.output
+    meta, _ = parse_note(draft_path)
+    assert meta["status"] == "verified"
+
+
+def test_cli_verify_help_is_available(vault: Path) -> None:
+    runner = CliRunner()
+    result = runner.invoke(cli, ["verify", "--help"])
     assert result.exit_code == 0
-    assert "--publish" in result.output
+    assert "--all" in result.output

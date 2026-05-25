@@ -175,7 +175,7 @@ def test_approve_moves_draft_to_wiki(vault, config, db):
         )
     )
 
-    published = approve_drafts(config, db, [draft_path], publish=True)
+    published = approve_drafts(config, db, [draft_path])
     assert len(published) == 1
     assert published[0].exists()
     assert published[0].parent == config.wiki_dir
@@ -562,7 +562,7 @@ def test_approve_db_updated_before_draft_removed(vault, config, db, monkeypatch)
     monkeypatch.setattr(Path, "unlink", failing_unlink)
 
     with pytest.raises(OSError, match="simulated disk full"):
-        approve_drafts(config, db, [draft_path], publish=True)
+        approve_drafts(config, db, [draft_path])
 
     # DB must be consistent — article is published
     record = db.get_article(str(target.relative_to(vault)))

@@ -1526,15 +1526,9 @@ def compile(
     default=0.0,
     help="Skip drafts below this confidence score (0–1).",
 )
-@click.option(
-    "--publish",
-    "do_publish",
-    is_flag=True,
-    help="Promote verified article(s) to wiki/ (default: only mark verified).",
-)
 @click.argument("files", nargs=-1, type=click.Path())
-def approve(vault_str, approve_all, min_confidence, do_publish, files):
-    """Verify draft(s) — with --publish, promote to wiki/."""
+def approve(vault_str, approve_all, min_confidence, files):
+    """Publish draft(s) from wiki/.drafts/ to wiki/."""
     from .git_ops import git_commit
     from .pipeline.compile import approve_drafts
 
@@ -1550,14 +1544,9 @@ def approve(vault_str, approve_all, min_confidence, do_publish, files):
         sys.exit(1)
 
     all_paths = list((config.drafts_dir).glob("*.md")) if paths is None else paths
-    affected = approve_drafts(
-        config, db, paths, min_confidence=min_confidence, publish=do_publish
-    )
+    affected = approve_drafts(config, db, paths, min_confidence=min_confidence)
     if not affected:
-        if do_publish:
-            console.print("[yellow]No drafts to publish.[/yellow]")
-        else:
-            console.print("[yellow]No drafts to verify.[/yellow]")
+        console.print("[yellow]No drafts to publish.[/yellow]")
         return
 
     held_back = len(all_paths) - len(affected)
@@ -1567,30 +1556,81 @@ def approve(vault_str, approve_all, min_confidence, do_publish, files):
             f"{min_confidence:.2f}.[/yellow]"
         )
 
-    if do_publish:
-        console.print(f"[green]Published {len(affected)} article(s).[/green]")
-    else:
-        console.print(
-            f"[green]Verified {len(affected)} article(s).[/green] "
-            f"Re-run with [bold]--publish[/bold] to promote to wiki/."
-        )
+    console.print(f"[green]Published {len(affected)} article(s).[/green]")
 
     # Update index and log
     from .indexer import append_log, generate_index
 
     generate_index(config, db)
-    action = "publish" if do_publish else "verify"
-    append_log(config, f"approve | {len(affected)} articles {action}")
+    append_log(config, f"approve | {len(affected)} articles published")
 
     if config.pipeline.auto_commit:
-        commit_msg = (
-            f"approve: {len(affected)} articles published"
-            if do_publish
-            else f"verify: {len(affected)} articles verified"
-        )
         outcome = git_commit(
             config.vault,
-            commit_msg,
+            f"approve: {len(affected)} articles published",
+            paths=["wiki/", ".synto/"],
+        )
+        if outcome == "committed":
+            console.print("[dim]Git commit created.[/dim]")
+        elif outcome == "failed":
+            console.print("[yellow]⚠ Git commit failed — run 'git status' in your vault.[/yellow]")
+        elif outcome == "blocked":
+            console.print(
+                "[yellow]⚠ Auto-commit skipped — you have staged changes. "
+                "Commit or stash them first.[/yellow]"
+            )
+
+
+@cli.command()
+@click.option("--vault", "vault_str", envvar=VAULT_ENV_VAR, default=None)
+@click.option("--all", "verify_all", is_flag=True)
+@click.option(
+    "--min-confidence",
+    type=float,
+    default=0.0,
+    help="Skip drafts below this confidence score (0–1).",
+)
+@click.argument("files", nargs=-1, type=click.Path())
+def verify(vault_str, verify_all, min_confidence, files):
+    """Mark draft(s) verified in place without publishing."""
+    from .git_ops import git_commit
+    from .pipeline.compile import verify_drafts
+
+    config = _load_config(vault_str)
+    db = _load_db(config)
+
+    if verify_all:
+        paths = None
+    elif files:
+        paths = [_resolve_draft_arg(config, f) for f in files]
+    else:
+        click.echo("Specify --all or file paths.", err=True)
+        sys.exit(1)
+
+    all_paths = list(config.drafts_dir.glob("*.md")) if paths is None else paths
+    affected = verify_drafts(config, db, paths, min_confidence=min_confidence)
+    if not affected:
+        console.print("[yellow]No drafts to verify.[/yellow]")
+        return
+
+    held_back = len(all_paths) - len(affected)
+    if held_back > 0:
+        console.print(
+            f"[yellow]Held back {held_back} draft(s) below confidence "
+            f"{min_confidence:.2f}.[/yellow]"
+        )
+    console.print(f"[green]Verified {len(affected)} article(s).[/green]")
+    console.print("Run [bold]synto approve --all[/bold] to publish.")
+
+    from .indexer import append_log, generate_index
+
+    generate_index(config, db)
+    append_log(config, f"verify | {len(affected)} articles verified")
+
+    if config.pipeline.auto_commit:
+        outcome = git_commit(
+            config.vault,
+            f"verify: {len(affected)} articles verified",
             paths=["wiki/", ".synto/"],
         )
         if outcome == "committed":
@@ -1693,6 +1733,7 @@ def status(vault_str, show_failed):
     table.add_row("Raw: compiled", str(raw.get("compiled", 0)))
     table.add_row("Raw: failed", str(raw.get("failed", 0)))
     table.add_row("Drafts pending", str(stats["drafts"]))
+    table.add_row("Verified pending", str(stats.get("verified", 0)))
     table.add_row("Published articles", str(stats["published"]))
 
     console.print(table)
@@ -1700,12 +1741,14 @@ def status(vault_str, show_failed):
     # List pending drafts
     drafts = db.list_articles(drafts_only=True)
     known_draft_paths = {article.path for article in drafts}
+    verified = [article for article in db.list_articles() if article.is_verified]
+    known_verified_paths = {article.path for article in verified}
     if config.drafts_dir.exists():
         from .vault import list_draft_articles
 
         for title, path, sources in list_draft_articles(config.drafts_dir):
             rel_path = str(path.relative_to(config.vault))
-            if rel_path in known_draft_paths:
+            if rel_path in known_draft_paths or rel_path in known_verified_paths:
                 continue
             drafts.append(
                 WikiArticleRecord(
@@ -1719,6 +1762,12 @@ def status(vault_str, show_failed):
     if drafts:
         console.print(f"\n[bold]{len(drafts)} draft(s) pending review:[/bold]")
         for article in drafts:
+            sources_str = ", ".join(Path(s).name for s in article.sources)
+            console.print(f"  [dim]{article.path}[/dim]  (from: {sources_str})")
+        console.print("\nRun [bold]synto verify --all[/bold] to mark reviewed.")
+    if verified:
+        console.print(f"\n[bold]{len(verified)} verified article(s) pending publish:[/bold]")
+        for article in verified:
             sources_str = ", ".join(Path(s).name for s in article.sources)
             console.print(f"  [dim]{article.path}[/dim]  (from: {sources_str})")
         console.print("\nRun [bold]synto approve --all[/bold] to publish.")
@@ -2285,7 +2334,7 @@ def review(vault_str):
 
     from rich.markup import escape
 
-    from .pipeline.compile import approve_drafts, reject_draft
+    from .pipeline.compile import approve_drafts, reject_draft, verify_drafts
     from .pipeline.review import (
         compute_diff,
         compute_rejection_diff,
@@ -2306,6 +2355,7 @@ def review(vault_str):
         table = Table(title="Drafts Pending Review", show_header=True, show_lines=False)
         table.add_column("#", justify="right", style="dim")
         table.add_column("Title")
+        table.add_column("Status")
         table.add_column("Conf", justify="right")
         table.add_column("Sources", justify="right")
         table.add_column("Rejections", justify="right")
@@ -2323,6 +2373,7 @@ def review(vault_str):
             table.add_row(
                 str(i),
                 escape(s.title),
+                s.status,
                 f"[{conf_color}]{s.confidence:.2f}[/{conf_color}]",
                 str(s.source_count),
                 str(s.rejection_count),
@@ -2330,7 +2381,10 @@ def review(vault_str):
             )
 
         console.print(table)
-        console.print("\n[dim]  Type: number=open draft, a=approve all, x=reject all, q=quit[/dim]")
+        console.print(
+            "\n[dim]  Type: number=open draft, a=approve all, v=verify all, "
+            "p=publish verified, x=reject all, q=quit[/dim]"
+        )
         choice = click.prompt("\nChoice", prompt_suffix=" > ").strip().lower()
 
         if choice == "q":
@@ -2343,6 +2397,27 @@ def review(vault_str):
 
             generate_index(config, db)
             append_log(config, f"review | approved {len(published)} articles")
+            return
+        elif choice == "v":
+            all_paths = [s.path for s in summaries]
+            verified = verify_drafts(config, db, all_paths)
+            console.print(f"[green]Verified {len(verified)} article(s).[/green]")
+            from .indexer import append_log, generate_index
+
+            generate_index(config, db)
+            append_log(config, f"review | verified {len(verified)} articles")
+            return
+        elif choice == "p":
+            verified_paths = [s.path for s in summaries if s.status == "verified"]
+            if not verified_paths:
+                console.print("[yellow]No verified drafts ready to publish.[/yellow]")
+                continue
+            published = approve_drafts(config, db, verified_paths)
+            console.print(f"[green]Published {len(published)} verified article(s).[/green]")
+            from .indexer import append_log, generate_index
+
+            generate_index(config, db)
+            append_log(config, f"review | published {len(published)} verified articles")
             return
         elif choice == "x":
             reason = click.prompt("Reason for rejecting all", default="")
@@ -2360,6 +2435,7 @@ def review(vault_str):
                 config,
                 db,
                 approve_drafts,
+                verify_drafts,
                 reject_draft,
                 compute_diff,
                 compute_rejection_diff,
@@ -2374,6 +2450,7 @@ def _review_single(
     config,
     db,
     approve_drafts,
+    verify_drafts,
     reject_draft,
     compute_diff,
     compute_rejection_diff,
@@ -2420,8 +2497,8 @@ def _review_single(
         console.print(Panel(escape(body_display), title="Draft"))
 
         console.print(
-            "\n[dim]Type: a=approve, r=reject, e=edit, "
-            "d=diff vs published, v=rejection diff, s=skip[/dim]"
+            "\n[dim]Type: a=approve, p=publish, v=verify, r=reject, e=edit, "
+            "d=diff vs published, x=rejection diff, s=skip[/dim]"
         )
         raw_action = click.prompt("\nAction", prompt_suffix=" > ").strip()
         action = raw_action.lower()
@@ -2438,6 +2515,29 @@ def _review_single(
 
             generate_index(config, db)
             append_log(config, f"review | approved {summary.title}")
+            return
+        elif action == "p":
+            if not summary.path.exists():
+                console.print("[yellow]Draft disappeared.[/yellow]")
+                return
+            published = approve_drafts(config, db, [summary.path])
+            console.print(f"[green]Published:[/green] {published[0].name if published else '?'}")
+            from .indexer import append_log, generate_index
+
+            generate_index(config, db)
+            append_log(config, f"review | approved {summary.title}")
+            return
+        elif action == "v":
+            if not summary.path.exists():
+                console.print("[yellow]Draft disappeared.[/yellow]")
+                return
+            verified = verify_drafts(config, db, [summary.path])
+            verified_name = verified[0].name if verified else summary.path.name
+            console.print(f"[green]Verified:[/green] {verified_name}")
+            from .indexer import append_log, generate_index
+
+            generate_index(config, db)
+            append_log(config, f"review | verified {summary.title}")
             return
         elif action == "r":
             reason = click.prompt("Reason?", default="")
@@ -2467,7 +2567,7 @@ def _review_single(
                 console.print("[dim]No published version — this is a new article.[/dim]")
             else:
                 console.print(diff, markup=False)
-        elif action == "v":
+        elif action == "x":
             diff = compute_rejection_diff(summary.path, db, summary.title)
             if diff is None:
                 console.print("[dim]No rejected body stored for this concept.[/dim]")

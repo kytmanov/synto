@@ -105,11 +105,11 @@ synto reject wiki/.drafts/Qubit.md --feedback "Too abstract, needs a hardware an
 **Confidence scores.** Each compiled draft gets a confidence score (0–1). Approve selectively or set a threshold — drafts below it stay in `.drafts/` for manual review.
 
 ```bash
-synto approve --min-confidence 0.8              # mark trusted drafts as verified
-synto approve --min-confidence 0.8 --publish    # promote verified drafts to wiki/
+synto verify --min-confidence 0.8               # mark trusted drafts as verified
+synto approve --min-confidence 0.8              # publish reviewed or fresh drafts to wiki/
 ```
 
-**Three-state lifecycle.** Drafts move through `draft` → `verified` → `published`. `synto approve` marks a reviewed draft as `verified` in place (frontmatter `status: verified`, file stays in `.drafts/`); pass `--publish` to promote a verified or fresh draft to `wiki/`. Agents reading frontmatter can treat `status: verified` as human-trusted without it appearing in the active wiki yet.
+**Three-state lifecycle.** Drafts move through `draft` → `verified` → `published`. `synto verify` marks a reviewed draft as `verified` in place (frontmatter `status: verified`, file stays in `.drafts/`). `synto approve` publishes drafts to `wiki/`, preserving the existing publish workflow while allowing an explicit staged review step.
 
 **Hand-edit protection.** Edit a published article in Obsidian or any editor. Synto tracks a SHA-256 content hash and detects your change on the next run — your edits are never overwritten by a recompile.
 
@@ -310,10 +310,10 @@ synto run --vault ~/my-wiki
 Ingest + compile. Drafts appear in `wiki/.drafts/`. Then review and publish:
 
 ```bash
-synto review --vault ~/my-wiki                    # inspect each draft: approve / reject / edit
+synto review --vault ~/my-wiki                    # inspect each draft: approve / verify / reject / edit
 # or
-synto approve --all --vault ~/my-wiki             # mark all drafts verified
-synto approve --all --publish --vault ~/my-wiki   # promote verified drafts to wiki/
+synto verify --all --vault ~/my-wiki              # mark all drafts verified in place
+synto approve --all --vault ~/my-wiki             # publish drafts to wiki/
 ```
 
 **One-command flow** (skip review):

@@ -233,6 +233,18 @@ class WikiArticleRecord(BaseModel):
         # model_dump() now that the SQL column is gone.
         return self.status == "draft"
 
+    @property
+    def is_verified(self) -> bool:
+        return self.status == "verified"
+
+    @property
+    def is_published(self) -> bool:
+        return self.status == "published"
+
+    @property
+    def is_trusted(self) -> bool:
+        return self.status in {"verified", "published"}
+
 
 class KnowledgeItemRecord(BaseModel):
     name: str

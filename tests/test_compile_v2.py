@@ -526,7 +526,7 @@ def test_annotations_stripped_on_approve(config, db, tmp_path):
         )
     )
 
-    published = approve_drafts(config, db, [draft_path], publish=True)
+    published = approve_drafts(config, db, [draft_path])
     assert len(published) == 1
     _, pub_body = parse_note(published[0])
     assert "synto-auto" not in pub_body
@@ -1016,7 +1016,7 @@ def test_approve_drafts_records_untracked_on_disk_draft(config, db):
     meta = {"title": "Untracked", "status": "draft", "tags": [], "sources": ["raw/a.md"]}
     atomic_write(draft_path, fm_lib.dumps(fm_lib.Post("Body.", **meta)))
 
-    published = approve_drafts(config, db, [draft_path], publish=True)
+    published = approve_drafts(config, db, [draft_path])
 
     assert len(published) == 1
     art = db.get_article("wiki/Untracked.md")

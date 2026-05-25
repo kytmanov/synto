@@ -284,7 +284,7 @@ def test_approve_preserves_new_fields(vault, config, db):
         )
     )
 
-    published = approve_drafts(config, db, [draft_path], publish=True)
+    published = approve_drafts(config, db, [draft_path])
     assert len(published) == 1
 
     meta_pub, _ = parse_note(published[0])

@@ -1784,7 +1784,8 @@ class StateDB:
 
     def list_synthesis_articles_brief(self) -> list[tuple[str, str]]:
         rows = self._conn.execute(
-            "SELECT path, title FROM wiki_articles WHERE kind = 'synthesis' ORDER BY path"
+            "SELECT path, title FROM wiki_articles "
+            "WHERE kind = 'synthesis' AND status = 'published' ORDER BY path"
         ).fetchall()
         return [(row["path"], row["title"]) for row in rows]
 
@@ -1839,6 +1840,13 @@ class StateDB:
         art = self.get_article(path)
         if art:
             self.mark_concept_compile_state(art.title, art.sources, "compiled")
+
+    def count_articles_by_status(self, status: str) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM wiki_articles WHERE status = ?",
+            (status,),
+        ).fetchone()
+        return int(row[0]) if row else 0
 
     def approve_article(self, path: str, notes: str = "") -> None:
         """Record approval timestamp on a published article.
@@ -2063,22 +2071,45 @@ class StateDB:
                 )
                 if untracked_raw:
                     raw_counts["new"] = raw_counts.get("new", 0) + untracked_raw
-        db_draft_count = self._conn.execute(
-            "SELECT COUNT(*) FROM wiki_articles WHERE status='draft'"
-        ).fetchone()[0]
-        disk_draft_count = 0
+        db_draft_count = self.count_articles_by_status("draft")
+        db_verified_count = self.count_articles_by_status("verified")
+        orphan_draft_count = 0
+        orphan_verified_count = 0
         if vault is not None:
             drafts_dir = vault / "wiki" / ".drafts"
             if drafts_dir.exists():
-                disk_draft_count = sum(1 for _ in drafts_dir.rglob("*.md"))
-        pub_count = self._conn.execute(
-            "SELECT COUNT(*) FROM wiki_articles WHERE status='published'"
-        ).fetchone()[0]
+                tracked_rows = self._conn.execute(
+                    "SELECT path FROM wiki_articles WHERE path LIKE 'wiki/.drafts/%'"
+                ).fetchall()
+                tracked_paths = {row["path"] for row in tracked_rows}
+                for path in drafts_dir.rglob("*.md"):
+                    rel_path = str(path.relative_to(vault))
+                    if rel_path in tracked_paths:
+                        continue
+                    try:
+                        meta = self._infer_orphan_draft_status(path)
+                    except Exception:
+                        meta = "draft"
+                    if meta == "verified":
+                        orphan_verified_count += 1
+                    else:
+                        orphan_draft_count += 1
+        pub_count = self.count_articles_by_status("published")
         return {
             "raw": raw_counts,
-            "drafts": max(db_draft_count, disk_draft_count),
+            "drafts": db_draft_count + orphan_draft_count,
+            "verified": db_verified_count + orphan_verified_count,
             "published": pub_count,
         }
+
+    def _infer_orphan_draft_status(self, path: Path) -> str:
+        from .vault import parse_note
+
+        meta, _ = parse_note(path)
+        status = meta.get("status")
+        if status == "verified":
+            return "verified"
+        return "draft"
 
     def quality_stats(self) -> dict[str, int]:
         """Distribution of source quality levels."""
