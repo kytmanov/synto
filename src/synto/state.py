@@ -844,8 +844,7 @@ class StateDB:
         with self._tx():
             if "status" not in cols:
                 self._conn.execute(
-                    "ALTER TABLE wiki_articles "
-                    "ADD COLUMN status TEXT NOT NULL DEFAULT 'draft'"
+                    "ALTER TABLE wiki_articles ADD COLUMN status TEXT NOT NULL DEFAULT 'draft'"
                 )
             if "is_draft" in cols:
                 self._conn.execute(

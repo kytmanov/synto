@@ -153,9 +153,7 @@ def test_run_query_save_decodes_literal_newlines_in_answer(vault, config, db):
     _write_concept_page(config, "Topic")
 
     selection_json = json.dumps({"pages": ["Topic"]})
-    answer_json = json.dumps(
-        {"answer": "Line 1\\n\\n### Heading\\nUse [[Topic]] here."}
-    )
+    answer_json = json.dumps({"answer": "Line 1\\n\\n### Heading\\nUse [[Topic]] here."})
     client = _make_client(selection_json, answer_json)
 
     result = run_query(config, client, db, "Tell me about Topic", save=True)

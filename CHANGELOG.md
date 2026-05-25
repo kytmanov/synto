@@ -4,6 +4,24 @@
 
 ### Added
 
+- Three-state lifecycle: drafts now progress through `draft` → `verified` →
+  `published`. `synto verify` marks reviewed drafts as `verified` in place
+  (frontmatter `status: verified`, file stays in `.drafts/`). `synto approve`
+  still publishes, preserving the v0.2.2 workflow. `synto status` reports
+  the verified-pending count alongside draft and published counts.
+- Schema v15 migration: `is_draft` column replaced with `status` column
+  (`draft` | `verified` | `published`), SQL-level CHECK constraint enforced
+  at the database layer. `is_draft` is removed from `WikiArticleRecord.model_dump()`;
+  `is_draft`, `is_published`, and `is_trusted` properties derive from `status`.
+  Migration is idempotent and preserves the correct intent of every row
+  (`is_draft=1` → `status='draft'`, `is_draft=0` → `status='published'`).
+- `synto review` interactive session adds a verify action for marking
+  individual drafts as reviewed without publishing. The existing approve
+  action still publishes immediately.
+- `synto compile` skips verified drafts, protecting human-reviewed content
+  from accidental regeneration on the next compile run.
+- Drafts can be rejected even after verification, giving curators a way to
+  walk back a reviewed draft without manual SQL surgery.
 - Query vocabulary bridge: `synto query` now augments the routing prompt with
   a hint naming the concepts whose aliases match whole words in the user's
   question (e.g., "ML" → "Machine Learning"). This helps the fast model pick
@@ -30,6 +48,12 @@
 
 ### Fixed
 
+- Structured-output JSON parser now correctly repairs odd-length backslash
+  runs before LaTeX commands (e.g. `\\\in` → `\\\\in`), resolving transient
+  compile failures on real LLM output. Valid `\\uXXXX` unicode escapes and
+  standard JSON escapes (`\n`, `\t`, `\"`, etc.) are preserved unchanged.
+- Saved query answer pages no longer contain literal `\\n` text — escaped
+  newlines from the model's JSON output are decoded before writing to disk.
 - `synto compile` now reads document identity from `source_documents` (the
   canonical store since schema v9) instead of from a duplicate set of columns
   on `raw_notes` that were never populated. The `single_source` frontmatter
@@ -39,6 +63,14 @@
 
 ### Changed
 
+- Schema v15: `wiki_articles.is_draft` (boolean) replaced with
+  `wiki_articles.status` (text) constrained to `draft`, `verified`, or
+  `published`. Migration is automatic and idempotent on vault open.
+  `WikiArticleRecord` model no longer serializes `is_draft` in
+  `model_dump()` — callers using the field directly must switch to
+  `record.status` or one of the derived properties (`is_draft`,
+  `is_published`, `is_trusted`). External tooling querying `wiki_articles`
+  directly must read `status` instead of `is_draft`.
 - Schema v14: drop the five v8 metadata columns from `raw_notes`
   (`source_type`, `origin_uri`, `imported_at`, `normalized_hash`,
   `extractor_version`) that were superseded by `source_documents` in v9.
