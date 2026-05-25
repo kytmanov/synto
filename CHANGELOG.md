@@ -4,6 +4,38 @@
 
 ### Added
 
+- MCP server expansion: `synto serve` now exposes 8 tools instead of 3.
+  New: `search_articles` (lexical search across article name, summary, and
+  aliases), `get_concept` (canonical article body + aliases for a concept
+  name), `list_sources` (registered source documents), `trace_lineage`
+  (per-article compile lineage from frontmatter), `answer_question` (runs
+  the full vocabulary-bridged query pipeline end-to-end; triggers fast +
+  heavy LLM calls — cost-bearing on paid providers). Existing tools
+  unchanged in signature.
+- `list_articles` now surfaces `status`, `kind`, and (via the underlying
+  `ArticleRef`) `aliases` on every result. New filter parameters:
+  `min_status` (defaults to `"published"` — drafts are hidden unless the
+  caller opts in with `min_status="verified"` or `"draft"`), `kind`
+  (`"concept"` or `"synthesis"`), `exclude_single_source` (drops articles
+  whose frontmatter has `single_source: true`).
+- `VaultReader` surfaces synthesis articles (`wiki/synthesis/*.md`) and
+  per-article `aliases` from frontmatter, so the MCP layer can browse and
+  match against them. `pack_export` continues to scope to `kind="concept"`
+  for its `articles/` payload — synthesis stays in its own pack directory.
+- `synto serve` works out of the box: the `mcp` library moved from the
+  `[mcp]` optional extra to a required dependency. The `synto[mcp]`
+  extras flag is now a no-op (still resolves) and is no longer needed.
+
+### Changed
+
+- `mcp.audit=true` audit rows in `metric_events.metadata_json` now record
+  scalar arg values (`bool`, `int`, `float`) verbatim instead of hashing
+  them to 8-char sha256 prefixes. String args remain hashed so
+  user-supplied text never lands raw. Improves observability without
+  weakening privacy.
+- Version bumped 0.2.2 → 0.3.0 to mark the MCP wire-contract change
+  (new tools + `list_articles` default filter behavior).
+
 - Three-state lifecycle: drafts now progress through `draft` → `verified` →
   `published`. `synto verify` marks reviewed drafts as `verified` in place
   (frontmatter `status: verified`, file stays in `.drafts/`). `synto approve`
