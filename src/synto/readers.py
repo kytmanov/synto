@@ -101,6 +101,12 @@ class ArticleRef:
     source_quality: str | None = None
     status: str | None = None
     kind: str = "concept"
+    # Aliases the concept goes by (from frontmatter, written at compile time).
+    # PackReader currently returns () — pack-export INDEX.json has no aliases
+    # field; revisit when pack-serve lands. Source-of-truth for the routing-
+    # time vocabulary bridge is the DB (concept_aliases); frontmatter is a
+    # snapshot and can drift if aliases were added after the last compile.
+    aliases: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -650,6 +656,13 @@ class VaultReader:
                 raw_status if isinstance(raw_status, str) and raw_status in _STATUS_RANK else None
             )
 
+            raw_aliases = metadata.get("aliases")
+            aliases: tuple[str, ...] = (
+                tuple(str(a) for a in raw_aliases if isinstance(a, str))
+                if isinstance(raw_aliases, list)
+                else ()
+            )
+
             kind = "synthesis" if is_synthesis_article_path(record.path) else "concept"
 
             refs.append(
@@ -666,6 +679,7 @@ class VaultReader:
                     source_quality=source_quality,
                     status=status,
                     kind=kind,
+                    aliases=aliases,
                 )
             )
 

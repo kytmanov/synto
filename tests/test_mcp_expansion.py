@@ -29,6 +29,7 @@ def _write_article(
     visibility: str = "public",
     tags: list[str] | None = None,
     lineage: list[dict] | None = None,
+    aliases: list[str] | None = None,
 ) -> None:
     lines = ["---", f"title: {path.stem}", f"visibility: {visibility}"]
     if status is not None:
@@ -45,6 +46,10 @@ def _write_article(
         import json as _json
 
         lines.append(f"lineage: {_json.dumps(lineage)}")
+    if aliases is not None:
+        import json as _json
+
+        lines.append(f"aliases: {_json.dumps(aliases)}")
     lines.append("---")
     lines.append("")
     lines.append(body)
@@ -280,3 +285,59 @@ def test_apply_filter_min_status_unknown_falls_through(vault, db):
     reader = VaultReader(vault)
     refs = reader.list_articles(filter=ArticleFilter(min_status="bogus"))
     assert [r.name for r in refs] == ["Pub"]
+
+
+def test_search_articles_matches_alias(vault, db):
+    """Alias-only query resolves the article (dobryakov ROI-equation case)."""
+    wiki = vault / "wiki"
+    _write_article(
+        wiki / "Agentic ROI framework.md",
+        "Framework body without the alias surface.",
+        aliases=["ROI equation", "cost dynamics"],
+    )
+    _seed_article(db, "wiki/Agentic ROI framework.md", "Agentic ROI framework")
+
+    handlers = _tools(vault)
+    result = handlers["search_articles"]("ROI equation")
+    assert len(result) == 1
+    assert result[0]["name"] == "Agentic ROI framework"
+    assert result[0]["score"] >= 1
+
+
+def test_search_articles_alias_misses_when_aliases_absent(vault, db):
+    """No frontmatter aliases → alias-only query yields no result."""
+    wiki = vault / "wiki"
+    _write_article(wiki / "Plain.md", "totally unrelated body about cooking")
+    _seed_article(db, "wiki/Plain.md", "Plain")
+
+    handlers = _tools(vault)
+    assert handlers["search_articles"]("ROI equation") == []
+
+
+def test_search_articles_dedupes_when_term_in_name_and_alias(vault, db):
+    """A query that hits both the name AND an alias returns the article once."""
+    wiki = vault / "wiki"
+    _write_article(
+        wiki / "Tokens.md",
+        "summary text",
+        aliases=["tokens-as-capital", "tokens economy"],
+    )
+    _seed_article(db, "wiki/Tokens.md", "Tokens")
+
+    handlers = _tools(vault)
+    result = handlers["search_articles"]("tokens")
+    assert len(result) == 1
+    # "Tokens" name = 1 hit; aliases contain "tokens" twice → score >= 3 total.
+    assert result[0]["score"] >= 3
+
+
+def test_hash_args_passes_through_scalars():
+    """Bools/ints/floats keep their value; strings still hash."""
+    from synto.serve import _hash_args
+
+    out = _hash_args({"flag": False, "n": 10, "ratio": 0.5, "name": "secret"})
+    assert out["flag"] is False
+    assert out["n"] == 10
+    assert out["ratio"] == 0.5
+    assert isinstance(out["name"], str)
+    assert len(out["name"]) == 8 and out["name"] != "secret"

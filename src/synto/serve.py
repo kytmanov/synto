@@ -41,11 +41,16 @@ def _vault_id(vault: Path) -> str:
     return hashlib.sha256(str(vault.resolve()).encode("utf-8")).hexdigest()[:16]
 
 
-def _hash_args(arguments: dict[str, Any]) -> dict[str, str | None]:
-    safe: dict[str, str | None] = {}
+def _hash_args(arguments: dict[str, Any]) -> dict[str, Any]:
+    # bool/int/float are low-cardinality (often only two or three useful
+    # values, e.g. limit/exclude_single_source). Hashing them loses all
+    # signal for audit/debug without adding privacy. Strings, lists, and
+    # dicts still get the 8-char sha256 prefix so user-supplied text
+    # never lands raw in metric_events.
+    safe: dict[str, Any] = {}
     for key, value in arguments.items():
-        if value is None:
-            safe[key] = None
+        if value is None or isinstance(value, (bool, int, float)):
+            safe[key] = value
         else:
             safe[key] = hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:8]
     return safe
@@ -267,6 +272,12 @@ def build_tool_handlers(
         kind: str | None = None,
         exclude_single_source: bool = False,
     ) -> list[dict[str, object]]:
+        """Lexical search across article name, summary, and aliases.
+
+        Use `get_concept` for concept-graph lookups, and `answer_question`
+        for a routed/synthesized answer. Returns up to `limit` results
+        (capped at 50) sorted by substring-hit score.
+        """
         started = time.monotonic()
         success = False
         arguments = {
@@ -281,27 +292,33 @@ def build_tool_handlers(
                 success = True
                 return []
             capped_limit = max(0, min(int(limit), _SEARCH_LIMIT_CAP))
+            # No `contains=` here — that filter only inspects name+summary
+            # and would drop alias-only matches before scoring sees them.
             refs = reader.list_articles(
                 filter=ArticleFilter(
-                    contains=query,
                     min_status=_resolve_min_status(min_status),
                     kind=kind,
                     exclude_single_source=exclude_single_source,
                 )
             )
-            visible = _filter_visible_refs(reader, refs, config.mcp)
             needle = query.casefold()
-            scored: list[tuple[int, ArticleRef]] = []
-            for ref in visible:
-                haystack = f"{ref.name}\n{ref.summary or ''}".casefold()
+            scored_candidates: list[tuple[int, ArticleRef]] = []
+            for ref in refs:
+                haystack = f"{ref.name}\n{ref.summary or ''}\n{' '.join(ref.aliases)}".casefold()
                 score = haystack.count(needle)
-                if score == 0:
-                    continue
-                scored.append((score, ref))
-            scored.sort(key=lambda item: item[0], reverse=True)
+                if score:
+                    scored_candidates.append((score, ref))
+            # Visibility check after scoring to avoid file-reading every
+            # article in vaults where the query matches a small subset.
+            visible_refs = _filter_visible_refs(
+                reader, [r for _, r in scored_candidates], config.mcp
+            )
+            visible_ids = {r.id for r in visible_refs}
+            scored_visible = [(s, r) for s, r in scored_candidates if r.id in visible_ids]
+            scored_visible.sort(key=lambda item: item[0], reverse=True)
             success = True
             results: list[dict[str, object]] = []
-            for score, ref in scored[:capped_limit]:
+            for score, ref in scored_visible[:capped_limit]:
                 payload = _ref_to_dict(ref)
                 payload["score"] = score
                 results.append(payload)
