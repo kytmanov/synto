@@ -220,6 +220,14 @@ def _apply_filter(refs: list[ArticleRef], filt: ArticleFilter) -> list[ArticleRe
         refs = [ref for ref in refs if ref.kind == filt.kind]
     if filt.min_status is not None:
         threshold = _status_rank(filt.min_status)
+        if threshold is None and filt.min_status != "":
+            import logging as _logging
+
+            _logging.getLogger(__name__).warning(
+                "ArticleFilter.min_status=%r is not one of %s; filter ignored",
+                filt.min_status,
+                sorted(_STATUS_RANK),
+            )
         if threshold is not None:
             refs = [
                 ref
