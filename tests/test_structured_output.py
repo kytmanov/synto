@@ -270,6 +270,37 @@ def test_invalid_unicode_style_escape_in_content_is_repaired():
     assert result.content == "Equation: \\underbrace{x+y} and \\uparrow"
 
 
+def test_odd_backslash_run_before_latex_command_is_repaired():
+    raw = (
+        r'{"title":"T","content":"Coverage rate $H_i \\\in [0,1]$ '
+        r'and cost $\\\approx 3.4$K.","tags":["t"]}'
+    )
+
+    result = request_structured(
+        client=_client(raw),
+        prompt="write",
+        model_class=SingleArticle,
+        model="qwen2.5:14b",
+        max_retries=0,
+    )
+
+    assert result.content == r"Coverage rate $H_i \\in [0,1]$ and cost $\\approx 3.4$K."
+
+
+def test_valid_unicode_escape_is_preserved():
+    raw = '{"title":"T","content":"Dash: \\u2014 done.","tags":["t"]}'
+
+    result = request_structured(
+        client=_client(raw),
+        prompt="write",
+        model_class=SingleArticle,
+        model="qwen2.5:14b",
+        max_retries=0,
+    )
+
+    assert result.content in {"Dash: - done.", "Dash: \u2014 done.", "Dash: — done."}
+
+
 def test_latex_backslash_t_commands_are_restored():
     # LLM emits \text and \times without double-escaping; json.loads converts \t → tab
     raw = '{"title":"T","content":"C_{\\text{generate},i} and 24\\times","tags":["t"]}'
@@ -294,6 +325,25 @@ def test_latex_backslash_b_and_f_commands_are_restored():
         max_retries=0,
     )
     assert result.content == "\\beta + \\frac{1}{2}"
+
+
+def test_fenced_json_with_odd_backslash_run_parses():
+    wrapped = (
+        "Here is the article:\n\n```json\n"
+        r'{"title":"T","content":"$H_i \\\in [0,1]$ and $\\\approx 3.4$K","tags":["t"]}'
+        "\n```"
+    )
+
+    result = request_structured(
+        client=_client(wrapped),
+        prompt="write",
+        model_class=SingleArticle,
+        model="qwen2.5:14b",
+        max_retries=0,
+    )
+
+    assert result.title == "T"
+    assert r"$H_i \\in [0,1]$" in result.content
 
 
 # ── _make_template: nested object rendering ──────────────────────────────────

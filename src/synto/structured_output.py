@@ -166,6 +166,45 @@ def _unwrap(data: dict, model_class: type[T]) -> dict:
 
 _CTRL_TO_ESCAPE = {"\t": "t", "\x08": "b", "\x0c": "f"}
 _CTRL_ESCAPE_RE = re.compile(r"([\t\x08\x0c])([a-zA-Z])")
+_JSON_SIMPLE_ESCAPES = {'"', "\\", "/", "b", "f", "n", "r", "t"}
+
+
+def _repair_invalid_json_escapes(raw: str) -> str:
+    """Make invalid JSON backslash runs parseable without disturbing valid escapes.
+
+    LLMs often emit LaTeX commands such as ``\\in`` or ``\\approx`` inside JSON
+    strings. A single backslash before those commands is invalid JSON. More subtly,
+    models sometimes emit odd-length runs like ``\\\\\\in`` where the final
+    backslash still starts an invalid escape. This helper preserves valid JSON
+    escapes and only appends one backslash when a run would otherwise terminate in
+    an invalid escape.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(raw)
+    while i < n:
+        if raw[i] != "\\":
+            out.append(raw[i])
+            i += 1
+            continue
+
+        start = i
+        while i < n and raw[i] == "\\":
+            i += 1
+        run = raw[start:i]
+        next_char = raw[i] if i < n else ""
+
+        valid_escape = next_char in _JSON_SIMPLE_ESCAPES
+        if next_char == "u":
+            valid_escape = i + 4 < n and all(
+                c in "0123456789abcdefABCDEF" for c in raw[i + 1 : i + 5]
+            )
+
+        if not valid_escape and len(run) % 2 == 1:
+            run += "\\"
+        out.append(run)
+
+    return "".join(out)
 
 
 def _fix_json_ctrl_escapes(obj: Any) -> Any:
@@ -195,7 +234,7 @@ def _try_parse(raw: str, model_class: type[T]) -> tuple[T | None, str]:
     except json.JSONDecodeError as e:
         if "Invalid \\escape" in str(e) or "Invalid \\uXXXX escape" in str(e):
             try:
-                repaired = re.sub(r"\\(?![\"\\/bfnrt]|u[0-9a-fA-F]{4})", r"\\\\", raw)
+                repaired = _repair_invalid_json_escapes(raw)
                 data = json.loads(repaired)
             except json.JSONDecodeError:
                 return None, f"Invalid JSON: {e}"
