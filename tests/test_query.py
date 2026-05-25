@@ -148,6 +148,25 @@ def test_run_query_sanitizes_obsidian_math_in_answer(vault, config, db):
     assert result.answer == "Equation:\n$$\na=b\n$$"
 
 
+def test_run_query_save_decodes_literal_newlines_in_answer(vault, config, db):
+    _write_index(config, "# Wiki Index\n\n## Concepts\n- [[Topic]]\n")
+    _write_concept_page(config, "Topic")
+
+    selection_json = json.dumps({"pages": ["Topic"]})
+    answer_json = json.dumps(
+        {"answer": "Line 1\\n\\n### Heading\\nUse [[Topic]] here."}
+    )
+    client = _make_client(selection_json, answer_json)
+
+    result = run_query(config, client, db, "Tell me about Topic", save=True)
+
+    assert "\\n" not in result.answer
+    assert "### Heading" in result.answer
+    saved = result.query_save.path.read_text(encoding="utf-8")
+    assert "\\n" not in saved
+    assert "Line 1\n\n### Heading" in saved
+
+
 def test_find_page_by_filename(vault, config):
     _write_concept_page(config, "Machine Learning")
     found = _find_page(config, "Machine Learning")
