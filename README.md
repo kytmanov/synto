@@ -156,7 +156,7 @@ Works today with Markdown. Drop notes in `raw/`, run `synto run`, and get a cros
 
 **Pack export.** `synto pack export --target agents` produces a portable directory any file-aware agent can read: articles, `INDEX.json` for fast concept lookup, source provenance, and agent-readable entry points.
 
-**MCP server.** `synto serve` exposes your wiki as a local MCP server with eight tools: `list_articles`, `read_article`, `find_concept`, `search_articles`, `get_concept`, `list_sources`, `trace_lineage`, and `answer_question`. Wire it into Claude Code, Cursor, or any MCP-compatible client in one command. Drafts are hidden by default; `answer_question` runs a full vocabulary-bridged query through the fast and heavy models, so be aware of provider cost when wiring it to paid models.
+**MCP server.** `synto serve` exposes your wiki as a local MCP server with eight tools: `list_articles`, `read_article`, `find_concept`, `search_articles`, `get_concept`, `list_sources`, `trace_lineage`, and `answer_question`. Wire it into Claude Code, Cursor, or any MCP-compatible client in one command. Drafts are hidden by default; `answer_question` runs the same routed query as `synto query` end-to-end (uses both fast and heavy models), so it may cost money on paid providers.
 
 **Self-maintenance.** `synto maintain` repairs broken wikilinks and creates stubs for missing targets. `synto lint` reports orphans, stale articles, and missing frontmatter.
 

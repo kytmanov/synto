@@ -2,121 +2,114 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-25
+
 ### Added
 
 - MCP server expansion: `synto serve` now exposes 8 tools instead of 3.
-  New: `search_articles` (lexical search across article name, summary, and
-  aliases), `get_concept` (canonical article body + aliases for a concept
-  name), `list_sources` (registered source documents), `trace_lineage`
-  (per-article compile lineage from frontmatter), `answer_question` (runs
-  the full vocabulary-bridged query pipeline end-to-end; triggers fast +
-  heavy LLM calls — cost-bearing on paid providers). Existing tools
-  unchanged in signature.
-- `list_articles` now surfaces `status`, `kind`, and (via the underlying
-  `ArticleRef`) `aliases` on every result. New filter parameters:
-  `min_status` (defaults to `"published"` — drafts are hidden unless the
-  caller opts in with `min_status="verified"` or `"draft"`), `kind`
-  (`"concept"` or `"synthesis"`), `exclude_single_source` (drops articles
-  whose frontmatter has `single_source: true`).
-- `VaultReader` surfaces synthesis articles (`wiki/synthesis/*.md`) and
-  per-article `aliases` from frontmatter, so the MCP layer can browse and
-  match against them. `pack_export` continues to scope to `kind="concept"`
-  for its `articles/` payload — synthesis stays in its own pack directory.
-- `synto serve` works out of the box: the `mcp` library moved from the
+  The new five:
+  - `search_articles` — lexical search across article name, summary, and aliases.
+  - `get_concept` — concept lookup that returns the canonical article body,
+    aliases, and frontmatter in one call.
+  - `list_sources` — registered source documents (id, title, type).
+  - `trace_lineage` — the article's compile lineage from frontmatter (same data
+    `synto trace article` shows on the CLI).
+  - `answer_question` — runs the same routed query as `synto query` end-to-end
+    and returns the answer plus the selected pages. Uses both the fast and the
+    heavy model, so it may cost money on paid providers.
+- `list_articles` now exposes `status` and `kind` on every result and
+  accepts three new filters: `min_status` (defaults to `"published"`, so
+  drafts are hidden unless the caller opts in with `"verified"` or
+  `"draft"`), `kind` (`"concept"` or `"synthesis"`), and
+  `exclude_single_source` (drops articles whose frontmatter has
+  `single_source: true`).
+- `synto serve` reaches synthesis articles too. Previously only concept
+  articles under `wiki/` were browsable; now `wiki/synthesis/*.md` shows
+  up in `list_articles` and is readable via `read_article`, tagged
+  `kind="synthesis"`. `synto pack export` still groups synthesis under
+  its own directory in exported packs.
+- Three-state article lifecycle: drafts now progress through `draft` →
+  `verified` → `published`. `synto verify` marks reviewed drafts as
+  `verified` in place (frontmatter `status: verified`, file stays in
+  `.drafts/`). `synto approve` still publishes, preserving the v0.2.2
+  workflow. `synto status` reports the verified-pending count alongside
+  the draft and published counts. `synto review` adds a verify action
+  per draft, and `synto compile` skips verified drafts so human review
+  isn't overwritten by regeneration.
+- Drafts can be rejected even after they've been verified. Useful when
+  you want to walk back a review without editing the database by hand.
+- Query vocabulary bridge: `synto query` now hints the routing prompt
+  with concepts whose aliases match whole words in the user's question
+  (e.g. "ML" surfaces "Machine Learning"). Helps the fast model pick
+  the right page when the user types an acronym instead of the
+  canonical title. Aliases claimed by two or more concepts are
+  filtered. All-caps acronyms of length ≥ 2 bypass the length floor.
+  Pure-CJK aliases are a silent no-op for now (Python's `\b` needs
+  word boundaries).
+- Article frontmatter now includes three quality signals written at
+  compile time: `source_count` (int), `single_source` (bool), and
+  `source_quality` (`"high"` | `"medium"` | `"low"`). File readers,
+  Obsidian plugins, MCP tools, and agents can use these without a DB
+  query. `single_source: true` is derived from unique source-document
+  identity where available, falling back to path uniqueness. Synthesis
+  articles carry `source_count` and `single_source` on the same basis.
+- Per-source-type ingest overrides: `[pipeline.source_overrides.<type>]`
+  sections in `synto.toml` let you raise `max_concepts_per_source` for
+  long-form sources (e.g. `textbook`, `paper`) without changing the
+  global default. Quality-based reduction still applies within the
+  per-type ceiling. Unknown type keys warn at load time. Re-run
+  `synto ingest --force` to apply changes to already-ingested sources.
+
+### Changed
+
+- `synto serve` ships out of the box: the `mcp` library moved from the
   `[mcp]` optional extra to a required dependency. The `synto[mcp]`
-  extras flag is now a no-op (still resolves) and is no longer needed.
-
-### Changed
-
-- `mcp.audit=true` audit rows in `metric_events.metadata_json` now record
-  scalar arg values (`bool`, `int`, `float`) verbatim instead of hashing
-  them to 8-char sha256 prefixes. String args remain hashed so
-  user-supplied text never lands raw. Improves observability without
-  weakening privacy.
-- Version bumped 0.2.2 → 0.3.0 to mark the MCP wire-contract change
-  (new tools + `list_articles` default filter behavior).
-
-- Three-state lifecycle: drafts now progress through `draft` → `verified` →
-  `published`. `synto verify` marks reviewed drafts as `verified` in place
-  (frontmatter `status: verified`, file stays in `.drafts/`). `synto approve`
-  still publishes, preserving the v0.2.2 workflow. `synto status` reports
-  the verified-pending count alongside draft and published counts.
-- Schema v15 migration: `is_draft` column replaced with `status` column
-  (`draft` | `verified` | `published`), SQL-level CHECK constraint enforced
-  at the database layer. `is_draft` is removed from `WikiArticleRecord.model_dump()`;
-  `is_draft`, `is_published`, and `is_trusted` properties derive from `status`.
-  Migration is idempotent and preserves the correct intent of every row
-  (`is_draft=1` → `status='draft'`, `is_draft=0` → `status='published'`).
-- `synto review` interactive session adds a verify action for marking
-  individual drafts as reviewed without publishing. The existing approve
-  action still publishes immediately.
-- `synto compile` skips verified drafts, protecting human-reviewed content
-  from accidental regeneration on the next compile run.
-- Drafts can be rejected even after verification, giving curators a way to
-  walk back a reviewed draft without manual SQL surgery.
-- Query vocabulary bridge: `synto query` now augments the routing prompt with
-  a hint naming the concepts whose aliases match whole words in the user's
-  question (e.g., "ML" → "Machine Learning"). This helps the fast model pick
-  the right wiki article when the user types an acronym or surface form
-  instead of the canonical title. Ambiguous aliases (claimed by ≥2 concepts)
-  are filtered. All-caps acronyms of length ≥2 bypass the length floor.
-  Pure-CJK aliases are a silent no-op (v1 limitation: Python's `\b` requires
-  word boundaries). No new dependencies, no public-API changes.
-- Article frontmatter now includes three machine-readable quality signals emitted
-  at compile time: `source_count` (int), `single_source` (bool), and
-  `source_quality` ("high" | "medium" | "low"). These let file readers, Obsidian
-  plugins, MCP tools, and AI agents assess corroboration needs without DB access.
-  `single_source: true` is derived from unique source-document identity where
-  available, falling back to path uniqueness. Synthesis articles carry
-  `source_count` and `single_source` on the same basis. `read_article` in the MCP
-  server inherits all three fields; `list_articles` now includes them in its
-  projection.
-- Per-source-type ingest overrides: `[pipeline.source_overrides.<type>]` sections in
-  `synto.toml` let you raise the `max_concepts_per_source` ceiling for long-form source
-  types (e.g. `textbook`, `paper`) without changing the global default. Quality-based
-  reduction still applies within the per-type ceiling. Unknown source type keys emit a
-  warning at load time. Re-run `synto ingest --force` to apply changes to already-ingested
-  sources.
-
-### Fixed
-
-- Structured-output JSON parser now correctly repairs odd-length backslash
-  runs before LaTeX commands (e.g. `\\\in` → `\\\\in`), resolving transient
-  compile failures on real LLM output. Valid `\\uXXXX` unicode escapes and
-  standard JSON escapes (`\n`, `\t`, `\"`, etc.) are preserved unchanged.
-- Saved query answer pages no longer contain literal `\\n` text — escaped
-  newlines from the model's JSON output are decoded before writing to disk.
-- `synto compile` now reads document identity from `source_documents` (the
-  canonical store since schema v9) instead of from a duplicate set of columns
-  on `raw_notes` that were never populated. The `single_source` frontmatter
-  field is unchanged for every current ingestion scenario (each source is its
-  own raw file, so path-uniqueness gives the correct answer either way); the
-  change is structural and makes the doc-identity branch alive and tested.
-
-### Changed
-
+  extras flag still resolves but is no longer needed.
+- `list_articles` defaults to `min_status="published"`. v0.2.2 callers
+  passing no filter previously saw drafts too; they now need to pass
+  `min_status="draft"` to get the old behavior.
+- `mcp.audit=true` audit rows in `metric_events.metadata_json` now
+  record `bool`, `int`, and `float` argument values directly instead
+  of hashing them. String arguments are still hashed, so user-supplied
+  text never lands raw.
 - Schema v15: `wiki_articles.is_draft` (boolean) replaced with
   `wiki_articles.status` (text) constrained to `draft`, `verified`, or
   `published`. Migration is automatic and idempotent on vault open.
-  `WikiArticleRecord` model no longer serializes `is_draft` in
-  `model_dump()` — callers using the field directly must switch to
-  `record.status` or one of the derived properties (`is_draft`,
-  `is_published`, `is_trusted`). External tooling querying `wiki_articles`
-  directly must read `status` instead of `is_draft`.
-- Schema v14: drop the five v8 metadata columns from `raw_notes`
+  `WikiArticleRecord` no longer serializes `is_draft` in `model_dump()` —
+  callers using it directly must switch to `record.status` or one of
+  the derived properties (`is_draft`, `is_published`, `is_trusted`).
+  External tooling querying `wiki_articles` directly must read `status`
+  instead of `is_draft`.
+- Schema v14: dropped the five v8 metadata columns from `raw_notes`
   (`source_type`, `origin_uri`, `imported_at`, `normalized_hash`,
-  `extractor_version`) that were superseded by `source_documents` in v9.
-  These columns held NULL on every row in every released version except
-  `source_type` (which had `DEFAULT 'notes'` but was never read). Vaults
-  migrate automatically on next open. External tooling querying those
-  columns directly must JOIN through `source_documents.id = stem(raw_notes.path)`.
+  `extractor_version`). They were superseded by `source_documents` in
+  v9 and held NULL on every row in every released version. Vaults
+  migrate automatically on next open. External tooling reading those
+  columns directly must JOIN through
+  `source_documents.id = stem(raw_notes.path)`.
 - `synto` now requires SQLite ≥ 3.35.0 (for the v14 migration's
-  `DROP COLUMN`). Modern Python stdlib distributions on macOS and Linux
-  already meet this. The error message at startup names the required
-  version if the check fails.
+  `DROP COLUMN`). Modern Python stdlib distributions on macOS and
+  Linux already meet this. The error message at startup names the
+  required version if the check fails.
 - A downgrade guard now blocks opening a vault whose on-disk schema
   version is newer than the installed `synto` binary, with a clear
   upgrade-required error.
+
+### Fixed
+
+- Structured-output JSON parser repairs odd-length backslash runs
+  before LaTeX commands (e.g. `\\\in` → `\\\\in`), fixing transient
+  compile failures on real LLM output. Valid `\\uXXXX` escapes and
+  standard JSON escapes (`\n`, `\t`, `\"`, etc.) are preserved.
+- Saved query answer pages no longer contain literal `\\n` text —
+  escaped newlines from the model's JSON output are decoded before
+  writing to disk.
+- `synto compile` now reads document identity from `source_documents`
+  (the canonical store since schema v9) instead of from a duplicate
+  set of columns on `raw_notes` that were never populated. The
+  `single_source` frontmatter field is unchanged for every current
+  ingestion scenario; the fix makes the doc-identity branch alive and
+  tested.
 
 ## [0.2.2] - 2026-05-22
 
