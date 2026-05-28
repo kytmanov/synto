@@ -125,21 +125,41 @@ def _effective_source_access_mode(
     return effective
 
 
+def _license_allows_value(license_str: str | None, mode: str, permissive: set[str]) -> bool:
+    """Pure-function gate. `mode` is the *effective* mode (post-grandfather).
+    `permissive` is the casefolded set of allowed license strings.
+    """
+    if mode == "all":
+        return True
+    if mode == "deny":
+        return False
+    # permissive_only
+    if license_str is None:
+        return False
+    return license_str.casefold() in permissive
+
+
 def _license_allows(source_id: str, db: StateDB, mcp_config: McpConfig, vault_key: str) -> bool:
-    """Return True if the source's license permits verbatim access under current policy."""
+    """Single-source convenience wrapper for read_source_segment and list_segments.
+
+    For multi-row tools (search_source_segments, get_source_passages), use the
+    batched source-meta + _license_allows_value pattern instead to avoid N+1.
+    """
     effective_mode = _effective_source_access_mode(db, mcp_config.source_access, vault_key)
     if effective_mode == "all":
         return True
     if effective_mode == "deny":
         return False
-    # permissive_only
+    # permissive_only — need the license value
     row = db._conn.execute(
         "SELECT license FROM source_documents WHERE id = ?", (source_id,)
     ).fetchone()
-    if row is None or row["license"] is None:
-        return False
-    allowed = {lic.casefold() for lic in mcp_config.source_access.permissive_licenses}
-    return row["license"].casefold() in allowed
+    if row is None:
+        return False  # Orphan source. For single-source tools, this collapses to "policy denial"
+        # which is acceptable because they already checked the source exists upstream.
+    license_str: str | None = row["license"]
+    permissive = {lic.casefold() for lic in mcp_config.source_access.permissive_licenses}
+    return _license_allows_value(license_str, effective_mode, permissive)
 
 
 def _ref_to_dict(ref: ArticleRef) -> dict[str, object]:
@@ -584,6 +604,8 @@ def build_tool_handlers(
         Use when the user wants the source's own words, not a synto-generated
         synthesis. Returns ranked snippets with segment ids; fetch the full body
         with read_source_segment. limit is capped at 50.
+        The response includes `hidden_by_policy` (count blocked by license gate) and
+        `orphan_segments` (count whose source document is missing from the registry).
         """
         started = time.monotonic()
         success = False
@@ -620,13 +642,23 @@ def build_tool_handlers(
                 )
                 for src in db._conn.execute(_sql, source_ids).fetchall():
                     source_meta[src["id"]] = (src["license"], src["origin_uri"])
-            results = []
-            hidden = 0
+            # Effective mode + permissive set computed once for the whole result page.
+            effective_mode = _effective_source_access_mode(db, config.mcp.source_access, vault_key)
+            permissive = {lic.casefold() for lic in config.mcp.source_access.permissive_licenses}
+            results: list[dict[str, Any]] = []
+            hidden_by_policy = 0
+            orphan_segments = 0
             for r in rows:
-                if not _license_allows(r["source_id"], db, config.mcp, vault_key):
-                    hidden += 1
+                meta = source_meta.get(r["source_id"])
+                if meta is None:
+                    # source_id present in source_segments but missing from source_documents
+                    # → orphan. Distinct from policy denial.
+                    orphan_segments += 1
                     continue
-                _license, origin_uri = source_meta.get(r["source_id"], (None, None))
+                license_str, origin_uri = meta
+                if not _license_allows_value(license_str, effective_mode, permissive):
+                    hidden_by_policy += 1
+                    continue
                 results.append(
                     {
                         "segment_id": r["segment_id"],
@@ -638,7 +670,11 @@ def build_tool_handlers(
                     }
                 )
             success = True
-            return {"results": results, "hidden_by_policy": hidden}
+            return {
+                "results": results,
+                "hidden_by_policy": hidden_by_policy,
+                "orphan_segments": orphan_segments,
+            }
         finally:
             _audit(
                 db,
@@ -659,6 +695,8 @@ def build_tool_handlers(
         the source's own explanation, not a synto-generated synthesis.
         Results are ordered by extraction confidence then reading order.
         Pass max_chars to cap each paragraph (default 8000, max 16000).
+        The response includes `hidden_by_policy` (count blocked by license gate) and
+        `orphan_segments` (count whose source document is missing from the registry).
         """
         started = time.monotonic()
         success = False
@@ -675,28 +713,29 @@ def build_tool_handlers(
             resolved = db.find_concept_by_name_or_alias(concept_name)
             if resolved is None:
                 success = True
-                return {"results": [], "hidden_by_policy": 0}
+                return {"results": [], "hidden_by_policy": 0, "orphan_segments": 0}
             canonical, _aliases = resolved
             rows = db.select_passages_for_concept(canonical, max_passages)
-            # Batch fetch licenses for all distinct sources in results
-            source_ids = list({r["source_id"] for r in rows})
-            source_meta: dict[str, tuple[str | None, str | None]] = {}
-            if source_ids:
-                placeholders = ",".join("?" * len(source_ids))
-                _sql = (
-                    "SELECT id, license, origin_uri FROM source_documents"
-                    f" WHERE id IN ({placeholders})"
-                )
-                for src in db._conn.execute(_sql, source_ids).fetchall():
-                    source_meta[src["id"]] = (src["license"], src["origin_uri"])
+            # select_passages_for_concept already JOINs source_documents and returns
+            # origin_uri, license, and doc_id — no separate batch fetch needed.
+            # doc_id is NULL when source_id has no matching source_documents row (orphan).
             char_cap = min(max_chars, 16000) if max_chars is not None else 8000
-            results = []
-            hidden = 0
+            # Effective mode + permissive set computed once for the whole result page.
+            effective_mode = _effective_source_access_mode(db, config.mcp.source_access, vault_key)
+            permissive = {lic.casefold() for lic in config.mcp.source_access.permissive_licenses}
+            results: list[dict[str, Any]] = []
+            hidden_by_policy = 0
+            orphan_segments = 0
             for r in rows:
-                if not _license_allows(r["source_id"], db, config.mcp, vault_key):
-                    hidden += 1
+                if r["doc_id"] is None:
+                    # LEFT JOIN miss: source_id in source_segments with no source_documents row.
+                    orphan_segments += 1
                     continue
-                _license, origin_uri = source_meta.get(r["source_id"], (None, None))
+                license_str: str | None = r["license"]
+                origin_uri: str | None = r["origin_uri"]
+                if not _license_allows_value(license_str, effective_mode, permissive):
+                    hidden_by_policy += 1
+                    continue
                 body: str = r["text"]
                 truncated = False
                 if len(body) > char_cap:
@@ -714,7 +753,11 @@ def build_tool_handlers(
                     }
                 )
             success = True
-            return {"results": results, "hidden_by_policy": hidden}
+            return {
+                "results": results,
+                "hidden_by_policy": hidden_by_policy,
+                "orphan_segments": orphan_segments,
+            }
         finally:
             _audit(
                 db,

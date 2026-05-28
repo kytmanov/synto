@@ -2294,7 +2294,8 @@ class StateDB:
         secondary order (ordinal ASC) acts as the effective ordering in that case.
         """
         return self._conn.execute(
-            """SELECT s.id, s.source_id, s.ordinal, s.text, co.confidence, d.origin_uri
+            """SELECT s.id, s.source_id, s.ordinal, s.text, co.confidence,
+                      d.origin_uri, d.license, d.id AS doc_id
                FROM concept_occurrences co
                JOIN source_segments s ON s.id = co.source_segment_id
                LEFT JOIN source_documents d ON d.id = s.source_id

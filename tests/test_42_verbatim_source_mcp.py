@@ -409,7 +409,7 @@ def test_get_source_passages_unknown_concept_returns_empty(vault: Path) -> None:
     db = StateDB(vault / ".synto" / "state.db")
     handlers = _make_handlers(vault, db)
     result = handlers["get_source_passages"]("NonexistentConcept")
-    assert result == {"results": [], "hidden_by_policy": 0}
+    assert result == {"results": [], "hidden_by_policy": 0, "orphan_segments": 0}
 
 
 def test_get_source_passages_max_passages_exceeded_raises(vault: Path) -> None:
@@ -704,3 +704,163 @@ def test_grandfather_caches_per_vault(vault: Path) -> None:
     assert ("stageA-vault", "permissive_only") in serve_module._effective_mode_cache
     # Cache value should be "all" (grandfather kicked in because 0 declared licenses)
     assert serve_module._effective_mode_cache[("stageA-vault", "permissive_only")] == "all"
+
+
+# ── Stage B: N+1 license-query fix + orphan-segment distinction ─────────────
+
+
+class _CountingConn:
+    """Thin proxy over a sqlite3.Connection that counts source_documents SELECTs.
+
+    sqlite3.Connection.execute is read-only in CPython 3.13+, so we cannot
+    monkey-patch it. Instead we swap db._conn for this proxy, which forwards
+    every call while maintaining a counter.
+    """
+
+    def __init__(self, conn) -> None:
+        self._conn = conn
+        self.source_documents_selects = 0
+
+    def execute(self, sql, *args, **kwargs):
+        if "source_documents" in sql.lower():
+            self.source_documents_selects += 1
+        return self._conn.execute(sql, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def test_search_does_not_n_plus_one_license_queries(vault: Path) -> None:
+    """search_source_segments must batch-fetch licenses, not query per result.
+
+    The grandfather check (Stage A) and the batch fetch each issue 1 SELECT
+    against source_documents. After the cache warms, only the batch fetch fires.
+    Total per call: ≤2 SELECTs against source_documents (1 grandfather + 1 batch),
+    and after the first call only 1.
+    """
+    _clear_mode_cache()
+    db = StateDB(vault / ".synto" / "state.db")
+    # Sentinel licensed source so grandfather does NOT fire and the gate is active.
+    _insert_source(db, "open", license="CC-BY")
+    _insert_segment(db, "open:p:0:aa", "open", "alpha topic from open source", ordinal=0)
+    # Build 10 additional permissive sources, each with one segment matching "alpha".
+    for i in range(10):
+        sid = f"book{i}"
+        _insert_source(db, sid, license="CC-BY")
+        _insert_segment(db, f"{sid}:p:0:aa", sid, f"alpha topic in book {i}", ordinal=0)
+    handlers = _make_handlers_with_default_gate(vault, db)
+
+    counting = _CountingConn(db._conn)
+    real_conn = db._conn
+    db._conn = counting  # type: ignore[assignment]
+    try:
+        result = handlers["search_source_segments"]("alpha", limit=50)
+    finally:
+        db._conn = real_conn
+
+    assert len(result["results"]) == 11
+    # ≤2: at most one grandfather probe + one batched fetch.
+    assert counting.source_documents_selects <= 2, (
+        f"search_source_segments issued {counting.source_documents_selects} SELECTs"
+        " against source_documents — should be ≤2 (1 grandfather + 1 batch)."
+    )
+
+
+def test_get_source_passages_does_not_n_plus_one_license_queries(vault: Path) -> None:
+    """get_source_passages must batch-fetch licenses, not query per result."""
+    _clear_mode_cache()
+    db = StateDB(vault / ".synto" / "state.db")
+    _insert_source(db, "sentinel", license="CC-BY")
+    _insert_concept(db, "TestConcept")
+    for i in range(10):
+        sid = f"book{i}"
+        _insert_source(db, sid, license="CC-BY")
+        _insert_segment(db, f"{sid}:p:0:aa", sid, f"passage {i}", ordinal=0)
+        _insert_occurrence(db, "TestConcept", f"{sid}:p:0:aa", confidence=1.0, ordinal=i)
+    handlers = _make_handlers_with_default_gate(vault, db)
+
+    counting = _CountingConn(db._conn)
+    real_conn = db._conn
+    db._conn = counting  # type: ignore[assignment]
+    try:
+        result = handlers["get_source_passages"]("TestConcept", max_passages=10)
+    finally:
+        db._conn = real_conn
+
+    assert len(result["results"]) == 10
+    assert counting.source_documents_selects <= 2, (
+        f"get_source_passages issued {counting.source_documents_selects} SELECTs"
+        " against source_documents — should be ≤2 (1 grandfather + 1 batch)."
+    )
+
+
+def test_search_orphan_segment_counted_separately(vault: Path) -> None:
+    """Segments whose source_id is missing from source_documents → orphan, not policy."""
+    _clear_mode_cache()
+    db = StateDB(vault / ".synto" / "state.db")
+    _insert_source(db, "real", license="CC-BY")
+    _insert_segment(db, "real:p:0:aa", "real", "alpha real content", ordinal=0)
+    # Directly insert a segment row whose source_id has no row in source_documents.
+    db._conn.execute(
+        """INSERT INTO source_segments
+           (id, identity, ordinal, source_id, structural_locator, content_hash, text)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        ("orphan:p:0:aa", "orphan:para:0", 0, "orphan", "p:0", "abc", "alpha orphan content"),
+    )
+    db._conn.commit()
+    handlers = _make_handlers_with_default_gate(vault, db)
+    result = handlers["search_source_segments"]("alpha")
+    visible_ids = [r["segment_id"] for r in result["results"]]
+    assert "real:p:0:aa" in visible_ids
+    assert "orphan:p:0:aa" not in visible_ids
+    assert result["orphan_segments"] == 1
+    assert result["hidden_by_policy"] == 0
+
+
+def test_get_source_passages_orphan_segment_counted_separately(vault: Path) -> None:
+    """Orphan segments in get_source_passages also surface as orphan_segments, not policy."""
+    _clear_mode_cache()
+    db = StateDB(vault / ".synto" / "state.db")
+    _insert_source(db, "real", license="CC-BY")
+    _insert_segment(db, "real:p:0:aa", "real", "real passage", ordinal=0)
+    # Orphan segment + occurrence
+    db._conn.execute(
+        """INSERT INTO source_segments
+           (id, identity, ordinal, source_id, structural_locator, content_hash, text)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        ("orphan:p:0:aa", "orphan:para:0", 0, "orphan", "p:0", "abc", "orphan passage"),
+    )
+    _insert_concept(db, "MyConcept")
+    _insert_occurrence(db, "MyConcept", "real:p:0:aa", confidence=1.0, ordinal=0)
+    _insert_occurrence(db, "MyConcept", "orphan:p:0:aa", confidence=1.0, ordinal=1)
+    db._conn.commit()
+    handlers = _make_handlers_with_default_gate(vault, db)
+    result = handlers["get_source_passages"]("MyConcept")
+    visible_ids = [r["segment_id"] for r in result["results"]]
+    assert "real:p:0:aa" in visible_ids
+    assert "orphan:p:0:aa" not in visible_ids
+    assert result["orphan_segments"] == 1
+    assert result["hidden_by_policy"] == 0
+
+
+def test_search_response_shape_includes_orphan_segments_field(vault: Path) -> None:
+    """All search responses include orphan_segments (default 0)."""
+    _clear_mode_cache()
+    db = StateDB(vault / ".synto" / "state.db")
+    _insert_source(db, "book1", license="CC-BY")
+    _insert_segment(db, "book1:p:0:aa", "book1", "topic content", ordinal=0)
+    handlers = _make_handlers_with_default_gate(vault, db)
+    result = handlers["search_source_segments"]("topic")
+    assert "orphan_segments" in result
+    assert result["orphan_segments"] == 0
+
+
+def test_get_source_passages_response_shape_includes_orphan_segments(vault: Path) -> None:
+    """get_source_passages response always includes orphan_segments."""
+    _clear_mode_cache()
+    db = StateDB(vault / ".synto" / "state.db")
+    handlers = _make_handlers_with_default_gate(vault, db)
+    # Unknown concept path
+    result = handlers["get_source_passages"]("Nonexistent")
+    assert "orphan_segments" in result
+    assert result["orphan_segments"] == 0
