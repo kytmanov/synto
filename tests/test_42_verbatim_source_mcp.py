@@ -321,3 +321,99 @@ def test_search_source_segments_returns_source_path(vault: Path) -> None:
     handlers = _make_handlers(vault, db)
     result = handlers["search_source_segments"]("origin")
     assert result["results"][0]["source_path"] == "/raw/book1.pdf"
+
+
+# ── Stage 4: get_source_passages ─────────────────────────────────────────────
+
+
+def _insert_concept(db: StateDB, name: str, source_path: str = "raw/book1.md") -> None:
+    db._conn.execute(
+        "INSERT OR IGNORE INTO concepts (name, source_path) VALUES (?, ?)",
+        (name, source_path),
+    )
+    db._conn.commit()
+
+
+def _insert_occurrence(
+    db: StateDB, concept_name: str, segment_id: str, confidence: float = 1.0, ordinal: int = 0
+) -> None:
+    db._conn.execute(
+        """INSERT OR REPLACE INTO concept_occurrences
+           (concept_name, source_segment_id, ordinal, confidence)
+           VALUES (?, ?, ?, ?)""",
+        (concept_name, segment_id, ordinal, confidence),
+    )
+    db._conn.commit()
+
+
+def test_get_source_passages_known_concept(vault: Path) -> None:
+    """Known concept returns segments ordered by confidence DESC, ordinal ASC."""
+    db = StateDB(vault / ".synto" / "state.db")
+    _insert_source(db, "book1")
+    _insert_segment(db, "book1:p:0:aa", "book1", "high confidence passage", ordinal=0)
+    _insert_segment(db, "book1:p:1:bb", "book1", "low confidence passage", ordinal=1)
+    _insert_concept(db, "Quantum")
+    _insert_occurrence(db, "Quantum", "book1:p:0:aa", confidence=0.9)
+    _insert_occurrence(db, "Quantum", "book1:p:1:bb", confidence=0.3)
+    handlers = _make_handlers(vault, db)
+    result = handlers["get_source_passages"]("Quantum")
+    assert result["hidden_by_policy"] == 0
+    assert len(result["results"]) == 2
+    assert result["results"][0]["segment_id"] == "book1:p:0:aa"
+    assert result["results"][0]["confidence"] == pytest.approx(0.9)
+    assert result["results"][1]["segment_id"] == "book1:p:1:bb"
+
+
+def test_get_source_passages_alias_resolution(vault: Path) -> None:
+    """Alias of a canonical concept returns the same results as the canonical name."""
+    db = StateDB(vault / ".synto" / "state.db")
+    _insert_source(db, "book1")
+    _insert_segment(db, "book1:p:0:aa", "book1", "the passage body", ordinal=0)
+    _insert_concept(db, "Quantum Mechanics")
+    _insert_occurrence(db, "Quantum Mechanics", "book1:p:0:aa")
+    # Insert alias
+    db._conn.execute(
+        "INSERT OR IGNORE INTO concept_aliases (concept_name, alias) VALUES (?, ?)",
+        ("Quantum Mechanics", "QM"),
+    )
+    db._conn.commit()
+    handlers = _make_handlers(vault, db)
+    by_canonical = handlers["get_source_passages"]("Quantum Mechanics")
+    by_alias = handlers["get_source_passages"]("QM")
+    assert len(by_canonical["results"]) == 1
+    assert len(by_alias["results"]) == 1
+    assert by_alias["results"][0]["segment_id"] == by_canonical["results"][0]["segment_id"]
+
+
+def test_get_source_passages_unknown_concept_returns_empty(vault: Path) -> None:
+    """Unknown concept returns empty results without raising an error."""
+    db = StateDB(vault / ".synto" / "state.db")
+    handlers = _make_handlers(vault, db)
+    result = handlers["get_source_passages"]("NonexistentConcept")
+    assert result == {"results": [], "hidden_by_policy": 0}
+
+
+def test_get_source_passages_max_passages_exceeded_raises(vault: Path) -> None:
+    """max_passages > 20 raises a tool error."""
+    db = StateDB(vault / ".synto" / "state.db")
+    handlers = _make_handlers(vault, db)
+    with pytest.raises(Exception, match="20"):
+        handlers["get_source_passages"]("anything", max_passages=21)
+
+
+def test_get_source_passages_truncation(vault: Path) -> None:
+    """max_chars truncates body and sets truncated=True; default cap is 8000."""
+    db = StateDB(vault / ".synto" / "state.db")
+    _insert_source(db, "book1")
+    _insert_segment(db, "book1:p:0:aa", "book1", "X" * 10000, ordinal=0)
+    _insert_concept(db, "Big")
+    _insert_occurrence(db, "Big", "book1:p:0:aa")
+    handlers = _make_handlers(vault, db)
+    # Default cap is 8000
+    result = handlers["get_source_passages"]("Big")
+    assert result["results"][0]["truncated"] is True
+    assert len(result["results"][0]["body"]) <= 8001
+    # Explicit max_chars
+    result2 = handlers["get_source_passages"]("Big", max_chars=100)
+    assert result2["results"][0]["truncated"] is True
+    assert len(result2["results"][0]["body"]) <= 101

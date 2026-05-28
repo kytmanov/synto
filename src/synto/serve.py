@@ -607,6 +607,79 @@ def build_tool_handlers(
                 mcp_config=config.mcp,
             )
 
+    def get_source_passages(
+        concept_name: str, max_passages: int = 5, max_chars: int | None = None
+    ) -> dict[str, object]:
+        """Return verbatim paragraphs explicitly linked to a concept.
+
+        Use when you know which concept the user is asking about and want
+        the source's own explanation, not a synto-generated synthesis.
+        Results are ordered by extraction confidence then reading order.
+        Pass max_chars to cap each paragraph (default 8000, max 16000).
+        """
+        started = time.monotonic()
+        success = False
+        arguments: dict[str, Any] = {
+            "concept_name": concept_name,
+            "max_passages": max_passages,
+            "max_chars": max_chars,
+        }
+        try:
+            assert db is not None
+            if max_passages > 20:
+                raise tool_error_cls("max_passages must be at most 20")
+            max_passages = max(1, max_passages)
+            resolved = db.find_concept_by_name_or_alias(concept_name)
+            if resolved is None:
+                success = True
+                return {"results": [], "hidden_by_policy": 0}
+            canonical, _aliases = resolved
+            rows = db.select_passages_for_concept(canonical, max_passages)
+            # Batch fetch licenses for all distinct sources in results
+            source_ids = list({r["source_id"] for r in rows})
+            source_meta: dict[str, tuple[str | None, str | None]] = {}
+            if source_ids:
+                placeholders = ",".join("?" * len(source_ids))
+                for src in db._conn.execute(
+                    f"SELECT id, license, origin_uri FROM source_documents WHERE id IN ({placeholders})",
+                    source_ids,
+                ).fetchall():
+                    source_meta[src["id"]] = (src["license"], src["origin_uri"])
+            char_cap = min(max_chars, 16000) if max_chars is not None else 8000
+            results = []
+            hidden = 0
+            for r in rows:
+                if not _license_allows(r["source_id"], db, config.mcp):
+                    hidden += 1
+                    continue
+                _license, origin_uri = source_meta.get(r["source_id"], (None, None))
+                body: str = r["text"]
+                truncated = False
+                if len(body) > char_cap:
+                    body = body[:char_cap] + "…"
+                    truncated = True
+                results.append({
+                    "segment_id": r["id"],
+                    "source_id": r["source_id"],
+                    "ordinal": r["ordinal"],
+                    "body": body,
+                    "confidence": r["confidence"],
+                    "source_path": origin_uri,
+                    "truncated": truncated,
+                })
+            success = True
+            return {"results": results, "hidden_by_policy": hidden}
+        finally:
+            _audit(
+                db,
+                vault_id=vault_key,
+                tool="get_source_passages",
+                arguments=arguments,
+                success=success,
+                latency_ms=int((time.monotonic() - started) * 1000),
+                mcp_config=config.mcp,
+            )
+
     handlers: dict[str, Callable[..., Any]] = {
         "list_articles": list_articles,
         "read_article": read_article,
@@ -620,6 +693,7 @@ def build_tool_handlers(
     if db is not None:
         handlers["read_source_segment"] = read_source_segment
         handlers["search_source_segments"] = search_source_segments
+        handlers["get_source_passages"] = get_source_passages
     return handlers
 
 

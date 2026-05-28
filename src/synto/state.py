@@ -2285,6 +2285,25 @@ class StateDB:
             "SELECT * FROM concept_occurrences ORDER BY concept_name, source_segment_id"
         ).fetchall()
 
+    def select_passages_for_concept(
+        self, canonical_name: str, max_passages: int
+    ) -> list[sqlite3.Row]:
+        """Return source segments linked to a concept, ordered by confidence then ordinal.
+
+        Confidence defaults to 1.0 for extractors that don't set it, so the
+        secondary order (ordinal ASC) acts as the effective ordering in that case.
+        """
+        return self._conn.execute(
+            """SELECT s.id, s.source_id, s.ordinal, s.text, co.confidence, d.origin_uri
+               FROM concept_occurrences co
+               JOIN source_segments s ON s.id = co.source_segment_id
+               LEFT JOIN source_documents d ON d.id = s.source_id
+               WHERE co.concept_name = ?
+               ORDER BY co.confidence DESC, s.ordinal ASC
+               LIMIT ?""",
+            (canonical_name, max_passages),
+        ).fetchall()
+
     def upsert_source_document(self, doc: object) -> None:
         """Insert or replace a SourceDocument record."""
         import json
