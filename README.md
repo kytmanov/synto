@@ -158,6 +158,30 @@ Works today with Markdown. Drop notes in `raw/`, run `synto run`, and get a cros
 
 **MCP server.** `synto serve` exposes your wiki as a local MCP server with eight tools: `list_articles`, `read_article`, `find_concept`, `search_articles`, `get_concept`, `list_sources`, `trace_lineage`, and `answer_question`. Wire it into Claude Code, Cursor, or any MCP-compatible client in one command. Drafts are hidden by default; `answer_question` runs the same routed query as `synto query` end-to-end (uses both fast and heavy models), so it may cost money on paid providers.
 
+### Verbatim source tools
+
+Four additional MCP tools expose raw source paragraphs to frontier-model callers.
+Use them when you want the source's own words, not a synto-generated synthesis.
+
+- `read_source_segment(segment_id)` — fetch one paragraph by id.
+- `search_source_segments(query, limit=10)` — BM25 search across raw segments.
+- `get_source_passages(concept_name, max_passages=5)` — verbatim passages backing
+  a known concept.
+- `list_segments(source_id, limit=200, offset=0)` — enumerate a source's segments
+  in reading order.
+
+Access is governed by `[mcp.source_access]` in `synto.toml`:
+
+```toml
+[mcp.source_access]
+mode = "permissive_only"  # or "all" | "deny"
+permissive_licenses = ["CC-BY", "CC-BY-SA", "MIT", "Apache-2.0", "BSD-3-Clause", "public-domain"]
+```
+
+Vaults upgraded from v0.3.0 with no declared licenses are treated as `"all"`
+for one session so the upgrade is seamless. Once any source has a license set,
+restart `synto serve` to engage the configured mode.
+
 **Self-maintenance.** `synto maintain` repairs broken wikilinks and creates stubs for missing targets. `synto lint` reports orphans, stale articles, and missing frontmatter.
 
 **A/B model comparison.** `synto compare` runs your query set against two different models in isolated copies of your vault so you can evaluate a model switch without touching anything live.

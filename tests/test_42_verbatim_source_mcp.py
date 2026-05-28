@@ -561,8 +561,13 @@ def test_privacy_gate_permissive_only_allows_permissive_license(vault: Path) -> 
 
 
 def test_privacy_gate_permissive_only_blocks_null_license(vault: Path) -> None:
-    """mode='permissive_only' blocks sources with null license."""
+    """mode='permissive_only' blocks sources with null license.
+
+    A sentinel source with a declared license ensures the grandfather rule does not
+    fire — the gate must be active for the null-license block to be meaningful.
+    """
     db = StateDB(vault / ".synto" / "state.db")
+    _insert_source(db, "sentinel", license="CC-BY")  # declares a license → grandfather stays off
     _insert_source(db, "nolic")  # no license set
     _insert_segment(db, "nolic:p:0:aa", "nolic", "unknown rights content", ordinal=0)
     handlers = _make_handlers_with_access(vault, db, mode="permissive_only")
@@ -625,3 +630,77 @@ def test_privacy_gate_search_hidden_by_policy_count(vault: Path) -> None:
     assert "open:p:0:aa" in visible_ids
     assert "closed:p:0:aa" not in visible_ids
     assert result["hidden_by_policy"] == 1
+
+
+# ── Stage A: grandfather rule for legacy vaults ──────────────────────────────
+
+
+def _clear_mode_cache() -> None:
+    from synto import serve as serve_module
+
+    serve_module._effective_mode_cache.clear()
+
+
+def _make_handlers_with_default_gate(vault: Path, db: StateDB):
+    """Build handlers with default permissive_only mode (the real-world default)."""
+    config = Config(vault=vault, mcp=McpConfig(audit=False))  # default source_access
+    reader = VaultReader(vault)
+    return build_tool_handlers(reader, config, db, vault_key="stageA-vault")
+
+
+def test_grandfather_legacy_vault_with_no_licenses(vault: Path) -> None:
+    """Legacy vault (0 declared licenses) under default config → tools work seamlessly."""
+    _clear_mode_cache()
+    db = StateDB(vault / ".synto" / "state.db")
+    _insert_source(db, "book1")  # no license argument → license stays NULL
+    _insert_segment(db, "book1:p:0:aa", "book1", "the brown fox", ordinal=0)
+    handlers = _make_handlers_with_default_gate(vault, db)
+    result = handlers["read_source_segment"]("book1:p:0:aa")
+    assert result["body"] == "the brown fox"
+
+
+def test_grandfather_disengages_when_any_license_declared(vault: Path) -> None:
+    """Once any source has a license, the gate re-engages on a fresh process."""
+    _clear_mode_cache()
+    db = StateDB(vault / ".synto" / "state.db")
+    _insert_source(db, "open", license="CC-BY")
+    _insert_source(db, "unknown")  # NULL license
+    _insert_segment(db, "open:p:0:aa", "open", "open content", ordinal=0)
+    _insert_segment(db, "unknown:p:0:aa", "unknown", "unknown content", ordinal=0)
+    handlers = _make_handlers_with_default_gate(vault, db)
+    # Open source is visible
+    open_result = handlers["read_source_segment"]("open:p:0:aa")
+    assert open_result["body"] == "open content"
+    # NULL-license source is blocked (grandfather did NOT fire)
+    with pytest.raises(Exception, match="restricted by license policy"):
+        handlers["read_source_segment"]("unknown:p:0:aa")
+
+
+def test_grandfather_does_not_override_explicit_deny(vault: Path) -> None:
+    """mode='deny' on a legacy vault still denies. Grandfather only relaxes permissive_only."""
+    _clear_mode_cache()
+    db = StateDB(vault / ".synto" / "state.db")
+    _insert_source(db, "book1")  # NULL license, would normally trigger grandfather
+    _insert_segment(db, "book1:p:0:aa", "book1", "content", ordinal=0)
+    sa = McpSourceAccessConfig(mode="deny")
+    config = Config(vault=vault, mcp=McpConfig(audit=False, source_access=sa))
+    reader = VaultReader(vault)
+    handlers = build_tool_handlers(reader, config, db, vault_key="stageA-vault")
+    with pytest.raises(Exception, match="restricted by license policy"):
+        handlers["read_source_segment"]("book1:p:0:aa")
+
+
+def test_grandfather_caches_per_vault(vault: Path) -> None:
+    """Effective mode is computed once per (vault_key, configured.mode), not per call."""
+    _clear_mode_cache()
+    db = StateDB(vault / ".synto" / "state.db")
+    _insert_source(db, "book1")
+    _insert_segment(db, "book1:p:0:aa", "book1", "content", ordinal=0)
+    from synto import serve as serve_module
+
+    handlers = _make_handlers_with_default_gate(vault, db)
+    handlers["read_source_segment"]("book1:p:0:aa")
+    # After first call, cache should be populated
+    assert ("stageA-vault", "permissive_only") in serve_module._effective_mode_cache
+    # Cache value should be "all" (grandfather kicked in because 0 declared licenses)
+    assert serve_module._effective_mode_cache[("stageA-vault", "permissive_only")] == "all"

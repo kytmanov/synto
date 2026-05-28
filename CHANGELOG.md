@@ -2,6 +2,29 @@
 
 ## [Unreleased]
 
+### Added
+
+- Four new MCP tools for verbatim source access (Feature 42):
+  - `read_source_segment(segment_id)` — fetch one paragraph by id.
+  - `search_source_segments(query, limit)` — BM25 search across raw segments.
+  - `get_source_passages(concept_name, max_passages)` — verbatim passages backing
+    a concept, ordered by extraction confidence.
+  - `list_segments(source_id, limit, offset)` — enumerate a source's segments.
+- New `[mcp.source_access]` config block. `mode = "permissive_only"` (default)
+  filters segments by license; `"all"` returns everything; `"deny"` refuses all
+  raw-passage tools. Default `permissive_licenses` covers CC-BY, CC-BY-SA, MIT,
+  Apache-2.0, BSD-3-Clause, and public-domain.
+- SQLite FTS5 virtual table `source_segments_fts` with sync triggers and v16
+  migration backfill.
+
+### Notes
+
+- **Upgrade behaviour:** vaults upgraded from v0.3.0 have no declared license
+  on any source. To keep the upgrade seamless, the privacy gate is relaxed to
+  `"all"` for vaults with zero declared licenses. A single INFO log line surfaces
+  this at `synto serve` startup. Declare any license on any source (and restart
+  serve) to engage the configured privacy gate.
+
 ## [0.3.0] - 2026-05-25
 
 ### Added

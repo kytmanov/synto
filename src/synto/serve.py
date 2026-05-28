@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .config import Config, McpConfig
+from .config import Config, McpConfig, McpSourceAccessConfig
 from .readers import (
     Article,
     ArticleFilter,
@@ -92,18 +92,45 @@ def _read_visible_article(reader: VaultReader, name_or_id: str, mcp_config: McpC
     return article
 
 
-def _license_allows(source_id: str, db: StateDB, mcp_config: McpConfig) -> bool:
-    """Return True if the source's license permits verbatim access under current policy.
+# Per-process cache of effective source-access mode keyed by (vault_key, configured_mode).
+# Populated once at run_server() startup so individual handlers don't re-query the DB.
+_effective_mode_cache: dict[tuple[str, str], str] = {}
 
-    "all"              — always allow.
-    "deny"             — always deny.
-    "permissive_only"  — allow iff source_documents.license (case-insensitive) is in
-                         mcp_config.source_access.permissive_licenses. Null license → deny.
+
+def _effective_source_access_mode(
+    db: StateDB, configured: McpSourceAccessConfig, vault_key: str
+) -> str:
+    """Return effective source-access mode after grandfather check.
+
+    Legacy vaults (zero declared licenses) get the configured "permissive_only" mode
+    relaxed to "all" so upgrades from v0.3.0 are seamless. Once any source has a
+    license set, the configured mode takes effect on the next process restart.
+
+    "all" and "deny" modes pass through unchanged — grandfather only relaxes
+    "permissive_only", it never overrides an explicit choice.
+
+    Result is cached per (vault_key, configured.mode) for the process lifetime.
     """
-    sa = mcp_config.source_access
-    if sa.mode == "all":
+    if configured.mode != "permissive_only":
+        return configured.mode
+    cache_key = (vault_key, configured.mode)
+    cached = _effective_mode_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    declared = db._conn.execute(
+        "SELECT 1 FROM source_documents WHERE license IS NOT NULL LIMIT 1"
+    ).fetchone()
+    effective = "permissive_only" if declared is not None else "all"
+    _effective_mode_cache[cache_key] = effective
+    return effective
+
+
+def _license_allows(source_id: str, db: StateDB, mcp_config: McpConfig, vault_key: str) -> bool:
+    """Return True if the source's license permits verbatim access under current policy."""
+    effective_mode = _effective_source_access_mode(db, mcp_config.source_access, vault_key)
+    if effective_mode == "all":
         return True
-    if sa.mode == "deny":
+    if effective_mode == "deny":
         return False
     # permissive_only
     row = db._conn.execute(
@@ -111,7 +138,7 @@ def _license_allows(source_id: str, db: StateDB, mcp_config: McpConfig) -> bool:
     ).fetchone()
     if row is None or row["license"] is None:
         return False
-    allowed = {lic.casefold() for lic in sa.permissive_licenses}
+    allowed = {lic.casefold() for lic in mcp_config.source_access.permissive_licenses}
     return row["license"].casefold() in allowed
 
 
@@ -520,7 +547,7 @@ def build_tool_handlers(
             ).fetchone()
             if row is None:
                 raise tool_error_cls(f"unknown segment_id: {segment_id!r}")
-            if not _license_allows(row["source_id"], db, config.mcp):
+            if not _license_allows(row["source_id"], db, config.mcp, vault_key):
                 raise tool_error_cls(f"source {row['source_id']!r} is restricted by license policy")
             body: str = row["text"]
             truncated = False
@@ -596,7 +623,7 @@ def build_tool_handlers(
             results = []
             hidden = 0
             for r in rows:
-                if not _license_allows(r["source_id"], db, config.mcp):
+                if not _license_allows(r["source_id"], db, config.mcp, vault_key):
                     hidden += 1
                     continue
                 _license, origin_uri = source_meta.get(r["source_id"], (None, None))
@@ -666,7 +693,7 @@ def build_tool_handlers(
             results = []
             hidden = 0
             for r in rows:
-                if not _license_allows(r["source_id"], db, config.mcp):
+                if not _license_allows(r["source_id"], db, config.mcp, vault_key):
                     hidden += 1
                     continue
                 _license, origin_uri = source_meta.get(r["source_id"], (None, None))
@@ -718,7 +745,7 @@ def build_tool_handlers(
             ).fetchone()
             if src is None:
                 raise tool_error_cls(f"unknown source_id: {source_id!r}")
-            if not _license_allows(source_id, db, config.mcp):
+            if not _license_allows(source_id, db, config.mcp, vault_key):
                 raise tool_error_cls(f"source {source_id!r} is restricted by license policy")
             total = db._conn.execute(
                 "SELECT count(*) FROM source_segments WHERE source_id = ?", (source_id,)
@@ -791,12 +818,21 @@ def run_server(vault: Path, transport: str = "stdio") -> None:
     # Always open db — new verbatim-source tools query it regardless of audit setting.
     # _audit() still respects config.mcp.audit before writing any audit rows.
     db = StateDB(config.state_db_path)
+    vault_key = _vault_id(vault)
+    # Surface grandfather behaviour exactly once at startup so legacy vault users
+    # know why permissive_only is being treated as "all".
+    effective_mode = _effective_source_access_mode(db, config.mcp.source_access, vault_key)
+    if config.mcp.source_access.mode == "permissive_only" and effective_mode == "all":
+        log.info(
+            "synto: legacy vault detected (0 declared licenses); MCP source-access mode treated"
+            ' as "all" for this session. Set [mcp.source_access] in synto.toml or declare'
+            " licenses on sources to engage the privacy gate."
+        )
     server = FastMCP(
         _server_name(vault),
         instructions=_SERVER_INSTRUCTIONS,
         json_response=True,
     )
-    vault_key = _vault_id(vault)
     handlers = build_tool_handlers(reader, config, db, vault_key, tool_error_cls=ToolError)
     for handler in handlers.values():
         server.tool()(handler)
