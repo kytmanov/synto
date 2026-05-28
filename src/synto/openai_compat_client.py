@@ -300,8 +300,9 @@ class OpenAICompatClient:
     def healthcheck(self) -> bool:
         try:
             resp = self._client.get(self._models_url(), timeout=5)
-            # 200 = healthy + auth ok; 401 = service running but wrong key
-            return resp.status_code in (200, 401)
+            # Any HTTP response proves the server is reachable.
+            # 404/405 are common for providers that lack a /models endpoint.
+            return resp.status_code < 500
         except (httpx.ConnectError, httpx.TimeoutException):
             return False
         except Exception:
