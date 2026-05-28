@@ -2023,6 +2023,25 @@ def doctor(vault_str):
     console.print(f"  Drafts pending:    {stats['drafts']}")
     console.print(f"  Published:         {stats['published']}")
 
+    # ── Verbatim source index ─────────────────────────────────────────────────
+    console.print("\n[bold]Verbatim source index[/bold]")
+    try:
+        fts_exists, fts_count, seg_count = db.source_segments_fts_status()
+        if not fts_exists:
+            console.print(
+                "  [yellow]![/yellow] source_segments_fts not present"
+                " (vault below v16 — run any synto command to migrate)"
+            )
+        elif fts_count == seg_count:
+            console.print(f"  [green]✓[/green] {seg_count} segments indexed (FTS5 in sync)")
+        else:
+            console.print(
+                f"  [red]✗[/red] FTS index drift: {fts_count} indexed vs {seg_count} segments"
+            )
+            ok = False
+    except Exception as exc:  # pragma: no cover — defensive
+        console.print(f"  [yellow]![/yellow] could not read FTS index status: {exc}")
+
     draft_graph_filter = [
         "-path:raw",
         "-path:wiki/sources",

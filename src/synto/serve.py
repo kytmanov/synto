@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .config import Config, McpConfig
+from .config import Config, McpConfig, McpSourceAccessConfig
 from .readers import (
     Article,
     ArticleFilter,
@@ -92,6 +92,70 @@ def _read_visible_article(reader: VaultReader, name_or_id: str, mcp_config: McpC
     return article
 
 
+# Per-process cache of effective source-access mode keyed by (vault_key, configured_mode).
+# Populated once at run_server() startup so individual handlers don't re-query the DB.
+_effective_mode_cache: dict[tuple[str, str], str] = {}
+
+
+def _effective_source_access_mode(
+    db: StateDB, configured: McpSourceAccessConfig, vault_key: str
+) -> str:
+    """Return effective source-access mode after grandfather check.
+
+    Legacy vaults (zero declared licenses) get the configured "permissive_only" mode
+    relaxed to "all" so upgrades from v0.3.0 are seamless. Once any source has a
+    license set, the configured mode takes effect on the next process restart.
+
+    "all" and "deny" modes pass through unchanged — grandfather only relaxes
+    "permissive_only", it never overrides an explicit choice.
+
+    Result is cached per (vault_key, configured.mode) for the process lifetime.
+    """
+    if configured.mode != "permissive_only":
+        return configured.mode
+    cache_key = (vault_key, configured.mode)
+    cached = _effective_mode_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    declared = db._conn.execute(
+        "SELECT 1 FROM source_documents WHERE license IS NOT NULL LIMIT 1"
+    ).fetchone()
+    effective = "permissive_only" if declared is not None else "all"
+    _effective_mode_cache[cache_key] = effective
+    return effective
+
+
+def _license_allows_value(license_str: str | None, mode: str, permissive: set[str]) -> bool:
+    """Pure-function gate. `mode` is the *effective* mode (post-grandfather).
+    `permissive` is the casefolded set of allowed license strings.
+    """
+    if mode == "all":
+        return True
+    if mode == "deny":
+        return False
+    # permissive_only
+    if license_str is None:
+        return False
+    return license_str.casefold() in permissive
+
+
+def _license_allows(source_id: str, db: StateDB, mcp_config: McpConfig, vault_key: str) -> bool:
+    """Single-source convenience wrapper for read_source_segment and list_segments.
+
+    For multi-row tools (search_source_segments, get_source_passages), use the
+    batched source-meta + _license_allows_value pattern instead to avoid N+1.
+    """
+    effective_mode = _effective_source_access_mode(db, mcp_config.source_access, vault_key)
+    if effective_mode == "all":
+        return True
+    if effective_mode == "deny":
+        return False
+    # permissive_only — need the license value
+    license_str = db.fetch_source_license(source_id)
+    permissive = {lic.casefold() for lic in mcp_config.source_access.permissive_licenses}
+    return _license_allows_value(license_str, effective_mode, permissive)
+
+
 def _ref_to_dict(ref: ArticleRef) -> dict[str, object]:
     return {
         "id": ref.id,
@@ -148,6 +212,267 @@ def _resolve_min_status(value: str | None) -> str:
 
 class _DefaultToolError(RuntimeError):
     """Placeholder exception type used when handlers are built outside FastMCP."""
+
+
+def _register_verbatim_source_handlers(
+    handlers: dict[str, Callable[..., Any]],
+    config: Config,
+    db: StateDB,
+    vault_key: str,
+    tool_error_cls: type[Exception],
+) -> None:
+    """Register the four Feature 42 handlers. db is guaranteed non-None by caller."""
+
+    def read_source_segment(segment_id: str, max_chars: int | None = None) -> dict[str, object]:
+        """Fetch one verbatim paragraph by segment id.
+
+        Use when you already have a segment id from another tool and want the
+        exact source text. Returns the raw paragraph body as ingested, not a
+        synto-generated synthesis. If you don't have a segment id yet, call
+        `search_source_segments` for a free-text query or `get_source_passages`
+        for a known concept first. Pass max_chars to cap the returned body size
+        (capped at 16000; default is unbounded for single-segment fetches).
+        """
+        started = time.monotonic()
+        success = False
+        arguments: dict[str, Any] = {"segment_id": segment_id, "max_chars": max_chars}
+        try:
+            row = db.fetch_segment_by_id(segment_id)
+            if row is None:
+                raise tool_error_cls(f"unknown segment_id: {segment_id!r}")
+            if not _license_allows(row["source_id"], db, config.mcp, vault_key):
+                raise tool_error_cls(f"source {row['source_id']!r} is restricted by license policy")
+            body: str = row["text"]
+            truncated = False
+            if max_chars is not None:
+                cap = min(max_chars, 16000)
+                if len(body) > cap:
+                    body = body[:cap] + "…"
+                    truncated = True
+            success = True
+            return {
+                "segment_id": segment_id,
+                "source_id": row["source_id"],
+                "identity": row["identity"],
+                "ordinal": row["ordinal"],
+                "content_hash": row["content_hash"],
+                "body": body,
+                "source_path": row["origin_uri"],
+                "truncated": truncated,
+            }
+        finally:
+            _audit(
+                db,
+                vault_id=vault_key,
+                tool="read_source_segment",
+                arguments=arguments,
+                success=success,
+                latency_ms=int((time.monotonic() - started) * 1000),
+                mcp_config=config.mcp,
+            )
+
+    def search_source_segments(query: str, limit: int = 10) -> dict[str, object]:
+        """Full-text search (BM25) across raw source paragraphs.
+
+        Use when the user wants the source's own words, not a synto-generated
+        synthesis. Returns ranked snippets with segment ids; fetch the full body
+        with read_source_segment. Returns snippets only; fetch the full body with
+        `read_source_segment`. limit is capped at 50.
+        The response includes `hidden_by_policy` (count blocked by license gate) and
+        `orphan_segments` (count whose source document is missing from the registry).
+        """
+        started = time.monotonic()
+        success = False
+        arguments: dict[str, Any] = {"query": query, "limit": limit}
+        try:
+            cleaned = query.strip().strip('"').strip() if query else ""
+            if not cleaned:
+                raise tool_error_cls("query must be non-empty")
+            if limit < 1:
+                raise tool_error_cls("limit must be at least 1")
+            limit = min(limit, 50)
+            # Wrap in double-quotes to treat user input as a literal phrase.
+            # Internal double-quotes are doubled to escape them in FTS5 syntax.
+            match_arg = '"' + cleaned.replace('"', '""') + '"'
+            rows = db.search_segments_fts(match_arg, limit)
+            # Batch fetch licenses and origin_uris for all distinct sources
+            source_ids = list({r["source_id"] for r in rows})
+            source_meta = db.fetch_source_meta(source_ids)
+            # Effective mode + permissive set computed once for the whole result page.
+            effective_mode = _effective_source_access_mode(db, config.mcp.source_access, vault_key)
+            permissive = {lic.casefold() for lic in config.mcp.source_access.permissive_licenses}
+            results: list[dict[str, Any]] = []
+            hidden_by_policy = 0
+            orphan_segments = 0
+            for r in rows:
+                meta = source_meta.get(r["source_id"])
+                if meta is None:
+                    # source_id present in source_segments but missing from source_documents
+                    # → orphan. Distinct from policy denial.
+                    orphan_segments += 1
+                    continue
+                license_str, origin_uri = meta
+                if not _license_allows_value(license_str, effective_mode, permissive):
+                    hidden_by_policy += 1
+                    continue
+                results.append(
+                    {
+                        "segment_id": r["segment_id"],
+                        "source_id": r["source_id"],
+                        "ordinal": r["ordinal"],
+                        "snippet": r["snippet"],
+                        "score": -r["rank"],  # BM25 is negative; flip so higher = better
+                        "body_length": r["body_length"],
+                        "source_path": origin_uri,
+                    }
+                )
+            success = True
+            return {
+                "results": results,
+                "hidden_by_policy": hidden_by_policy,
+                "orphan_segments": orphan_segments,
+            }
+        finally:
+            _audit(
+                db,
+                vault_id=vault_key,
+                tool="search_source_segments",
+                arguments=arguments,
+                success=success,
+                latency_ms=int((time.monotonic() - started) * 1000),
+                mcp_config=config.mcp,
+            )
+
+    def get_source_passages(
+        concept_name: str, max_passages: int = 5, max_chars_per_passage: int | None = None
+    ) -> dict[str, object]:
+        """Return verbatim paragraphs explicitly linked to a concept.
+
+        Use when you know which concept the user is asking about and want
+        the source's own explanation, not a synto-generated synthesis.
+        Results are ordered by extraction confidence then reading order.
+        For free-text questions instead of a known concept, use `search_source_segments`.
+        Pass max_chars_per_passage to cap each paragraph (default 8000, max 16000).
+        The response includes `hidden_by_policy` (count blocked by license gate) and
+        `orphan_segments` (count whose source document is missing from the registry).
+        """
+        started = time.monotonic()
+        success = False
+        arguments: dict[str, Any] = {
+            "concept_name": concept_name,
+            "max_passages": max_passages,
+            "max_chars_per_passage": max_chars_per_passage,
+        }
+        try:
+            if max_passages > 20:
+                raise tool_error_cls("max_passages must be at most 20")
+            max_passages = max(1, max_passages)
+            resolved = db.find_concept_by_name_or_alias(concept_name)
+            if resolved is None:
+                success = True
+                return {"results": [], "hidden_by_policy": 0, "orphan_segments": 0}
+            canonical, _aliases = resolved
+            rows = db.select_passages_for_concept(canonical, max_passages)
+            # select_passages_for_concept already JOINs source_documents and returns
+            # origin_uri, license, and doc_id — no separate batch fetch needed.
+            # doc_id is NULL when source_id has no matching source_documents row (orphan).
+            if max_chars_per_passage is not None:
+                char_cap = min(max_chars_per_passage, 16000)
+            else:
+                char_cap = 8000
+            # Effective mode + permissive set computed once for the whole result page.
+            effective_mode = _effective_source_access_mode(db, config.mcp.source_access, vault_key)
+            permissive = {lic.casefold() for lic in config.mcp.source_access.permissive_licenses}
+            results: list[dict[str, Any]] = []
+            hidden_by_policy = 0
+            orphan_segments = 0
+            for r in rows:
+                if r["doc_id"] is None:
+                    # LEFT JOIN miss: source_id in source_segments with no source_documents row.
+                    orphan_segments += 1
+                    continue
+                license_str: str | None = r["license"]
+                origin_uri: str | None = r["origin_uri"]
+                if not _license_allows_value(license_str, effective_mode, permissive):
+                    hidden_by_policy += 1
+                    continue
+                body: str = r["text"]
+                truncated = False
+                if len(body) > char_cap:
+                    body = body[:char_cap] + "…"
+                    truncated = True
+                results.append(
+                    {
+                        "segment_id": r["id"],
+                        "source_id": r["source_id"],
+                        "ordinal": r["ordinal"],
+                        "body": body,
+                        "confidence": r["confidence"],
+                        "source_path": origin_uri,
+                        "truncated": truncated,
+                    }
+                )
+            success = True
+            return {
+                "results": results,
+                "hidden_by_policy": hidden_by_policy,
+                "orphan_segments": orphan_segments,
+            }
+        finally:
+            _audit(
+                db,
+                vault_id=vault_key,
+                tool="get_source_passages",
+                arguments=arguments,
+                success=success,
+                latency_ms=int((time.monotonic() - started) * 1000),
+                mcp_config=config.mcp,
+            )
+
+    def list_segments(source_id: str, limit: int = 200, offset: int = 0) -> dict[str, object]:
+        """Enumerate a single source document's paragraphs in reading order.
+
+        Use for sequential exploration of a known document. Returns segment metadata
+        only — fetch individual bodies with `read_source_segment`. limit is capped at 500.
+        """
+        started = time.monotonic()
+        success = False
+        arguments: dict[str, Any] = {"source_id": source_id, "limit": limit, "offset": offset}
+        try:
+            limit = min(max(1, limit), 500)
+            offset = max(0, offset)
+            if not db.source_document_exists(source_id):
+                raise tool_error_cls(f"unknown source_id: {source_id!r}")
+            if not _license_allows(source_id, db, config.mcp, vault_key):
+                raise tool_error_cls(f"source {source_id!r} is restricted by license policy")
+            total = db.count_segments_for_source(source_id)
+            rows = db.list_segments_for_source(source_id, limit, offset)
+            segments = [
+                {"segment_id": r["id"], "ordinal": r["ordinal"], "length": r["length"]}
+                for r in rows
+            ]
+            success = True
+            return {
+                "source_id": source_id,
+                "total": total,
+                "returned": len(segments),
+                "segments": segments,
+            }
+        finally:
+            _audit(
+                db,
+                vault_id=vault_key,
+                tool="list_segments",
+                arguments=arguments,
+                success=success,
+                latency_ms=int((time.monotonic() - started) * 1000),
+                mcp_config=config.mcp,
+            )
+
+    handlers["read_source_segment"] = read_source_segment
+    handlers["search_source_segments"] = search_source_segments
+    handlers["get_source_passages"] = get_source_passages
+    handlers["list_segments"] = list_segments
 
 
 def build_tool_handlers(
@@ -474,7 +799,7 @@ def build_tool_handlers(
                 mcp_config=config.mcp,
             )
 
-    return {
+    handlers: dict[str, Callable[..., Any]] = {
         "list_articles": list_articles,
         "read_article": read_article,
         "find_concept": find_concept,
@@ -484,6 +809,9 @@ def build_tool_handlers(
         "trace_lineage": trace_lineage,
         "answer_question": answer_question,
     }
+    if db is not None:
+        _register_verbatim_source_handlers(handlers, config, db, vault_key, tool_error_cls)
+    return handlers
 
 
 def run_server(vault: Path, transport: str = "stdio") -> None:
@@ -503,13 +831,24 @@ def run_server(vault: Path, transport: str = "stdio") -> None:
 
     config = Config.from_vault(vault)
     reader = VaultReader(vault)
-    db = StateDB(config.state_db_path) if config.mcp.audit else None
+    # Always open db — new verbatim-source tools query it regardless of audit setting.
+    # _audit() still respects config.mcp.audit before writing any audit rows.
+    db = StateDB(config.state_db_path)
+    vault_key = _vault_id(vault)
+    # Surface grandfather behaviour exactly once at startup so legacy vault users
+    # know why permissive_only is being treated as "all".
+    effective_mode = _effective_source_access_mode(db, config.mcp.source_access, vault_key)
+    if config.mcp.source_access.mode == "permissive_only" and effective_mode == "all":
+        log.info(
+            "synto: legacy vault detected (0 declared licenses); MCP source-access mode treated"
+            ' as "all" for this session. Set [mcp.source_access] in synto.toml or declare'
+            " licenses on sources to engage the privacy gate."
+        )
     server = FastMCP(
         _server_name(vault),
         instructions=_SERVER_INSTRUCTIONS,
         json_response=True,
     )
-    vault_key = _vault_id(vault)
     handlers = build_tool_handlers(reader, config, db, vault_key, tool_error_cls=ToolError)
     for handler in handlers.values():
         server.tool()(handler)
@@ -517,8 +856,7 @@ def run_server(vault: Path, transport: str = "stdio") -> None:
     try:
         server.run(transport="stdio")
     finally:
-        if db is not None:
-            db.close()
+        db.close()
 
 
 async def run_server_async(vault: Path, transport: str = "stdio") -> None:

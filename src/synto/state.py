@@ -36,7 +36,7 @@ from pathlib import Path
 
 from .models import ItemMentionRecord, KnowledgeItemRecord, RawNoteRecord, WikiArticleRecord
 
-_CURRENT_SCHEMA_VERSION = 15
+_CURRENT_SCHEMA_VERSION = 16
 _CHECKPOINT_SCHEMA_VERSION = 2
 
 _CROCKFORD32_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
@@ -595,6 +595,7 @@ _VERSIONED_MIGRATIONS: dict[int, list[str]] = {
     ],
     14: [],  # all v14 work happens in the post-hook below for atomicity
     15: [],  # all v15 work happens in the post-hook below for atomicity
+    16: [],  # all v16 work happens in the post-hook below for atomicity
 }
 
 
@@ -769,6 +770,8 @@ class StateDB:
                 self._drop_zombie_v8_columns_v14()
             if version == 15:
                 self._apply_status_column_v15()
+            if version == 16:
+                self._create_source_segments_fts_v16()
             with self._tx():
                 self._conn.execute(
                     "INSERT OR REPLACE INTO schema_version (id, version) VALUES (1, ?)",
@@ -852,6 +855,57 @@ class StateDB:
                     "CASE WHEN is_draft = 1 THEN 'draft' ELSE 'published' END"
                 )
                 self._conn.execute("ALTER TABLE wiki_articles DROP COLUMN is_draft")
+
+    def _create_source_segments_fts_v16(self) -> None:
+        """Create FTS5 virtual table and sync triggers for source_segments.
+
+        External-content FTS5 (content='source_segments') keeps the index
+        small — only the indexed text column is stored in the FTS table;
+        other columns are joined back via rowid at query time.
+
+        Triggers maintain the FTS index for INSERT/UPDATE/DELETE after the
+        initial backfill. This covers every current and future extractor
+        automatically without touching extractor code.
+
+        Atomic via _tx(); idempotent via sqlite_master probe.
+        """
+        exists = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='source_segments_fts'"
+        ).fetchone()
+        if exists:
+            return
+        with self._tx():
+            self._conn.execute("""
+                CREATE VIRTUAL TABLE source_segments_fts USING fts5(
+                    text,
+                    content='source_segments',
+                    content_rowid='rowid'
+                )
+            """)
+            self._conn.execute("""
+                CREATE TRIGGER source_segments_fts_ai AFTER INSERT ON source_segments BEGIN
+                    INSERT INTO source_segments_fts(rowid, text) VALUES (new.rowid, new.text);
+                END
+            """)
+            self._conn.execute("""
+                CREATE TRIGGER source_segments_fts_ad AFTER DELETE ON source_segments BEGIN
+                    INSERT INTO source_segments_fts(source_segments_fts, rowid, text)
+                        VALUES ('delete', old.rowid, old.text);
+                END
+            """)
+            self._conn.execute("""
+                CREATE TRIGGER source_segments_fts_au AFTER UPDATE ON source_segments BEGIN
+                    INSERT INTO source_segments_fts(source_segments_fts, rowid, text)
+                        VALUES ('delete', old.rowid, old.text);
+                    INSERT INTO source_segments_fts(rowid, text) VALUES (new.rowid, new.text);
+                END
+            """)
+            # Backfill rows that existed before this migration ran.
+            # Triggers only fire for future writes; historical rows need explicit insert.
+            self._conn.execute("""
+                INSERT INTO source_segments_fts(rowid, text)
+                SELECT rowid, text FROM source_segments
+            """)
 
     def _validate_v6_tables(self) -> None:
         expected_ingest = {
@@ -2229,6 +2283,113 @@ class StateDB:
             return []
         return self._conn.execute(
             "SELECT * FROM concept_occurrences ORDER BY concept_name, source_segment_id"
+        ).fetchall()
+
+    def select_passages_for_concept(
+        self, canonical_name: str, max_passages: int
+    ) -> list[sqlite3.Row]:
+        """Return source segments linked to a concept, ordered by confidence then ordinal.
+
+        Confidence defaults to 1.0 for extractors that don't set it, so the
+        secondary order (ordinal ASC) acts as the effective ordering in that case.
+        """
+        return self._conn.execute(
+            """SELECT s.id, s.source_id, s.ordinal, s.text, co.confidence,
+                      d.origin_uri, d.license, d.id AS doc_id
+               FROM concept_occurrences co
+               JOIN source_segments s ON s.id = co.source_segment_id
+               LEFT JOIN source_documents d ON d.id = s.source_id
+               WHERE co.concept_name = ?
+               ORDER BY co.confidence DESC, s.ordinal ASC
+               LIMIT ?""",
+            (canonical_name, max_passages),
+        ).fetchall()
+
+    def source_segments_fts_status(self) -> tuple[bool, int, int]:
+        """Return (fts_table_exists, fts_row_count, segment_row_count).
+
+        Used by `synto doctor` to surface FTS index drift. When the FTS
+        table is absent (vault below v16), fts_row_count is 0.
+        """
+        seg_count = self._conn.execute("SELECT count(*) FROM source_segments").fetchone()[0]
+        fts_exists = (
+            self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='source_segments_fts'"
+            ).fetchone()
+            is not None
+        )
+        if not fts_exists:
+            return (False, 0, seg_count)
+        fts_count = self._conn.execute("SELECT count(*) FROM source_segments_fts").fetchone()[0]
+        return (True, fts_count, seg_count)
+
+    def fetch_segment_by_id(self, segment_id: str) -> sqlite3.Row | None:
+        """Return source_segments row joined with source_documents.origin_uri, or None."""
+        return self._conn.execute(
+            """SELECT s.source_id, s.identity, s.ordinal, s.content_hash, s.text,
+                      d.origin_uri
+               FROM source_segments s
+               LEFT JOIN source_documents d ON d.id = s.source_id
+               WHERE s.id = ?""",
+            (segment_id,),
+        ).fetchone()
+
+    def search_segments_fts(self, match_arg: str, limit: int) -> list[sqlite3.Row]:
+        """BM25 search across source_segments_fts; rows joined back to source_segments."""
+        return self._conn.execute(
+            """SELECT s.id AS segment_id, s.source_id, s.ordinal,
+                      snippet(source_segments_fts, 0, '', '', '…', 32) AS snippet,
+                      bm25(source_segments_fts) AS rank,
+                      length(s.text) AS body_length
+               FROM source_segments_fts
+               JOIN source_segments s ON s.rowid = source_segments_fts.rowid
+               WHERE source_segments_fts MATCH ?
+               ORDER BY rank
+               LIMIT ?""",
+            (match_arg, limit),
+        ).fetchall()
+
+    def fetch_source_meta(self, source_ids: list[str]) -> dict[str, tuple[str | None, str | None]]:
+        """Return {source_id: (license, origin_uri)} for the given source_ids."""
+        if not source_ids:
+            return {}
+        placeholders = ",".join("?" * len(source_ids))
+        rows = self._conn.execute(
+            f"SELECT id, license, origin_uri FROM source_documents WHERE id IN ({placeholders})",
+            source_ids,
+        ).fetchall()
+        return {r["id"]: (r["license"], r["origin_uri"]) for r in rows}
+
+    def source_document_exists(self, source_id: str) -> bool:
+        """True if source_documents has a row with this id."""
+        row = self._conn.execute(
+            "SELECT 1 FROM source_documents WHERE id = ?", (source_id,)
+        ).fetchone()
+        return row is not None
+
+    def fetch_source_license(self, source_id: str) -> str | None:
+        """Return the license string for a source, or None for unknown/null."""
+        row = self._conn.execute(
+            "SELECT license FROM source_documents WHERE id = ?", (source_id,)
+        ).fetchone()
+        return row["license"] if row is not None else None
+
+    def count_segments_for_source(self, source_id: str) -> int:
+        return self._conn.execute(
+            "SELECT count(*) FROM source_segments WHERE source_id = ?", (source_id,)
+        ).fetchone()[0]
+
+    def list_segments_for_source(
+        self, source_id: str, limit: int, offset: int
+    ) -> list[sqlite3.Row]:
+        """Return id/ordinal/length tuples for segments of a source, ordered by ordinal."""
+        return self._conn.execute(
+            """SELECT id, ordinal, length(text) AS length
+               FROM source_segments
+               WHERE source_id = ?
+               ORDER BY ordinal
+               LIMIT ? OFFSET ?""",
+            (source_id, limit, offset),
         ).fetchall()
 
     def upsert_source_document(self, doc: object) -> None:

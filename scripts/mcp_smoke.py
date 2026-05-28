@@ -209,6 +209,95 @@ def make_audit_vault(tmp: Path) -> Path:
     return vault
 
 
+def make_verbatim_vault(tmp: Path) -> Path:
+    """Vault for verbatim source tool tests.
+
+    Two source documents: book1 (CC-BY, permissive) and secret (proprietary, blocked).
+    Three segments for book1; one for secret. One concept linked to two book1 segments.
+    No explicit [mcp] config — default permissive_only mode is used.
+    """
+    from synto.state import StateDB
+
+    vault = tmp / "verbatim_vault"
+    (vault / "wiki").mkdir(parents=True)
+    (vault / ".synto").mkdir()
+    (vault / "raw").mkdir()
+    (vault / "synto.toml").write_text(_base_toml())
+
+    db = StateDB(vault / ".synto" / "state.db")
+
+    # Open source — CC-BY license passes default permissive_only gate
+    db._conn.execute(
+        "INSERT INTO source_documents"
+        " (id, source_type, origin_uri, title, imported_at, redistribution, license)"
+        " VALUES ('book1', 'pdf', '/raw/book1.pdf', 'Open Book',"
+        " '2024-01-01T00:00:00', 'unknown', 'CC-BY')"
+    )
+    segments = [
+        (
+            "book1:p:0:aa",
+            "book1:p:0",
+            0,
+            "p:0",
+            "h0",
+            "Quantum mechanics describes the behaviour of matter at small scales.",
+        ),
+        (
+            "book1:p:1:aa",
+            "book1:p:1",
+            1,
+            "p:1",
+            "h1",
+            "Wave function collapse is the reduction of quantum superposition.",
+        ),
+        (
+            "book1:p:2:aa",
+            "book1:p:2",
+            2,
+            "p:2",
+            "h2",
+            "Entanglement is a correlation between quantum particles.",
+        ),
+    ]
+    for seg_id, identity, ordinal, locator, chash, text in segments:
+        db._conn.execute(
+            "INSERT INTO source_segments"
+            " (id, identity, ordinal, source_id, structural_locator, content_hash, text)"
+            " VALUES (?, ?, ?, 'book1', ?, ?, ?)",
+            (seg_id, identity, ordinal, locator, chash, text),
+        )
+
+    # Restricted source — proprietary license blocked under default mode
+    db._conn.execute(
+        "INSERT INTO source_documents"
+        " (id, source_type, origin_uri, title, imported_at, redistribution, license)"
+        " VALUES ('secret', 'pdf', '/raw/secret.pdf', 'Secret Book',"
+        " '2024-01-01T00:00:00', 'unknown', 'proprietary')"
+    )
+    db._conn.execute(
+        "INSERT INTO source_segments"
+        " (id, identity, ordinal, source_id, structural_locator, content_hash, text)"
+        " VALUES ('secret:p:0:aa', 'secret:p:0', 0, 'secret', 'p:0', 'hs0',"
+        " 'Hidden content here')"
+    )
+
+    # Concept linked to two book1 segments at different confidences
+    db._conn.execute("INSERT INTO concepts (name, source_path) VALUES ('Quantum', 'raw/book1.md')")
+    db._conn.execute(
+        "INSERT INTO concept_occurrences"
+        " (concept_name, source_segment_id, ordinal, confidence)"
+        " VALUES ('Quantum', 'book1:p:0:aa', 0, 0.9)"
+    )
+    db._conn.execute(
+        "INSERT INTO concept_occurrences"
+        " (concept_name, source_segment_id, ordinal, confidence)"
+        " VALUES ('Quantum', 'book1:p:1:aa', 1, 0.6)"
+    )
+    db._conn.commit()
+    db.close()
+    return vault
+
+
 # ── StdioServerParameters factory ────────────────────────────────────────────
 
 def _params(vault: Path):
@@ -243,11 +332,13 @@ async def suite_list_articles(vault: Path) -> None:
             # ── tool list sanity ───────────────────────────────────────────
             tools = await s.list_tools()
             names = {t.name for t in tools.tools}
-            check("tool list has 8 expected names (v0.3.0)",
+            check("tool list has 12 expected names (v0.4.0)",
                   names == {
                       "list_articles", "read_article", "find_concept",
                       "search_articles", "get_concept", "list_sources",
                       "trace_lineage", "answer_question",
+                      "read_source_segment", "search_source_segments",
+                      "get_source_passages", "list_segments",
                   }, str(names))
 
             # ── no filter: visibility ──────────────────────────────────────
@@ -567,6 +658,220 @@ async def suite_audit_disabled(vault: Path) -> None:
         check("audit=false: no state DB created by server (audit writes skipped)", True)
 
 
+async def suite_verbatim_source_tools(vault: Path) -> None:
+    from mcp import ClientSession
+    from mcp.client.stdio import stdio_client
+
+    async with stdio_client(_params(vault)) as (r, w):
+        async with ClientSession(r, w) as s:
+            await s.initialize()
+
+            # ── read_source_segment: happy path ────────────────────────────
+            res = await s.call_tool("read_source_segment", {"segment_id": "book1:p:0:aa"})
+            check(
+                "read_source_segment: not isError",
+                not res.isError,
+                res.content[0].text[:80] if res.content else "empty",
+            )
+            data = _sc(res)
+            for field in ("segment_id", "source_id", "body", "source_path", "truncated"):
+                check(
+                    f"read_source_segment response has '{field}'",
+                    data is not None and field in data,
+                    str(list(data.keys()) if data else None),
+                )
+            if data:
+                check(
+                    "read_source_segment: body non-empty",
+                    isinstance(data.get("body"), str) and len(data["body"]) > 0,
+                )
+                check(
+                    "read_source_segment: source_path is origin_uri",
+                    data.get("source_path") == "/raw/book1.pdf",
+                    repr(data.get("source_path")),
+                )
+                check(
+                    "read_source_segment: truncated=False for full read",
+                    data.get("truncated") is False,
+                    repr(data.get("truncated")),
+                )
+
+            # ── read_source_segment: truncation ────────────────────────────
+            res_trunc = await s.call_tool(
+                "read_source_segment", {"segment_id": "book1:p:0:aa", "max_chars": 5}
+            )
+            check("read_source_segment max_chars: not isError", not res_trunc.isError)
+            td = _sc(res_trunc)
+            if td:
+                check(
+                    "read_source_segment max_chars: body truncated",
+                    len(td.get("body", "")) <= 6,  # 5 chars + ellipsis
+                    repr(td.get("body")),
+                )
+                check("read_source_segment max_chars: truncated=True", td.get("truncated") is True)
+
+            # ── read_source_segment: unknown id ────────────────────────────
+            res_unk = await s.call_tool("read_source_segment", {"segment_id": "nonexistent:id"})
+            check("read_source_segment unknown id: isError", bool(res_unk.isError))
+
+            # ── read_source_segment: policy blocked ────────────────────────
+            res_pol = await s.call_tool("read_source_segment", {"segment_id": "secret:p:0:aa"})
+            check("read_source_segment proprietary source: isError (policy)", bool(res_pol.isError))
+
+            # ── search_source_segments: basic BM25 ────────────────────────
+            res_fts = await s.call_tool("search_source_segments", {"query": "quantum"})
+            check("search_source_segments: not isError", not res_fts.isError)
+            fts = _sc(res_fts)
+            results = fts.get("results", []) if fts else []
+            check(
+                "search_source_segments: results non-empty",
+                len(results) > 0,
+                f"got {len(results)} results",
+            )
+            if results:
+                for field in ("segment_id", "snippet", "score"):
+                    check(
+                        f"search_source_segments result has '{field}'",
+                        field in results[0],
+                        str(list(results[0].keys())),
+                    )
+                scores = [r["score"] for r in results]
+                check(
+                    "search_source_segments: scores descending",
+                    scores == sorted(scores, reverse=True),
+                    str(scores),
+                )
+
+            # ── search_source_segments: privacy gate ──────────────────────
+            res_hid = await s.call_tool("search_source_segments", {"query": "hidden content"})
+            check("search_source_segments hidden query: not isError", not res_hid.isError)
+            hd = _sc(res_hid)
+            if hd:
+                check(
+                    "search_source_segments: proprietary segment filtered",
+                    hd.get("results") == [],
+                    repr(hd.get("results")),
+                )
+                check(
+                    "search_source_segments: hidden_by_policy == 1",
+                    hd.get("hidden_by_policy") == 1,
+                    repr(hd.get("hidden_by_policy")),
+                )
+
+            # ── search_source_segments: empty query → error ────────────────
+            res_empty = await s.call_tool("search_source_segments", {"query": ""})
+            check("search_source_segments empty query: isError", bool(res_empty.isError))
+
+            # ── search_source_segments: FTS5 special chars ────────────────
+            res_sp = await s.call_tool(
+                "search_source_segments", {"query": '"quoted":value AND OR NOT'}
+            )
+            check(
+                "search_source_segments: special chars do not raise",
+                not res_sp.isError,
+                res_sp.content[0].text[:80] if res_sp.isError and res_sp.content else "",
+            )
+
+            # ── get_source_passages: known concept ─────────────────────────
+            res_gsp = await s.call_tool("get_source_passages", {"concept_name": "Quantum"})
+            check("get_source_passages: not isError", not res_gsp.isError)
+            gsp = _sc(res_gsp)
+            passages = gsp.get("results", []) if gsp else []
+            check(
+                "get_source_passages: 2 passages returned",
+                len(passages) == 2,
+                f"got {len(passages)}",
+            )
+            if passages:
+                for field in ("segment_id", "source_id", "body", "confidence"):
+                    check(
+                        f"get_source_passages result has '{field}'",
+                        field in passages[0],
+                        str(list(passages[0].keys())),
+                    )
+                check(
+                    "get_source_passages: first confidence ≈ 0.9",
+                    abs(passages[0].get("confidence", 0) - 0.9) < 0.01,
+                    repr(passages[0].get("confidence")),
+                )
+
+            # ── get_source_passages: max_passages=1 ───────────────────────
+            res_mp = await s.call_tool(
+                "get_source_passages", {"concept_name": "Quantum", "max_passages": 1}
+            )
+            check("get_source_passages max_passages=1: not isError", not res_mp.isError)
+            mp = _sc(res_mp)
+            if mp:
+                check(
+                    "get_source_passages max_passages=1: exactly 1 result",
+                    len(mp.get("results", [])) == 1,
+                    str(len(mp.get("results", []))),
+                )
+
+            # ── get_source_passages: unknown concept → empty, not error ───
+            res_unk2 = await s.call_tool(
+                "get_source_passages", {"concept_name": "XYZ_no_concept_99999"}
+            )
+            check("get_source_passages unknown concept: not isError", not res_unk2.isError)
+            uk2 = _sc(res_unk2)
+            if uk2:
+                check(
+                    "get_source_passages unknown concept: empty results",
+                    uk2.get("results") == [],
+                    repr(uk2.get("results")),
+                )
+
+            # ── list_segments: basic enumeration ──────────────────────────
+            res_ls = await s.call_tool("list_segments", {"source_id": "book1"})
+            check("list_segments: not isError", not res_ls.isError)
+            ls = _sc(res_ls)
+            if ls:
+                check("list_segments: total == 3", ls.get("total") == 3, repr(ls.get("total")))
+                check(
+                    "list_segments: returned == 3",
+                    ls.get("returned") == 3,
+                    repr(ls.get("returned")),
+                )
+                segs = ls.get("segments", [])
+                check(
+                    "list_segments: segments ordered by ordinal",
+                    [s["ordinal"] for s in segs] == sorted(s["ordinal"] for s in segs),
+                )
+                if segs:
+                    for field in ("segment_id", "ordinal", "length"):
+                        check(
+                            f"list_segments segment has '{field}'",
+                            field in segs[0],
+                            str(list(segs[0].keys())),
+                        )
+
+            # ── list_segments: pagination ──────────────────────────────────
+            res_pg = await s.call_tool(
+                "list_segments", {"source_id": "book1", "limit": 2, "offset": 1}
+            )
+            check("list_segments pagination: not isError", not res_pg.isError)
+            pg = _sc(res_pg)
+            if pg:
+                check(
+                    "list_segments pagination: total still 3",
+                    pg.get("total") == 3,
+                    repr(pg.get("total")),
+                )
+                check(
+                    "list_segments pagination: returned == 2",
+                    pg.get("returned") == 2,
+                    repr(pg.get("returned")),
+                )
+
+            # ── list_segments: unknown source → error ─────────────────────
+            res_nox = await s.call_tool("list_segments", {"source_id": "nope_src"})
+            check("list_segments unknown source: isError", bool(res_nox.isError))
+
+            # ── list_segments: proprietary source → policy error ──────────
+            res_pol2 = await s.call_tool("list_segments", {"source_id": "secret"})
+            check("list_segments proprietary source: isError (policy)", bool(res_pol2.isError))
+
+
 # ── Suite registry ────────────────────────────────────────────────────────────
 
 _VAULT_FACTORIES = {
@@ -574,6 +879,7 @@ _VAULT_FACTORIES = {
     "exclude": make_exclude_tags_vault,
     "private": make_private_default_vault,
     "audit":   make_audit_vault,
+    "verbatim": make_verbatim_vault,
 }
 
 SUITES: dict[str, tuple] = {
@@ -584,6 +890,7 @@ SUITES: dict[str, tuple] = {
     "default_visibility_private": (suite_default_visibility_private, "private"),
     "audit":                      (suite_audit,                      "audit"),
     "audit_disabled":             (suite_audit_disabled,             "main"),
+    "verbatim_source_tools":      (suite_verbatim_source_tools,      "verbatim"),
 }
 
 

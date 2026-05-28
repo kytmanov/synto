@@ -30,3 +30,10 @@ REQUIREMENTS.md
 IMPLEMENTATION_PLAN.md
 IMPLEMENTAION_PLAN.md
 REVIEW.md
+
+# CLAUDE.md is suppressed locally via `git update-index --skip-worktree`
+# so personal additions stay off-public. The file is already tracked at
+# the last public state on master; this .gitignore entry is belt-and-
+# suspenders in case the skip-worktree flag gets cleared. Use
+# `git update-index --no-skip-worktree CLAUDE.md` to restore tracking.
+CLAUDE.md
