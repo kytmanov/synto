@@ -475,6 +475,24 @@ def test_healthcheck_true_on_401():
         assert client.healthcheck() is True
 
 
+def test_healthcheck_true_on_404():
+    """404 means server running but /models not supported — still reachable."""
+    client = _make_client()
+    mock_resp = MagicMock()
+    mock_resp.status_code = 404
+    with patch.object(client._client, "get", return_value=mock_resp):
+        assert client.healthcheck() is True
+
+
+def test_healthcheck_false_on_500():
+    """5xx means the server has an internal error — treat as unhealthy."""
+    client = _make_client()
+    mock_resp = MagicMock()
+    mock_resp.status_code = 500
+    with patch.object(client._client, "get", return_value=mock_resp):
+        assert client.healthcheck() is False
+
+
 def test_healthcheck_false_on_connect_error():
     client = _make_client()
     with patch.object(client._client, "get", side_effect=httpx.ConnectError("refused")):
