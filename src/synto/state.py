@@ -2305,6 +2305,80 @@ class StateDB:
             (canonical_name, max_passages),
         ).fetchall()
 
+    def fetch_segment_by_id(self, segment_id: str) -> sqlite3.Row | None:
+        """Return source_segments row joined with source_documents.origin_uri, or None."""
+        return self._conn.execute(
+            """SELECT s.source_id, s.identity, s.ordinal, s.content_hash, s.text,
+                      d.origin_uri
+               FROM source_segments s
+               LEFT JOIN source_documents d ON d.id = s.source_id
+               WHERE s.id = ?""",
+            (segment_id,),
+        ).fetchone()
+
+    def search_segments_fts(self, match_arg: str, limit: int) -> list[sqlite3.Row]:
+        """BM25 search across source_segments_fts; rows joined back to source_segments."""
+        return self._conn.execute(
+            """SELECT s.id AS segment_id, s.source_id, s.ordinal,
+                      snippet(source_segments_fts, 0, '', '', '…', 32) AS snippet,
+                      bm25(source_segments_fts) AS rank
+               FROM source_segments_fts
+               JOIN source_segments s ON s.rowid = source_segments_fts.rowid
+               WHERE source_segments_fts MATCH ?
+               ORDER BY rank
+               LIMIT ?""",
+            (match_arg, limit),
+        ).fetchall()
+
+    def fetch_source_meta(self, source_ids: list[str]) -> dict[str, tuple[str | None, str | None]]:
+        """Return {source_id: (license, origin_uri)} for the given source_ids."""
+        if not source_ids:
+            return {}
+        placeholders = ",".join("?" * len(source_ids))
+        rows = self._conn.execute(
+            f"SELECT id, license, origin_uri FROM source_documents WHERE id IN ({placeholders})",
+            source_ids,
+        ).fetchall()
+        return {r["id"]: (r["license"], r["origin_uri"]) for r in rows}
+
+    def source_document_exists(self, source_id: str) -> bool:
+        """True if source_documents has a row with this id."""
+        row = self._conn.execute(
+            "SELECT 1 FROM source_documents WHERE id = ?", (source_id,)
+        ).fetchone()
+        return row is not None
+
+    def fetch_source_license(self, source_id: str) -> str | None:
+        """Return the license string for a source, or None for unknown/null."""
+        row = self._conn.execute(
+            "SELECT license FROM source_documents WHERE id = ?", (source_id,)
+        ).fetchone()
+        return row["license"] if row is not None else None
+
+    def count_segments_for_source(self, source_id: str) -> int:
+        return self._conn.execute(
+            "SELECT count(*) FROM source_segments WHERE source_id = ?", (source_id,)
+        ).fetchone()[0]
+
+    def list_segments_for_source(
+        self, source_id: str, limit: int, offset: int
+    ) -> list[sqlite3.Row]:
+        """Return id/ordinal/length tuples for segments of a source, ordered by ordinal."""
+        return self._conn.execute(
+            """SELECT id, ordinal, length(text) AS length
+               FROM source_segments
+               WHERE source_id = ?
+               ORDER BY ordinal
+               LIMIT ? OFFSET ?""",
+            (source_id, limit, offset),
+        ).fetchall()
+
+    def count_declared_licenses(self) -> int:
+        """Return the count of source_documents rows with a non-null license."""
+        return self._conn.execute(
+            "SELECT count(*) FROM source_documents WHERE license IS NOT NULL"
+        ).fetchone()[0]
+
     def upsert_source_document(self, doc: object) -> None:
         """Insert or replace a SourceDocument record."""
         import json

@@ -151,13 +151,7 @@ def _license_allows(source_id: str, db: StateDB, mcp_config: McpConfig, vault_ke
     if effective_mode == "deny":
         return False
     # permissive_only — need the license value
-    row = db._conn.execute(
-        "SELECT license FROM source_documents WHERE id = ?", (source_id,)
-    ).fetchone()
-    if row is None:
-        return False  # Orphan source. For single-source tools, this collapses to "policy denial"
-        # which is acceptable because they already checked the source exists upstream.
-    license_str: str | None = row["license"]
+    license_str = db.fetch_source_license(source_id)
     permissive = {lic.casefold() for lic in mcp_config.source_access.permissive_licenses}
     return _license_allows_value(license_str, effective_mode, permissive)
 
@@ -218,6 +212,264 @@ def _resolve_min_status(value: str | None) -> str:
 
 class _DefaultToolError(RuntimeError):
     """Placeholder exception type used when handlers are built outside FastMCP."""
+
+
+def _register_verbatim_source_handlers(
+    handlers: dict[str, Callable[..., Any]],
+    reader: VaultReader,
+    config: Config,
+    db: StateDB,
+    vault_key: str,
+    tool_error_cls: type[Exception],
+) -> None:
+    """Register the four Feature 42 handlers. db is guaranteed non-None by caller."""
+
+    def read_source_segment(segment_id: str, max_chars: int | None = None) -> dict[str, object]:
+        """Fetch one verbatim paragraph by segment id.
+
+        Use when you already have a segment id from another tool and want the
+        exact source text. Returns the raw paragraph body as ingested, not a
+        synto-generated synthesis. Pass max_chars to cap the returned body size
+        (capped at 16000; default is unbounded for single-segment fetches).
+        """
+        started = time.monotonic()
+        success = False
+        arguments: dict[str, Any] = {"segment_id": segment_id, "max_chars": max_chars}
+        try:
+            row = db.fetch_segment_by_id(segment_id)
+            if row is None:
+                raise tool_error_cls(f"unknown segment_id: {segment_id!r}")
+            if not _license_allows(row["source_id"], db, config.mcp, vault_key):
+                raise tool_error_cls(f"source {row['source_id']!r} is restricted by license policy")
+            body: str = row["text"]
+            truncated = False
+            if max_chars is not None:
+                cap = min(max_chars, 16000)
+                if len(body) > cap:
+                    body = body[:cap] + "…"
+                    truncated = True
+            success = True
+            return {
+                "segment_id": segment_id,
+                "source_id": row["source_id"],
+                "identity": row["identity"],
+                "ordinal": row["ordinal"],
+                "content_hash": row["content_hash"],
+                "body": body,
+                "source_path": row["origin_uri"],
+                "truncated": truncated,
+            }
+        finally:
+            _audit(
+                db,
+                vault_id=vault_key,
+                tool="read_source_segment",
+                arguments=arguments,
+                success=success,
+                latency_ms=int((time.monotonic() - started) * 1000),
+                mcp_config=config.mcp,
+            )
+
+    def search_source_segments(query: str, limit: int = 10) -> dict[str, object]:
+        """Full-text search (BM25) across raw source paragraphs.
+
+        Use when the user wants the source's own words, not a synto-generated
+        synthesis. Returns ranked snippets with segment ids; fetch the full body
+        with read_source_segment. limit is capped at 50.
+        The response includes `hidden_by_policy` (count blocked by license gate) and
+        `orphan_segments` (count whose source document is missing from the registry).
+        """
+        started = time.monotonic()
+        success = False
+        arguments: dict[str, Any] = {"query": query, "limit": limit}
+        try:
+            cleaned = query.strip().strip('"').strip() if query else ""
+            if not cleaned:
+                raise tool_error_cls("query must be non-empty")
+            if limit < 1:
+                raise tool_error_cls("limit must be at least 1")
+            limit = min(limit, 50)
+            # Wrap in double-quotes to treat user input as a literal phrase.
+            # Internal double-quotes are doubled to escape them in FTS5 syntax.
+            match_arg = '"' + cleaned.replace('"', '""') + '"'
+            rows = db.search_segments_fts(match_arg, limit)
+            # Batch fetch licenses and origin_uris for all distinct sources
+            source_ids = list({r["source_id"] for r in rows})
+            source_meta = db.fetch_source_meta(source_ids)
+            # Effective mode + permissive set computed once for the whole result page.
+            effective_mode = _effective_source_access_mode(db, config.mcp.source_access, vault_key)
+            permissive = {lic.casefold() for lic in config.mcp.source_access.permissive_licenses}
+            results: list[dict[str, Any]] = []
+            hidden_by_policy = 0
+            orphan_segments = 0
+            for r in rows:
+                meta = source_meta.get(r["source_id"])
+                if meta is None:
+                    # source_id present in source_segments but missing from source_documents
+                    # → orphan. Distinct from policy denial.
+                    orphan_segments += 1
+                    continue
+                license_str, origin_uri = meta
+                if not _license_allows_value(license_str, effective_mode, permissive):
+                    hidden_by_policy += 1
+                    continue
+                results.append(
+                    {
+                        "segment_id": r["segment_id"],
+                        "source_id": r["source_id"],
+                        "ordinal": r["ordinal"],
+                        "snippet": r["snippet"],
+                        "score": -r["rank"],  # BM25 is negative; flip so higher = better
+                        "source_path": origin_uri,
+                    }
+                )
+            success = True
+            return {
+                "results": results,
+                "hidden_by_policy": hidden_by_policy,
+                "orphan_segments": orphan_segments,
+            }
+        finally:
+            _audit(
+                db,
+                vault_id=vault_key,
+                tool="search_source_segments",
+                arguments=arguments,
+                success=success,
+                latency_ms=int((time.monotonic() - started) * 1000),
+                mcp_config=config.mcp,
+            )
+
+    def get_source_passages(
+        concept_name: str, max_passages: int = 5, max_chars_per_passage: int | None = None
+    ) -> dict[str, object]:
+        """Return verbatim paragraphs explicitly linked to a concept.
+
+        Use when you know which concept the user is asking about and want
+        the source's own explanation, not a synto-generated synthesis.
+        Results are ordered by extraction confidence then reading order.
+        Pass max_chars_per_passage to cap each paragraph (default 8000, max 16000).
+        The response includes `hidden_by_policy` (count blocked by license gate) and
+        `orphan_segments` (count whose source document is missing from the registry).
+        """
+        started = time.monotonic()
+        success = False
+        arguments: dict[str, Any] = {
+            "concept_name": concept_name,
+            "max_passages": max_passages,
+            "max_chars_per_passage": max_chars_per_passage,
+        }
+        try:
+            if max_passages > 20:
+                raise tool_error_cls("max_passages must be at most 20")
+            max_passages = max(1, max_passages)
+            resolved = db.find_concept_by_name_or_alias(concept_name)
+            if resolved is None:
+                success = True
+                return {"results": [], "hidden_by_policy": 0, "orphan_segments": 0}
+            canonical, _aliases = resolved
+            rows = db.select_passages_for_concept(canonical, max_passages)
+            # select_passages_for_concept already JOINs source_documents and returns
+            # origin_uri, license, and doc_id — no separate batch fetch needed.
+            # doc_id is NULL when source_id has no matching source_documents row (orphan).
+            if max_chars_per_passage is not None:
+                char_cap = min(max_chars_per_passage, 16000)
+            else:
+                char_cap = 8000
+            # Effective mode + permissive set computed once for the whole result page.
+            effective_mode = _effective_source_access_mode(db, config.mcp.source_access, vault_key)
+            permissive = {lic.casefold() for lic in config.mcp.source_access.permissive_licenses}
+            results: list[dict[str, Any]] = []
+            hidden_by_policy = 0
+            orphan_segments = 0
+            for r in rows:
+                if r["doc_id"] is None:
+                    # LEFT JOIN miss: source_id in source_segments with no source_documents row.
+                    orphan_segments += 1
+                    continue
+                license_str: str | None = r["license"]
+                origin_uri: str | None = r["origin_uri"]
+                if not _license_allows_value(license_str, effective_mode, permissive):
+                    hidden_by_policy += 1
+                    continue
+                body: str = r["text"]
+                truncated = False
+                if len(body) > char_cap:
+                    body = body[:char_cap] + "…"
+                    truncated = True
+                results.append(
+                    {
+                        "segment_id": r["id"],
+                        "source_id": r["source_id"],
+                        "ordinal": r["ordinal"],
+                        "body": body,
+                        "confidence": r["confidence"],
+                        "source_path": origin_uri,
+                        "truncated": truncated,
+                    }
+                )
+            success = True
+            return {
+                "results": results,
+                "hidden_by_policy": hidden_by_policy,
+                "orphan_segments": orphan_segments,
+            }
+        finally:
+            _audit(
+                db,
+                vault_id=vault_key,
+                tool="get_source_passages",
+                arguments=arguments,
+                success=success,
+                latency_ms=int((time.monotonic() - started) * 1000),
+                mcp_config=config.mcp,
+            )
+
+    def list_segments(source_id: str, limit: int = 200, offset: int = 0) -> dict[str, object]:
+        """Enumerate a single source document's paragraphs in reading order.
+
+        Use for sequential exploration of a known document. Returns segment ids
+        and character lengths (not full bodies) — fetch individual bodies with
+        read_source_segment. limit is capped at 500.
+        """
+        started = time.monotonic()
+        success = False
+        arguments: dict[str, Any] = {"source_id": source_id, "limit": limit, "offset": offset}
+        try:
+            limit = min(max(1, limit), 500)
+            offset = max(0, offset)
+            if not db.source_document_exists(source_id):
+                raise tool_error_cls(f"unknown source_id: {source_id!r}")
+            if not _license_allows(source_id, db, config.mcp, vault_key):
+                raise tool_error_cls(f"source {source_id!r} is restricted by license policy")
+            total = db.count_segments_for_source(source_id)
+            rows = db.list_segments_for_source(source_id, limit, offset)
+            segments = [
+                {"segment_id": r["id"], "ordinal": r["ordinal"], "length": r["length"]}
+                for r in rows
+            ]
+            success = True
+            return {
+                "source_id": source_id,
+                "total": total,
+                "returned": len(segments),
+                "segments": segments,
+            }
+        finally:
+            _audit(
+                db,
+                vault_id=vault_key,
+                tool="list_segments",
+                arguments=arguments,
+                success=success,
+                latency_ms=int((time.monotonic() - started) * 1000),
+                mcp_config=config.mcp,
+            )
+
+    handlers["read_source_segment"] = read_source_segment
+    handlers["search_source_segments"] = search_source_segments
+    handlers["get_source_passages"] = get_source_passages
+    handlers["list_segments"] = list_segments
 
 
 def build_tool_handlers(
@@ -544,285 +796,6 @@ def build_tool_handlers(
                 mcp_config=config.mcp,
             )
 
-    def read_source_segment(segment_id: str, max_chars: int | None = None) -> dict[str, object]:
-        """Fetch one verbatim paragraph by segment id.
-
-        Use when you already have a segment id from another tool and want the
-        exact source text. Returns the raw paragraph body as ingested, not a
-        synto-generated synthesis. Pass max_chars to cap the returned body size
-        (capped at 16000; default is unbounded for single-segment fetches).
-        """
-        started = time.monotonic()
-        success = False
-        arguments: dict[str, Any] = {"segment_id": segment_id, "max_chars": max_chars}
-        try:
-            assert db is not None
-            row = db._conn.execute(
-                """SELECT s.source_id, s.identity, s.ordinal, s.content_hash, s.text,
-                          d.origin_uri
-                   FROM source_segments s
-                   LEFT JOIN source_documents d ON d.id = s.source_id
-                   WHERE s.id = ?""",
-                (segment_id,),
-            ).fetchone()
-            if row is None:
-                raise tool_error_cls(f"unknown segment_id: {segment_id!r}")
-            if not _license_allows(row["source_id"], db, config.mcp, vault_key):
-                raise tool_error_cls(f"source {row['source_id']!r} is restricted by license policy")
-            body: str = row["text"]
-            truncated = False
-            if max_chars is not None:
-                cap = min(max_chars, 16000)
-                if len(body) > cap:
-                    body = body[:cap] + "…"
-                    truncated = True
-            success = True
-            return {
-                "segment_id": segment_id,
-                "source_id": row["source_id"],
-                "identity": row["identity"],
-                "ordinal": row["ordinal"],
-                "content_hash": row["content_hash"],
-                "body": body,
-                "source_path": row["origin_uri"],
-                "truncated": truncated,
-            }
-        finally:
-            _audit(
-                db,
-                vault_id=vault_key,
-                tool="read_source_segment",
-                arguments=arguments,
-                success=success,
-                latency_ms=int((time.monotonic() - started) * 1000),
-                mcp_config=config.mcp,
-            )
-
-    def search_source_segments(query: str, limit: int = 10) -> dict[str, object]:
-        """Full-text search (BM25) across raw source paragraphs.
-
-        Use when the user wants the source's own words, not a synto-generated
-        synthesis. Returns ranked snippets with segment ids; fetch the full body
-        with read_source_segment. limit is capped at 50.
-        The response includes `hidden_by_policy` (count blocked by license gate) and
-        `orphan_segments` (count whose source document is missing from the registry).
-        """
-        started = time.monotonic()
-        success = False
-        arguments: dict[str, Any] = {"query": query, "limit": limit}
-        try:
-            assert db is not None
-            if not query or not query.strip():
-                raise tool_error_cls("query must be non-empty")
-            if limit < 1:
-                raise tool_error_cls("limit must be at least 1")
-            limit = min(limit, 50)
-            # Wrap in double-quotes to treat user input as a literal phrase.
-            # Internal double-quotes are doubled to escape them in FTS5 syntax.
-            match_arg = '"' + query.replace('"', '""') + '"'
-            rows = db._conn.execute(
-                """SELECT s.id AS segment_id, s.source_id, s.ordinal,
-                          snippet(source_segments_fts, 0, '', '', '…', 32) AS snippet,
-                          bm25(source_segments_fts) AS rank
-                   FROM source_segments_fts
-                   JOIN source_segments s ON s.rowid = source_segments_fts.rowid
-                   WHERE source_segments_fts MATCH ?
-                   ORDER BY rank
-                   LIMIT ?""",
-                (match_arg, limit),
-            ).fetchall()
-            # Batch fetch licenses and origin_uris for all distinct sources
-            source_ids = list({r["source_id"] for r in rows})
-            source_meta: dict[str, tuple[str | None, str | None]] = {}
-            if source_ids:
-                placeholders = ",".join("?" * len(source_ids))
-                _sql = (
-                    "SELECT id, license, origin_uri FROM source_documents"
-                    f" WHERE id IN ({placeholders})"
-                )
-                for src in db._conn.execute(_sql, source_ids).fetchall():
-                    source_meta[src["id"]] = (src["license"], src["origin_uri"])
-            # Effective mode + permissive set computed once for the whole result page.
-            effective_mode = _effective_source_access_mode(db, config.mcp.source_access, vault_key)
-            permissive = {lic.casefold() for lic in config.mcp.source_access.permissive_licenses}
-            results: list[dict[str, Any]] = []
-            hidden_by_policy = 0
-            orphan_segments = 0
-            for r in rows:
-                meta = source_meta.get(r["source_id"])
-                if meta is None:
-                    # source_id present in source_segments but missing from source_documents
-                    # → orphan. Distinct from policy denial.
-                    orphan_segments += 1
-                    continue
-                license_str, origin_uri = meta
-                if not _license_allows_value(license_str, effective_mode, permissive):
-                    hidden_by_policy += 1
-                    continue
-                results.append(
-                    {
-                        "segment_id": r["segment_id"],
-                        "source_id": r["source_id"],
-                        "ordinal": r["ordinal"],
-                        "snippet": r["snippet"],
-                        "score": -r["rank"],  # BM25 is negative; flip so higher = better
-                        "source_path": origin_uri,
-                    }
-                )
-            success = True
-            return {
-                "results": results,
-                "hidden_by_policy": hidden_by_policy,
-                "orphan_segments": orphan_segments,
-            }
-        finally:
-            _audit(
-                db,
-                vault_id=vault_key,
-                tool="search_source_segments",
-                arguments=arguments,
-                success=success,
-                latency_ms=int((time.monotonic() - started) * 1000),
-                mcp_config=config.mcp,
-            )
-
-    def get_source_passages(
-        concept_name: str, max_passages: int = 5, max_chars: int | None = None
-    ) -> dict[str, object]:
-        """Return verbatim paragraphs explicitly linked to a concept.
-
-        Use when you know which concept the user is asking about and want
-        the source's own explanation, not a synto-generated synthesis.
-        Results are ordered by extraction confidence then reading order.
-        Pass max_chars to cap each paragraph (default 8000, max 16000).
-        The response includes `hidden_by_policy` (count blocked by license gate) and
-        `orphan_segments` (count whose source document is missing from the registry).
-        """
-        started = time.monotonic()
-        success = False
-        arguments: dict[str, Any] = {
-            "concept_name": concept_name,
-            "max_passages": max_passages,
-            "max_chars": max_chars,
-        }
-        try:
-            assert db is not None
-            if max_passages > 20:
-                raise tool_error_cls("max_passages must be at most 20")
-            max_passages = max(1, max_passages)
-            resolved = db.find_concept_by_name_or_alias(concept_name)
-            if resolved is None:
-                success = True
-                return {"results": [], "hidden_by_policy": 0, "orphan_segments": 0}
-            canonical, _aliases = resolved
-            rows = db.select_passages_for_concept(canonical, max_passages)
-            # select_passages_for_concept already JOINs source_documents and returns
-            # origin_uri, license, and doc_id — no separate batch fetch needed.
-            # doc_id is NULL when source_id has no matching source_documents row (orphan).
-            char_cap = min(max_chars, 16000) if max_chars is not None else 8000
-            # Effective mode + permissive set computed once for the whole result page.
-            effective_mode = _effective_source_access_mode(db, config.mcp.source_access, vault_key)
-            permissive = {lic.casefold() for lic in config.mcp.source_access.permissive_licenses}
-            results: list[dict[str, Any]] = []
-            hidden_by_policy = 0
-            orphan_segments = 0
-            for r in rows:
-                if r["doc_id"] is None:
-                    # LEFT JOIN miss: source_id in source_segments with no source_documents row.
-                    orphan_segments += 1
-                    continue
-                license_str: str | None = r["license"]
-                origin_uri: str | None = r["origin_uri"]
-                if not _license_allows_value(license_str, effective_mode, permissive):
-                    hidden_by_policy += 1
-                    continue
-                body: str = r["text"]
-                truncated = False
-                if len(body) > char_cap:
-                    body = body[:char_cap] + "…"
-                    truncated = True
-                results.append(
-                    {
-                        "segment_id": r["id"],
-                        "source_id": r["source_id"],
-                        "ordinal": r["ordinal"],
-                        "body": body,
-                        "confidence": r["confidence"],
-                        "source_path": origin_uri,
-                        "truncated": truncated,
-                    }
-                )
-            success = True
-            return {
-                "results": results,
-                "hidden_by_policy": hidden_by_policy,
-                "orphan_segments": orphan_segments,
-            }
-        finally:
-            _audit(
-                db,
-                vault_id=vault_key,
-                tool="get_source_passages",
-                arguments=arguments,
-                success=success,
-                latency_ms=int((time.monotonic() - started) * 1000),
-                mcp_config=config.mcp,
-            )
-
-    def list_segments(source_id: str, limit: int = 200, offset: int = 0) -> dict[str, object]:
-        """Enumerate a single source document's paragraphs in reading order.
-
-        Use for sequential exploration of a known document. Returns segment ids
-        and character lengths (not full bodies) — fetch individual bodies with
-        read_source_segment. limit is capped at 500.
-        """
-        started = time.monotonic()
-        success = False
-        arguments: dict[str, Any] = {"source_id": source_id, "limit": limit, "offset": offset}
-        try:
-            assert db is not None
-            limit = min(max(1, limit), 500)
-            offset = max(0, offset)
-            src = db._conn.execute(
-                "SELECT id, license FROM source_documents WHERE id = ?", (source_id,)
-            ).fetchone()
-            if src is None:
-                raise tool_error_cls(f"unknown source_id: {source_id!r}")
-            if not _license_allows(source_id, db, config.mcp, vault_key):
-                raise tool_error_cls(f"source {source_id!r} is restricted by license policy")
-            total = db._conn.execute(
-                "SELECT count(*) FROM source_segments WHERE source_id = ?", (source_id,)
-            ).fetchone()[0]
-            rows = db._conn.execute(
-                """SELECT id, ordinal, length(text) AS length
-                   FROM source_segments
-                   WHERE source_id = ?
-                   ORDER BY ordinal
-                   LIMIT ? OFFSET ?""",
-                (source_id, limit, offset),
-            ).fetchall()
-            segments = [
-                {"segment_id": r["id"], "ordinal": r["ordinal"], "length": r["length"]}
-                for r in rows
-            ]
-            success = True
-            return {
-                "source_id": source_id,
-                "total": total,
-                "returned": len(segments),
-                "segments": segments,
-            }
-        finally:
-            _audit(
-                db,
-                vault_id=vault_key,
-                tool="list_segments",
-                arguments=arguments,
-                success=success,
-                latency_ms=int((time.monotonic() - started) * 1000),
-                mcp_config=config.mcp,
-            )
-
     handlers: dict[str, Callable[..., Any]] = {
         "list_articles": list_articles,
         "read_article": read_article,
@@ -834,10 +807,7 @@ def build_tool_handlers(
         "answer_question": answer_question,
     }
     if db is not None:
-        handlers["read_source_segment"] = read_source_segment
-        handlers["search_source_segments"] = search_source_segments
-        handlers["get_source_passages"] = get_source_passages
-        handlers["list_segments"] = list_segments
+        _register_verbatim_source_handlers(handlers, reader, config, db, vault_key, tool_error_cls)
     return handlers
 
 

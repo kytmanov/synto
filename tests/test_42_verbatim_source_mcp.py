@@ -421,7 +421,7 @@ def test_get_source_passages_max_passages_exceeded_raises(vault: Path) -> None:
 
 
 def test_get_source_passages_truncation(vault: Path) -> None:
-    """max_chars truncates body and sets truncated=True; default cap is 8000."""
+    """max_chars_per_passage truncates body and sets truncated=True; default cap is 8000."""
     db = StateDB(vault / ".synto" / "state.db")
     _insert_source(db, "book1")
     _insert_segment(db, "book1:p:0:aa", "book1", "X" * 10000, ordinal=0)
@@ -432,8 +432,8 @@ def test_get_source_passages_truncation(vault: Path) -> None:
     result = handlers["get_source_passages"]("Big")
     assert result["results"][0]["truncated"] is True
     assert len(result["results"][0]["body"]) <= 8001
-    # Explicit max_chars
-    result2 = handlers["get_source_passages"]("Big", max_chars=100)
+    # Explicit max_chars_per_passage
+    result2 = handlers["get_source_passages"]("Big", max_chars_per_passage=100)
     assert result2["results"][0]["truncated"] is True
     assert len(result2["results"][0]["body"]) <= 101
 
@@ -864,3 +864,32 @@ def test_get_source_passages_response_shape_includes_orphan_segments(vault: Path
     result = handlers["get_source_passages"]("Nonexistent")
     assert "orphan_segments" in result
     assert result["orphan_segments"] == 0
+
+
+# ── Stage C: degenerate-query handling + max_chars_per_passage rename ────────
+
+
+def test_search_degenerate_quoted_query_raises(vault: Path) -> None:
+    """Queries that collapse to empty after stripping quotes raise validation error."""
+    _clear_mode_cache()
+    db = StateDB(vault / ".synto" / "state.db")
+    _insert_source(db, "book1", license="CC-BY")
+    _insert_segment(db, "book1:p:0:aa", "book1", "content", ordinal=0)
+    handlers = _make_handlers_with_default_gate(vault, db)
+    for degenerate in ['""', '"  "', '"', '   "   "   ']:
+        with pytest.raises(Exception, match="non-empty"):
+            handlers["search_source_segments"](degenerate)
+
+
+def test_get_source_passages_max_chars_per_passage_param(vault: Path) -> None:
+    """get_source_passages uses max_chars_per_passage as the keyword (post-Stage-C rename)."""
+    _clear_mode_cache()
+    db = StateDB(vault / ".synto" / "state.db")
+    _insert_source(db, "book1", license="CC-BY")
+    _insert_segment(db, "book1:p:0:aa", "book1", "X" * 1000, ordinal=0)
+    _insert_concept(db, "Big")
+    _insert_occurrence(db, "Big", "book1:p:0:aa")
+    handlers = _make_handlers_with_default_gate(vault, db)
+    result = handlers["get_source_passages"]("Big", max_chars_per_passage=50)
+    assert result["results"][0]["truncated"] is True
+    assert len(result["results"][0]["body"]) <= 51
