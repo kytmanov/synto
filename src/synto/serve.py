@@ -95,9 +95,24 @@ def _read_visible_article(reader: VaultReader, name_or_id: str, mcp_config: McpC
 def _license_allows(source_id: str, db: StateDB, mcp_config: McpConfig) -> bool:
     """Return True if the source's license permits verbatim access under current policy.
 
-    Stub implementation — always permits. Replaced with the real gate in Stage 6.
+    "all"              — always allow.
+    "deny"             — always deny.
+    "permissive_only"  — allow iff source_documents.license (case-insensitive) is in
+                         mcp_config.source_access.permissive_licenses. Null license → deny.
     """
-    return True
+    sa = mcp_config.source_access
+    if sa.mode == "all":
+        return True
+    if sa.mode == "deny":
+        return False
+    # permissive_only
+    row = db._conn.execute(
+        "SELECT license FROM source_documents WHERE id = ?", (source_id,)
+    ).fetchone()
+    if row is None or row["license"] is None:
+        return False
+    allowed = {lic.casefold() for lic in sa.permissive_licenses}
+    return row["license"].casefold() in allowed
 
 
 def _ref_to_dict(ref: ArticleRef) -> dict[str, object]:
@@ -506,9 +521,7 @@ def build_tool_handlers(
             if row is None:
                 raise tool_error_cls(f"unknown segment_id: {segment_id!r}")
             if not _license_allows(row["source_id"], db, config.mcp):
-                raise tool_error_cls(
-                    f"source {row['source_id']!r} is restricted by license policy"
-                )
+                raise tool_error_cls(f"source {row['source_id']!r} is restricted by license policy")
             body: str = row["text"]
             truncated = False
             if max_chars is not None:
@@ -574,10 +587,11 @@ def build_tool_handlers(
             source_meta: dict[str, tuple[str | None, str | None]] = {}
             if source_ids:
                 placeholders = ",".join("?" * len(source_ids))
-                for src in db._conn.execute(
-                    f"SELECT id, license, origin_uri FROM source_documents WHERE id IN ({placeholders})",
-                    source_ids,
-                ).fetchall():
+                _sql = (
+                    "SELECT id, license, origin_uri FROM source_documents"
+                    f" WHERE id IN ({placeholders})"
+                )
+                for src in db._conn.execute(_sql, source_ids).fetchall():
                     source_meta[src["id"]] = (src["license"], src["origin_uri"])
             results = []
             hidden = 0
@@ -586,14 +600,16 @@ def build_tool_handlers(
                     hidden += 1
                     continue
                 _license, origin_uri = source_meta.get(r["source_id"], (None, None))
-                results.append({
-                    "segment_id": r["segment_id"],
-                    "source_id": r["source_id"],
-                    "ordinal": r["ordinal"],
-                    "snippet": r["snippet"],
-                    "score": -r["rank"],  # BM25 is negative; flip so higher = better
-                    "source_path": origin_uri,
-                })
+                results.append(
+                    {
+                        "segment_id": r["segment_id"],
+                        "source_id": r["source_id"],
+                        "ordinal": r["ordinal"],
+                        "snippet": r["snippet"],
+                        "score": -r["rank"],  # BM25 is negative; flip so higher = better
+                        "source_path": origin_uri,
+                    }
+                )
             success = True
             return {"results": results, "hidden_by_policy": hidden}
         finally:
@@ -640,10 +656,11 @@ def build_tool_handlers(
             source_meta: dict[str, tuple[str | None, str | None]] = {}
             if source_ids:
                 placeholders = ",".join("?" * len(source_ids))
-                for src in db._conn.execute(
-                    f"SELECT id, license, origin_uri FROM source_documents WHERE id IN ({placeholders})",
-                    source_ids,
-                ).fetchall():
+                _sql = (
+                    "SELECT id, license, origin_uri FROM source_documents"
+                    f" WHERE id IN ({placeholders})"
+                )
+                for src in db._conn.execute(_sql, source_ids).fetchall():
                     source_meta[src["id"]] = (src["license"], src["origin_uri"])
             char_cap = min(max_chars, 16000) if max_chars is not None else 8000
             results = []
@@ -658,15 +675,17 @@ def build_tool_handlers(
                 if len(body) > char_cap:
                     body = body[:char_cap] + "…"
                     truncated = True
-                results.append({
-                    "segment_id": r["id"],
-                    "source_id": r["source_id"],
-                    "ordinal": r["ordinal"],
-                    "body": body,
-                    "confidence": r["confidence"],
-                    "source_path": origin_uri,
-                    "truncated": truncated,
-                })
+                results.append(
+                    {
+                        "segment_id": r["id"],
+                        "source_id": r["source_id"],
+                        "ordinal": r["ordinal"],
+                        "body": body,
+                        "confidence": r["confidence"],
+                        "source_path": origin_uri,
+                        "truncated": truncated,
+                    }
+                )
             success = True
             return {"results": results, "hidden_by_policy": hidden}
         finally:
@@ -680,9 +699,7 @@ def build_tool_handlers(
                 mcp_config=config.mcp,
             )
 
-    def list_segments(
-        source_id: str, limit: int = 200, offset: int = 0
-    ) -> dict[str, object]:
+    def list_segments(source_id: str, limit: int = 200, offset: int = 0) -> dict[str, object]:
         """Enumerate a single source document's paragraphs in reading order.
 
         Use for sequential exploration of a known document. Returns segment ids
@@ -702,9 +719,7 @@ def build_tool_handlers(
             if src is None:
                 raise tool_error_cls(f"unknown source_id: {source_id!r}")
             if not _license_allows(source_id, db, config.mcp):
-                raise tool_error_cls(
-                    f"source {source_id!r} is restricted by license policy"
-                )
+                raise tool_error_cls(f"source {source_id!r} is restricted by license policy")
             total = db._conn.execute(
                 "SELECT count(*) FROM source_segments WHERE source_id = ?", (source_id,)
             ).fetchone()[0]

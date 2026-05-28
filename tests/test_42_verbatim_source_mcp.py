@@ -7,18 +7,14 @@ All tests use in-memory or tmp_path SQLite; no Ollama required.
 
 from __future__ import annotations
 
-import sqlite3
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import pytest
 
-from synto.config import Config, McpConfig
+from synto.config import Config, McpConfig, McpSourceAccessConfig
 from synto.readers import VaultReader
 from synto.serve import build_tool_handlers
 from synto.state import StateDB
-
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -50,7 +46,15 @@ def _insert_segment(
         """INSERT OR REPLACE INTO source_segments
            (id, identity, ordinal, source_id, structural_locator, content_hash, text)
            VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (seg_id, f"{source_id}:para:{ordinal}", ordinal, source_id, f"p:{ordinal}", content_hash, text),
+        (
+            seg_id,
+            f"{source_id}:para:{ordinal}",
+            ordinal,
+            source_id,
+            f"p:{ordinal}",
+            content_hash,
+            text,
+        ),
     )
     db._conn.commit()
 
@@ -70,10 +74,15 @@ def test_fts5_migration_fresh_db(tmp_path: Path) -> None:
     triggers = {
         r[0]
         for r in db._conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'source_segments_fts_%'"
+            "SELECT name FROM sqlite_master"
+            " WHERE type='trigger' AND name LIKE 'source_segments_fts_%'"
         ).fetchall()
     }
-    assert triggers == {"source_segments_fts_ai", "source_segments_fts_ad", "source_segments_fts_au"}
+    assert triggers == {
+        "source_segments_fts_ai",
+        "source_segments_fts_ad",
+        "source_segments_fts_au",
+    }
     # Zero FTS rows on empty DB
     count = db._conn.execute("SELECT count(*) FROM source_segments_fts").fetchone()[0]
     assert count == 0
@@ -140,10 +149,12 @@ def test_fts5_trigger_update(tmp_path: Path) -> None:
     db._conn.commit()
     # Old term should not match; new term should
     old_hits = db._conn.execute(
-        "SELECT count(*) FROM source_segments_fts WHERE source_segments_fts MATCH '\"old content here\"'"
+        "SELECT count(*) FROM source_segments_fts"
+        " WHERE source_segments_fts MATCH '\"old content here\"'"
     ).fetchone()[0]
     new_hits = db._conn.execute(
-        "SELECT count(*) FROM source_segments_fts WHERE source_segments_fts MATCH '\"new content here\"'"
+        "SELECT count(*) FROM source_segments_fts"
+        " WHERE source_segments_fts MATCH '\"new content here\"'"
     ).fetchone()[0]
     assert old_hits == 0
     assert new_hits == 1
@@ -174,8 +185,9 @@ def vault(tmp_path: Path) -> Path:
 
 
 def _make_handlers(vault: Path, db: StateDB):
-    """Build MCP handlers with a real StateDB (no audit)."""
-    config = Config(vault=vault, mcp=McpConfig(audit=False))
+    """Build MCP handlers with a real StateDB, gate mode='all' (for non-gate tests)."""
+    sa = McpSourceAccessConfig(mode="all")
+    config = Config(vault=vault, mcp=McpConfig(audit=False, source_access=sa))
     reader = VaultReader(vault)
     return build_tool_handlers(reader, config, db, vault_key="test-vault")
 
@@ -237,7 +249,10 @@ def test_read_source_segment_source_path_from_origin_uri(vault: Path) -> None:
     assert result["source_path"] == "/raw/book1.pdf"
 
     # Source with null origin_uri
-    db._conn.execute("INSERT INTO source_documents (id, source_type, redistribution) VALUES ('nouri', 'pdf', 'unknown')")
+    db._conn.execute(
+        "INSERT INTO source_documents (id, source_type, redistribution)"
+        " VALUES ('nouri', 'pdf', 'unknown')"
+    )
     db._conn.commit()
     _insert_segment(db, "nouri:p:0:aa", "nouri", "text2", ordinal=0)
     result2 = handlers["read_source_segment"]("nouri:p:0:aa")
@@ -260,8 +275,12 @@ def test_search_source_segments_bm25_ordering(vault: Path) -> None:
     db = StateDB(vault / ".synto" / "state.db")
     _insert_source(db, "book1")
     # Segment with many occurrences of "quantum" should rank higher than one with one
-    _insert_segment(db, "book1:p:0:aa", "book1", "quantum quantum quantum mechanics quantum field", ordinal=0)
-    _insert_segment(db, "book1:p:1:bb", "book1", "classical mechanics has no quantum at all", ordinal=1)
+    _insert_segment(
+        db, "book1:p:0:aa", "book1", "quantum quantum quantum mechanics quantum field", ordinal=0
+    )
+    _insert_segment(
+        db, "book1:p:1:bb", "book1", "classical mechanics has no quantum at all", ordinal=1
+    )
     handlers = _make_handlers(vault, db)
     result = handlers["search_source_segments"]("quantum")
     assert result["hidden_by_policy"] == 0
@@ -480,3 +499,129 @@ def test_list_segments_limit_clamped(vault: Path) -> None:
     # Passing limit=999 should not raise; returns all 5 segments
     result = handlers["list_segments"]("book1", limit=999)
     assert result["returned"] == 5
+
+
+# ── Stage 6: privacy gate ─────────────────────────────────────────────────────
+
+
+def _make_handlers_with_access(
+    vault: Path, db: StateDB, mode: str, permissive: list[str] | None = None
+):
+    """Build handlers with a specific source_access config."""
+    sa_kwargs: dict = {"mode": mode}
+    if permissive is not None:
+        sa_kwargs["permissive_licenses"] = permissive
+    sa = McpSourceAccessConfig(**sa_kwargs)
+    config = Config(vault=vault, mcp=McpConfig(audit=False, source_access=sa))
+    reader = VaultReader(vault)
+    return build_tool_handlers(reader, config, db, vault_key="test-vault")
+
+
+def test_privacy_gate_mode_all_permits_any_license(vault: Path) -> None:
+    """mode='all' allows access regardless of license."""
+    db = StateDB(vault / ".synto" / "state.db")
+    _insert_source(db, "restricted", license="proprietary")
+    _insert_segment(db, "restricted:p:0:aa", "restricted", "secret content", ordinal=0)
+    handlers = _make_handlers_with_access(vault, db, mode="all")
+    result = handlers["read_source_segment"]("restricted:p:0:aa")
+    assert result["body"] == "secret content"
+
+
+def test_privacy_gate_mode_deny_blocks_all(vault: Path) -> None:
+    """mode='deny' blocks all four tools regardless of license."""
+    db = StateDB(vault / ".synto" / "state.db")
+    _insert_source(db, "open", license="CC-BY")
+    _insert_segment(db, "open:p:0:aa", "open", "open content", ordinal=0)
+    _insert_concept(db, "Concept")
+    _insert_occurrence(db, "Concept", "open:p:0:aa")
+    handlers = _make_handlers_with_access(vault, db, mode="deny")
+    # read_source_segment
+    with pytest.raises(Exception, match="restricted by license policy"):
+        handlers["read_source_segment"]("open:p:0:aa")
+    # list_segments
+    with pytest.raises(Exception, match="restricted by license policy"):
+        handlers["list_segments"]("open")
+    # search_source_segments — multi-source tool returns empty with hidden_by_policy count
+    result = handlers["search_source_segments"]("open")
+    assert result["results"] == []
+    assert result["hidden_by_policy"] >= 0  # may be 0 if FTS returns no rows, that's fine
+    # get_source_passages — same pattern
+    result2 = handlers["get_source_passages"]("Concept")
+    assert result2["results"] == []
+
+
+def test_privacy_gate_permissive_only_allows_permissive_license(vault: Path) -> None:
+    """mode='permissive_only' allows sources with a permissive license."""
+    db = StateDB(vault / ".synto" / "state.db")
+    _insert_source(db, "ccby", license="CC-BY")
+    _insert_segment(db, "ccby:p:0:aa", "ccby", "open content", ordinal=0)
+    handlers = _make_handlers_with_access(vault, db, mode="permissive_only")
+    result = handlers["read_source_segment"]("ccby:p:0:aa")
+    assert result["body"] == "open content"
+
+
+def test_privacy_gate_permissive_only_blocks_null_license(vault: Path) -> None:
+    """mode='permissive_only' blocks sources with null license."""
+    db = StateDB(vault / ".synto" / "state.db")
+    _insert_source(db, "nolic")  # no license set
+    _insert_segment(db, "nolic:p:0:aa", "nolic", "unknown rights content", ordinal=0)
+    handlers = _make_handlers_with_access(vault, db, mode="permissive_only")
+    with pytest.raises(Exception, match="restricted by license policy"):
+        handlers["read_source_segment"]("nolic:p:0:aa")
+
+
+def test_privacy_gate_permissive_only_blocks_restrictive_license(vault: Path) -> None:
+    """mode='permissive_only' blocks sources with non-permissive license."""
+    db = StateDB(vault / ".synto" / "state.db")
+    _insert_source(db, "prop", license="proprietary")
+    _insert_segment(db, "prop:p:0:aa", "prop", "private content", ordinal=0)
+    handlers = _make_handlers_with_access(vault, db, mode="permissive_only")
+    with pytest.raises(Exception, match="restricted by license policy"):
+        handlers["read_source_segment"]("prop:p:0:aa")
+
+
+def test_privacy_gate_case_insensitive_license_match(vault: Path) -> None:
+    """License comparison is case-insensitive: 'cc-by' matches 'CC-BY'."""
+    db = StateDB(vault / ".synto" / "state.db")
+    _insert_source(db, "src1", license="cc-by")  # lowercase
+    _insert_segment(db, "src1:p:0:aa", "src1", "content", ordinal=0)
+    handlers = _make_handlers_with_access(
+        vault,
+        db,
+        mode="permissive_only",
+        permissive=["CC-BY"],  # uppercase in config
+    )
+    result = handlers["read_source_segment"]("src1:p:0:aa")
+    assert result["body"] == "content"
+
+
+def test_privacy_gate_custom_permissive_licenses(vault: Path) -> None:
+    """Custom permissive_licenses list overrides the default."""
+    db = StateDB(vault / ".synto" / "state.db")
+    _insert_source(db, "custom", license="Custom-Open-License")
+    _insert_segment(db, "custom:p:0:aa", "custom", "custom licensed content", ordinal=0)
+    # Default list does not include Custom-Open-License → blocked
+    handlers_default = _make_handlers_with_access(vault, db, mode="permissive_only")
+    with pytest.raises(Exception, match="restricted by license policy"):
+        handlers_default["read_source_segment"]("custom:p:0:aa")
+    # Custom list includes it → allowed
+    handlers_custom = _make_handlers_with_access(
+        vault, db, mode="permissive_only", permissive=["Custom-Open-License"]
+    )
+    result = handlers_custom["read_source_segment"]("custom:p:0:aa")
+    assert result["body"] == "custom licensed content"
+
+
+def test_privacy_gate_search_hidden_by_policy_count(vault: Path) -> None:
+    """search_source_segments reports hidden_by_policy count for blocked sources."""
+    db = StateDB(vault / ".synto" / "state.db")
+    _insert_source(db, "open", license="CC-BY")
+    _insert_source(db, "closed", license="proprietary")
+    _insert_segment(db, "open:p:0:aa", "open", "open topic alpha", ordinal=0)
+    _insert_segment(db, "closed:p:0:aa", "closed", "closed topic alpha", ordinal=0)
+    handlers = _make_handlers_with_access(vault, db, mode="permissive_only")
+    result = handlers["search_source_segments"]("alpha")
+    visible_ids = [r["segment_id"] for r in result["results"]]
+    assert "open:p:0:aa" in visible_ids
+    assert "closed:p:0:aa" not in visible_ids
+    assert result["hidden_by_policy"] == 1

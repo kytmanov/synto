@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import tomllib
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -237,10 +238,25 @@ class MetricsConfig(BaseModel):
     hash_source_ids: bool = True
 
 
+class McpSourceAccessConfig(BaseModel):
+    mode: Literal["permissive_only", "all", "deny"] = "permissive_only"
+    permissive_licenses: list[str] = Field(
+        default_factory=lambda: [
+            "CC-BY",
+            "CC-BY-SA",
+            "MIT",
+            "Apache-2.0",
+            "BSD-3-Clause",
+            "public-domain",
+        ]
+    )
+
+
 class McpConfig(BaseModel):
     default_visibility: str = "public"
     exclude_tags: list[str] = Field(default_factory=list)
     audit: bool = False
+    source_access: McpSourceAccessConfig = Field(default_factory=McpSourceAccessConfig)
 
     @field_validator("default_visibility")
     @classmethod
