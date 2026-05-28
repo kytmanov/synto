@@ -216,7 +216,6 @@ class _DefaultToolError(RuntimeError):
 
 def _register_verbatim_source_handlers(
     handlers: dict[str, Callable[..., Any]],
-    reader: VaultReader,
     config: Config,
     db: StateDB,
     vault_key: str,
@@ -811,7 +810,7 @@ def build_tool_handlers(
         "answer_question": answer_question,
     }
     if db is not None:
-        _register_verbatim_source_handlers(handlers, reader, config, db, vault_key, tool_error_cls)
+        _register_verbatim_source_handlers(handlers, config, db, vault_key, tool_error_cls)
     return handlers
 
 

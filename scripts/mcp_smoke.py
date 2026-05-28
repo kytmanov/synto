@@ -45,9 +45,9 @@ def _c(code: str) -> str:
 
 
 _GREEN = "\033[32m"
-_RED = "\033[31m"
-_HEAD = "\033[1m"
-_RST = "\033[0m"
+_RED   = "\033[31m"
+_HEAD  = "\033[1m"
+_RST   = "\033[0m"
 
 PASS_SYM = f"{_c(_GREEN)}✓{_c(_RST)}" if _COLOR else "PASS"
 FAIL_SYM = f"{_c(_RED)}✗{_c(_RST)}" if _COLOR else "FAIL"
@@ -59,14 +59,12 @@ _JSON_MODE: bool = False
 
 
 def check(label: str, ok: bool, detail: str = "") -> None:
-    _results.append(
-        {
-            "suite": _current_suite,
-            "name": label,
-            "passed": ok,
-            "detail": detail or None,
-        }
-    )
+    _results.append({
+        "suite": _current_suite,
+        "name": label,
+        "passed": ok,
+        "detail": detail or None,
+    })
     if ok:
         if not _JSON_MODE:
             print(f"  {PASS_SYM} {label}")
@@ -84,28 +82,20 @@ def header(title: str) -> None:
 
 # ── Vault bootstrap ───────────────────────────────────────────────────────────
 
-
 def _base_toml() -> str:
     return (
-        '[models]\nfast = "dummy"\nheavy = "dummy"\n\n'
-        '[provider]\nname = "ollama"\nurl = "http://localhost:11434"\n'
+        "[models]\nfast = \"dummy\"\nheavy = \"dummy\"\n\n"
+        "[provider]\nname = \"ollama\"\nurl = \"http://localhost:11434\"\n"
     )
 
 
 def _insert(db, path: str, title: str, status: str = "published") -> None:
     from synto.models import WikiArticleRecord
-
-    db.upsert_article(
-        WikiArticleRecord(
-            path=path,
-            title=title,
-            sources=["raw/note.md"],
-            content_hash=f"h-{title}",
-            created_at=datetime.now(),
-            updated_at=datetime.now(),
-            status=status,
-        )
-    )
+    db.upsert_article(WikiArticleRecord(
+        path=path, title=title, sources=["raw/note.md"],
+        content_hash=f"h-{title}", created_at=datetime.now(),
+        updated_at=datetime.now(), status=status,
+    ))
 
 
 def make_main_vault(tmp: Path) -> Path:
@@ -119,7 +109,7 @@ def make_main_vault(tmp: Path) -> Path:
     (vault / "synto.toml").write_text(_base_toml())
 
     (vault / "wiki" / "Neural Networks.md").write_text(
-        '---\ntitle: Neural Networks\ntags: ["ml"]\nvisibility: public\n---\n\n'
+        "---\ntitle: Neural Networks\ntags: [\"ml\"]\nvisibility: public\n---\n\n"
         "Neural networks learn by adjusting weights through backpropagation.\n"
     )
     (vault / "wiki" / "Internal Notes.md").write_text(
@@ -127,7 +117,7 @@ def make_main_vault(tmp: Path) -> Path:
     )
     # No visibility field → default_visibility="public" (server default) → visible
     (vault / "wiki" / "Default Visibility.md").write_text(
-        '---\ntitle: Default Visibility\ntags: ["default"]\n---\n\n'
+        "---\ntitle: Default Visibility\ntags: [\"default\"]\n---\n\n"
         "This article has no explicit visibility field.\n"
     )
 
@@ -152,17 +142,19 @@ def make_exclude_tags_vault(tmp: Path) -> Path:
     (vault / "wiki").mkdir(parents=True)
     (vault / ".synto").mkdir()
     (vault / "raw").mkdir()
-    (vault / "synto.toml").write_text(_base_toml() + '\n[mcp]\nexclude_tags = ["secret"]\n')
+    (vault / "synto.toml").write_text(
+        _base_toml() + "\n[mcp]\nexclude_tags = [\"secret\"]\n"
+    )
 
     (vault / "wiki" / "Open Article.md").write_text(
-        '---\ntitle: Open Article\ntags: ["general"]\nvisibility: public\n---\n\nVisible body.\n'
+        "---\ntitle: Open Article\ntags: [\"general\"]\nvisibility: public\n---\n\nVisible body.\n"
     )
     (vault / "wiki" / "Secret Article.md").write_text(
-        '---\ntitle: Secret Article\ntags: ["secret", "general"]\nvisibility: public\n---\n\nHidden body.\n'
+        "---\ntitle: Secret Article\ntags: [\"secret\", \"general\"]\nvisibility: public\n---\n\nHidden body.\n"
     )
     # An article that is both tagged secret AND private — double-hidden
     (vault / "wiki" / "Double Hidden.md").write_text(
-        '---\ntitle: Double Hidden\ntags: ["secret"]\nvisibility: private\n---\n\nDouble hidden.\n'
+        "---\ntitle: Double Hidden\ntags: [\"secret\"]\nvisibility: private\n---\n\nDouble hidden.\n"
     )
 
     db = StateDB(vault / ".synto" / "state.db")
@@ -181,7 +173,9 @@ def make_private_default_vault(tmp: Path) -> Path:
     (vault / "wiki").mkdir(parents=True)
     (vault / ".synto").mkdir()
     (vault / "raw").mkdir()
-    (vault / "synto.toml").write_text(_base_toml() + '\n[mcp]\ndefault_visibility = "private"\n')
+    (vault / "synto.toml").write_text(
+        _base_toml() + "\n[mcp]\ndefault_visibility = \"private\"\n"
+    )
     (vault / "wiki" / "Explicit Public.md").write_text(
         "---\ntitle: Explicit Public\ntags: []\nvisibility: public\n---\n\nVisible.\n"
     )
@@ -306,10 +300,8 @@ def make_verbatim_vault(tmp: Path) -> Path:
 
 # ── StdioServerParameters factory ────────────────────────────────────────────
 
-
 def _params(vault: Path):
     from mcp.client.stdio import StdioServerParameters
-
     # Use the direct venv binary, NOT `uv run synto`.
     # `uv run` routes child stderr through its own stdout, which injects log
     # lines into the JSON-RPC stream and causes parse errors on the client.
@@ -329,7 +321,6 @@ def _sc(res, key: str | None = None):
 
 # ── Test suites ───────────────────────────────────────────────────────────────
 
-
 async def suite_list_articles(vault: Path) -> None:
     from mcp import ClientSession
     from mcp.client.stdio import stdio_client
@@ -341,25 +332,14 @@ async def suite_list_articles(vault: Path) -> None:
             # ── tool list sanity ───────────────────────────────────────────
             tools = await s.list_tools()
             names = {t.name for t in tools.tools}
-            check(
-                "tool list has 12 expected names (v0.4.0)",
-                names
-                == {
-                    "list_articles",
-                    "read_article",
-                    "find_concept",
-                    "search_articles",
-                    "get_concept",
-                    "list_sources",
-                    "trace_lineage",
-                    "answer_question",
-                    "read_source_segment",
-                    "search_source_segments",
-                    "get_source_passages",
-                    "list_segments",
-                },
-                str(names),
-            )
+            check("tool list has 12 expected names (v0.4.0)",
+                  names == {
+                      "list_articles", "read_article", "find_concept",
+                      "search_articles", "get_concept", "list_sources",
+                      "trace_lineage", "answer_question",
+                      "read_source_segment", "search_source_segments",
+                      "get_source_passages", "list_segments",
+                  }, str(names))
 
             # ── no filter: visibility ──────────────────────────────────────
             res = await s.call_tool("list_articles", {})
@@ -367,56 +347,31 @@ async def suite_list_articles(vault: Path) -> None:
             check("list_articles no-filter: returns list", isinstance(articles, list))
             titles = [a["name"] for a in articles]
             check("list_articles: public article present", "Neural Networks" in titles, str(titles))
-            check(
-                "list_articles: private article absent", "Internal Notes" not in titles, str(titles)
-            )
-            check(
-                "list_articles: no-visibility article present (default=public)",
-                "Default Visibility" in titles,
-                str(titles),
-            )
+            check("list_articles: private article absent", "Internal Notes" not in titles, str(titles))
+            check("list_articles: no-visibility article present (default=public)",
+                  "Default Visibility" in titles, str(titles))
 
             # ── response item structure ────────────────────────────────────
             if articles:
                 item = next(a for a in articles if a["name"] == "Neural Networks")
                 for field in ("id", "name", "path", "tags"):
-                    check(
-                        f"list_articles item has '{field}' field",
-                        field in item,
-                        str(list(item.keys())),
-                    )
+                    check(f"list_articles item has '{field}' field", field in item, str(list(item.keys())))
                 # summary may be None for empty body, but key must exist
-                check(
-                    "list_articles item has 'summary' key",
-                    "summary" in item,
-                    str(list(item.keys())),
-                )
+                check("list_articles item has 'summary' key", "summary" in item, str(list(item.keys())))
                 check("list_articles item tags is a list", isinstance(item.get("tags"), list))
-                check(
-                    "list_articles item id is a non-empty string",
-                    isinstance(item.get("id"), str) and len(item["id"]) > 0,
-                )
+                check("list_articles item id is a non-empty string",
+                      isinstance(item.get("id"), str) and len(item["id"]) > 0)
 
             # ── tag filter ─────────────────────────────────────────────────
             res = await s.call_tool("list_articles", {"tag": "ml"})
             tagged = _sc(res, "result") or []
             tagged_titles = [a["name"] for a in tagged]
-            check(
-                "tag filter: 'ml' article present",
-                "Neural Networks" in tagged_titles,
-                str(tagged_titles),
-            )
-            check(
-                "tag filter: non-ml article absent",
-                "Default Visibility" not in tagged_titles,
-                str(tagged_titles),
-            )
+            check("tag filter: 'ml' article present", "Neural Networks" in tagged_titles, str(tagged_titles))
+            check("tag filter: non-ml article absent",
+                  "Default Visibility" not in tagged_titles, str(tagged_titles))
             check("tag filter: private article absent", "Internal Notes" not in tagged_titles)
-            check(
-                "tag filter: all results have the tag",
-                all("ml" in a["tags"] for a in tagged),
-                str(tagged),
-            )
+            check("tag filter: all results have the tag",
+                  all("ml" in a["tags"] for a in tagged), str(tagged))
 
             # ── tag filter: no match → empty list, not error ───────────────
             res = await s.call_tool("list_articles", {"tag": "xyznonexistent_tag_12345"})
@@ -427,16 +382,10 @@ async def suite_list_articles(vault: Path) -> None:
             res = await s.call_tool("list_articles", {"contains": "neural"})
             matched = _sc(res, "result") or []
             matched_titles = [a["name"] for a in matched]
-            check(
-                "contains filter: matching article present",
-                "Neural Networks" in matched_titles,
-                str(matched_titles),
-            )
-            check(
-                "contains filter: non-matching article absent",
-                "Default Visibility" not in matched_titles,
-                str(matched_titles),
-            )
+            check("contains filter: matching article present",
+                  "Neural Networks" in matched_titles, str(matched_titles))
+            check("contains filter: non-matching article absent",
+                  "Default Visibility" not in matched_titles, str(matched_titles))
 
             # ── contains filter: no match → empty list, not error ──────────
             res = await s.call_tool("list_articles", {"contains": "xyznothing_12345"})
@@ -457,38 +406,25 @@ async def suite_read_article(vault: Path) -> None:
             check("read_article success: not isError", not res.isError)
             art = _sc(res)
             for field in ("id", "name", "path", "body", "frontmatter"):
-                check(
-                    f"read_article response has '{field}'",
-                    art is not None and field in art,
-                    str(list(art.keys()) if art else None),
-                )
+                check(f"read_article response has '{field}'",
+                      art is not None and field in art, str(list(art.keys()) if art else None))
             if art:
-                check(
-                    "read_article name matches request",
-                    art["name"] == "Neural Networks",
-                    repr(art["name"]),
-                )
-                check("read_article body contains expected text", "weights" in art.get("body", ""))
-                check(
-                    "read_article frontmatter is a dict", isinstance(art.get("frontmatter"), dict)
-                )
-                check(
-                    "read_article frontmatter has visibility",
-                    "visibility" in art.get("frontmatter", {}),
-                    str(art.get("frontmatter", {}).keys()),
-                )
-                check(
-                    "read_article id is a non-empty string",
-                    isinstance(art.get("id"), str) and len(art["id"]) > 0,
-                )
+                check("read_article name matches request", art["name"] == "Neural Networks",
+                      repr(art["name"]))
+                check("read_article body contains expected text",
+                      "weights" in art.get("body", ""))
+                check("read_article frontmatter is a dict",
+                      isinstance(art.get("frontmatter"), dict))
+                check("read_article frontmatter has visibility",
+                      "visibility" in art.get("frontmatter", {}),
+                      str(art.get("frontmatter", {}).keys()))
+                check("read_article id is a non-empty string",
+                      isinstance(art.get("id"), str) and len(art["id"]) > 0)
 
             # ── case-insensitive lookup ────────────────────────────────────
             res_lower = await s.call_tool("read_article", {"name_or_id": "neural networks"})
-            check(
-                "read_article case-insensitive lookup works",
-                not res_lower.isError,
-                res_lower.content[0].text[:60] if res_lower.content else "empty",
-            )
+            check("read_article case-insensitive lookup works", not res_lower.isError,
+                  res_lower.content[0].text[:60] if res_lower.content else "empty")
 
             # ── private article: indistinguishable from nonexistent ────────
             res_priv = await s.call_tool("read_article", {"name_or_id": "Internal Notes"})
@@ -499,16 +435,12 @@ async def suite_read_article(vault: Path) -> None:
             # Both errors should use the same message template — no hint of existence
             priv_text = res_priv.content[0].text if res_priv.content else ""
             noex_text = res_noex.content[0].text if res_noex.content else ""
-            check(
-                "read_article private error: does not say 'private' or 'hidden'",
-                "private" not in priv_text.lower() and "hidden" not in priv_text.lower(),
-                repr(priv_text[:100]),
-            )
-            check(
-                "read_article private error format matches nonexistent format",
-                "No article:" in priv_text and "No article:" in noex_text,
-                f"priv={priv_text[:60]!r}  noex={noex_text[:60]!r}",
-            )
+            check("read_article private error: does not say 'private' or 'hidden'",
+                  "private" not in priv_text.lower() and "hidden" not in priv_text.lower(),
+                  repr(priv_text[:100]))
+            check("read_article private error format matches nonexistent format",
+                  "No article:" in priv_text and "No article:" in noex_text,
+                  f"priv={priv_text[:60]!r}  noex={noex_text[:60]!r}")
 
 
 async def suite_find_concept(vault: Path) -> None:
@@ -524,60 +456,44 @@ async def suite_find_concept(vault: Path) -> None:
             data = _sc(res, "result")
             check("find_concept first alias: non-null", data is not None, repr(data))
             if data:
-                check(
-                    "find_concept first alias: correct name",
-                    data.get("name") == "Neural Networks",
-                    repr(data.get("name")),
-                )
-                check(
-                    "find_concept first alias: canonical_article_id set",
-                    bool(data.get("canonical_article_id")),
-                    repr(data.get("canonical_article_id")),
-                )
+                check("find_concept first alias: correct name",
+                      data.get("name") == "Neural Networks", repr(data.get("name")))
+                check("find_concept first alias: canonical_article_id set",
+                      bool(data.get("canonical_article_id")), repr(data.get("canonical_article_id")))
                 aliases = data.get("aliases", [])
-                check(
-                    "find_concept: aliases list contains first alias", "NN" in aliases, str(aliases)
-                )
-                check(
-                    "find_concept: aliases list contains second alias",
-                    "neural net" in aliases,
-                    str(aliases),
-                )
+                check("find_concept: aliases list contains first alias",
+                      "NN" in aliases, str(aliases))
+                check("find_concept: aliases list contains second alias",
+                      "neural net" in aliases, str(aliases))
 
             # ── alias lookup (second alias) ────────────────────────────────
             res2 = await s.call_tool("find_concept", {"query": "neural net"})
             data2 = _sc(res2, "result")
             check("find_concept second alias: non-null", data2 is not None, repr(data2))
             if data2:
-                check(
-                    "find_concept second alias: same canonical name",
-                    data2.get("name") == "Neural Networks",
-                    repr(data2.get("name")),
-                )
+                check("find_concept second alias: same canonical name",
+                      data2.get("name") == "Neural Networks", repr(data2.get("name")))
 
             # ── canonical name lookup ──────────────────────────────────────
             res3 = await s.call_tool("find_concept", {"query": "Neural Networks"})
             data3 = _sc(res3, "result")
             check("find_concept canonical name: non-null", data3 is not None)
             if data3:
-                check(
-                    "find_concept canonical name: id matches alias lookup id",
-                    data3.get("canonical_article_id") == (data or {}).get("canonical_article_id"),
-                )
+                check("find_concept canonical name: id matches alias lookup id",
+                      data3.get("canonical_article_id") == (data or {}).get("canonical_article_id"))
 
             # ── unknown query → null ───────────────────────────────────────
             res4 = await s.call_tool("find_concept", {"query": "XYZ_totally_unknown_55555"})
             data4 = _sc(res4, "result")
-            check(
-                "find_concept unknown: null, not error",
-                data4 is None and not res4.isError,
-                f"data={repr(data4)} isError={res4.isError}",
-            )
+            check("find_concept unknown: null, not error",
+                  data4 is None and not res4.isError,
+                  f"data={repr(data4)} isError={res4.isError}")
 
             # ── concept with private canonical article → null ──────────────
             res5 = await s.call_tool("find_concept", {"query": "Internal Notes"})
             data5 = _sc(res5, "result")
-            check("find_concept private canonical article → null", data5 is None, repr(data5))
+            check("find_concept private canonical article → null",
+                  data5 is None, repr(data5))
 
 
 async def suite_exclude_tags(vault: Path) -> None:
@@ -593,11 +509,8 @@ async def suite_exclude_tags(vault: Path) -> None:
             articles = _sc(res, "result") or []
             titles = [a["name"] for a in articles]
             check("exclude_tags: open article visible", "Open Article" in titles, str(titles))
-            check(
-                "exclude_tags: secret-tagged article absent",
-                "Secret Article" not in titles,
-                str(titles),
-            )
+            check("exclude_tags: secret-tagged article absent",
+                  "Secret Article" not in titles, str(titles))
             check("exclude_tags: double-hidden absent", "Double Hidden" not in titles, str(titles))
 
             # ── list_articles tag="general": excluded article still absent ──
@@ -605,24 +518,15 @@ async def suite_exclude_tags(vault: Path) -> None:
             # by "general", the exclude_tags="secret" rule must still hide it.
             res_gen = await s.call_tool("list_articles", {"tag": "general"})
             gen_titles = [a["name"] for a in (_sc(res_gen, "result") or [])]
-            check(
-                "exclude_tags + tag filter: open article with 'general' tag present",
-                "Open Article" in gen_titles,
-                str(gen_titles),
-            )
-            check(
-                "exclude_tags + tag filter: secret article absent even with matching tag",
-                "Secret Article" not in gen_titles,
-                str(gen_titles),
-            )
+            check("exclude_tags + tag filter: open article with 'general' tag present",
+                  "Open Article" in gen_titles, str(gen_titles))
+            check("exclude_tags + tag filter: secret article absent even with matching tag",
+                  "Secret Article" not in gen_titles, str(gen_titles))
 
             # ── read_article: excluded article looks nonexistent ───────────
             res_sec = await s.call_tool("read_article", {"name_or_id": "Secret Article"})
-            check(
-                "exclude_tags: read_article on excluded → isError",
-                bool(res_sec.isError),
-                repr(res_sec.content[0].text[:80] if res_sec.content else "empty"),
-            )
+            check("exclude_tags: read_article on excluded → isError", bool(res_sec.isError),
+                  repr(res_sec.content[0].text[:80] if res_sec.content else "empty"))
 
             # ── read_article: non-excluded article works ───────────────────
             res_open = await s.call_tool("read_article", {"name_or_id": "Open Article"})
@@ -640,22 +544,16 @@ async def suite_default_visibility_private(vault: Path) -> None:
             res = await s.call_tool("list_articles", {})
             articles = _sc(res, "result") or []
             titles = [a["name"] for a in articles]
-            check(
-                "default=private: explicit public visible", "Explicit Public" in titles, str(titles)
-            )
-            check(
-                "default=private: no-visibility article hidden",
-                "No Visibility Field" not in titles,
-                str(titles),
-            )
-            check("default=private: list contains exactly 1 article", len(titles) == 1, str(titles))
+            check("default=private: explicit public visible", "Explicit Public" in titles, str(titles))
+            check("default=private: no-visibility article hidden",
+                  "No Visibility Field" not in titles, str(titles))
+            check("default=private: list contains exactly 1 article",
+                  len(titles) == 1, str(titles))
 
             # Verify read_article for the hidden article also returns an error
             res_hid = await s.call_tool("read_article", {"name_or_id": "No Visibility Field"})
-            check(
-                "default=private: read_article on no-visibility article → isError",
-                bool(res_hid.isError),
-            )
+            check("default=private: read_article on no-visibility article → isError",
+                  bool(res_hid.isError))
 
             # And the explicitly public one is readable
             res_pub = await s.call_tool("read_article", {"name_or_id": "Explicit Public"})
@@ -690,11 +588,8 @@ async def suite_audit(vault: Path) -> None:
     ).fetchall()
     con.close()
 
-    check(
-        "audit: 3 mcp_call rows (list + read_success + read_fail)",
-        len(rows) == 3,
-        f"got {len(rows)}",
-    )
+    check("audit: 3 mcp_call rows (list + read_success + read_fail)",
+          len(rows) == 3, f"got {len(rows)}")
 
     if len(rows) >= 3:
         tools_logged = [json.loads(r["metadata_json"])["tool"] for r in rows]
@@ -704,12 +599,11 @@ async def suite_audit(vault: Path) -> None:
         # First row: list_articles, success=1
         p0 = json.loads(rows[0]["metadata_json"])
         check("audit row 0: tool=list_articles", p0["tool"] == "list_articles", str(p0))
-        check("audit row 0: success=1", rows[0]["success"] == 1, f"got {rows[0]['success']!r}")
-        check(
-            "audit row 0: latency_ms ≥ 0",
-            isinstance(rows[0]["latency_ms"], int) and rows[0]["latency_ms"] >= 0,
-            str(rows[0]["latency_ms"]),
-        )
+        check("audit row 0: success=1", rows[0]["success"] == 1,
+              f"got {rows[0]['success']!r}")
+        check("audit row 0: latency_ms ≥ 0",
+              isinstance(rows[0]["latency_ms"], int) and rows[0]["latency_ms"] >= 0,
+              str(rows[0]["latency_ms"]))
 
         # Second row: read_article success
         p1 = json.loads(rows[1]["metadata_json"])
@@ -719,26 +613,20 @@ async def suite_audit(vault: Path) -> None:
         # Third row: read_article failure — success must be 0
         p2 = json.loads(rows[2]["metadata_json"])
         check("audit row 2: tool=read_article", p2["tool"] == "read_article", str(p2))
-        check(
-            "audit row 2: failed call logged with success=0",
-            rows[2]["success"] == 0,
-            f"got {rows[2]['success']!r}",
-        )
+        check("audit row 2: failed call logged with success=0",
+              rows[2]["success"] == 0, f"got {rows[2]['success']!r}")
 
         # All rows: string args are hashed; scalars (bool/int/float) pass through.
         # v0.3.0 change: _hash_args no longer hashes low-cardinality scalars.
         for i, row in enumerate(rows):
             payload = json.loads(row["metadata_json"])
-            check(
-                f"audit row {i}: args hashed or scalar",
-                all(
-                    v is None
-                    or isinstance(v, (bool, int, float))
-                    or (isinstance(v, str) and len(v) == 8)
-                    for v in payload.get("args", {}).values()
-                ),
-                str(payload.get("args")),
-            )
+            check(f"audit row {i}: args hashed or scalar",
+                  all(
+                      v is None
+                      or isinstance(v, (bool, int, float))
+                      or (isinstance(v, str) and len(v) == 8)
+                      for v in payload.get("args", {}).values()
+                  ), str(payload.get("args")))
 
 
 async def suite_audit_disabled(vault: Path) -> None:
@@ -763,7 +651,8 @@ async def suite_audit_disabled(vault: Path) -> None:
             "SELECT COUNT(*) AS n FROM metric_events WHERE event_type='mcp_call'"
         ).fetchone()
         con.close()
-        check("audit=false: zero mcp_call rows written", rows["n"] == 0, f"got {rows['n']} rows")
+        check("audit=false: zero mcp_call rows written", rows["n"] == 0,
+              f"got {rows['n']} rows")
     else:
         # No DB at all is also acceptable (no audit = no DB creation by server)
         check("audit=false: no state DB created by server (audit writes skipped)", True)
@@ -986,27 +875,26 @@ async def suite_verbatim_source_tools(vault: Path) -> None:
 # ── Suite registry ────────────────────────────────────────────────────────────
 
 _VAULT_FACTORIES = {
-    "main": make_main_vault,
+    "main":    make_main_vault,
     "exclude": make_exclude_tags_vault,
     "private": make_private_default_vault,
-    "audit": make_audit_vault,
+    "audit":   make_audit_vault,
     "verbatim": make_verbatim_vault,
 }
 
 SUITES: dict[str, tuple] = {
-    "list_articles": (suite_list_articles, "main"),
-    "read_article": (suite_read_article, "main"),
-    "find_concept": (suite_find_concept, "main"),
-    "exclude_tags": (suite_exclude_tags, "exclude"),
+    "list_articles":              (suite_list_articles,              "main"),
+    "read_article":               (suite_read_article,               "main"),
+    "find_concept":               (suite_find_concept,               "main"),
+    "exclude_tags":               (suite_exclude_tags,               "exclude"),
     "default_visibility_private": (suite_default_visibility_private, "private"),
-    "audit": (suite_audit, "audit"),
-    "audit_disabled": (suite_audit_disabled, "main"),
-    "verbatim_source_tools": (suite_verbatim_source_tools, "verbatim"),
+    "audit":                      (suite_audit,                      "audit"),
+    "audit_disabled":             (suite_audit_disabled,             "main"),
+    "verbatim_source_tools":      (suite_verbatim_source_tools,      "verbatim"),
 }
 
 
 # ── Runner ────────────────────────────────────────────────────────────────────
-
 
 async def _run(name: str, coro) -> None:
     """Run one suite with timeout, converting exceptions to FAIL checks."""
@@ -1039,7 +927,6 @@ async def run_all(suite_filter: str | None = None) -> None:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-
 def main() -> int:
     global _JSON_MODE
 
@@ -1048,14 +935,11 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "--json",
-        dest="json_out",
-        action="store_true",
+        "--json", dest="json_out", action="store_true",
         help="Print results as a single JSON object to stdout (suppresses streaming output).",
     )
     parser.add_argument(
-        "--suite",
-        metavar="NAME",
+        "--suite", metavar="NAME",
         help="Run a single named suite. Use 'list' to print available names.",
     )
     args = parser.parse_args()

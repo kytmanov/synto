@@ -2305,6 +2305,24 @@ class StateDB:
             (canonical_name, max_passages),
         ).fetchall()
 
+    def source_segments_fts_status(self) -> tuple[bool, int, int]:
+        """Return (fts_table_exists, fts_row_count, segment_row_count).
+
+        Used by `synto doctor` to surface FTS index drift. When the FTS
+        table is absent (vault below v16), fts_row_count is 0.
+        """
+        seg_count = self._conn.execute("SELECT count(*) FROM source_segments").fetchone()[0]
+        fts_exists = (
+            self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='source_segments_fts'"
+            ).fetchone()
+            is not None
+        )
+        if not fts_exists:
+            return (False, 0, seg_count)
+        fts_count = self._conn.execute("SELECT count(*) FROM source_segments_fts").fetchone()[0]
+        return (True, fts_count, seg_count)
+
     def fetch_segment_by_id(self, segment_id: str) -> sqlite3.Row | None:
         """Return source_segments row joined with source_documents.origin_uri, or None."""
         return self._conn.execute(
@@ -2373,12 +2391,6 @@ class StateDB:
                LIMIT ? OFFSET ?""",
             (source_id, limit, offset),
         ).fetchall()
-
-    def count_declared_licenses(self) -> int:
-        """Return the count of source_documents rows with a non-null license."""
-        return self._conn.execute(
-            "SELECT count(*) FROM source_documents WHERE license IS NOT NULL"
-        ).fetchone()[0]
 
     def upsert_source_document(self, doc: object) -> None:
         """Insert or replace a SourceDocument record."""
