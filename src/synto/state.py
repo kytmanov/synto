@@ -36,7 +36,7 @@ from pathlib import Path
 
 from .models import ItemMentionRecord, KnowledgeItemRecord, RawNoteRecord, WikiArticleRecord
 
-_CURRENT_SCHEMA_VERSION = 15
+_CURRENT_SCHEMA_VERSION = 16
 _CHECKPOINT_SCHEMA_VERSION = 2
 
 _CROCKFORD32_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
@@ -595,6 +595,7 @@ _VERSIONED_MIGRATIONS: dict[int, list[str]] = {
     ],
     14: [],  # all v14 work happens in the post-hook below for atomicity
     15: [],  # all v15 work happens in the post-hook below for atomicity
+    16: [],  # all v16 work happens in the post-hook below for atomicity
 }
 
 
@@ -769,6 +770,8 @@ class StateDB:
                 self._drop_zombie_v8_columns_v14()
             if version == 15:
                 self._apply_status_column_v15()
+            if version == 16:
+                self._create_source_segments_fts_v16()
             with self._tx():
                 self._conn.execute(
                     "INSERT OR REPLACE INTO schema_version (id, version) VALUES (1, ?)",
@@ -852,6 +855,57 @@ class StateDB:
                     "CASE WHEN is_draft = 1 THEN 'draft' ELSE 'published' END"
                 )
                 self._conn.execute("ALTER TABLE wiki_articles DROP COLUMN is_draft")
+
+    def _create_source_segments_fts_v16(self) -> None:
+        """Create FTS5 virtual table and sync triggers for source_segments.
+
+        External-content FTS5 (content='source_segments') keeps the index
+        small — only the indexed text column is stored in the FTS table;
+        other columns are joined back via rowid at query time.
+
+        Triggers maintain the FTS index for INSERT/UPDATE/DELETE after the
+        initial backfill. This covers every current and future extractor
+        automatically without touching extractor code.
+
+        Atomic via _tx(); idempotent via sqlite_master probe.
+        """
+        exists = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='source_segments_fts'"
+        ).fetchone()
+        if exists:
+            return
+        with self._tx():
+            self._conn.execute("""
+                CREATE VIRTUAL TABLE source_segments_fts USING fts5(
+                    text,
+                    content='source_segments',
+                    content_rowid='rowid'
+                )
+            """)
+            self._conn.execute("""
+                CREATE TRIGGER source_segments_fts_ai AFTER INSERT ON source_segments BEGIN
+                    INSERT INTO source_segments_fts(rowid, text) VALUES (new.rowid, new.text);
+                END
+            """)
+            self._conn.execute("""
+                CREATE TRIGGER source_segments_fts_ad AFTER DELETE ON source_segments BEGIN
+                    INSERT INTO source_segments_fts(source_segments_fts, rowid, text)
+                        VALUES ('delete', old.rowid, old.text);
+                END
+            """)
+            self._conn.execute("""
+                CREATE TRIGGER source_segments_fts_au AFTER UPDATE ON source_segments BEGIN
+                    INSERT INTO source_segments_fts(source_segments_fts, rowid, text)
+                        VALUES ('delete', old.rowid, old.text);
+                    INSERT INTO source_segments_fts(rowid, text) VALUES (new.rowid, new.text);
+                END
+            """)
+            # Backfill rows that existed before this migration ran.
+            # Triggers only fire for future writes; historical rows need explicit insert.
+            self._conn.execute("""
+                INSERT INTO source_segments_fts(rowid, text)
+                SELECT rowid, text FROM source_segments
+            """)
 
     def _validate_v6_tables(self) -> None:
         expected_ingest = {

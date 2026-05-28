@@ -92,7 +92,7 @@ def test_concept_occurrences_schema(tmp_path: Path) -> None:
 def test_current_schema_version_v13() -> None:
     from synto.state import _CURRENT_SCHEMA_VERSION
 
-    assert _CURRENT_SCHEMA_VERSION == 15
+    assert _CURRENT_SCHEMA_VERSION == 16
 
 
 # ---------------------------------------------------------------------------
