@@ -92,6 +92,14 @@ def _read_visible_article(reader: VaultReader, name_or_id: str, mcp_config: McpC
     return article
 
 
+def _license_allows(source_id: str, db: StateDB, mcp_config: McpConfig) -> bool:
+    """Return True if the source's license permits verbatim access under current policy.
+
+    Stub implementation — always permits. Replaced with the real gate in Stage 6.
+    """
+    return True
+
+
 def _ref_to_dict(ref: ArticleRef) -> dict[str, object]:
     return {
         "id": ref.id,
@@ -474,7 +482,63 @@ def build_tool_handlers(
                 mcp_config=config.mcp,
             )
 
-    return {
+    def read_source_segment(segment_id: str, max_chars: int | None = None) -> dict[str, object]:
+        """Fetch one verbatim paragraph by segment id.
+
+        Use when you already have a segment id from another tool and want the
+        exact source text. Returns the raw paragraph body as ingested, not a
+        synto-generated synthesis. Pass max_chars to cap the returned body size
+        (capped at 16000; default is unbounded for single-segment fetches).
+        """
+        started = time.monotonic()
+        success = False
+        arguments: dict[str, Any] = {"segment_id": segment_id, "max_chars": max_chars}
+        try:
+            assert db is not None
+            row = db._conn.execute(
+                """SELECT s.source_id, s.identity, s.ordinal, s.content_hash, s.text,
+                          d.origin_uri
+                   FROM source_segments s
+                   LEFT JOIN source_documents d ON d.id = s.source_id
+                   WHERE s.id = ?""",
+                (segment_id,),
+            ).fetchone()
+            if row is None:
+                raise tool_error_cls(f"unknown segment_id: {segment_id!r}")
+            if not _license_allows(row["source_id"], db, config.mcp):
+                raise tool_error_cls(
+                    f"source {row['source_id']!r} is restricted by license policy"
+                )
+            body: str = row["text"]
+            truncated = False
+            if max_chars is not None:
+                cap = min(max_chars, 16000)
+                if len(body) > cap:
+                    body = body[:cap] + "…"
+                    truncated = True
+            success = True
+            return {
+                "segment_id": segment_id,
+                "source_id": row["source_id"],
+                "identity": row["identity"],
+                "ordinal": row["ordinal"],
+                "content_hash": row["content_hash"],
+                "body": body,
+                "source_path": row["origin_uri"],
+                "truncated": truncated,
+            }
+        finally:
+            _audit(
+                db,
+                vault_id=vault_key,
+                tool="read_source_segment",
+                arguments=arguments,
+                success=success,
+                latency_ms=int((time.monotonic() - started) * 1000),
+                mcp_config=config.mcp,
+            )
+
+    handlers: dict[str, Callable[..., Any]] = {
         "list_articles": list_articles,
         "read_article": read_article,
         "find_concept": find_concept,
@@ -484,6 +548,9 @@ def build_tool_handlers(
         "trace_lineage": trace_lineage,
         "answer_question": answer_question,
     }
+    if db is not None:
+        handlers["read_source_segment"] = read_source_segment
+    return handlers
 
 
 def run_server(vault: Path, transport: str = "stdio") -> None:
@@ -503,7 +570,9 @@ def run_server(vault: Path, transport: str = "stdio") -> None:
 
     config = Config.from_vault(vault)
     reader = VaultReader(vault)
-    db = StateDB(config.state_db_path) if config.mcp.audit else None
+    # Always open db — new verbatim-source tools query it regardless of audit setting.
+    # _audit() still respects config.mcp.audit before writing any audit rows.
+    db = StateDB(config.state_db_path)
     server = FastMCP(
         _server_name(vault),
         instructions=_SERVER_INSTRUCTIONS,
@@ -517,8 +586,7 @@ def run_server(vault: Path, transport: str = "stdio") -> None:
     try:
         server.run(transport="stdio")
     finally:
-        if db is not None:
-            db.close()
+        db.close()
 
 
 async def run_server_async(vault: Path, transport: str = "stdio") -> None:

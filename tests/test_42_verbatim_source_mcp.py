@@ -14,6 +14,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from synto.config import Config, McpConfig
+from synto.readers import VaultReader
+from synto.serve import build_tool_handlers
 from synto.state import StateDB
 
 
@@ -155,3 +158,95 @@ def test_fts5_migration_idempotent(tmp_path: Path) -> None:
     db._create_source_segments_fts_v16()
     count = db._conn.execute("SELECT count(*) FROM source_segments_fts").fetchone()[0]
     assert count == 1
+
+
+# ── Shared fixture for handler tests ─────────────────────────────────────────
+
+
+@pytest.fixture
+def vault(tmp_path: Path) -> Path:
+    (tmp_path / "raw").mkdir()
+    (tmp_path / "wiki").mkdir()
+    (tmp_path / "wiki" / ".drafts").mkdir()
+    (tmp_path / "wiki" / "sources").mkdir()
+    (tmp_path / ".synto").mkdir()
+    return tmp_path
+
+
+def _make_handlers(vault: Path, db: StateDB):
+    """Build MCP handlers with a real StateDB (no audit)."""
+    config = Config(vault=vault, mcp=McpConfig(audit=False))
+    reader = VaultReader(vault)
+    return build_tool_handlers(reader, config, db, vault_key="test-vault")
+
+
+# ── Stage 2: read_source_segment ─────────────────────────────────────────────
+
+
+def test_read_source_segment_returns_body(vault: Path, tmp_path: Path) -> None:
+    """Valid segment_id returns the verbatim body."""
+    db = StateDB(vault / ".synto" / "state.db")
+    _insert_source(db, "book1")
+    _insert_segment(db, "book1:p:0:aa", "book1", "The quick brown fox.", ordinal=0)
+    handlers = _make_handlers(vault, db)
+    result = handlers["read_source_segment"]("book1:p:0:aa")
+    assert result["body"] == "The quick brown fox."
+    assert result["segment_id"] == "book1:p:0:aa"
+    assert result["source_id"] == "book1"
+    assert result["truncated"] is False
+
+
+def test_read_source_segment_unknown_id_raises(vault: Path) -> None:
+    """Unknown segment_id raises a tool error."""
+    db = StateDB(vault / ".synto" / "state.db")
+    handlers = _make_handlers(vault, db)
+    with pytest.raises(Exception, match="unknown segment_id"):
+        handlers["read_source_segment"]("nonexistent:id")
+
+
+def test_read_source_segment_truncation(vault: Path) -> None:
+    """max_chars truncates body and sets truncated=True."""
+    db = StateDB(vault / ".synto" / "state.db")
+    _insert_source(db, "book1")
+    _insert_segment(db, "book1:p:0:aa", "book1", "A" * 200, ordinal=0)
+    handlers = _make_handlers(vault, db)
+    result = handlers["read_source_segment"]("book1:p:0:aa", max_chars=50)
+    assert len(result["body"]) <= 51  # 50 chars + ellipsis
+    assert result["truncated"] is True
+
+
+def test_read_source_segment_max_chars_cap(vault: Path) -> None:
+    """max_chars is capped at 16000 even if caller passes higher."""
+    db = StateDB(vault / ".synto" / "state.db")
+    _insert_source(db, "book1")
+    _insert_segment(db, "book1:p:0:aa", "book1", "B" * 20000, ordinal=0)
+    handlers = _make_handlers(vault, db)
+    result = handlers["read_source_segment"]("book1:p:0:aa", max_chars=99999)
+    # Cap is 16000; body has 20000 chars → must be truncated
+    assert result["truncated"] is True
+    assert len(result["body"]) <= 16001
+
+
+def test_read_source_segment_source_path_from_origin_uri(vault: Path) -> None:
+    """source_path is populated from origin_uri; null origin_uri → null source_path."""
+    db = StateDB(vault / ".synto" / "state.db")
+    _insert_source(db, "book1")  # origin_uri = /raw/book1.pdf
+    _insert_segment(db, "book1:p:0:aa", "book1", "text", ordinal=0)
+    handlers = _make_handlers(vault, db)
+    result = handlers["read_source_segment"]("book1:p:0:aa")
+    assert result["source_path"] == "/raw/book1.pdf"
+
+    # Source with null origin_uri
+    db._conn.execute("INSERT INTO source_documents (id, source_type, redistribution) VALUES ('nouri', 'pdf', 'unknown')")
+    db._conn.commit()
+    _insert_segment(db, "nouri:p:0:aa", "nouri", "text2", ordinal=0)
+    result2 = handlers["read_source_segment"]("nouri:p:0:aa")
+    assert result2["source_path"] is None
+
+
+def test_read_source_segment_not_registered_without_db(vault: Path) -> None:
+    """read_source_segment is not registered when db=None."""
+    config = Config(vault=vault, mcp=McpConfig(audit=False))
+    reader = VaultReader(vault)
+    handlers = build_tool_handlers(reader, config, None, vault_key="test-vault")
+    assert "read_source_segment" not in handlers
