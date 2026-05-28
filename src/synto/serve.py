@@ -229,7 +229,9 @@ def _register_verbatim_source_handlers(
 
         Use when you already have a segment id from another tool and want the
         exact source text. Returns the raw paragraph body as ingested, not a
-        synto-generated synthesis. Pass max_chars to cap the returned body size
+        synto-generated synthesis. If you don't have a segment id yet, call
+        `search_source_segments` for a free-text query or `get_source_passages`
+        for a known concept first. Pass max_chars to cap the returned body size
         (capped at 16000; default is unbounded for single-segment fetches).
         """
         started = time.monotonic()
@@ -275,7 +277,8 @@ def _register_verbatim_source_handlers(
 
         Use when the user wants the source's own words, not a synto-generated
         synthesis. Returns ranked snippets with segment ids; fetch the full body
-        with read_source_segment. limit is capped at 50.
+        with read_source_segment. Returns snippets only; fetch the full body with
+        `read_source_segment`. limit is capped at 50.
         The response includes `hidden_by_policy` (count blocked by license gate) and
         `orphan_segments` (count whose source document is missing from the registry).
         """
@@ -320,6 +323,7 @@ def _register_verbatim_source_handlers(
                         "ordinal": r["ordinal"],
                         "snippet": r["snippet"],
                         "score": -r["rank"],  # BM25 is negative; flip so higher = better
+                        "body_length": r["body_length"],
                         "source_path": origin_uri,
                     }
                 )
@@ -348,6 +352,7 @@ def _register_verbatim_source_handlers(
         Use when you know which concept the user is asking about and want
         the source's own explanation, not a synto-generated synthesis.
         Results are ordered by extraction confidence then reading order.
+        For free-text questions instead of a known concept, use `search_source_segments`.
         Pass max_chars_per_passage to cap each paragraph (default 8000, max 16000).
         The response includes `hidden_by_policy` (count blocked by license gate) and
         `orphan_segments` (count whose source document is missing from the registry).
@@ -428,9 +433,8 @@ def _register_verbatim_source_handlers(
     def list_segments(source_id: str, limit: int = 200, offset: int = 0) -> dict[str, object]:
         """Enumerate a single source document's paragraphs in reading order.
 
-        Use for sequential exploration of a known document. Returns segment ids
-        and character lengths (not full bodies) — fetch individual bodies with
-        read_source_segment. limit is capped at 500.
+        Use for sequential exploration of a known document. Returns segment metadata
+        only — fetch individual bodies with `read_source_segment`. limit is capped at 500.
         """
         started = time.monotonic()
         success = False

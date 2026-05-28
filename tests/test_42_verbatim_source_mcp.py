@@ -893,3 +893,18 @@ def test_get_source_passages_max_chars_per_passage_param(vault: Path) -> None:
     result = handlers["get_source_passages"]("Big", max_chars_per_passage=50)
     assert result["results"][0]["truncated"] is True
     assert len(result["results"][0]["body"]) <= 51
+
+
+# ── Stage D: body_length in search results ───────────────────────────────────
+
+
+def test_search_includes_body_length(vault: Path) -> None:
+    """Each search result row exposes body_length so callers can size truncation."""
+    _clear_mode_cache()
+    db = StateDB(vault / ".synto" / "state.db")
+    _insert_source(db, "book1", license="CC-BY")
+    _insert_segment(db, "book1:p:0:aa", "book1", "alpha topic content here exactly", ordinal=0)
+    handlers = _make_handlers_with_default_gate(vault, db)
+    result = handlers["search_source_segments"]("alpha")
+    assert "body_length" in result["results"][0]
+    assert result["results"][0]["body_length"] == len("alpha topic content here exactly")

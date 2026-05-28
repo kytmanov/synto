@@ -2321,7 +2321,8 @@ class StateDB:
         return self._conn.execute(
             """SELECT s.id AS segment_id, s.source_id, s.ordinal,
                       snippet(source_segments_fts, 0, '', '', '…', 32) AS snippet,
-                      bm25(source_segments_fts) AS rank
+                      bm25(source_segments_fts) AS rank,
+                      length(s.text) AS body_length
                FROM source_segments_fts
                JOIN source_segments s ON s.rowid = source_segments_fts.rowid
                WHERE source_segments_fts MATCH ?
