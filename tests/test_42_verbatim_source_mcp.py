@@ -250,3 +250,74 @@ def test_read_source_segment_not_registered_without_db(vault: Path) -> None:
     reader = VaultReader(vault)
     handlers = build_tool_handlers(reader, config, None, vault_key="test-vault")
     assert "read_source_segment" not in handlers
+
+
+# ── Stage 3: search_source_segments ──────────────────────────────────────────
+
+
+def test_search_source_segments_bm25_ordering(vault: Path) -> None:
+    """Results are ordered by BM25 relevance (score = -rank, higher = better)."""
+    db = StateDB(vault / ".synto" / "state.db")
+    _insert_source(db, "book1")
+    # Segment with many occurrences of "quantum" should rank higher than one with one
+    _insert_segment(db, "book1:p:0:aa", "book1", "quantum quantum quantum mechanics quantum field", ordinal=0)
+    _insert_segment(db, "book1:p:1:bb", "book1", "classical mechanics has no quantum at all", ordinal=1)
+    handlers = _make_handlers(vault, db)
+    result = handlers["search_source_segments"]("quantum")
+    assert result["hidden_by_policy"] == 0
+    scores = [r["score"] for r in result["results"]]
+    assert scores == sorted(scores, reverse=True), "results not in descending score order"
+    assert result["results"][0]["segment_id"] == "book1:p:0:aa"
+
+
+def test_search_source_segments_empty_query_raises(vault: Path) -> None:
+    """Empty or whitespace-only query raises a tool error."""
+    db = StateDB(vault / ".synto" / "state.db")
+    handlers = _make_handlers(vault, db)
+    with pytest.raises(Exception, match="non-empty"):
+        handlers["search_source_segments"]("")
+    with pytest.raises(Exception, match="non-empty"):
+        handlers["search_source_segments"]("   ")
+
+
+def test_search_source_segments_limit_clamped(vault: Path) -> None:
+    """limit > 50 is silently clamped to 50."""
+    db = StateDB(vault / ".synto" / "state.db")
+    _insert_source(db, "book1")
+    for i in range(5):
+        _insert_segment(db, f"book1:p:{i}:aa", "book1", f"topic alpha segment {i}", ordinal=i)
+    handlers = _make_handlers(vault, db)
+    # limit=200 is silently clamped; should return all 5 matching segments
+    result = handlers["search_source_segments"]("alpha", limit=200)
+    assert len(result["results"]) == 5
+
+
+def test_search_source_segments_limit_zero_raises(vault: Path) -> None:
+    """limit=0 raises a tool error."""
+    db = StateDB(vault / ".synto" / "state.db")
+    handlers = _make_handlers(vault, db)
+    with pytest.raises(Exception):
+        handlers["search_source_segments"]("anything", limit=0)
+
+
+def test_search_source_segments_special_chars_in_query(vault: Path) -> None:
+    """Query containing FTS5 special characters (quotes, colons) does not raise."""
+    db = StateDB(vault / ".synto" / "state.db")
+    _insert_source(db, "book1")
+    _insert_segment(db, "book1:p:0:aa", "book1", "some regular content here", ordinal=0)
+    handlers = _make_handlers(vault, db)
+    # These would blow up FTS5 MATCH parsing if not sanitised
+    result = handlers["search_source_segments"]('"quoted"')
+    assert "results" in result
+    result2 = handlers["search_source_segments"]("field:value AND NOT OR")
+    assert "results" in result2
+
+
+def test_search_source_segments_returns_source_path(vault: Path) -> None:
+    """Each result row includes source_path from origin_uri."""
+    db = StateDB(vault / ".synto" / "state.db")
+    _insert_source(db, "book1")
+    _insert_segment(db, "book1:p:0:aa", "book1", "origin test content", ordinal=0)
+    handlers = _make_handlers(vault, db)
+    result = handlers["search_source_segments"]("origin")
+    assert result["results"][0]["source_path"] == "/raw/book1.pdf"

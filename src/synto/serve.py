@@ -538,6 +538,75 @@ def build_tool_handlers(
                 mcp_config=config.mcp,
             )
 
+    def search_source_segments(query: str, limit: int = 10) -> dict[str, object]:
+        """Full-text search (BM25) across raw source paragraphs.
+
+        Use when the user wants the source's own words, not a synto-generated
+        synthesis. Returns ranked snippets with segment ids; fetch the full body
+        with read_source_segment. limit is capped at 50.
+        """
+        started = time.monotonic()
+        success = False
+        arguments: dict[str, Any] = {"query": query, "limit": limit}
+        try:
+            assert db is not None
+            if not query or not query.strip():
+                raise tool_error_cls("query must be non-empty")
+            if limit < 1:
+                raise tool_error_cls("limit must be at least 1")
+            limit = min(limit, 50)
+            # Wrap in double-quotes to treat user input as a literal phrase.
+            # Internal double-quotes are doubled to escape them in FTS5 syntax.
+            match_arg = '"' + query.replace('"', '""') + '"'
+            rows = db._conn.execute(
+                """SELECT s.id AS segment_id, s.source_id, s.ordinal,
+                          snippet(source_segments_fts, 0, '', '', '…', 32) AS snippet,
+                          bm25(source_segments_fts) AS rank
+                   FROM source_segments_fts
+                   JOIN source_segments s ON s.rowid = source_segments_fts.rowid
+                   WHERE source_segments_fts MATCH ?
+                   ORDER BY rank
+                   LIMIT ?""",
+                (match_arg, limit),
+            ).fetchall()
+            # Batch fetch licenses and origin_uris for all distinct sources
+            source_ids = list({r["source_id"] for r in rows})
+            source_meta: dict[str, tuple[str | None, str | None]] = {}
+            if source_ids:
+                placeholders = ",".join("?" * len(source_ids))
+                for src in db._conn.execute(
+                    f"SELECT id, license, origin_uri FROM source_documents WHERE id IN ({placeholders})",
+                    source_ids,
+                ).fetchall():
+                    source_meta[src["id"]] = (src["license"], src["origin_uri"])
+            results = []
+            hidden = 0
+            for r in rows:
+                if not _license_allows(r["source_id"], db, config.mcp):
+                    hidden += 1
+                    continue
+                _license, origin_uri = source_meta.get(r["source_id"], (None, None))
+                results.append({
+                    "segment_id": r["segment_id"],
+                    "source_id": r["source_id"],
+                    "ordinal": r["ordinal"],
+                    "snippet": r["snippet"],
+                    "score": -r["rank"],  # BM25 is negative; flip so higher = better
+                    "source_path": origin_uri,
+                })
+            success = True
+            return {"results": results, "hidden_by_policy": hidden}
+        finally:
+            _audit(
+                db,
+                vault_id=vault_key,
+                tool="search_source_segments",
+                arguments=arguments,
+                success=success,
+                latency_ms=int((time.monotonic() - started) * 1000),
+                mcp_config=config.mcp,
+            )
+
     handlers: dict[str, Callable[..., Any]] = {
         "list_articles": list_articles,
         "read_article": read_article,
@@ -550,6 +619,7 @@ def build_tool_handlers(
     }
     if db is not None:
         handlers["read_source_segment"] = read_source_segment
+        handlers["search_source_segments"] = search_source_segments
     return handlers
 
 
