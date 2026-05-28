@@ -680,6 +680,64 @@ def build_tool_handlers(
                 mcp_config=config.mcp,
             )
 
+    def list_segments(
+        source_id: str, limit: int = 200, offset: int = 0
+    ) -> dict[str, object]:
+        """Enumerate a single source document's paragraphs in reading order.
+
+        Use for sequential exploration of a known document. Returns segment ids
+        and character lengths (not full bodies) — fetch individual bodies with
+        read_source_segment. limit is capped at 500.
+        """
+        started = time.monotonic()
+        success = False
+        arguments: dict[str, Any] = {"source_id": source_id, "limit": limit, "offset": offset}
+        try:
+            assert db is not None
+            limit = min(max(1, limit), 500)
+            offset = max(0, offset)
+            src = db._conn.execute(
+                "SELECT id, license FROM source_documents WHERE id = ?", (source_id,)
+            ).fetchone()
+            if src is None:
+                raise tool_error_cls(f"unknown source_id: {source_id!r}")
+            if not _license_allows(source_id, db, config.mcp):
+                raise tool_error_cls(
+                    f"source {source_id!r} is restricted by license policy"
+                )
+            total = db._conn.execute(
+                "SELECT count(*) FROM source_segments WHERE source_id = ?", (source_id,)
+            ).fetchone()[0]
+            rows = db._conn.execute(
+                """SELECT id, ordinal, length(text) AS length
+                   FROM source_segments
+                   WHERE source_id = ?
+                   ORDER BY ordinal
+                   LIMIT ? OFFSET ?""",
+                (source_id, limit, offset),
+            ).fetchall()
+            segments = [
+                {"segment_id": r["id"], "ordinal": r["ordinal"], "length": r["length"]}
+                for r in rows
+            ]
+            success = True
+            return {
+                "source_id": source_id,
+                "total": total,
+                "returned": len(segments),
+                "segments": segments,
+            }
+        finally:
+            _audit(
+                db,
+                vault_id=vault_key,
+                tool="list_segments",
+                arguments=arguments,
+                success=success,
+                latency_ms=int((time.monotonic() - started) * 1000),
+                mcp_config=config.mcp,
+            )
+
     handlers: dict[str, Callable[..., Any]] = {
         "list_articles": list_articles,
         "read_article": read_article,
@@ -694,6 +752,7 @@ def build_tool_handlers(
         handlers["read_source_segment"] = read_source_segment
         handlers["search_source_segments"] = search_source_segments
         handlers["get_source_passages"] = get_source_passages
+        handlers["list_segments"] = list_segments
     return handlers
 
 

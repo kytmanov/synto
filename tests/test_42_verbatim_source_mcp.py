@@ -417,3 +417,66 @@ def test_get_source_passages_truncation(vault: Path) -> None:
     result2 = handlers["get_source_passages"]("Big", max_chars=100)
     assert result2["results"][0]["truncated"] is True
     assert len(result2["results"][0]["body"]) <= 101
+
+
+# ── Stage 5: list_segments ────────────────────────────────────────────────────
+
+
+def test_list_segments_returns_ordered_segments(vault: Path) -> None:
+    """Returns segments in ordinal order with correct total and returned counts."""
+    db = StateDB(vault / ".synto" / "state.db")
+    _insert_source(db, "book1")
+    for i in range(5):
+        _insert_segment(db, f"book1:p:{i}:aa", "book1", f"paragraph {i}" * 10, ordinal=i)
+    handlers = _make_handlers(vault, db)
+    result = handlers["list_segments"]("book1")
+    assert result["total"] == 5
+    assert result["returned"] == 5
+    ordinals = [s["ordinal"] for s in result["segments"]]
+    assert ordinals == sorted(ordinals)
+    # Each segment has id, ordinal, length
+    assert all("segment_id" in s and "length" in s for s in result["segments"])
+
+
+def test_list_segments_pagination(vault: Path) -> None:
+    """limit and offset work correctly."""
+    db = StateDB(vault / ".synto" / "state.db")
+    _insert_source(db, "book1")
+    for i in range(10):
+        _insert_segment(db, f"book1:p:{i}:aa", "book1", f"text {i}", ordinal=i)
+    handlers = _make_handlers(vault, db)
+    result = handlers["list_segments"]("book1", limit=3, offset=2)
+    assert result["total"] == 10
+    assert result["returned"] == 3
+    assert result["segments"][0]["ordinal"] == 2
+
+
+def test_list_segments_unknown_source_raises(vault: Path) -> None:
+    """Unknown source_id raises a tool error."""
+    db = StateDB(vault / ".synto" / "state.db")
+    handlers = _make_handlers(vault, db)
+    with pytest.raises(Exception, match="unknown source_id"):
+        handlers["list_segments"]("does-not-exist")
+
+
+def test_list_segments_source_with_zero_segments(vault: Path) -> None:
+    """Source with no segments returns empty list without error."""
+    db = StateDB(vault / ".synto" / "state.db")
+    _insert_source(db, "empty-book")
+    handlers = _make_handlers(vault, db)
+    result = handlers["list_segments"]("empty-book")
+    assert result["total"] == 0
+    assert result["returned"] == 0
+    assert result["segments"] == []
+
+
+def test_list_segments_limit_clamped(vault: Path) -> None:
+    """limit > 500 is clamped to 500."""
+    db = StateDB(vault / ".synto" / "state.db")
+    _insert_source(db, "book1")
+    for i in range(5):
+        _insert_segment(db, f"book1:p:{i}:aa", "book1", f"text {i}", ordinal=i)
+    handlers = _make_handlers(vault, db)
+    # Passing limit=999 should not raise; returns all 5 segments
+    result = handlers["list_segments"]("book1", limit=999)
+    assert result["returned"] == 5
