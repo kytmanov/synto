@@ -16,6 +16,19 @@
   Apache-2.0, BSD-3-Clause, and public-domain.
 - SQLite FTS5 virtual table `source_segments_fts` with sync triggers and v16
   migration backfill.
+- `synto doctor --backlog [--since 1d|7d|30d|all]` (Feature 29 Stage 5) — an
+  opt-in MCP demand-vs-coverage report mined from the audit log: zero-result
+  queries, single-source concepts in active demand, repeat weak queries, and
+  per-session tool-mix (verbatim vs `answer_question`). Default `synto doctor`
+  output is unchanged.
+- MCP audit rows now record `result_count` and `resolved_label` inside
+  `metadata_json` (no schema change), so a successful zero-result call is
+  distinguishable from a call that raised.
+- New `[mcp] audit_detailed` option (default `false`). When `false`, query text
+  and resolved labels are stored as 8-char hashes, preserving the v0.3.0 privacy
+  posture. When `true`, the **raw user query text is written in plaintext to the
+  local state DB** so the backlog report can show literal queries — enable only
+  if storing query text locally is acceptable.
 
 ### Notes
 
