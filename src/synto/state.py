@@ -38,6 +38,7 @@ from .models import ItemMentionRecord, KnowledgeItemRecord, RawNoteRecord, WikiA
 
 _CURRENT_SCHEMA_VERSION = 16
 _CHECKPOINT_SCHEMA_VERSION = 2
+_SESSION_IDLE_GAP_SECONDS = 1800  # 30-min idle gap that splits MCP sessions in the backlog report
 
 _CROCKFORD32_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 
@@ -2541,7 +2542,16 @@ class StateDB:
         args_summary: dict[str, str | None],
         latency_ms: int,
         success: bool,
+        result_count: int | None = None,
+        resolved_label: str | None = None,
     ) -> None:
+        metadata: dict[str, object] = {"tool": tool, "args": args_summary}
+        # `result_count` must be embedded even when 0 (a zero-result call is the
+        # whole point of the backlog report); use `is not None`, not truthiness.
+        if result_count is not None:
+            metadata["result_count"] = result_count
+        if resolved_label is not None:
+            metadata["resolved_label"] = resolved_label
         self.insert_metric_event(
             ts=ts,
             vault_id=vault_id,
@@ -2552,8 +2562,171 @@ class StateDB:
             completion_tokens=None,
             latency_ms=latency_ms,
             success=success,
-            metadata_json=json.dumps({"tool": tool, "args": args_summary}, sort_keys=True),
+            metadata_json=json.dumps(metadata, sort_keys=True),
         )
+
+    def count_mcp_audit_rows_since(self, since_ts: str) -> int:
+        if not self._has_table("metric_events"):
+            return 0
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM metric_events WHERE event_type='mcp_call' AND ts >= ?",
+            (since_ts,),
+        ).fetchone()
+        return int(row[0])
+
+    def zero_result_query_counts(
+        self, since_ts: str, top_n: int = 20
+    ) -> list[tuple[str, str | None, int]]:
+        if not self._has_table("metric_events"):
+            return []
+        rows = self._conn.execute(
+            """
+            SELECT
+                json_extract(metadata_json,'$.tool') AS tool,
+                COALESCE(
+                    json_extract(metadata_json,'$.args.query'),
+                    json_extract(metadata_json,'$.args.concept_name')
+                ) AS label,
+                COUNT(*) AS cnt
+            FROM metric_events
+            WHERE event_type='mcp_call'
+              AND ts >= ?
+              AND success = 1
+              AND json_extract(metadata_json,'$.result_count') = 0
+              AND json_extract(metadata_json,'$.tool') IN (
+                    'find_concept','search_articles',
+                    'search_source_segments','get_source_passages'
+              )
+            GROUP BY tool, label
+            ORDER BY cnt DESC, label ASC, MIN(id) ASC
+            LIMIT ?
+            """,
+            (since_ts, top_n),
+        ).fetchall()
+        return [(r[0], r[1], int(r[2])) for r in rows]
+
+    def single_source_concepts_in_demand(self, since_ts: str) -> list[tuple[str, int, int]]:
+        if not self._has_table("metric_events"):
+            return []
+        if not self._has_table("concept_occurrences"):
+            return []
+        rows = self._conn.execute(
+            """
+            WITH single AS (
+                SELECT concept_name FROM concept_occurrences
+                GROUP BY concept_name HAVING COUNT(*) = 1
+            ),
+            demand AS (
+                SELECT json_extract(metadata_json,'$.resolved_label') AS label,
+                       COUNT(*) AS hits
+                FROM metric_events
+                WHERE event_type='mcp_call' AND ts >= ?
+                  AND json_extract(metadata_json,'$.tool') IN ('find_concept','get_source_passages')
+                  AND json_extract(metadata_json,'$.resolved_label') IS NOT NULL
+                GROUP BY label
+            )
+            SELECT s.concept_name, 1 AS occurrences, d.hits
+            FROM single s JOIN demand d ON d.label = s.concept_name
+            ORDER BY d.hits DESC, s.concept_name ASC
+            """,
+            (since_ts,),
+        ).fetchall()
+        return [(r[0], int(r[1]), int(r[2])) for r in rows]
+
+    def repeat_weak_queries(
+        self,
+        since_ts: str,
+        single_source_names: set[str],
+        min_hits: int = 2,
+    ) -> list[tuple[str | None, int, str]]:
+        if not self._has_table("metric_events"):
+            return []
+        # Avoid building an empty IN () which is invalid SQL.
+        if not single_source_names:
+            return []
+        placeholders = ",".join("?" * len(single_source_names))
+        params: list[object] = [
+            since_ts,
+            *sorted(single_source_names),
+            min_hits,
+        ]
+        rows = self._conn.execute(
+            f"""
+            SELECT
+                COALESCE(
+                    json_extract(metadata_json,'$.args.query'),
+                    json_extract(metadata_json,'$.args.concept_name')
+                ) AS label,
+                COUNT(*) AS hits,
+                json_extract(metadata_json,'$.resolved_label') AS target_concept
+            FROM metric_events
+            WHERE event_type='mcp_call' AND ts >= ?
+              AND json_extract(metadata_json,'$.tool') IN ('find_concept','get_source_passages')
+              AND json_extract(metadata_json,'$.resolved_label') IN ({placeholders})
+            GROUP BY label, target_concept
+            HAVING COUNT(*) >= ?
+            ORDER BY hits DESC, label ASC, MIN(id) ASC
+            """,
+            params,
+        ).fetchall()
+        return [(r[0], int(r[1]), r[2]) for r in rows]
+
+    def tool_mix_sessions(
+        self,
+        since_ts: str,
+        idle_gap_seconds: int = _SESSION_IDLE_GAP_SECONDS,
+        min_calls: int = 5,
+    ) -> list[tuple[int, int, int, int, int]]:
+        if not self._has_table("metric_events"):
+            return []
+        rows = self._conn.execute(
+            """
+            WITH base AS (
+                SELECT id, ts, COALESCE(vault_id, '_unknown_') AS part,
+                       json_extract(metadata_json,'$.tool') AS tool
+                FROM metric_events
+                WHERE event_type='mcp_call' AND ts >= ?
+            ),
+            lagged AS (
+                SELECT *,
+                    LAG(ts) OVER (PARTITION BY part ORDER BY ts, id) AS prev_ts
+                FROM base
+            ),
+            flagged AS (
+                SELECT *,
+                    CASE
+                        WHEN prev_ts IS NULL THEN 1
+                        WHEN (julianday(ts) - julianday(prev_ts)) * 86400.0 > ? THEN 1
+                        ELSE 0
+                    END AS is_new
+                FROM lagged
+            ),
+            sessioned AS (
+                SELECT *,
+                    SUM(is_new) OVER (PARTITION BY part ORDER BY ts, id
+                                      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS sess
+                FROM flagged
+            )
+            SELECT part, sess,
+                COUNT(*) AS total,
+                SUM(CASE WHEN tool IN (
+                    'read_source_segment','search_source_segments',
+                    'get_source_passages','list_segments'
+                ) THEN 1 ELSE 0 END) AS verbatim,
+                SUM(CASE WHEN tool = 'answer_question' THEN 1 ELSE 0 END) AS answer_question,
+                SUM(CASE WHEN tool NOT IN (
+                    'read_source_segment','search_source_segments',
+                    'get_source_passages','list_segments','answer_question'
+                ) THEN 1 ELSE 0 END) AS other
+            FROM sessioned
+            GROUP BY part, sess
+            HAVING COUNT(*) >= ?
+            ORDER BY part, sess
+            """,
+            (since_ts, idle_gap_seconds, min_calls),
+        ).fetchall()
+        # NULL vault rows are bucketed under '_unknown_', not dropped.
+        return [(sid, int(r[2]), int(r[3]), int(r[4]), int(r[5])) for sid, r in enumerate(rows)]
 
     def upsert_metric_rollup(
         self,

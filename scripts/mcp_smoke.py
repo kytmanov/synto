@@ -28,6 +28,7 @@ import asyncio
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -296,6 +297,66 @@ def make_verbatim_vault(tmp: Path) -> Path:
     db._conn.commit()
     db.close()
     return vault
+
+
+def make_audit_backlog_vault(tmp: Path, *, detailed: bool) -> Path:
+    """Vault for the F29 Stage 5 demand-vs-coverage backlog (`doctor --backlog`).
+
+    Combines a resolvable concept (published+public canonical article, so
+    find_concept hits and is visible) with a single CC-BY source segment linked
+    to that concept (so it counts as single-source and get_source_passages
+    returns a passage). audit is on; audit_detailed flips raw-vs-hashed storage.
+    """
+    from synto.state import StateDB
+
+    suffix = "detailed" if detailed else "hashed"
+    vault = tmp / f"audit_backlog_{suffix}_vault"
+    (vault / "wiki").mkdir(parents=True)
+    (vault / ".synto").mkdir()
+    (vault / "raw").mkdir()
+    (vault / "synto.toml").write_text(
+        _base_toml()
+        + f"\n[mcp]\naudit = true\naudit_detailed = {'true' if detailed else 'false'}\n"
+    )
+    (vault / "wiki" / "Neural Networks.md").write_text(
+        '---\ntitle: Neural Networks\ntags: ["ml"]\nvisibility: public\n---\n\n'
+        "Neural networks learn by adjusting weights through backpropagation.\n"
+    )
+
+    db = StateDB(vault / ".synto" / "state.db")
+    _insert(db, "wiki/Neural Networks.md", "Neural Networks")
+    db.upsert_concepts("raw/note.md", ["Neural Networks"])
+    db.upsert_aliases("Neural Networks", ["NN", "neural net"])
+
+    # CC-BY source + one segment, linked to the concept exactly once → single-source.
+    db._conn.execute(
+        "INSERT INTO source_documents"
+        " (id, source_type, origin_uri, title, imported_at, redistribution, license)"
+        " VALUES ('book1', 'pdf', '/raw/book1.pdf', 'Open Book',"
+        " '2024-01-01T00:00:00', 'unknown', 'CC-BY')"
+    )
+    db._conn.execute(
+        "INSERT INTO source_segments"
+        " (id, identity, ordinal, source_id, structural_locator, content_hash, text)"
+        " VALUES ('book1:p:0:aa', 'book1:p:0', 0, 'book1', 'p:0', 'h0',"
+        " 'Neural networks adjust weights through backpropagation.')"
+    )
+    db._conn.execute(
+        "INSERT INTO concept_occurrences"
+        " (concept_name, source_segment_id, ordinal, confidence)"
+        " VALUES ('Neural Networks', 'book1:p:0:aa', 0, 0.9)"
+    )
+    db._conn.commit()
+    db.close()
+    return vault
+
+
+def make_audit_backlog_detailed(tmp: Path) -> Path:
+    return make_audit_backlog_vault(tmp, detailed=True)
+
+
+def make_audit_backlog_hashed(tmp: Path) -> Path:
+    return make_audit_backlog_vault(tmp, detailed=False)
 
 
 # ── StdioServerParameters factory ────────────────────────────────────────────
@@ -872,6 +933,111 @@ async def suite_verbatim_source_tools(vault: Path) -> None:
             check("list_segments proprietary source: isError (policy)", bool(res_pol2.isError))
 
 
+def _is_hash8(value) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 8
+        and all(c in "0123456789abcdef" for c in value)
+    )
+
+
+async def _audit_backlog_body(vault: Path, *, detailed: bool) -> None:
+    """End-to-end F29 Stage 5: serve writes result_count/resolved_label, then
+    `doctor --backlog` reads them. Run once per audit_detailed mode."""
+    from mcp import ClientSession
+    from mcp.client.stdio import stdio_client
+
+    async with stdio_client(_params(vault)) as (r, w):
+        async with ClientSession(r, w) as s:
+            await s.initialize()
+            # 5 contiguous calls → one session of ≥5 calls for the tool-mix section.
+            await s.call_tool("find_concept", {"query": "Neural Networks"})  # hit, rc=1
+            await s.call_tool("find_concept", {"query": "Neural Networks"})  # hit again → repeat
+            await s.call_tool("find_concept", {"query": "XYZ_unknown_99999"})  # miss, rc=0
+            await s.call_tool("search_source_segments", {"query": "zzz_never_indexed_qqq"})  # rc=0
+            await s.call_tool("get_source_passages", {"concept_name": "Neural Networks"})  # rc≥1
+
+    time.sleep(0.5)  # let the serve child flush the DB
+
+    db_path = vault / ".synto" / "state.db"
+    check("audit_backlog: DB exists", db_path.exists())
+    if not db_path.exists():
+        return
+    con = sqlite3.connect(str(db_path))
+    con.row_factory = sqlite3.Row
+    rows = [
+        json.loads(r["metadata_json"])
+        for r in con.execute(
+            "SELECT metadata_json FROM metric_events WHERE event_type='mcp_call' ORDER BY id"
+        ).fetchall()
+    ]
+    con.close()
+
+    by_tool: dict[str, list[dict]] = {}
+    for meta in rows:
+        by_tool.setdefault(meta["tool"], []).append(meta)
+
+    # result_count threaded onto every collection-returning tool exercised here.
+    fc = by_tool.get("find_concept", [])
+    check("audit_backlog: 3 find_concept rows", len(fc) == 3, str(len(fc)))
+    fc_counts = sorted(m.get("result_count") for m in fc)
+    check("audit_backlog: find_concept result_count = [0,1,1]",
+          fc_counts == [0, 1, 1], str(fc_counts))
+
+    sss = by_tool.get("search_source_segments", [])
+    check("audit_backlog: search_source_segments zero-result rc=0",
+          bool(sss) and sss[0].get("result_count") == 0, str(sss))
+
+    gsp = by_tool.get("get_source_passages", [])
+    check("audit_backlog: get_source_passages rc≥1",
+          bool(gsp) and gsp[0].get("result_count", 0) >= 1, str(gsp))
+
+    # resolved_label: raw canonical name under detailed, 8-char hash under default.
+    labels = [m.get("resolved_label") for m in fc if m.get("result_count") == 1]
+    labels += [m.get("resolved_label") for m in gsp]
+    if detailed:
+        check("audit_backlog detailed: resolved_label is raw canonical name",
+              all(label == "Neural Networks" for label in labels), str(labels))
+    else:
+        check("audit_backlog hashed: resolved_label is 8-char hash",
+              all(_is_hash8(label) for label in labels), str(labels))
+
+    # ── doctor --backlog reads what serve wrote ──────────────────────────────
+    synto_bin = Path(sys.executable).parent / "synto"
+    proc = subprocess.run(
+        [str(synto_bin), "doctor", "--backlog", "--since", "all", "--vault", str(vault)],
+        capture_output=True, text=True,
+    )
+    check("doctor --backlog: exit 0", proc.returncode == 0, proc.stderr[-400:])
+    out = proc.stdout
+    check("doctor --backlog: header present", "MCP demand-vs-coverage (all time)" in out)
+    for section in (
+        "Zero-result queries",
+        "Single-source concepts in active demand",
+        "Repeat weak queries",
+        "Tool-mix per session",
+    ):
+        check(f"doctor --backlog: '{section}' section present", section in out, out[:600])
+    check("doctor --backlog: tool-mix session counted (≥5 calls)", "Sessions: 1" in out, out)
+
+    if detailed:
+        check("doctor --backlog detailed: raw concept name shown",
+              "Neural Networks" in out, out)
+        check("doctor --backlog detailed: no degradation footer",
+              "audit_detailed=true" not in out, out)
+    else:
+        check("doctor --backlog hashed: a <hash:8> label is shown",
+              "<" in out and ">" in out and "audit_detailed=true" in out, out)
+
+
+async def suite_audit_backlog_detailed(vault: Path) -> None:
+    await _audit_backlog_body(vault, detailed=True)
+
+
+async def suite_audit_backlog_hashed(vault: Path) -> None:
+    await _audit_backlog_body(vault, detailed=False)
+
+
 # ── Suite registry ────────────────────────────────────────────────────────────
 
 _VAULT_FACTORIES = {
@@ -880,6 +1046,8 @@ _VAULT_FACTORIES = {
     "private": make_private_default_vault,
     "audit":   make_audit_vault,
     "verbatim": make_verbatim_vault,
+    "audit_backlog_detailed": make_audit_backlog_detailed,
+    "audit_backlog_hashed":   make_audit_backlog_hashed,
 }
 
 SUITES: dict[str, tuple] = {
@@ -891,6 +1059,8 @@ SUITES: dict[str, tuple] = {
     "audit":                      (suite_audit,                      "audit"),
     "audit_disabled":             (suite_audit_disabled,             "main"),
     "verbatim_source_tools":      (suite_verbatim_source_tools,      "verbatim"),
+    "audit_backlog_detailed":     (suite_audit_backlog_detailed,     "audit_backlog_detailed"),
+    "audit_backlog_hashed":       (suite_audit_backlog_hashed,       "audit_backlog_hashed"),
 }
 
 

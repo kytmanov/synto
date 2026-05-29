@@ -56,6 +56,26 @@ def _hash_args(arguments: dict[str, Any]) -> dict[str, Any]:
     return safe
 
 
+def _raw_args(arguments: dict[str, Any]) -> dict[str, Any]:
+    # Detailed-audit counterpart to _hash_args: keep low-cardinality primitives
+    # as-is, store strings/lists/dicts as their raw stringified value instead of
+    # an 8-char hash. Opt-in via mcp.audit_detailed; trades the v0.4.0 privacy
+    # guarantee for raw query text in `synto doctor --backlog`.
+    safe: dict[str, Any] = {}
+    for key, value in arguments.items():
+        if value is None or isinstance(value, (bool, int, float)):
+            safe[key] = value
+        elif isinstance(value, str):
+            safe[key] = value
+        else:
+            safe[key] = str(value)
+    return safe
+
+
+def _hash8(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+
+
 def _tags_from_frontmatter(frontmatter: dict[str, object]) -> set[str]:
     tags = frontmatter.get("tags", [])
     if not isinstance(tags, list):
@@ -181,17 +201,27 @@ def _audit(
     success: bool,
     latency_ms: int,
     mcp_config: McpConfig,
+    result_count: int | None = None,
+    resolved_label: str | None = None,
 ) -> None:
     if db is None or not mcp_config.audit:
         return
+    if mcp_config.audit_detailed:
+        args_summary = _raw_args(arguments)
+        label = resolved_label
+    else:
+        args_summary = _hash_args(arguments)
+        label = _hash8(resolved_label) if resolved_label is not None else None
     try:
         db.insert_mcp_audit_event(
             ts=datetime.now(UTC).isoformat(),
             vault_id=vault_id,
             tool=tool,
-            args_summary=_hash_args(arguments),
+            args_summary=args_summary,
             latency_ms=latency_ms,
             success=success,
+            result_count=result_count,
+            resolved_label=label,
         )
     except Exception as exc:  # noqa: BLE001
         log.warning("mcp audit failed: %s", exc)
@@ -283,6 +313,7 @@ def _register_verbatim_source_handlers(
         """
         started = time.monotonic()
         success = False
+        result_count: int | None = None
         arguments: dict[str, Any] = {"query": query, "limit": limit}
         try:
             cleaned = query.strip().strip('"').strip() if query else ""
@@ -326,6 +357,7 @@ def _register_verbatim_source_handlers(
                         "source_path": origin_uri,
                     }
                 )
+            result_count = len(results)
             success = True
             return {
                 "results": results,
@@ -341,6 +373,7 @@ def _register_verbatim_source_handlers(
                 success=success,
                 latency_ms=int((time.monotonic() - started) * 1000),
                 mcp_config=config.mcp,
+                result_count=result_count,
             )
 
     def get_source_passages(
@@ -358,6 +391,8 @@ def _register_verbatim_source_handlers(
         """
         started = time.monotonic()
         success = False
+        result_count: int | None = None
+        resolved_label: str | None = None
         arguments: dict[str, Any] = {
             "concept_name": concept_name,
             "max_passages": max_passages,
@@ -369,9 +404,11 @@ def _register_verbatim_source_handlers(
             max_passages = max(1, max_passages)
             resolved = db.find_concept_by_name_or_alias(concept_name)
             if resolved is None:
+                result_count = 0
                 success = True
                 return {"results": [], "hidden_by_policy": 0, "orphan_segments": 0}
             canonical, _aliases = resolved
+            resolved_label = canonical
             rows = db.select_passages_for_concept(canonical, max_passages)
             # select_passages_for_concept already JOINs source_documents and returns
             # origin_uri, license, and doc_id — no separate batch fetch needed.
@@ -412,6 +449,7 @@ def _register_verbatim_source_handlers(
                         "truncated": truncated,
                     }
                 )
+            result_count = len(results)
             success = True
             return {
                 "results": results,
@@ -427,6 +465,8 @@ def _register_verbatim_source_handlers(
                 success=success,
                 latency_ms=int((time.monotonic() - started) * 1000),
                 mcp_config=config.mcp,
+                result_count=result_count,
+                resolved_label=resolved_label,
             )
 
     def list_segments(source_id: str, limit: int = 200, offset: int = 0) -> dict[str, object]:
@@ -437,6 +477,7 @@ def _register_verbatim_source_handlers(
         """
         started = time.monotonic()
         success = False
+        result_count: int | None = None
         arguments: dict[str, Any] = {"source_id": source_id, "limit": limit, "offset": offset}
         try:
             limit = min(max(1, limit), 500)
@@ -451,6 +492,7 @@ def _register_verbatim_source_handlers(
                 {"segment_id": r["id"], "ordinal": r["ordinal"], "length": r["length"]}
                 for r in rows
             ]
+            result_count = len(segments)
             success = True
             return {
                 "source_id": source_id,
@@ -467,6 +509,7 @@ def _register_verbatim_source_handlers(
                 success=success,
                 latency_ms=int((time.monotonic() - started) * 1000),
                 mcp_config=config.mcp,
+                result_count=result_count,
             )
 
     handlers["read_source_segment"] = read_source_segment
@@ -500,6 +543,7 @@ def build_tool_handlers(
     ) -> list[dict[str, object]]:
         started = time.monotonic()
         success = False
+        result_count: int | None = None
         arguments = {
             "tag": tag,
             "contains": contains,
@@ -518,6 +562,7 @@ def build_tool_handlers(
                 )
             )
             visible = _filter_visible_refs(reader, refs, config.mcp)
+            result_count = len(visible)
             success = True
             return [_ref_to_dict(ref) for ref in visible]
         finally:
@@ -529,6 +574,7 @@ def build_tool_handlers(
                 success=success,
                 latency_ms=int((time.monotonic() - started) * 1000),
                 mcp_config=config.mcp,
+                result_count=result_count,
             )
 
     def read_article(name_or_id: str) -> dict[str, object]:
@@ -562,17 +608,23 @@ def build_tool_handlers(
     def find_concept(query: str) -> dict[str, object] | None:
         started = time.monotonic()
         success = False
+        result_count: int | None = None
+        resolved_label: str | None = None
         arguments = {"query": query}
         try:
             concept = reader.find_concept(query)
             if concept is None or not concept.canonical_article_id:
+                result_count = 0
                 success = True
                 return None
             try:
                 _read_visible_article(reader, concept.canonical_article_id, config.mcp)
             except ArticleNotFound:
+                result_count = 0
                 success = True
                 return None
+            result_count = 1
+            resolved_label = concept.name
             success = True
             return {
                 "name": concept.name,
@@ -588,6 +640,8 @@ def build_tool_handlers(
                 success=success,
                 latency_ms=int((time.monotonic() - started) * 1000),
                 mcp_config=config.mcp,
+                result_count=result_count,
+                resolved_label=resolved_label,
             )
 
     def search_articles(
@@ -605,6 +659,7 @@ def build_tool_handlers(
         """
         started = time.monotonic()
         success = False
+        result_count: int | None = None
         arguments = {
             "query": query,
             "limit": limit,
@@ -614,6 +669,7 @@ def build_tool_handlers(
         }
         try:
             if not query:
+                result_count = 0
                 success = True
                 return []
             capped_limit = max(0, min(int(limit), _SEARCH_LIMIT_CAP))
@@ -641,12 +697,13 @@ def build_tool_handlers(
             visible_ids = {r.id for r in visible_refs}
             scored_visible = [(s, r) for s, r in scored_candidates if r.id in visible_ids]
             scored_visible.sort(key=lambda item: item[0], reverse=True)
-            success = True
             results: list[dict[str, object]] = []
             for score, ref in scored_visible[:capped_limit]:
                 payload = _ref_to_dict(ref)
                 payload["score"] = score
                 results.append(payload)
+            result_count = len(results)
+            success = True
             return results
         finally:
             _audit(
@@ -657,6 +714,7 @@ def build_tool_handlers(
                 success=success,
                 latency_ms=int((time.monotonic() - started) * 1000),
                 mcp_config=config.mcp,
+                result_count=result_count,
             )
 
     def get_concept(name: str) -> dict[str, object]:
