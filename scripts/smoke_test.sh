@@ -1645,6 +1645,20 @@ soft_check "doctor output contains Vault structure section" \
     "grep -q 'Vault structure' \"$_TMP\""
 rm -f "$_TMP"
 
+# ── synto doctor --backlog (MCP demand-vs-coverage, empty-window path) ─────────
+header "synto doctor --backlog"
+_BL_RC=0
+BL_OUT=$($OLW doctor --backlog --since=7d 2>&1) || _BL_RC=$?
+echo "$BL_OUT"
+check "doctor --backlog exits 0" "test $_BL_RC -eq 0"
+_BL_TMP=$(mktemp); echo "$BL_OUT" > "$_BL_TMP"
+soft_check "doctor --backlog renders the demand-vs-coverage section" \
+    "grep -q 'MCP demand-vs-coverage' \"$_BL_TMP\""
+# This vault sees no MCP traffic in the run → exercises the empty-window branch.
+soft_check "doctor --backlog reports no MCP activity on a quiet vault" \
+    "grep -q 'no MCP activity' \"$_BL_TMP\""
+rm -f "$_BL_TMP"
+
 # ── synto config inline-source-citations ──────────────────────────────────────
 header "synto config inline-source-citations"
 _CISC_RC=0
