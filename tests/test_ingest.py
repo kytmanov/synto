@@ -1197,12 +1197,26 @@ def test_merge_summary_from_first_chunk():
     assert merged.summary == "First summary."
 
 
-def test_merge_quality_is_minimum():
-    r1 = _make_result(["A"], quality="high")
-    r2 = _make_result(["B"], quality="low")
-    r3 = _make_result(["C"], quality="medium")
-    merged = _merge_chunk_results([r1, r2, r3])
-    assert merged.quality == "low"
+def test_merge_quality_is_most_common_not_minimum():
+    """Quality is the most common rating, not the conservative min.
+
+    Why it matters: with segment-aligned chunking a single thin/peripheral section
+    (title page, references) rates low and, under the old min, dragged a mostly-high
+    paper down to low — which the quality cap then used to halve the concept count.
+    A paper whose substantive majority is high should rate high.
+    """
+    # Substantive majority high, one peripheral low section → high (not low).
+    highs = [_make_result([c], quality="high") for c in ["A", "B", "C"]]
+    low = _make_result(["D"], quality="low")
+    assert _merge_chunk_results([*highs, low]).quality == "high"
+
+    # Genuine majority low → low.
+    lows = [_make_result([c], quality="low") for c in ["A", "B"]]
+    assert _merge_chunk_results([*lows, _make_result(["C"], quality="high")]).quality == "low"
+
+    # Tie → broken toward the higher rank.
+    tie = [_make_result(["A"], quality="high"), _make_result(["B"], quality="medium")]
+    assert _merge_chunk_results(tie).quality == "high"
 
 
 def test_merge_unions_topics():

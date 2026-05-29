@@ -200,8 +200,10 @@ def _merge_chunk_results(results: list[AnalysisResult]) -> AnalysisResult:
     Concepts and topics: union (deduplicated, insertion order preserved).
     Aliases for the same concept are merged across chunks.
     Summary: first chunk's (intro is most representative).
-    Quality: minimum across chunks (conservative).
+    Quality: most common rating across chunks (ties broken toward the higher rank).
     """
+    from collections import Counter
+
     if len(results) == 1:
         return results[0]
 
@@ -243,8 +245,18 @@ def _merge_chunk_results(results: list[AnalysisResult]) -> AnalysisResult:
                 seen_refs.add(key)
                 all_named_references.append(ref)
 
+    # Most common quality across chunks, ties broken toward the higher rank. (Was a
+    # conservative min, but with segment-aligned chunks a single thin or peripheral section
+    # — title page, references — would drag the whole note down and, via the quality cap in
+    # ingest_note, halve the extracted concept count. The note's quality should reflect its
+    # substantive majority, not its weakest section.)
     quality_rank = {"high": 2, "medium": 1, "low": 0}
-    min_result = min(results, key=lambda r: quality_rank.get(r.quality, 1))
+    quality_counts = Counter(r.quality for r in results if r.quality)
+    merged_quality = (
+        max(quality_counts, key=lambda q: (quality_counts[q], quality_rank.get(q, 1)))
+        if quality_counts
+        else "medium"
+    )
 
     merged_language = next((r.language for r in results if r.language), None)
 
@@ -253,7 +265,7 @@ def _merge_chunk_results(results: list[AnalysisResult]) -> AnalysisResult:
         concepts=all_concepts,
         suggested_topics=all_topics[:5],
         named_references=all_named_references[:8],
-        quality=min_result.quality,
+        quality=merged_quality,
         language=merged_language,
     )
 
@@ -1328,7 +1340,13 @@ def ingest_note(
     chunk_units: list[tuple[str, list[str]]] | None = None
     chunk_attribution: dict[int, list[str]] | None = None
     if source_segments:
-        chunk_units = _build_segment_units(source_segments, config.effective_provider.fast_ctx // 2)
+        # Pack segments into chapter-sized analysis units. fast_ctx is in TOKENS; a target of
+        # ~1.5x fast_ctx CHARS (~0.4x fast_ctx tokens of input) keeps each call well within
+        # context while grouping whole sections, so thin/peripheral segments (title page,
+        # references) aren't analyzed in isolation — which would rate medium/low and, via the
+        # min-quality aggregation + quality cap, halve the extracted concept count.
+        unit_target = max(config.effective_provider.fast_ctx * 3 // 2, 4096)
+        chunk_units = _build_segment_units(source_segments, unit_target)
         chunk_attribution = {}
     try:
         result: AnalysisResult = _analyze_body_with_checkpoints(
