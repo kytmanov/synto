@@ -171,6 +171,49 @@ def test_fts5_migration_idempotent(tmp_path: Path) -> None:
     assert count == 1
 
 
+def test_fts5_migration_skipped_when_unavailable(tmp_path: Path, monkeypatch) -> None:
+    """On a SQLite build without FTS5 the v16 migration skips the index, but the schema
+    still advances to v16 and core (non-MCP) operations keep working.
+
+    This is the release-blocker guard: a local-only user whose SQLite lacks FTS5 must
+    never be bricked by a verbatim-search feature they don't use. Without the guard the
+    CREATE VIRTUAL TABLE would raise on every StateDB open and break every command.
+    """
+    monkeypatch.setattr("synto.state._fts5_available", lambda conn: False)
+    db = StateDB(tmp_path / "state.db")
+
+    version = db._conn.execute("SELECT version FROM schema_version WHERE id = 1").fetchone()[0]
+    assert version == 16, "schema must still advance even when FTS5 is unavailable"
+    assert not db.source_segments_fts_exists(), "FTS table must not be created without FTS5"
+    trigger_count = db._conn.execute(
+        "SELECT count(*) FROM sqlite_master"
+        " WHERE type='trigger' AND name LIKE 'source_segments_fts_%'"
+    ).fetchone()[0]
+    assert trigger_count == 0, "FTS sync triggers must not be created without FTS5"
+
+    # Core operations still work end-to-end — the user is not bricked.
+    _insert_source(db, "src1")
+    _insert_segment(db, "src1:p:0:aa", "src1", "still works without fts5")
+    assert db.count_source_segments() == 1
+
+
+def test_verbatim_tools_degrade_gracefully_without_fts5(vault: Path, monkeypatch) -> None:
+    """Without FTS5, search_source_segments errors clearly while the concept- and
+    id-keyed tools (which query source_segments directly) keep working."""
+    monkeypatch.setattr("synto.state._fts5_available", lambda conn: False)
+    db = StateDB(vault / ".synto" / "state.db")
+    _insert_source(db, "book1")
+    _insert_segment(db, "book1:p:0:aa", "book1", "The quick brown fox.", ordinal=0)
+    handlers = _make_handlers(vault, db)
+
+    with pytest.raises(Exception, match="FTS5"):
+        handlers["search_source_segments"]("fox")
+
+    # read_source_segment does not touch the FTS index → still works.
+    result = handlers["read_source_segment"]("book1:p:0:aa")
+    assert result["body"] == "The quick brown fox."
+
+
 # ── Shared fixture for handler tests ─────────────────────────────────────────
 
 

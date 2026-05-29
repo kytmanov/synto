@@ -170,17 +170,38 @@ Use them when you want the source's own words, not a synto-generated synthesis.
 - `list_segments(source_id, limit=200, offset=0)` — enumerate a source's segments
   in reading order.
 
-Access is governed by `[mcp.source_access]` in `synto.toml`:
+#### Privacy and source access
+
+Raw-paragraph access is governed by `[mcp.source_access]` in `synto.toml`:
 
 ```toml
 [mcp.source_access]
-mode = "permissive_only"  # or "all" | "deny"
+mode = "permissive_only"  # "all" returns every segment; "deny" disables raw-passage tools
 permissive_licenses = ["CC-BY", "CC-BY-SA", "MIT", "Apache-2.0", "BSD-3-Clause", "public-domain"]
 ```
 
-Vaults upgraded from v0.3.0 with no declared licenses are treated as `"all"`
-for one session so the upgrade is seamless. Once any source has a license set,
-restart `synto serve` to engage the configured mode.
+- **`permissive_only`** (default) — only sources whose `license` is in
+  `permissive_licenses` return raw text; everything else is hidden.
+- **`all`** — every segment is returned. Use for a private personal vault where you
+  trust the connected MCP client.
+- **`deny`** — the four verbatim tools refuse all raw passages.
+
+**Legacy-vault behavior (important).** A vault with no declared license on any source
+cannot return anything under `permissive_only`, so to keep the feature working `synto`
+treats such vaults as `"all"` until you declare a license or set `mode` explicitly. That
+means **all raw source text is readable by any connected MCP client.** This is surfaced as
+a WARNING at `synto serve` startup and in `synto doctor`. If your vault holds private or
+copyrighted material, declare licenses on your sources or set `mode` explicitly, then
+restart `serve`.
+
+**Audit detail.** `[mcp] audit_detailed` (default `false`) keeps query text and resolved
+labels as 8-char hashes in the local state DB. Set it to `true` only if you want the
+`synto doctor --backlog` report to show literal query text — it writes raw queries to the
+DB. The backlog report works either way.
+
+**SQLite without FTS5.** If your SQLite build lacks the FTS5 module, the search index is
+skipped on upgrade (with a warning) and only `search_source_segments` is unavailable; the
+other three verbatim tools and every other command keep working.
 
 **Self-maintenance.** `synto maintain` repairs broken wikilinks and creates stubs for missing targets. `synto lint` reports orphans, stale articles, and missing frontmatter.
 

@@ -2141,7 +2141,14 @@ def doctor(vault_str, backlog, since):
     console.print("\n[bold]Verbatim source index[/bold]")
     try:
         fts_exists, fts_count, seg_count = db.source_segments_fts_status()
-        if not fts_exists:
+        if not fts_exists and not db.fts5_available():
+            # v16 migration skipped the index because this SQLite build lacks FTS5.
+            # search_source_segments is disabled; the other verbatim tools still work.
+            console.print(
+                "  [yellow]![/yellow] FTS5 not available in this SQLite build —"
+                " full-text search disabled (other verbatim tools work)"
+            )
+        elif not fts_exists:
             console.print(
                 "  [yellow]![/yellow] source_segments_fts not present"
                 " (vault below v16 — run any synto command to migrate)"
@@ -2155,6 +2162,22 @@ def doctor(vault_str, backlog, since):
             ok = False
     except Exception as exc:  # pragma: no cover — defensive
         console.print(f"  [yellow]![/yellow] could not read FTS index status: {exc}")
+
+    # ── MCP source-access posture ─────────────────────────────────────────────
+    # Surfaces the effective privacy gate so the legacy-vault grandfather (which
+    # exposes all raw source text over MCP) is never silent. See serve.py.
+    sa = config.mcp.source_access
+    if sa.mode == "permissive_only" and not db.any_source_license_declared():
+        console.print(
+            '  [yellow]![/yellow] source-access mode: "permissive_only" configured,'
+            ' but no source declares a license → effective "all".'
+        )
+        console.print(
+            "      [dim]All raw source text is readable by MCP clients. Declare licenses on"
+            " sources, or set [mcp.source_access] mode explicitly in synto.toml.[/dim]"
+        )
+    else:
+        console.print(f'  source-access mode: "{sa.mode}"')
 
     # ── MCP demand-vs-coverage backlog (opt-in via --backlog) ────────────────
     if backlog:

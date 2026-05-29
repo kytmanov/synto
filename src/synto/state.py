@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 import time
 import uuid
@@ -35,6 +36,37 @@ from datetime import date, datetime
 from pathlib import Path
 
 from .models import ItemMentionRecord, KnowledgeItemRecord, RawNoteRecord, WikiArticleRecord
+
+log = logging.getLogger(__name__)
+
+
+def _hash8(value: str) -> str:
+    """8-char SHA256 prefix used for hashed MCP audit labels.
+
+    Single source of truth: serve._audit() writes resolved labels through this
+    when audit_detailed is off, and the backlog report matches against it. The
+    two must stay identical, so serve.py imports this rather than redefining it.
+    """
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+
+
+def _fts5_available(conn: sqlite3.Connection) -> bool:
+    """True if this SQLite build supports FTS5.
+
+    Probes with a throwaway temp virtual table — the only reliable check that
+    also catches FTS5 loaded as a runtime extension (PRAGMA compile_options
+    misses that case). Side-effect-free: the probe table lives in the
+    connection-scoped temp schema and is dropped immediately. DDL runs in
+    autocommit under sqlite3's default isolation, so this never opens or
+    disturbs a transaction.
+    """
+    try:
+        conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS temp.__synto_fts5_probe USING fts5(x)")
+        conn.execute("DROP TABLE IF EXISTS temp.__synto_fts5_probe")
+        return True
+    except sqlite3.OperationalError:
+        return False
+
 
 _CURRENT_SCHEMA_VERSION = 16
 _CHECKPOINT_SCHEMA_VERSION = 2
@@ -868,12 +900,25 @@ class StateDB:
         initial backfill. This covers every current and future extractor
         automatically without touching extractor code.
 
+        Skips gracefully on SQLite builds without FTS5: the table/triggers are
+        not created and the migration still returns normally so the schema
+        version advances and every non-MCP command keeps working. Only
+        `search_source_segments` is unavailable in that case — the other three
+        verbatim tools query source_segments directly and are unaffected.
+
         Atomic via _tx(); idempotent via sqlite_master probe.
         """
         exists = self._conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='source_segments_fts'"
         ).fetchone()
         if exists:
+            return
+        if not _fts5_available(self._conn):
+            log.warning(
+                "This SQLite build lacks the FTS5 module; the verbatim search index was "
+                "not created. All other synto features work normally. Rebuild Python/SQLite "
+                "with FTS5 to enable the search_source_segments MCP tool."
+            )
             return
         with self._tx():
             self._conn.execute("""
@@ -2306,6 +2351,30 @@ class StateDB:
             (canonical_name, max_passages),
         ).fetchall()
 
+    def fts5_available(self) -> bool:
+        """True if this SQLite build supports FTS5 (verbatim search index)."""
+        return _fts5_available(self._conn)
+
+    def source_segments_fts_exists(self) -> bool:
+        """Cheap existence check for the FTS index (no row count)."""
+        return (
+            self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='source_segments_fts'"
+            ).fetchone()
+            is not None
+        )
+
+    def any_source_license_declared(self) -> bool:
+        """True if at least one source_documents row has a non-null license."""
+        if not self._has_table("source_documents"):
+            return False
+        return (
+            self._conn.execute(
+                "SELECT 1 FROM source_documents WHERE license IS NOT NULL LIMIT 1"
+            ).fetchone()
+            is not None
+        )
+
     def source_segments_fts_status(self) -> tuple[bool, int, int]:
         """Return (fts_table_exists, fts_row_count, segment_row_count).
 
@@ -2606,32 +2675,44 @@ class StateDB:
         return [(r[0], r[1], int(r[2])) for r in rows]
 
     def single_source_concepts_in_demand(self, since_ts: str) -> list[tuple[str, int, int]]:
+        # resolved_label is stored hashed when mcp.audit_detailed is off (the default)
+        # and plaintext when it is on. Concept names in concept_occurrences are always
+        # plaintext, so we cannot JOIN them in SQL — we match in Python against both the
+        # plaintext name and its _hash8, which makes the report work under either mode
+        # (and across mixed history) without weakening the privacy default.
         if not self._has_table("metric_events"):
             return []
         if not self._has_table("concept_occurrences"):
             return []
-        rows = self._conn.execute(
+        single_names = [
+            r[0]
+            for r in self._conn.execute(
+                "SELECT concept_name FROM concept_occurrences "
+                "GROUP BY concept_name HAVING COUNT(*) = 1"
+            ).fetchall()
+        ]
+        if not single_names:
+            return []
+        label_to_name = self._build_label_lookup(single_names)
+        demand = self._conn.execute(
             """
-            WITH single AS (
-                SELECT concept_name FROM concept_occurrences
-                GROUP BY concept_name HAVING COUNT(*) = 1
-            ),
-            demand AS (
-                SELECT json_extract(metadata_json,'$.resolved_label') AS label,
-                       COUNT(*) AS hits
-                FROM metric_events
-                WHERE event_type='mcp_call' AND ts >= ?
-                  AND json_extract(metadata_json,'$.tool') IN ('find_concept','get_source_passages')
-                  AND json_extract(metadata_json,'$.resolved_label') IS NOT NULL
-                GROUP BY label
-            )
-            SELECT s.concept_name, 1 AS occurrences, d.hits
-            FROM single s JOIN demand d ON d.label = s.concept_name
-            ORDER BY d.hits DESC, s.concept_name ASC
+            SELECT json_extract(metadata_json,'$.resolved_label') AS label, COUNT(*) AS hits
+            FROM metric_events
+            WHERE event_type='mcp_call' AND ts >= ?
+              AND json_extract(metadata_json,'$.tool') IN ('find_concept','get_source_passages')
+              AND json_extract(metadata_json,'$.resolved_label') IS NOT NULL
+            GROUP BY label
             """,
             (since_ts,),
         ).fetchall()
-        return [(r[0], int(r[1]), int(r[2])) for r in rows]
+        hits_by_name: dict[str, int] = {}
+        for label, hits in demand:
+            name = label_to_name.get(label)
+            if name is not None:
+                hits_by_name[name] = hits_by_name.get(name, 0) + int(hits)
+        # Match the prior SQL ordering: hits DESC, then concept name ASC.
+        ranked = sorted(hits_by_name.items(), key=lambda kv: (-kv[1], kv[0]))
+        return [(name, 1, hits) for name, hits in ranked]
 
     def repeat_weak_queries(
         self,
@@ -2644,12 +2725,13 @@ class StateDB:
         # Avoid building an empty IN () which is invalid SQL.
         if not single_source_names:
             return []
-        placeholders = ",".join("?" * len(single_source_names))
-        params: list[object] = [
-            since_ts,
-            *sorted(single_source_names),
-            min_hits,
-        ]
+        # Match stored resolved_label in either form (plaintext or _hash8) — see
+        # single_source_concepts_in_demand for why. The IN set spans both forms; the
+        # returned target_concept is mapped back to the plaintext concept name.
+        label_to_name = self._build_label_lookup(single_source_names)
+        match_labels = sorted(label_to_name.keys())
+        placeholders = ",".join("?" * len(match_labels))
+        params: list[object] = [since_ts, *match_labels, min_hits]
         rows = self._conn.execute(
             f"""
             SELECT
@@ -2669,7 +2751,21 @@ class StateDB:
             """,
             params,
         ).fetchall()
-        return [(r[0], int(r[1]), r[2]) for r in rows]
+        return [(r[0], int(r[1]), label_to_name.get(r[2], r[2])) for r in rows]
+
+    @staticmethod
+    def _build_label_lookup(names) -> dict[str, str]:
+        """Map every stored resolved_label form back to its plaintext concept name.
+
+        Each concept name maps from both itself (audit_detailed=true) and its _hash8
+        (audit_detailed=false). 8-char-prefix collisions are theoretically possible but
+        negligible for an informational report.
+        """
+        lookup: dict[str, str] = {}
+        for name in names:
+            lookup[name] = name
+            lookup[_hash8(name)] = name
+        return lookup
 
     def tool_mix_sessions(
         self,
