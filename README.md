@@ -17,7 +17,7 @@
 
 You drop Markdown notes in a folder. Synto reads them with a local LLM, extracts the concepts they contain, and writes one cross-linked article per concept. Every note you add makes the wiki richer. Every article stays on your machine unless you decide otherwise.
 
-After setup (~5 minutes) you have: a structured wiki built from your notes, a queryable knowledge base that works without embeddings or a vector database, and an agent-ready pack that Claude, Cursor, or any file-aware AI can install and reason over.
+After setup (~5 minutes) you have: a structured wiki built from your notes, a queryable knowledge base that works without embeddings or a vector database, and an agent-ready pack that Claude, Cursor, or any file-aware AI can install and reason over — including reading your sources' exact words on demand over MCP.
 
 <p align=center>
 <img width="341" height="463" alt="image" src="https://github.com/user-attachments/assets/b3e13203-bb4a-42a4-a16d-0d4d93404f71" />
@@ -156,12 +156,13 @@ Works today with Markdown. Drop notes in `raw/`, run `synto run`, and get a cros
 
 **Pack export.** `synto pack export --target agents` produces a portable directory any file-aware agent can read: articles, `INDEX.json` for fast concept lookup, source provenance, and agent-readable entry points.
 
-**MCP server.** `synto serve` exposes your wiki as a local MCP server with eight tools: `list_articles`, `read_article`, `find_concept`, `search_articles`, `get_concept`, `list_sources`, `trace_lineage`, and `answer_question`. Wire it into Claude Code, Cursor, or any MCP-compatible client in one command. Drafts are hidden by default; `answer_question` runs the same routed query as `synto query` end-to-end (uses both fast and heavy models), so it may cost money on paid providers.
+**MCP server.** `synto serve` exposes your wiki as a local MCP server with 12 tools. Eight cover the published wiki: `list_articles`, `read_article`, `find_concept`, `search_articles`, `get_concept`, `list_sources`, `trace_lineage`, and `answer_question`. Four more (below) expose the raw source text. Wire it into Claude Code, Cursor, or any MCP-compatible client in one command. Drafts are hidden by default; `answer_question` runs the same routed query as `synto query` end-to-end (uses both fast and heavy models), so it may cost money on paid providers.
 
 ### Verbatim source tools
 
 Four additional MCP tools expose raw source paragraphs to frontier-model callers.
 Use them when you want the source's own words, not a synto-generated synthesis.
+(For a ready-made answer from your own local models instead, use `answer_question`.)
 
 - `read_source_segment(segment_id)` — fetch one paragraph by id.
 - `search_source_segments(query, limit=10)` — BM25 search across raw segments.
@@ -203,7 +204,7 @@ DB. The backlog report works either way.
 skipped on upgrade (with a warning) and only `search_source_segments` is unavailable; the
 other three verbatim tools and every other command keep working.
 
-**Self-maintenance.** `synto maintain` repairs broken wikilinks and creates stubs for missing targets. `synto lint` reports orphans, stale articles, and missing frontmatter.
+**Self-maintenance.** `synto maintain` repairs broken wikilinks, creates stubs for missing targets, and reports orphans, stale articles, and missing frontmatter. `--dry-run` shows the structural-health report without changing anything.
 
 **A/B model comparison.** `synto compare` runs your query set against two different models in isolated copies of your vault so you can evaluate a model switch without touching anything live.
 
@@ -405,7 +406,8 @@ Any OpenAI-compatible endpoint works. Use `synto setup` to configure interactive
 
 - Full ingest → compile → approve pipeline; supports Markdown notes and Obsidian vaults
 - `synto pack export --target agents` — portable knowledge pack with `INDEX.json` and agent metadata
-- `synto serve` — MCP server with 8 tools: `list_articles`, `read_article`, `find_concept`, `search_articles`, `get_concept`, `list_sources`, `trace_lineage`, `answer_question`. Quality signals (`status`, `confidence`, `source_count`, `single_source`) are surfaced on every article ref so agents can self-filter; `min_status` defaults to `"published"` to keep drafts out of agent context.
+- `synto serve` — MCP server with 12 tools. Eight wiki tools: `list_articles`, `read_article`, `find_concept`, `search_articles`, `get_concept`, `list_sources`, `trace_lineage`, `answer_question`. Four verbatim-source tools: `search_source_segments`, `get_source_passages`, `read_source_segment`, `list_segments`. Quality signals (`status`, `confidence`, `source_count`, `single_source`) are surfaced on every article ref so agents can self-filter; `min_status` defaults to `"published"` to keep drafts out of agent context.
+- `synto doctor --backlog` — reads the MCP audit log to show what to ingest next: zero-result queries, single-source concepts in active demand, and the verbatim-vs-`answer_question` tool mix.
 - `synto query` — index-routed Q&A with optional synthesis to `wiki/synthesis/`
 - `synto review` — interactive draft review: approve, reject, edit, or diff before publishing
 - `synto watch` — file watcher: auto-ingest and compile on every save
@@ -442,7 +444,7 @@ pack/
   CLAUDE.md           Claude Code context file
 ```
 
-Any file-aware agent can read the articles directly. `INDEX.json` enables fast concept lookup without a database. `synto serve` exposes 8 MCP tools — browse (`list_articles`), read (`read_article`, `get_concept`, `trace_lineage`, `list_sources`), search (`search_articles`, `find_concept`), and answer (`answer_question`, which runs the full query pipeline).
+Any file-aware agent can read the articles directly. `INDEX.json` enables fast concept lookup without a database. `synto serve` exposes 12 MCP tools — browse (`list_articles`), read (`read_article`, `get_concept`, `trace_lineage`, `list_sources`), search (`search_articles`, `find_concept`), answer (`answer_question`, which runs the full query pipeline), and read raw source text (`search_source_segments`, `get_source_passages`, `read_source_segment`, `list_segments`).
 
 ---
 
@@ -453,6 +455,7 @@ Any file-aware agent can read the articles directly. `INDEX.json` enables fast c
 - **No remote analytics.** Synto does not send usage data anywhere. Local runtime and cost metrics stay in your vault database.
 - **Pack exports.** Exported packs include raw notes, sources, wiki articles, queries, and synthesis by default. Review your vault before sharing a pack.
 - **API keys.** Stored in `~/.config/synto/config.toml` (user-owned, not inside the vault). Never commit that file.
+- **Verbatim MCP tools gate raw text by source license.** The four verbatim-source tools return raw paragraphs only from sources whose license is permissive (`[mcp.source_access]` in `synto.toml`). A vault with no declared licenses is treated as `"all"` — every segment is readable by a connected MCP client — and `synto serve`/`synto doctor` warn you about it. See [Privacy and source access](#privacy-and-source-access).
 
 ---
 
