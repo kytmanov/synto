@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.4.0] - 2026-05-29
 
 ### Added
 
@@ -19,8 +19,12 @@
 - `synto doctor --backlog [--since 1d|7d|30d|all]` (Feature 29 Stage 5) — an
   opt-in MCP demand-vs-coverage report mined from the audit log: zero-result
   queries, single-source concepts in active demand, repeat weak queries, and
-  per-session tool-mix (verbatim vs `answer_question`). Default `synto doctor`
-  output is unchanged.
+  per-session tool-mix (verbatim vs `answer_question`). The opt-in backlog report
+  is hidden unless `--backlog` is passed.
+- `synto doctor` now always prints a short **"Verbatim source index"** section
+  reporting whether the FTS5 search index is in sync, and an **MCP source-access**
+  line showing the effective privacy posture. This is a small addition to the
+  default `synto doctor` output; the exit code is unchanged.
 - MCP audit rows now record `result_count` and `resolved_label` inside
   `metadata_json` (no schema change), so a successful zero-result call is
   distinguishable from a call that raised.
@@ -28,15 +32,46 @@
   and resolved labels are stored as 8-char hashes, preserving the v0.3.0 privacy
   posture. When `true`, the **raw user query text is written in plaintext to the
   local state DB** so the backlog report can show literal queries — enable only
-  if storing query text locally is acceptable.
+  if storing query text locally is acceptable. The backlog report works under
+  either setting (it matches concepts by hash when labels are hashed).
+- The `answer_question` MCP tool now carries a description that routes callers
+  between it (ready-made synthesis) and the verbatim primitives. Behavior is
+  unchanged.
+- Ingest now analyzes tracked sources in **segment-aligned chunks** (whole
+  `source_segments` packed to the context budget instead of fixed-size byte
+  slices) and records which segments produced each concept in
+  `concept_occurrences`. This populates `get_source_passages` from the model's own
+  extraction at no extra LLM cost, and avoids splitting paragraphs mid-text. Plain
+  notes (no segments) keep the existing fixed-size chunking. **Existing vaults:**
+  run `synto ingest --force` once to backfill concept→segment links for
+  already-ingested sources (re-runs analysis only; published articles are
+  untouched). `synto doctor` reports link coverage and prints this tip when links
+  are absent.
 
 ### Notes
 
-- **Upgrade behaviour:** vaults upgraded from v0.3.0 have no declared license
-  on any source. To keep the upgrade seamless, the privacy gate is relaxed to
-  `"all"` for vaults with zero declared licenses. A single INFO log line surfaces
-  this at `synto serve` startup. Declare any license on any source (and restart
-  serve) to engage the configured privacy gate.
+- **Upgrade is seamless and non-destructive.** v0.3.0 vaults are schema v15; only
+  the additive v16 migration runs (it creates the FTS index and backfills it). It
+  is atomic and idempotent — a re-run after an interrupted upgrade is a no-op. No
+  existing command, MCP tool, or output format changes behavior; the four verbatim
+  tools and the doctor additions above are the only user-visible changes.
+- **The state DB now migrates on the first synto command of any kind after upgrade**
+  (including `synto serve`, which now opens the DB even when `[mcp] audit` is off,
+  because the verbatim tools query it). On a large vault the first command pays a
+  one-time FTS backfill cost.
+- **SQLite without FTS5 degrades gracefully.** If your Python/SQLite build lacks the
+  FTS5 module, the v16 migration skips the search index (and logs a warning) instead
+  of failing — every other command keeps working. Only `search_source_segments` is
+  unavailable; the other three verbatim tools query segments directly. `synto doctor`
+  reports this state.
+- **Privacy gate on upgrade (read this if your vault holds private or copyrighted
+  sources).** Upgraded vaults have no declared license on any source. To keep the
+  feature working day one, `permissive_only` is relaxed to `"all"` when no source
+  declares a license — meaning **all raw source text is readable by any MCP client
+  connected to `synto serve`.** This is surfaced loudly: a WARNING at `synto serve`
+  startup and a warning in `synto doctor`. To lock it down, declare licenses on your
+  sources or set `[mcp.source_access] mode` explicitly in `synto.toml`, then restart
+  `serve`.
 
 ## [0.3.0] - 2026-05-25
 

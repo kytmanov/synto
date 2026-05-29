@@ -200,8 +200,10 @@ def _merge_chunk_results(results: list[AnalysisResult]) -> AnalysisResult:
     Concepts and topics: union (deduplicated, insertion order preserved).
     Aliases for the same concept are merged across chunks.
     Summary: first chunk's (intro is most representative).
-    Quality: minimum across chunks (conservative).
+    Quality: most common rating across chunks (ties broken toward the higher rank).
     """
+    from collections import Counter
+
     if len(results) == 1:
         return results[0]
 
@@ -243,8 +245,18 @@ def _merge_chunk_results(results: list[AnalysisResult]) -> AnalysisResult:
                 seen_refs.add(key)
                 all_named_references.append(ref)
 
+    # Most common quality across chunks, ties broken toward the higher rank. (Was a
+    # conservative min, but with segment-aligned chunks a single thin or peripheral section
+    # — title page, references — would drag the whole note down and, via the quality cap in
+    # ingest_note, halve the extracted concept count. The note's quality should reflect its
+    # substantive majority, not its weakest section.)
     quality_rank = {"high": 2, "medium": 1, "low": 0}
-    min_result = min(results, key=lambda r: quality_rank.get(r.quality, 1))
+    quality_counts = Counter(r.quality for r in results if r.quality)
+    merged_quality = (
+        max(quality_counts, key=lambda q: (quality_counts[q], quality_rank.get(q, 1)))
+        if quality_counts
+        else "medium"
+    )
 
     merged_language = next((r.language for r in results if r.language), None)
 
@@ -253,9 +265,70 @@ def _merge_chunk_results(results: list[AnalysisResult]) -> AnalysisResult:
         concepts=all_concepts,
         suggested_topics=all_topics[:5],
         named_references=all_named_references[:8],
-        quality=min_result.quality,
+        quality=merged_quality,
         language=merged_language,
     )
+
+
+def _build_segment_units(segments: list, chunk_size: int) -> list[tuple[str, list[str]]]:
+    """Pack whole segments (in `ordinal` order) into analysis units up to chunk_size chars.
+
+    Returns [(unit_text, [segment_id, ...])]. A segment is never split, so a segment longer
+    than chunk_size becomes its own unit. This keeps the analysis aligned to structural
+    segments so extracted concepts can be attributed to known segment ids.
+    """
+    units: list[tuple[str, list[str]]] = []
+    parts: list[str] = []
+    ids: list[str] = []
+    cur_len = 0
+    for seg in segments:
+        text = seg["text"]
+        seg_id = seg["id"]
+        add_len = len(text) + 2  # joiner allowance
+        if ids and cur_len + add_len > chunk_size:
+            units.append(("\n\n".join(parts), ids))
+            parts, ids, cur_len = [], [], 0
+        parts.append(text)
+        ids.append(seg_id)
+        cur_len += add_len
+    if ids:
+        units.append(("\n\n".join(parts), ids))
+    return units
+
+
+def _persist_concept_occurrences(
+    db: StateDB,
+    source_id: str,
+    units: list[tuple[str, list[str]]],
+    attribution: dict[int, list[str]],
+    canonical_names: list[str],
+) -> None:
+    """Link extracted concepts to the segments that fed each analysis chunk.
+
+    The concepts a chunk yielded are attributed to every segment in that chunk, after
+    resolving raw concept names to the source's final canonical names. Only canonical
+    names that survived normalization are persisted. Re-ingest replaces the source's rows.
+    """
+    from collections import namedtuple
+
+    canon_set = set(canonical_names)
+    seg_to_concepts: dict[str, set[str]] = {}
+    for idx, (_text, seg_ids) in enumerate(units):
+        canon_here: set[str] = set()
+        for raw in attribution.get(idx, []):
+            resolved = db.find_concept_by_name_or_alias(raw)
+            canonical = resolved[0] if resolved else (raw if raw in canon_set else None)
+            if canonical in canon_set:
+                canon_here.add(canonical)
+        if not canon_here:
+            continue
+        for sid in seg_ids:
+            seg_to_concepts.setdefault(sid, set()).update(canon_here)
+
+    db.clear_concept_occurrences_for_source(source_id)
+    occ = namedtuple("occ", ["name", "confidence"])
+    for sid, concepts in seg_to_concepts.items():
+        db.upsert_concept_occurrences([occ(name=c, confidence=1.0) for c in sorted(concepts)], sid)
 
 
 def _analyze_body(
@@ -269,11 +342,20 @@ def _analyze_body(
     skip_completed: set[int] | None = None,
     prompt_contexts: list[_PromptConceptContext] | None = None,
     source_type: str = "notes",
+    units: list[tuple[str, list[str]]] | None = None,
+    attribution: dict[int, list[str]] | None = None,
 ) -> AnalysisResult:
-    """Analyze note body, splitting into chunks if body exceeds fast_ctx // 2 chars."""
+    """Analyze note body, splitting into chunks if body exceeds fast_ctx // 2 chars.
+
+    units: optional pre-built [(chunk_text, [segment_id, ...])] aligned to a tracked
+    source's segments. When given, these replace fixed-size body splitting so the
+    concepts each chunk yields can be attributed to known segment ids.
+    attribution: optional dict, populated chunk_index -> [extracted concept name], for
+    callers that persist concept_occurrences. Filled on fresh analysis of each chunk.
+    """
     chunk_size = config.effective_provider.fast_ctx // 2
 
-    if len(body) <= chunk_size:
+    if units is None and len(body) <= chunk_size:
         prompt = _build_analysis_prompt(
             body,
             existing_concepts,
@@ -281,7 +363,7 @@ def _analyze_body(
             language=config.pipeline.language,
             prompt_concepts=prompt_contexts,
         )
-        return request_structured(
+        result = request_structured(
             client=client,
             prompt=prompt,
             model_class=AnalysisResult,
@@ -292,16 +374,28 @@ def _analyze_body(
             stage="ingest",
             model_role="fast",
         )
+        if attribution is not None:
+            attribution[0] = [c.name for c in result.concepts]
+        return result
 
-    # Split into chunks — no overlap needed for concept extraction
-    chunks = [body[i : i + chunk_size] for i in range(0, len(body), chunk_size)]
-    log.info(
-        "Note %s split into %d chunks for analysis (%d chars, chunk_size=%d)",
-        path_name or "unknown",
-        len(chunks),
-        len(body),
-        chunk_size,
-    )
+    # Segment-aligned units (tracked sources) replace fixed-size body slices.
+    if units is not None:
+        chunks = [text for text, _seg_ids in units]
+        log.info(
+            "Note %s analyzed in %d segment-aligned chunk(s)",
+            path_name or "unknown",
+            len(chunks),
+        )
+    else:
+        # Split into chunks — no overlap needed for concept extraction
+        chunks = [body[i : i + chunk_size] for i in range(0, len(body), chunk_size)]
+        log.info(
+            "Note %s split into %d chunks for analysis (%d chars, chunk_size=%d)",
+            path_name or "unknown",
+            len(chunks),
+            len(body),
+            chunk_size,
+        )
 
     def _analyze_chunk(chunk: str, idx: int) -> AnalysisResult:
         import time
@@ -349,6 +443,8 @@ def _analyze_body(
                         errors.append(exc)
                         continue
                     chunk_results[idx] = result
+                    if attribution is not None:
+                        attribution[idx] = [c.name for c in result.concepts]
                     if on_chunk_result is not None:
                         on_chunk_result(idx, result)
             if errors:
@@ -360,6 +456,8 @@ def _analyze_body(
             if i in completed:
                 continue
             result = _analyze_chunk(chunk, i)
+            if attribution is not None:
+                attribution[i] = [c.name for c in result.concepts]
             if on_chunk_result is not None:
                 on_chunk_result(i, result)
             results.append(result)
@@ -379,6 +477,8 @@ def _analyze_body_with_checkpoints(
     force: bool = False,
     prompt_contexts: list[_PromptConceptContext] | None = None,
     source_type: str = "notes",
+    units: list[tuple[str, list[str]]] | None = None,
+    attribution: dict[int, list[str]] | None = None,
 ) -> AnalysisResult:
     chunk_size = config.effective_provider.fast_ctx // 2
     rel_path = str(path.relative_to(config.vault))
@@ -389,7 +489,7 @@ def _analyze_body_with_checkpoints(
         source_type=source_type,
     )
 
-    if len(body) <= chunk_size:
+    if units is None and len(body) <= chunk_size:
         if force:
             db.purge_ingest_chunks(rel_path)
         else:
@@ -402,9 +502,14 @@ def _analyze_body_with_checkpoints(
             config,
             prompt_contexts=prompt_contexts,
             source_type=source_type,
+            attribution=attribution,
         )
 
-    chunks = [body[i : i + chunk_size] for i in range(0, len(body), chunk_size)]
+    # Tracked sources pass segment-aligned units; plain notes split the body by size.
+    if units is not None:
+        chunks = [text for text, _seg_ids in units]
+    else:
+        chunks = [body[i : i + chunk_size] for i in range(0, len(body), chunk_size)]
     if force:
         db.purge_ingest_chunks(rel_path)
     else:
@@ -421,6 +526,9 @@ def _analyze_body_with_checkpoints(
             continue
         chunk_results[row["chunk_index"]] = result
         completed.add(row["chunk_index"])
+        # Resumed chunks must still feed attribution (they aren't re-analyzed below).
+        if attribution is not None:
+            attribution[row["chunk_index"]] = [c.name for c in result.concepts]
 
     if completed:
         log.info(
@@ -452,6 +560,8 @@ def _analyze_body_with_checkpoints(
             skip_completed=completed,
             prompt_contexts=prompt_contexts,
             source_type=source_type,
+            units=units,
+            attribution=attribution,
         )
 
     results = [result for result in chunk_results if result is not None]
@@ -1221,6 +1331,23 @@ def ingest_note(
         existing_topics,
         seed_alias_map or db.list_alias_map(),
     )
+    # Tracked sources (raw/<source_id>.md backed by source_segments) get segment-aligned
+    # analysis units so extracted concepts can be attributed to known segment ids
+    # (concept_occurrences) — at no extra LLM cost. `chunk_attribution` is filled
+    # chunk_index -> [extracted concept name] and mapped to segments after canonicalization.
+    source_id = path.stem
+    source_segments = db.get_segments_for_source(source_id)
+    chunk_units: list[tuple[str, list[str]]] | None = None
+    chunk_attribution: dict[int, list[str]] | None = None
+    if source_segments:
+        # Pack segments into chapter-sized analysis units. fast_ctx is in TOKENS; a target of
+        # ~1.5x fast_ctx CHARS (~0.4x fast_ctx tokens of input) keeps each call well within
+        # context while grouping whole sections, so thin/peripheral segments (title page,
+        # references) aren't analyzed in isolation — which would rate medium/low and, via the
+        # min-quality aggregation + quality cap, halve the extracted concept count.
+        unit_target = max(config.effective_provider.fast_ctx * 3 // 2, 4096)
+        chunk_units = _build_segment_units(source_segments, unit_target)
+        chunk_attribution = {}
     try:
         result: AnalysisResult = _analyze_body_with_checkpoints(
             body=body,
@@ -1233,6 +1360,8 @@ def ingest_note(
             force=force,
             prompt_contexts=prompt_contexts,
             source_type=source_type,
+            units=chunk_units,
+            attribution=chunk_attribution,
         )
     except Exception as e:
         log.error("Analysis failed for %s: %s", path.name, e)
@@ -1302,6 +1431,16 @@ def ingest_note(
         persistable_aliases = _persistable_aliases(aliases)
         if persistable_aliases:
             db.upsert_aliases(canonical, persistable_aliases)
+
+    # Persist concept→segment links for tracked sources (enables get_source_passages).
+    # Non-fatal: an attribution failure must not fail the ingest.
+    if chunk_attribution is not None and chunk_units is not None:
+        try:
+            _persist_concept_occurrences(
+                db, source_id, chunk_units, chunk_attribution, canonical_names
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("concept_occurrences attribution failed for %s: %s", path.name, e)
 
     title_for_items = str(meta.get("title") or path.stem.replace("-", " ").strip())
     item_candidates = [

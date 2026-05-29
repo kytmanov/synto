@@ -67,7 +67,19 @@ def _audit_row(
     )
 
 
-def _add_occurrence(db: StateDB, concept_name: str, seg_id: str) -> None:
+def _add_occurrence(
+    db: StateDB, concept_name: str, seg_id: str, source_id: str | None = None
+) -> None:
+    # Back the occurrence with a real source_segments row so single_source_concepts_in_demand
+    # can count DISTINCT source documents (not segments). Each segment defaults to its own
+    # source, so a concept spanning N segments spans N sources unless source_id is shared.
+    src = source_id or seg_id
+    db._conn.execute(
+        """INSERT OR IGNORE INTO source_segments
+           (id, identity, ordinal, source_id, structural_locator, content_hash, text)
+           VALUES (?, ?, 0, ?, '', '', '')""",
+        (seg_id, seg_id, src),
+    )
     db._conn.execute(
         """INSERT INTO concept_occurrences
            (concept_name, source_segment_id, ordinal, confidence)
@@ -270,6 +282,90 @@ def test_backlog_single_source_concepts_section(tmp_path: Path) -> None:
 
     rows = db.single_source_concepts_in_demand("")
     assert rows == [("Yoneda lemma", 1, 2)]
+
+
+def test_single_source_counts_distinct_source_documents(tmp_path: Path) -> None:
+    """'Single-source' means one source DOCUMENT, not one segment.
+
+    Why it matters: concept_occurrences keys on segment id, and a source has many
+    segments. A concept appearing in two segments of the SAME source is still
+    single-source; spanning two different sources is not. (Before the fix the query
+    counted rows, so any multi-segment concept was wrongly excluded.)
+    """
+    db = StateDB(tmp_path / "state.db")
+    # "Spans one source" — two segments, both source srcA → single-source.
+    _add_occurrence(db, "OneSource", "a1", source_id="srcA")
+    _add_occurrence(db, "OneSource", "a2", source_id="srcA")
+    # "Spans two sources" — segments in srcA and srcB → NOT single-source.
+    _add_occurrence(db, "TwoSources", "a3", source_id="srcA")
+    _add_occurrence(db, "TwoSources", "b1", source_id="srcB")
+
+    now = datetime.now(UTC).isoformat()
+    _audit_row(db, ts=now, tool="find_concept", resolved_label="OneSource")
+    _audit_row(db, ts=now, tool="find_concept", resolved_label="TwoSources")
+
+    names = [name for name, _occ, _hits in db.single_source_concepts_in_demand("")]
+    assert "OneSource" in names
+    assert "TwoSources" not in names
+
+
+def test_backlog_single_source_matches_hashed_label_default(tmp_path: Path) -> None:
+    """Under the DEFAULT audit_detailed=False path, resolved_label is stored as a hash,
+    yet the concept must still surface — matched via _hash8(name), not plaintext.
+
+    Regression guard for a silent blinder: the section joined the hashed stored label
+    against the plaintext concept_occurrences.concept_name, so it always returned (none)
+    under the default config. The _audit_row helper writes plaintext and never caught it;
+    this test drives the real _audit() hashing path that production uses.
+    """
+    db = StateDB(tmp_path / "state.db")
+    _add_occurrence(db, "Yoneda lemma", "seg-1")  # single source
+
+    now = datetime.now(UTC).isoformat()
+    mcp = McpConfig(audit=True, audit_detailed=False)  # the default privacy posture
+    for _ in range(2):
+        _audit(
+            db,
+            vault_id="vk",
+            tool="get_source_passages",
+            arguments={"concept_name": "yoneda", "ts": now},
+            success=True,
+            latency_ms=1,
+            mcp_config=mcp,
+            result_count=3,
+            resolved_label="Yoneda lemma",
+        )
+
+    # The stored label is the hash, not the plaintext name (proves we hit the real path).
+    assert _last_mcp_meta(db)["resolved_label"] != "Yoneda lemma"
+
+    rows = db.single_source_concepts_in_demand("")
+    assert rows == [("Yoneda lemma", 1, 2)]
+
+
+def test_backlog_repeat_weak_queries_matches_hashed_label_default(tmp_path: Path) -> None:
+    """repeat_weak_queries must also work under the default hashed path, and map the
+    target_concept back to its plaintext name for display."""
+    db = StateDB(tmp_path / "state.db")
+    mcp = McpConfig(audit=True, audit_detailed=False)
+    for _ in range(2):
+        _audit(
+            db,
+            vault_id="vk",
+            tool="get_source_passages",
+            arguments={"concept_name": "yoneda"},
+            success=True,
+            latency_ms=1,
+            mcp_config=mcp,
+            result_count=1,
+            resolved_label="Yoneda lemma",
+        )
+
+    rows = db.repeat_weak_queries("", {"Yoneda lemma"}, min_hits=2)
+    assert len(rows) == 1
+    _label, hits, target = rows[0]
+    assert hits == 2
+    assert target == "Yoneda lemma"  # mapped back from the stored hash
 
 
 def test_backlog_repeat_weak_queries_section(tmp_path: Path) -> None:
@@ -489,3 +585,60 @@ def test_backlog_degrades_without_audit_detailed(
     assert result.exit_code == 0, result.output
     assert "<a1b2c3d4>" in result.output
     assert "audit_detailed=true" in result.output
+
+
+def test_doctor_warns_when_grandfather_exposes_sources(
+    vault: Path, runner: CliRunner, fake_provider
+) -> None:
+    """A vault with no declared license must warn loudly that all raw text is exposed.
+
+    Why it matters: the legacy-vault grandfather relaxes permissive_only to "all"; a
+    privacy-sensitive user must never discover that silently. This is the "warn loudly"
+    decision for v0.4.0.
+    """
+    result = runner.invoke(cli, ["doctor", "--vault", str(vault)])
+    assert result.exit_code == 0, result.output
+    assert 'effective "all"' in result.output
+    assert "readable by MCP clients" in result.output
+    # The literal config-section name must survive Rich rendering (it is markup-escaped);
+    # a bare [mcp.source_access] would be parsed as a style tag and silently dropped.
+    assert "[mcp.source_access]" in result.output
+
+
+def test_doctor_shows_plain_mode_once_license_declared(
+    vault: Path, runner: CliRunner, fake_provider
+) -> None:
+    """Once any source declares a license, the gate engages and the warning disappears."""
+    db = _open_vault_db(vault)
+    db._conn.execute(
+        """INSERT OR REPLACE INTO source_documents
+           (id, source_type, origin_uri, title, imported_at, redistribution, license)
+           VALUES ('s1', 'pdf', '/raw/s1.pdf', 's1', '2024-01-01T00:00:00', 'unknown', 'CC-BY')"""
+    )
+    db._conn.commit()
+    db._conn.close()
+
+    result = runner.invoke(cli, ["doctor", "--vault", str(vault)])
+    assert result.exit_code == 0, result.output
+    assert 'source-access mode: "permissive_only"' in result.output
+    assert 'effective "all"' not in result.output
+
+
+def test_doctor_tips_ingest_force_when_no_concept_links(
+    vault: Path, runner: CliRunner, fake_provider
+) -> None:
+    """A vault with segments but 0 concept→segment links must tell the user how to backfill,
+    so get_source_passages isn't silently empty after upgrade (seamless-transition UX)."""
+    db = _open_vault_db(vault)
+    db._conn.execute(
+        """INSERT OR IGNORE INTO source_segments
+           (id, identity, ordinal, source_id, structural_locator, content_hash, text)
+           VALUES ('s1:p:0', 's1:p:0', 0, 's1', '', '', 'body')"""
+    )
+    db._conn.commit()
+    db._conn.close()
+
+    result = runner.invoke(cli, ["doctor", "--vault", str(vault)])
+    assert result.exit_code == 0, result.output
+    assert "0 concept→segment links" in result.output
+    assert "ingest --force" in result.output

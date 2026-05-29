@@ -20,7 +20,7 @@ from .readers import (
     VaultReader,
     _extract_first_paragraph,
 )
-from .state import StateDB
+from .state import StateDB, _hash8
 
 log = logging.getLogger(__name__)
 
@@ -70,10 +70,6 @@ def _raw_args(arguments: dict[str, Any]) -> dict[str, Any]:
         else:
             safe[key] = str(value)
     return safe
-
-
-def _hash8(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
 
 
 def _tags_from_frontmatter(frontmatter: dict[str, object]) -> set[str]:
@@ -316,6 +312,14 @@ def _register_verbatim_source_handlers(
         result_count: int | None = None
         arguments: dict[str, Any] = {"query": query, "limit": limit}
         try:
+            if not db.source_segments_fts_exists():
+                # FTS5 missing from this SQLite build (the v16 migration skipped the
+                # index). The other three verbatim tools query source_segments directly
+                # and still work; only full-text search is unavailable.
+                raise tool_error_cls(
+                    "verbatim search index unavailable: this SQLite build lacks FTS5. "
+                    "Use get_source_passages (concept-keyed) or list_segments instead."
+                )
             cleaned = query.strip().strip('"').strip() if query else ""
             if not cleaned:
                 raise tool_error_cls("query must be non-empty")
@@ -815,6 +819,18 @@ def build_tool_handlers(
             )
 
     def answer_question(question: str, max_pages: int = 5) -> dict[str, object]:
+        """Generate a synthesized answer using synto's configured fast + heavy local LLMs
+        over the vault.
+
+        Useful when the caller wants a ready-made answer rather than composing one from
+        primitives — common cases include fully-local workflows (no cloud LLM available) and
+        frontier-model callers who want a cheap synthesis without spending their own tokens.
+        Runs both the fast and heavy models, so it may incur cost on paid providers.
+
+        For verbatim structure (raw source paragraphs or segment-level search), prefer the
+        primitive tools: `search_source_segments`, `get_source_passages`, `read_source_segment`,
+        `search_articles`, and `read_article`.
+        """
         started = time.monotonic()
         success = False
         arguments = {"question": question, "max_pages": max_pages}
@@ -893,14 +909,16 @@ def run_server(vault: Path, transport: str = "stdio") -> None:
     # _audit() still respects config.mcp.audit before writing any audit rows.
     db = StateDB(config.state_db_path)
     vault_key = _vault_id(vault)
-    # Surface grandfather behaviour exactly once at startup so legacy vault users
-    # know why permissive_only is being treated as "all".
+    # Surface grandfather behaviour loudly at startup so legacy-vault users are never
+    # silently exposing raw source text. WARNING (not INFO) because this relaxes the
+    # configured privacy gate — see Decision 1 in the v0.4.0 release plan.
     effective_mode = _effective_source_access_mode(db, config.mcp.source_access, vault_key)
     if config.mcp.source_access.mode == "permissive_only" and effective_mode == "all":
-        log.info(
-            "synto: legacy vault detected (0 declared licenses); MCP source-access mode treated"
-            ' as "all" for this session. Set [mcp.source_access] in synto.toml or declare'
-            " licenses on sources to engage the privacy gate."
+        log.warning(
+            'synto: no source declares a license, so MCP source-access is treated as "all" '
+            "for this session — ALL raw source text is readable by connected MCP clients. "
+            "Declare licenses on your sources, or set [mcp.source_access] mode explicitly in "
+            "synto.toml, to engage the privacy gate."
         )
     server = FastMCP(
         _server_name(vault),
