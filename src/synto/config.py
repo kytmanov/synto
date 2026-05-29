@@ -256,6 +256,10 @@ class McpConfig(BaseModel):
     default_visibility: str = "public"
     exclude_tags: list[str] = Field(default_factory=list)
     audit: bool = False
+    # When True, MCP audit rows store raw stringified arg values and resolved
+    # labels instead of 8-char SHA256 hashes. Default-off preserves the v0.4.0
+    # privacy posture; opt-in to see raw query text in `synto doctor --backlog`.
+    audit_detailed: bool = False
     source_access: McpSourceAccessConfig = Field(default_factory=McpSourceAccessConfig)
 
     @field_validator("default_visibility")

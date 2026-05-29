@@ -1933,9 +1933,123 @@ def support():
     console.print("  - the error message or unexpected behavior")
 
 
+def _is_hash8(value: str | None) -> bool:
+    # An 8-char SHA256 prefix (the default-audit form). Distinguishes hashed
+    # labels from raw query text so the report can flag degraded mode.
+    return bool(value) and len(value) == 8 and all(c in "0123456789abcdef" for c in value)
+
+
+def _render_mcp_backlog(db, since: str) -> None:
+    """Render the MCP demand-vs-coverage backlog section of `synto doctor`.
+
+    Informational only — never affects exit status. Reads existing audit rows
+    in `metric_events`; degrades gracefully when audit_detailed is off (labels
+    show as <hash:8>).
+    """
+    from datetime import UTC, datetime, timedelta
+
+    # since_ts: ISO-8601 lower bound; "" means all-time (matches every row lexically).
+    if since == "all":
+        since_ts = ""
+        window_label = "all time"
+        no_activity_label = "(no MCP activity recorded)"
+    else:
+        days = {"1d": 1, "7d": 7, "30d": 30}[since]
+        since_ts = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+        window_label = f"last {since}"
+        no_activity_label = f"(no MCP activity in the {window_label})"
+
+    console.print(f"\n[bold]MCP demand-vs-coverage ({window_label})[/bold]\n")
+
+    if db.count_mcp_audit_rows_since(since_ts) == 0:
+        console.print(f"  {no_activity_label}")
+        return
+
+    degraded = False
+
+    def label_str(value: str | None) -> str:
+        nonlocal degraded
+        if value is None:
+            return "<none>"
+        if _is_hash8(value):
+            degraded = True
+            return f"<{value}>"
+        return f'"{value}"'
+
+    # 1) Zero-result queries
+    console.print("  Zero-result queries (top 20 by frequency)")
+    zero = db.zero_result_query_counts(since_ts, top_n=20)
+    if zero:
+        console.print(f"    [dim]{'Tool':<26}{'Query':<26}{'Hits':>5}[/dim]")
+        for tool, label, count in zero:
+            console.print(f"    {tool:<26}{label_str(label):<26}{count:>5}")
+    else:
+        console.print("    [dim](none)[/dim]")
+
+    # 2) Single-source concepts in active demand
+    console.print("\n  Single-source concepts in active demand")
+    single = db.single_source_concepts_in_demand(since_ts)
+    single_names = {name for name, _occ, _hits in single}
+    if single:
+        header = f"{'Concept':<26}{'Occurrences':>12}{'Resolved-label hits':>22}"
+        console.print(f"    [dim]{header}[/dim]")
+        for name, occ, hits in single:
+            console.print(f"    {name:<26}{occ:>12}{hits:>22}")
+    else:
+        console.print("    [dim](none)[/dim]")
+
+    # 3) Repeat weak queries against single-source concepts
+    console.print("\n  Repeat weak queries (≥2 hits against single-source concepts)")
+    repeats = db.repeat_weak_queries(since_ts, single_names, min_hits=2)
+    if repeats:
+        console.print(f"    [dim]{'Query':<26}{'Hits':>5}   {'Target concept'}[/dim]")
+        for label, hits, target in repeats:
+            console.print(f"    {label_str(label):<26}{hits:>5}   {target}")
+    else:
+        console.print("    [dim](none)[/dim]")
+
+    # 4) Tool-mix per session
+    console.print("\n  Tool-mix per session (≥5 calls, 30-min idle gap)")
+    sessions = db.tool_mix_sessions(since_ts)
+    if sessions:
+        total = sum(s[1] for s in sessions)
+        verbatim = sum(s[2] for s in sessions)
+        answers = sum(s[3] for s in sessions)
+        other = sum(s[4] for s in sessions)
+        if total > 0:
+            vpct, apct, opct = (
+                round(100 * verbatim / total),
+                round(100 * answers / total),
+                round(100 * other / total),
+            )
+        else:
+            vpct = apct = opct = 0
+        console.print(
+            f"    Sessions: {len(sessions)}   Verbatim: {vpct}%   "
+            f"answer_question: {apct}%   Other: {opct}%"
+        )
+    else:
+        console.print("    [dim](no sessions with ≥5 calls)[/dim]")
+
+    if degraded:
+        console.print(
+            "\n  [dim](audit_detailed=false → some labels shown as <hash:8>;\n"
+            "        set [mcp] audit_detailed=true in synto.toml to see raw queries)[/dim]"
+        )
+
+
 @cli.command()
 @click.option("--vault", "vault_str", envvar=VAULT_ENV_VAR, default=None)
-def doctor(vault_str):
+@click.option(
+    "--backlog", is_flag=True, default=False, help="Show MCP demand-vs-coverage backlog (opt-in)."
+)
+@click.option(
+    "--since",
+    type=click.Choice(["1d", "7d", "30d", "all"]),
+    default="7d",
+    help="Lookback window for --backlog.",
+)
+def doctor(vault_str, backlog, since):
     """Check LLM provider connection, model availability, and vault health."""
     from .client_factory import LLMError, build_client
 
@@ -2041,6 +2155,10 @@ def doctor(vault_str):
             ok = False
     except Exception as exc:  # pragma: no cover — defensive
         console.print(f"  [yellow]![/yellow] could not read FTS index status: {exc}")
+
+    # ── MCP demand-vs-coverage backlog (opt-in via --backlog) ────────────────
+    if backlog:
+        _render_mcp_backlog(db, since)
 
     draft_graph_filter = [
         "-path:raw",
