@@ -2174,7 +2174,8 @@ def doctor(vault_str, backlog, since):
         )
         console.print(
             "      [dim]All raw source text is readable by MCP clients. Declare licenses on"
-            " sources, or set [mcp.source_access] mode explicitly in synto.toml.[/dim]"
+            # Escape the literal [mcp.source_access] so Rich doesn't parse it as a markup tag.
+            r" sources, or set \[mcp.source_access] mode explicitly in synto.toml.[/dim]"
         )
     else:
         console.print(f'  source-access mode: "{sa.mode}"')

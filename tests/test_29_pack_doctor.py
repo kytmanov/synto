@@ -563,6 +563,9 @@ def test_doctor_warns_when_grandfather_exposes_sources(
     assert result.exit_code == 0, result.output
     assert 'effective "all"' in result.output
     assert "readable by MCP clients" in result.output
+    # The literal config-section name must survive Rich rendering (it is markup-escaped);
+    # a bare [mcp.source_access] would be parsed as a style tag and silently dropped.
+    assert "[mcp.source_access]" in result.output
 
 
 def test_doctor_shows_plain_mode_once_license_declared(
