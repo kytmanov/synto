@@ -2331,6 +2331,37 @@ class StateDB:
             "SELECT * FROM concept_occurrences ORDER BY concept_name, source_segment_id"
         ).fetchall()
 
+    def get_segments_for_source(self, source_id: str) -> list[sqlite3.Row]:
+        """Return a source's segments (id, ordinal, structural_locator, text) in reading order.
+
+        Used by ingest to build structure-aware analysis chunks aligned to segments, so the
+        concepts a chunk yields can be attributed to known segment ids (concept_occurrences).
+        """
+        if not self._has_table("source_segments"):
+            return []
+        return self._conn.execute(
+            """SELECT id, ordinal, structural_locator, text
+               FROM source_segments WHERE source_id = ? ORDER BY ordinal""",
+            (source_id,),
+        ).fetchall()
+
+    def clear_concept_occurrences_for_source(self, source_id: str) -> None:
+        """Delete all concept→segment links for a source's segments (re-ingest = replace)."""
+        if not self._has_table("concept_occurrences") or not self._has_table("source_segments"):
+            return
+        with self._tx():
+            self._conn.execute(
+                """DELETE FROM concept_occurrences WHERE source_segment_id IN
+                   (SELECT id FROM source_segments WHERE source_id = ?)""",
+                (source_id,),
+            )
+
+    def concept_occurrence_count(self) -> int:
+        """Total concept→segment links — used by `synto doctor` for coverage reporting."""
+        if not self._has_table("concept_occurrences"):
+            return 0
+        return int(self._conn.execute("SELECT count(*) FROM concept_occurrences").fetchone()[0])
+
     def select_passages_for_concept(
         self, canonical_name: str, max_passages: int
     ) -> list[sqlite3.Row]:
@@ -2684,13 +2715,21 @@ class StateDB:
             return []
         if not self._has_table("concept_occurrences"):
             return []
-        single_names = [
-            r[0]
-            for r in self._conn.execute(
+        # "Single-source" means backed by exactly one source DOCUMENT. concept_occurrences
+        # keys on segment id, and one source has many segments, so COUNT(*) would count
+        # segments, not sources — JOIN source_segments and count DISTINCT source_id.
+        if self._has_table("source_segments"):
+            single_sql = (
+                "SELECT co.concept_name FROM concept_occurrences co "
+                "JOIN source_segments s ON s.id = co.source_segment_id "
+                "GROUP BY co.concept_name HAVING COUNT(DISTINCT s.source_id) = 1"
+            )
+        else:
+            single_sql = (
                 "SELECT concept_name FROM concept_occurrences "
                 "GROUP BY concept_name HAVING COUNT(*) = 1"
-            ).fetchall()
-        ]
+            )
+        single_names = [r[0] for r in self._conn.execute(single_sql).fetchall()]
         if not single_names:
             return []
         label_to_name = self._build_label_lookup(single_names)

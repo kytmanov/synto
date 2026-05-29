@@ -37,6 +37,16 @@
 - The `answer_question` MCP tool now carries a description that routes callers
   between it (ready-made synthesis) and the verbatim primitives. Behavior is
   unchanged.
+- Ingest now analyzes tracked sources in **segment-aligned chunks** (whole
+  `source_segments` packed to the context budget instead of fixed-size byte
+  slices) and records which segments produced each concept in
+  `concept_occurrences`. This populates `get_source_passages` from the model's own
+  extraction at no extra LLM cost, and avoids splitting paragraphs mid-text. Plain
+  notes (no segments) keep the existing fixed-size chunking. **Existing vaults:**
+  run `synto ingest --force` once to backfill concept→segment links for
+  already-ingested sources (re-runs analysis only; published articles are
+  untouched). `synto doctor` reports link coverage and prints this tip when links
+  are absent.
 
 ### Notes
 

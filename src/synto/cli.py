@@ -2163,6 +2163,24 @@ def doctor(vault_str, backlog, since):
     except Exception as exc:  # pragma: no cover — defensive
         console.print(f"  [yellow]![/yellow] could not read FTS index status: {exc}")
 
+    # Concept→segment links back get_source_passages. They are populated at ingest;
+    # vaults ingested before this feature have segments but zero links until re-ingested.
+    try:
+        seg_total = db.count_source_segments()
+        link_count = db.concept_occurrence_count()
+        if seg_total > 0 and link_count == 0:
+            console.print(
+                "  [yellow]![/yellow] 0 concept→segment links — get_source_passages will be"
+                " empty. Run [bold]synto ingest --force[/bold] to backfill (analysis only;"
+                " published articles are untouched)."
+            )
+        elif link_count > 0:
+            console.print(
+                f"  [green]✓[/green] {link_count} concept→segment links (get_source_passages ready)"
+            )
+    except Exception as exc:  # pragma: no cover — defensive
+        console.print(f"  [yellow]![/yellow] could not read concept-link status: {exc}")
+
     # ── MCP source-access posture ─────────────────────────────────────────────
     # Surfaces the effective privacy gate so the legacy-vault grandfather (which
     # exposes all raw source text over MCP) is never silent. See serve.py.

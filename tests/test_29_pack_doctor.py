@@ -67,7 +67,19 @@ def _audit_row(
     )
 
 
-def _add_occurrence(db: StateDB, concept_name: str, seg_id: str) -> None:
+def _add_occurrence(
+    db: StateDB, concept_name: str, seg_id: str, source_id: str | None = None
+) -> None:
+    # Back the occurrence with a real source_segments row so single_source_concepts_in_demand
+    # can count DISTINCT source documents (not segments). Each segment defaults to its own
+    # source, so a concept spanning N segments spans N sources unless source_id is shared.
+    src = source_id or seg_id
+    db._conn.execute(
+        """INSERT OR IGNORE INTO source_segments
+           (id, identity, ordinal, source_id, structural_locator, content_hash, text)
+           VALUES (?, ?, 0, ?, '', '', '')""",
+        (seg_id, seg_id, src),
+    )
     db._conn.execute(
         """INSERT INTO concept_occurrences
            (concept_name, source_segment_id, ordinal, confidence)
@@ -270,6 +282,31 @@ def test_backlog_single_source_concepts_section(tmp_path: Path) -> None:
 
     rows = db.single_source_concepts_in_demand("")
     assert rows == [("Yoneda lemma", 1, 2)]
+
+
+def test_single_source_counts_distinct_source_documents(tmp_path: Path) -> None:
+    """'Single-source' means one source DOCUMENT, not one segment.
+
+    Why it matters: concept_occurrences keys on segment id, and a source has many
+    segments. A concept appearing in two segments of the SAME source is still
+    single-source; spanning two different sources is not. (Before the fix the query
+    counted rows, so any multi-segment concept was wrongly excluded.)
+    """
+    db = StateDB(tmp_path / "state.db")
+    # "Spans one source" — two segments, both source srcA → single-source.
+    _add_occurrence(db, "OneSource", "a1", source_id="srcA")
+    _add_occurrence(db, "OneSource", "a2", source_id="srcA")
+    # "Spans two sources" — segments in srcA and srcB → NOT single-source.
+    _add_occurrence(db, "TwoSources", "a3", source_id="srcA")
+    _add_occurrence(db, "TwoSources", "b1", source_id="srcB")
+
+    now = datetime.now(UTC).isoformat()
+    _audit_row(db, ts=now, tool="find_concept", resolved_label="OneSource")
+    _audit_row(db, ts=now, tool="find_concept", resolved_label="TwoSources")
+
+    names = [name for name, _occ, _hits in db.single_source_concepts_in_demand("")]
+    assert "OneSource" in names
+    assert "TwoSources" not in names
 
 
 def test_backlog_single_source_matches_hashed_label_default(tmp_path: Path) -> None:
@@ -585,3 +622,23 @@ def test_doctor_shows_plain_mode_once_license_declared(
     assert result.exit_code == 0, result.output
     assert 'source-access mode: "permissive_only"' in result.output
     assert 'effective "all"' not in result.output
+
+
+def test_doctor_tips_ingest_force_when_no_concept_links(
+    vault: Path, runner: CliRunner, fake_provider
+) -> None:
+    """A vault with segments but 0 concept→segment links must tell the user how to backfill,
+    so get_source_passages isn't silently empty after upgrade (seamless-transition UX)."""
+    db = _open_vault_db(vault)
+    db._conn.execute(
+        """INSERT OR IGNORE INTO source_segments
+           (id, identity, ordinal, source_id, structural_locator, content_hash, text)
+           VALUES ('s1:p:0', 's1:p:0', 0, 's1', '', '', 'body')"""
+    )
+    db._conn.commit()
+    db._conn.close()
+
+    result = runner.invoke(cli, ["doctor", "--vault", str(vault)])
+    assert result.exit_code == 0, result.output
+    assert "0 concept→segment links" in result.output
+    assert "ingest --force" in result.output
