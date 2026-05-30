@@ -21,8 +21,10 @@ def test_resolve_api_key_explicit_env_empty_returns_none(monkeypatch):
     monkeypatch.setenv("TEST_EMPTY_KEY", "")
     monkeypatch.delenv("SYNTO_API_KEY", raising=False)
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
-    key = _resolve_api_key("groq", get_provider("groq"), api_key_env="TEST_EMPTY_KEY")
-    assert key is None
+
+    with patch("synto.global_config.load_global_config", return_value=None):
+        key = _resolve_api_key("groq", get_provider("groq"), api_key_env="TEST_EMPTY_KEY")
+        assert key is None
 
 
 def test_resolve_api_key_provider_specific_env(monkeypatch):
@@ -130,4 +132,24 @@ def test_build_client_custom_provider(tmp_path, monkeypatch):
 
     assert isinstance(client, OpenAICompatClient)
     assert client.base_url == "http://localhost:9999/v1"
+    client.close()
+
+
+def test_build_client_kimi_returns_anthropic_client(tmp_path, monkeypatch):
+    """build_client returns AnthropicCompatClient for Kimi provider."""
+    monkeypatch.setenv("KIMI_API_KEY", "kimi-test-key")
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "raw").mkdir()
+    (vault / "wiki").mkdir()
+    (vault / ".synto").mkdir()
+    (vault / "synto.toml").write_text(
+        '[provider]\nname = "kimi"\nurl = "https://api.kimi.com/coding"\n'
+    )
+    config = Config.from_vault(vault)
+    client = build_client(config)
+    from synto.anthropic_compat_client import AnthropicCompatClient
+
+    assert isinstance(client, AnthropicCompatClient)
+    assert client.base_url == "https://api.kimi.com/coding"
     client.close()
