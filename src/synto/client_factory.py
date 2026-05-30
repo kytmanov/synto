@@ -31,6 +31,17 @@ def build_client(
     prov_info = get_provider(prov.name)
     api_key = _resolve_api_key(prov.name, prov_info, api_key_env=api_key_env)
 
+    if prov_info and prov_info.anthropic_compat:
+        from .anthropic_compat_client import AnthropicCompatClient
+
+        return AnthropicCompatClient(
+            base_url=prov.url,
+            provider_name=prov.name,
+            api_key=api_key,
+            timeout=prov.timeout,
+            cache=cache,
+        )
+
     return OpenAICompatClient(
         base_url=prov.url,
         provider_name=prov.name,
