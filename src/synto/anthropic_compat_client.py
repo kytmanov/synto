@@ -90,6 +90,7 @@ class AnthropicCompatClient:
                 wait = delay
             if waited + wait > 60.0:
                 return resp
+            resp.close()  # release connection before sleeping
             log.debug("%s: HTTP 429, backing off %.1fs", self.provider_name, wait)
             time.sleep(wait)
             waited += wait
@@ -142,8 +143,9 @@ class AnthropicCompatClient:
         """
         messages: list[dict] = [{"role": "user", "content": prompt}]
 
+        # Build cache key once for both get and put
+        cache_messages: list[dict] | None = None
         if self._cache is not None:
-            # Include system in cache key for consistency
             cache_messages = []
             if system:
                 cache_messages.append({"role": "system", "content": system})
@@ -207,11 +209,7 @@ class AnthropicCompatClient:
                 finish_reason=stop_reason or ("empty_content" if is_empty else None),
             )
 
-        if self._cache is not None:
-            cache_messages = []
-            if system:
-                cache_messages.append({"role": "system", "content": system})
-            cache_messages.append({"role": "user", "content": prompt})
+        if self._cache is not None and cache_messages is not None:
             self._cache.put(model, cache_messages, content)
 
         return content
