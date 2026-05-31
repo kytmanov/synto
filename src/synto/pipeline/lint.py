@@ -482,6 +482,12 @@ def _add_graph_quality_issues(
         )
 
 
+def _wiki_rel_key(path: Path, wiki_dir: Path) -> str:
+    # Forward-slash, suffix-less, vault-relative key. as_posix() (not str()) so
+    # [[sources/X]] links — always forward-slash — resolve on Windows too. See #26.
+    return path.relative_to(wiki_dir).with_suffix("").as_posix().lower()
+
+
 def _build_title_index(config: Config, db: StateDB | None = None) -> dict[str, Path]:
     """Map lowercase title/stem → path for every wiki page, including drafts.
 
@@ -494,8 +500,7 @@ def _build_title_index(config: Config, db: StateDB | None = None) -> dict[str, P
     for md in config.wiki_dir.rglob("*.md"):
         index[md.stem.lower()] = md
         try:
-            rel_no_suffix = str(md.relative_to(config.wiki_dir).with_suffix(""))
-            index[rel_no_suffix.lower()] = md
+            index[_wiki_rel_key(md, config.wiki_dir)] = md
         except ValueError:
             pass
         try:
