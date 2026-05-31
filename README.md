@@ -374,10 +374,14 @@ synto query "what is consistent hashing?" --vault ~/my-wiki
 synto query "explain backpropagation" --vault ~/my-wiki --synthesize
 ```
 
-**Expose as MCP server** (Claude Code, Cursor, any MCP client):
-```bash
-synto serve --vault ~/my-wiki
+**Expose as MCP server** (Claude Code, Cursor, any MCP client). `synto serve` is a
+stdio server launched *by* the client, not run by hand — point your client's config at
+it:
+```json
+{ "mcpServers": { "synto": { "command": "synto", "args": ["serve", "--vault", "~/my-wiki"] } } }
 ```
+Run by hand it will print a "waiting for a client" line on stderr and otherwise sit
+idle — that is expected, not a hang.
 
 ---
 

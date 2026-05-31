@@ -1,5 +1,16 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- `synto serve` no longer looks like it hangs on startup (#30). The stdio MCP
+  server now prints a "ready / waiting for an MCP client" line to **stderr**, and
+  all server-side logging is routed to stderr so no log record can corrupt the
+  stdout JSON-RPC stream. The README now shows the MCP client-config form instead
+  of a bare command. The `\n` validation error users saw is expected stdio
+  behavior (a terminal is not a valid MCP client); the fix makes the wait legible.
+
 ## [0.4.0] - 2026-05-29
 
 ### Added

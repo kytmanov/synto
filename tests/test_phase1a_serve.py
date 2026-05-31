@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -50,6 +51,44 @@ def test_serve_help_works():
     assert result.exit_code == 0
     assert "stdio" in result.output
     assert "list_articles" in result.output
+
+
+def test_run_server_prints_startup_banner_to_stderr_and_keeps_stdout_clean(
+    vault, monkeypatch, capsys
+) -> None:
+    """run_server must announce itself on stderr (issue #30: silent hang) while
+    keeping stdout pristine for JSON-RPC. A stray log/print on stdout corrupts the
+    protocol stream and breaks a connected MCP client."""
+    pytest.importorskip("mcp.server.fastmcp")
+    import logging
+    from unittest.mock import MagicMock
+
+    from synto.serve import run_server
+
+    # Stub FastMCP so server.run() returns instead of blocking on stdin.
+    monkeypatch.setattr("mcp.server.fastmcp.FastMCP", MagicMock())
+
+    root = logging.getLogger()
+    saved_handlers = root.handlers[:]
+    # Simulate the CLI group callback that routes logging at stdout.
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+    root.addHandler(logging.StreamHandler(sys.stdout))
+    try:
+        run_server(vault)
+
+        # The redirect must leave no logging handler pointed at stdout.
+        assert root.handlers
+        assert all(getattr(h, "stream", None) is not sys.stdout for h in root.handlers)
+    finally:
+        for handler in list(root.handlers):
+            root.removeHandler(handler)
+        for handler in saved_handlers:
+            root.addHandler(handler)
+
+    captured = capsys.readouterr()
+    assert "Waiting for an MCP client" in captured.err
+    assert captured.out == ""
 
 
 def test_mcp_sdk_fastmcp_api_is_compatible_when_installed():
