@@ -17,6 +17,33 @@ import subprocess
 import sys
 from pathlib import Path
 
+# ── Console encoding (stdlib only, no deps) ───────────────────────────────────
+
+
+def _ensure_utf8_streams() -> None:
+    """Reconfigure stdout/stderr to UTF-8 when the console can't encode the
+    status glyphs (✓, ✗) we print — see issue #23. No-op when already UTF-8.
+
+    The classic case is a Windows legacy console (cp1252), but an ascii/POSIX
+    locale on Linux/CI hits the same UnicodeEncodeError. This installer runs
+    before the synto package is installed, so it carries its own copy of the
+    helper rather than importing one.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if stream is None:  # e.g. pythonw / detached GUI process
+            continue
+        encoding = (getattr(stream, "encoding", None) or "").lower()
+        if encoding.startswith("utf"):
+            continue
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:  # non-TextIOWrapper (pipe wrapper)
+            continue
+        try:
+            reconfigure(encoding="utf-8")
+        except (ValueError, OSError):
+            pass
+
+
 # ── Color helpers (stdlib only, no deps) ──────────────────────────────────────
 
 
@@ -190,6 +217,8 @@ def main() -> None:
     parser.add_argument("--pip", action="store_true", help="Force pip install")
     parser.add_argument("--uv", action="store_true", help="Force uv install")
     args = parser.parse_args()
+
+    _ensure_utf8_streams()
 
     print()
     print(bold("Synto") + "  installer")
