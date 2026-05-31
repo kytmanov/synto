@@ -115,7 +115,11 @@ def ensure_wikilinks(content: str, targets: list[str]) -> str:
             continue
         # Whole-word boundary match, case-sensitive, first occurrence only
         pattern = re.compile(r"(?<!\[)(?<!\|)\b" + re.escape(target) + r"\b(?!\])")
-        masked = pattern.sub(f"[[{target}]]", masked, count=1)
+        # Escape backslashes in replacement to prevent re.sub interpreting
+        # them as group references (e.g. \1) — titles with LaTeX like \int
+        # would otherwise raise re.PatternError.
+        repl = f"[[{target}]]".replace("\\", "\\\\")
+        masked = pattern.sub(repl, masked, count=1)
 
     return _restore_code_blocks(masked, spans)
 

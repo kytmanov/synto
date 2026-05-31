@@ -164,6 +164,18 @@ def test_ensure_wikilinks_empty_targets():
     assert ensure_wikilinks(content, []) == content
 
 
+def test_ensure_wikilinks_backslash_target():
+    # LaTeX titles like \int crashed re.sub via a bad group escape (\i);
+    # the replacement must be backslash-escaped so the link is inserted literally.
+    assert ensure_wikilinks(r"x\int y", [r"\int"]) == r"x[[\int]] y"
+
+
+def test_ensure_wikilinks_backslash_target_no_match_does_not_raise():
+    # re.sub parses the replacement template eagerly, so a backslash title raised
+    # re.PatternError even when the body never matched the pattern.
+    assert ensure_wikilinks("no latex here", [r"\int"]) == "no latex here"
+
+
 # ── chunk_text ────────────────────────────────────────────────────────────────
 
 # ── sanitize_filename ─────────────────────────────────────────────────────────
