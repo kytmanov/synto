@@ -184,11 +184,11 @@ def is_synthesis_article_path(relative_path: str) -> bool:
 
 # ── Wikilink target safety ────────────────────────────────────────────────────
 
-_WIKILINK_UNSAFE = re.compile(r"[\[\]|#^]")
+_WIKILINK_UNSAFE = re.compile(r"[\\\[\]|#^]")
 
 
 def sanitize_wikilink_target(name: str) -> str:
-    """Remove characters that break [[wikilink]] syntax: [ ] | # ^"""
+    """Remove characters that break [[wikilink]] syntax, including backslashes."""
     return _WIKILINK_UNSAFE.sub("", name).strip()
 
 

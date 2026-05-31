@@ -181,6 +181,11 @@ def test_ensure_wikilinks_backslash_target_no_match_does_not_raise():
 # ── sanitize_filename ─────────────────────────────────────────────────────────
 
 
+def test_sanitize_wikilink_target_matches_backslash_stripped_filename():
+    assert sanitize_filename(r"\int") == "int"
+    assert sanitize_wikilink_target(r"\int") == "int"
+
+
 def test_sanitize_filename_strips_forbidden():
     assert sanitize_filename('A*B"C/D') == "ABCD"
 
