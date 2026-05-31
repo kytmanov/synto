@@ -202,6 +202,21 @@ def test_source_path_wikilink_missing_is_broken(vault, config, db):
     assert "sources/Missing Source" in broken[0].description
 
 
+def test_wiki_rel_key_forward_slash_on_windows_paths():
+    # #26: [[sources/X]] links (always forward-slash) were falsely reported broken
+    # on Windows because the title-index key used backslashes. The key must be
+    # forward-slash regardless of how wiki pages are enumerated by the OS.
+    from pathlib import PureWindowsPath
+
+    from synto.pipeline.lint import _wiki_rel_key
+
+    key = _wiki_rel_key(
+        PureWindowsPath(r"C:\v\wiki\sources\Source Note.md"),
+        PureWindowsPath(r"C:\v\wiki"),
+    )
+    assert key == "sources/source note"
+
+
 def test_duplicate_broken_links_deduplicated(vault, config, db):
     """Same broken target appearing multiple times in one page → only one issue."""
     body = "See [[Ghost]] here. Also [[Ghost]] there. And [[Ghost]] again."
