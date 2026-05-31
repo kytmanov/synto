@@ -47,6 +47,22 @@ _LOCAL_MODEL_LOAD_RETRY_SIGNALS = (
 _LOCAL_SERVER_ERROR_RETRY_SIGNALS = ("internal server error",)
 _LOCAL_MODEL_LOAD_RETRY_DELAYS = (2.0, 4.0, 8.0, 16.0, 32.0)
 
+# Some providers (notably OpenRouter free tier) return rate-limit / overloaded
+# errors as an {"error": {...}} body with an HTTP-2xx status, bypassing the
+# status-code backoff in _post_chat. These message substrings mark such a body
+# as transient (worth a bounded retry) rather than a permanent failure.
+_TRANSIENT_CLOUD_ERROR_SIGNALS = (
+    "rate limit",
+    "rate-limit",
+    "ratelimit",
+    "too many requests",
+    "temporarily",
+    "overloaded",
+    "try again",
+    "unavailable",
+)
+_TRANSIENT_CLOUD_RETRY_BUDGET_S = 60.0
+
 
 class LLMError(Exception):
     """Base error for all LLM client failures (OllamaError inherits from this)."""
@@ -210,6 +226,49 @@ class OpenAICompatClient:
             if any(signal in err_text for signal in _LOCAL_SERVER_ERROR_RETRY_SIGNALS):
                 return "HTTP 500"
         return None
+
+    @staticmethod
+    def _error_envelope_message(body: object) -> str | None:
+        """Human-readable message from a provider {"error": {...}} envelope, if any."""
+        if not isinstance(body, dict):
+            return None
+        err = body.get("error")
+        if isinstance(err, dict):
+            msg = err.get("message")
+            code = err.get("code")
+            if msg:
+                return f"{msg} (code={code})" if code is not None else str(msg)
+            return str(err)
+        if isinstance(err, str) and err:
+            return err
+        return None
+
+    def _transient_error_reason(self, body: object) -> str | None:
+        """Reason string if an error envelope looks transient (rate limit / overload)."""
+        msg = self._error_envelope_message(body)
+        if not msg:
+            return None
+        if isinstance(body, dict) and isinstance(body.get("error"), dict):
+            code = body["error"].get("code")
+            if code in (429, "429"):
+                return msg
+        if any(sig in msg.lower() for sig in _TRANSIENT_CLOUD_ERROR_SIGNALS):
+            return msg
+        return None
+
+    def _transient_2xx_error(self, resp: httpx.Response) -> str | None:
+        """Reason if a 2xx response actually carries a transient error envelope.
+
+        Returns None for normal completions and for non-2xx responses (those are
+        handled by raise_for_status / _wrap_error).
+        """
+        if not (200 <= resp.status_code < 300):
+            return None
+        try:
+            body = resp.json()
+        except ValueError:
+            return None
+        return self._transient_error_reason(body)
 
     def _post_chat(self, payload: dict) -> httpx.Response:
         """POST to chat endpoint with 429 exponential backoff (max ~60s cumulative)."""
@@ -402,6 +461,33 @@ class OpenAICompatClient:
                     use_json_mode=use_json_mode,
                 )
 
+            # Cloud throttle returned as an HTTP-2xx error envelope: retry with a
+            # bounded budget so a transient free-tier rate limit doesn't fail the
+            # caller. If the budget is exhausted the loop falls through and the
+            # parse block below surfaces the provider message as LLMBadRequestError.
+            waited = 0.0
+            delay = 1.0
+            while waited < _TRANSIENT_CLOUD_RETRY_BUDGET_S:
+                reason = self._transient_2xx_error(resp)
+                if not reason:
+                    break
+                wait = min(delay, _TRANSIENT_CLOUD_RETRY_BUDGET_S - waited)
+                log.warning(
+                    "%s: transient provider throttle (%s), retrying in %.1fs",
+                    self.provider_name,
+                    reason,
+                    wait,
+                )
+                time.sleep(wait)
+                waited += wait
+                delay = min(delay * 2, 16.0)
+                resp = self._post_chat(current_payload)
+                resp, current_payload = self._apply_chat_downgrades(
+                    resp,
+                    current_payload,
+                    use_json_mode=use_json_mode,
+                )
+
             resp.raise_for_status()
         except httpx.HTTPStatusError as e:
             self._last_stats = {"latency_ms": int((time.monotonic() - t0) * 1000)}
@@ -415,14 +501,31 @@ class OpenAICompatClient:
 
         try:
             body = resp.json()
-            choice = body["choices"][0]
-            content = choice["message"]["content"]
-            finish_reason = choice.get("finish_reason")
-        except (KeyError, IndexError, ValueError) as e:
+        except ValueError as e:
             self._last_stats = {"latency_ms": int((time.monotonic() - t0) * 1000)}
-            raise LLMError(
-                f"{self.provider_name}: unexpected response format: {resp.text[:200]}"
-            ) from e
+            snippet = resp.text.strip()[:200] or "<empty>"
+            raise LLMBadRequestError(f"{self.provider_name}: non-JSON response: {snippet}") from e
+
+        choice = None
+        if isinstance(body, dict):
+            choices = body.get("choices")
+            if isinstance(choices, list) and choices:
+                choice = choices[0]
+
+        if not isinstance(choice, dict):
+            # No usable choices on a 2xx body. Surface the provider's own error
+            # message (resp.text is unreliable — providers pad it with keep-alive
+            # whitespace) and raise LLMBadRequestError so callers isolate this
+            # per-unit instead of crashing the run.
+            self._last_stats = {"latency_ms": int((time.monotonic() - t0) * 1000)}
+            err_msg = self._error_envelope_message(body)
+            snippet = resp.text.strip()[:200]
+            detail = err_msg or f"no choices in response: {snippet or '<empty>'}"
+            raise LLMBadRequestError(f"{self.provider_name}: {detail}")
+
+        message = choice.get("message") or {}
+        content = message.get("content")
+        finish_reason = choice.get("finish_reason")
 
         usage = body.get("usage") or {}
         self._last_stats = {

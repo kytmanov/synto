@@ -333,3 +333,77 @@ def test_truncated_error_message_for_stop_does_not_suggest_raising_cap():
     assert "no usable content" in msg
     assert "lowering pipeline.article_max_tokens" in msg
     assert "Raise pipeline.article_max_tokens" not in msg
+
+
+# ── HTTP-2xx error envelope (issue #25: OpenRouter returns errors with 200) ─────
+
+
+def _error_body_2xx(message: str, code=None, *, text: str = "") -> MagicMock:
+    """A 200 response whose JSON body carries an {"error": {...}} envelope and
+    whose .text is keep-alive padding (the real failing case has whitespace text)."""
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.raise_for_status.return_value = None
+    error: dict = {"message": message}
+    if code is not None:
+        error["code"] = code
+    resp.json.return_value = {"error": error}
+    resp.text = text
+    return resp
+
+
+def test_generate_2xx_error_body_surfaces_provider_message():
+    """A 200 body with no usable choices must raise LLMBadRequestError carrying the
+    provider's own error message — not the old blank 'unexpected response format'."""
+    client = _make_client()
+    client._post_chat = MagicMock(
+        return_value=_error_body_2xx("Provider returned no completion", text="\n\n   \n")
+    )
+    with pytest.raises(LLMBadRequestError) as exc_info:
+        client.generate(prompt="hi", model="m", num_predict=2048)
+    msg = str(exc_info.value)
+    assert "Provider returned no completion" in msg
+    assert "unexpected response format" not in msg
+    # Non-transient → no retry.
+    assert client._post_chat.call_count == 1
+
+
+def test_generate_transient_2xx_error_retries_then_succeeds(monkeypatch):
+    """A transient rate-limit returned as a 200 error body is retried (issue #25:
+    OpenRouter free tier bypasses the 429 status backoff)."""
+    monkeypatch.setattr("synto.openai_compat_client.time.sleep", lambda _s: None)
+    client = _make_client()
+    transient = _error_body_2xx("Rate limit exceeded", code=429)
+    good = _ok_response("recovered", finish_reason="stop")
+    client._post_chat = MagicMock(side_effect=[transient, good])
+
+    assert client.generate(prompt="hi", model="m", num_predict=2048) == "recovered"
+    assert client._post_chat.call_count == 2
+
+
+def test_generate_transient_2xx_error_exhausts_budget_then_raises(monkeypatch):
+    """When the throttle never clears, the bounded retry gives up and raises a
+    classified error whose message is the real reason (never blank)."""
+    monkeypatch.setattr("synto.openai_compat_client.time.sleep", lambda _s: None)
+    client = _make_client()
+    client._post_chat = MagicMock(return_value=_error_body_2xx("Rate limit exceeded", code=429))
+
+    with pytest.raises(LLMBadRequestError) as exc_info:
+        client.generate(prompt="hi", model="m", num_predict=2048)
+    assert "Rate limit exceeded" in str(exc_info.value)
+    # Initial call + bounded retries (exponential 1,2,4,8,16,16,... within 60s).
+    assert client._post_chat.call_count > 1
+
+
+def test_generate_non_dict_body_raises_bad_request():
+    """A non-dict JSON body must not crash with an uncaught TypeError."""
+    client = _make_client()
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = ["unexpected", "list"]
+    resp.text = '["unexpected", "list"]'
+    client._post_chat = MagicMock(return_value=resp)
+
+    with pytest.raises(LLMBadRequestError):
+        client.generate(prompt="hi", model="m", num_predict=2048)

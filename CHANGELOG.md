@@ -4,6 +4,14 @@
 
 ### Fixed
 
+- `synto compile` no longer crashes (and `synto ingest` no longer fails notes with
+  a blank reason) when an OpenAI-compatible provider returns an error as an
+  HTTP-2xx body with no usable `choices` (#25). This is common on OpenRouter's free
+  tier, which returns rate-limit/overload errors as `{"error": {...}}` with a 200
+  status (bypassing the 429 backoff) and pads the body with keep-alive whitespace
+  that blanked the old error message. synto now surfaces the provider's real error
+  message, retries transient throttling with a bounded budget, and classifies the
+  failure so it is isolated to the affected note/concept instead of aborting the run.
 - synto no longer crashes with `UnicodeEncodeError` on the ✓/✗ status glyphs on
   Windows legacy (cp1252) consoles or ascii/POSIX locales (#23). `synto` and the
   `install.py` installer now reconfigure stdout/stderr to UTF-8 at startup when
