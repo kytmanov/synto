@@ -8,6 +8,7 @@ import pytest
 
 from synto.config import Config
 from synto.models import RawNoteRecord
+from synto.openai_compat_client import LLMBadRequestError
 from synto.pipeline.compile import (
     _resolve_language,
     _write_concept_prompt,
@@ -404,6 +405,25 @@ def test_compile_concepts_failed_same_source_stays_queued(vault, config, db):
     assert db.get_raw("raw/note.md").status == "ingested"
     assert "Beta" in db.concepts_needing_compile()
     assert "Alpha" not in db.concepts_needing_compile()
+
+
+def test_compile_concepts_isolates_provider_error(vault, config, db):
+    """A provider error (issue #25: e.g. OpenRouter 2xx rate-limit envelope, which
+    generate() now raises as LLMBadRequestError) must fail only that concept and
+    leave it queued for retry — never crash the whole compile run."""
+    db.upsert_raw(RawNoteRecord(path="raw/note.md", content_hash="abc", status="ingested"))
+    db.upsert_concepts("raw/note.md", ["Alpha"])
+    (vault / "raw" / "note.md").write_text("Body.")
+
+    client = MagicMock()
+    client.generate.side_effect = LLMBadRequestError("openrouter: Rate limit exceeded (code=429)")
+
+    drafts, failed, _ = compile_concepts(config=config, client=client, db=db)
+
+    assert drafts == []
+    assert failed == ["Alpha"]
+    assert db.get_raw("raw/note.md").status == "ingested"
+    assert "Alpha" in db.concepts_needing_compile()
 
 
 # ── Language tests ─────────────────────────────────────────────────────────────
