@@ -42,6 +42,32 @@ from .paths import (
     migration_message,
 )
 
+
+def _ensure_utf8_streams() -> None:
+    """Reconfigure stdout/stderr to UTF-8 when the console can't encode the
+    status glyphs (✓, ✗) we print — see issue #23. No-op when already UTF-8.
+
+    The classic case is a Windows legacy console (cp1252), but an ascii/POSIX
+    locale on Linux/CI hits the same UnicodeEncodeError. Must run before the
+    Console objects below are built, since rich binds the stream at construction.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if stream is None:  # e.g. pythonw / detached GUI process
+            continue
+        encoding = (getattr(stream, "encoding", None) or "").lower()
+        if encoding.startswith("utf"):
+            continue
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:  # non-TextIOWrapper (pytest capture, pipe wrapper)
+            continue
+        try:
+            reconfigure(encoding="utf-8")
+        except (ValueError, OSError):
+            pass
+
+
+_ensure_utf8_streams()
+
 console = Console()
 err_console = Console(stderr=True, style="bold red")
 

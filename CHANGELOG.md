@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- synto no longer crashes with `UnicodeEncodeError` on the ✓/✗ status glyphs on
+  Windows legacy (cp1252) consoles or ascii/POSIX locales (#23). `synto` and the
+  `install.py` installer now reconfigure stdout/stderr to UTF-8 at startup when
+  the console encoding can't represent them.
 - `synto serve` no longer looks like it hangs on startup (#30). The stdio MCP
   server now prints a "ready / waiting for an MCP client" line to **stderr**, and
   all server-side logging is routed to stderr so no log record can corrupt the
