@@ -1533,6 +1533,32 @@ def test_analyze_body_with_checkpoints_ignores_previous_schema_rows(vault, confi
     )
 
 
+def test_checkpoint_hash_changes_with_fast_provider_account(vault):
+    """Switching the fast provider/account (same model id) must bust ingest checkpoints —
+    otherwise old chunk analyses are reused and the new provider is never queried."""
+    content_hash = "deadbeef"
+    cfg_a = Config(
+        vault=vault,
+        providers={"p": {"name": "lm_studio", "url": "http://host-a:1234/v1"}},
+        models={
+            "fast": {"provider": "p", "model": "same-id"},
+            "heavy": {"provider": "p", "model": "h"},
+        },
+    )
+    cfg_b = Config(
+        vault=vault,
+        providers={"p": {"name": "lm_studio", "url": "http://host-b:1234/v1"}},
+        models={
+            "fast": {"provider": "p", "model": "same-id"},
+            "heavy": {"provider": "p", "model": "h"},
+        },
+    )
+    # Same fast model id, different fast endpoint -> different checkpoint hash.
+    assert _checkpoint_hash(content_hash, cfg_a, []) != _checkpoint_hash(content_hash, cfg_b, [])
+    # Identical config -> identical (stable) hash, so unchanged vaults don't re-ingest repeatedly.
+    assert _checkpoint_hash(content_hash, cfg_a, []) == _checkpoint_hash(content_hash, cfg_a, [])
+
+
 def test_ingest_note_replaces_stale_source_concepts(vault, config, db):
     path = _write_raw(vault, "note.md", "Initial body")
     first = _make_client(_analysis_json(concepts=["Alpha", "Beta"]))

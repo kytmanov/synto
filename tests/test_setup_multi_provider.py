@@ -17,7 +17,12 @@ from rich.console import Console
 
 from synto.cli import _setup_multi_provider
 from synto.config import Config
-from synto.global_config import _global_config_path, load_global_config
+from synto.global_config import (
+    GlobalConfig,
+    _global_config_path,
+    load_global_config,
+    save_global_config,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -44,6 +49,20 @@ def test_persists_per_role_split_to_global_config():
     assert g.providers[heavy_alias].api_key_env == "NVIDIA_API_KEY"
     # Secrets are never written to the global config — only the env-var name.
     assert not re.search(r"(?m)^\s*api_key\s*=", _global_config_path().read_text())
+
+
+def test_rerun_preserves_existing_global_provider_keys():
+    # The user-private per-alias key fallback ([provider_keys]) must survive re-running setup —
+    # rebuilding GlobalConfig from scratch would silently delete it.
+    save_global_config(GlobalConfig(provider_keys={"ngc": "secret-key"}))
+
+    # fast=ollama, heavy=nvidia (api_key_env), skip default-vault + citations.
+    _run(["1", "", "gemma4:e4b", "nvidia", "", "NVIDIA_API_KEY", "qwen2.5:14b", "", "n"])
+
+    g = load_global_config()
+    assert g is not None and g.is_multi_provider
+    assert g.provider_keys == {"ngc": "secret-key"}  # not dropped
+    assert "ngc" in _global_config_path().read_text()
 
 
 def test_optionally_applies_to_existing_vault_preserving_pipeline(tmp_path):

@@ -208,3 +208,36 @@ def test_override_preserves_per_role_model_and_params():
     r = c.resolve_role("heavy")
     assert (r.model, r.ctx, r.think, r.temperature) == ("big", 40000, True, 0.3)
     assert r.url == "http://relocated/v1"
+
+
+# ── cache namespace is account-aware (no cross-account collisions) ────────────
+
+
+def test_cache_namespace_differs_by_account_same_url(monkeypatch):
+    # Two accounts on the same endpoint must get different cache namespaces — otherwise one
+    # account can return the other's cached response.
+    monkeypatch.setenv("KEY_A", "aaa")
+    monkeypatch.setenv("KEY_B", "bbb")
+    c = _cfg(
+        providers={
+            "a": ProviderBlock(name="openrouter", url="https://x/v1", api_key_env="KEY_A"),
+            "b": ProviderBlock(name="openrouter", url="https://x/v1", api_key_env="KEY_B"),
+        },
+        models={
+            "fast": {"provider": "a", "model": "m"},
+            "heavy": {"provider": "b", "model": "m"},
+        },
+    )
+    assert c.resolve_role("fast").cache_namespace != c.resolve_role("heavy").cache_namespace
+
+
+def test_cache_namespace_stable_for_same_connection():
+    # Roles that share a connection (same client) must share a cache namespace.
+    c = _cfg(
+        providers={"default": ProviderBlock(name="ollama")},
+        models={
+            "fast": {"provider": "default", "model": "f"},
+            "heavy": {"provider": "default", "model": "h"},
+        },
+    )
+    assert c.resolve_role("fast").cache_namespace == c.resolve_role("heavy").cache_namespace

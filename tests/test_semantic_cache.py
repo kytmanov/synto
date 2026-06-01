@@ -78,6 +78,35 @@ def test_cache_key_namespaced_by_connection(tmp_path: Path) -> None:
     assert cache.get("qwen2.5:14b", messages, namespace="http://host-b") == "from-B"
 
 
+def test_cache_isolates_two_accounts_on_same_url(tmp_path: Path) -> None:
+    # Regression for the per-role bug: same URL + same model, but two accounts. Using each
+    # account's ResolvedModel.cache_namespace, account B must NOT see account A's cached response.
+    from synto.config import Config, ProviderBlock
+
+    db = StateDB(tmp_path / "state.db")
+    cache = LLMCache(db)
+    cfg = Config(
+        vault=str(tmp_path / "v"),
+        providers={
+            "a": ProviderBlock(name="openrouter", url="https://x/v1", api_key_env="KEY_A"),
+            "b": ProviderBlock(name="openrouter", url="https://x/v1", api_key_env="KEY_B"),
+        },
+        models={"fast": {"provider": "a", "model": "m"}, "heavy": {"provider": "b", "model": "m"}},
+    )
+    import os
+
+    os.environ["KEY_A"], os.environ["KEY_B"] = "aaa", "bbb"
+    try:
+        ns_a = cfg.resolve_role("fast").cache_namespace
+        ns_b = cfg.resolve_role("heavy").cache_namespace
+    finally:
+        del os.environ["KEY_A"], os.environ["KEY_B"]
+    messages = [{"role": "user", "content": "secret prompt"}]
+    cache.put("m", messages, "account-A-only", namespace=ns_a)
+    assert cache.get("m", messages, namespace=ns_b) is None  # B cannot read A's entry
+    assert cache.get("m", messages, namespace=ns_a) == "account-A-only"
+
+
 def test_cache_hit_increments_hit_count(tmp_path: Path) -> None:
     db = StateDB(tmp_path / "state.db")
     cache = LLMCache(db)

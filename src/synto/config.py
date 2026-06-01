@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import tomllib
 from dataclasses import dataclass
@@ -26,18 +28,29 @@ def _toml_quote(value: str) -> str:
 
 
 def _toml_value(value: Any) -> str:
-    """Serialize a scalar to a TOML value (bool/int/float/str). For options/headers passthrough."""
+    """Serialize a TOML value for options/headers passthrough.
+
+    Handles scalars (bool/int/float/str) plus nested dict (inline table) and list (array) —
+    provider-native options can be nested, e.g. {"thinking": {"budget": 1}}. bool is checked
+    before int because bool is an int subclass.
+    """
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, (int, float)):
         return str(value)
     if isinstance(value, str):
         return _toml_quote(value)
+    if isinstance(value, dict):
+        return _toml_inline_table(value)
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_toml_value(v) for v in value) + "]"
     raise ValueError(f"unsupported TOML value type for passthrough: {type(value).__name__}")
 
 
 def _toml_inline_table(table: dict[str, Any]) -> str:
-    """Serialize a flat dict to a TOML inline table: { "k" = v, ... }. Keys are always quoted."""
+    """Serialize a dict to a TOML inline table: { "k" = v, ... } (values may nest). Keys quoted."""
+    if not table:
+        return "{}"
     items = ", ".join(f"{_toml_quote(str(k))} = {_toml_value(v)}" for k, v in table.items())
     return f"{{ {items} }}"
 
@@ -236,6 +249,49 @@ def dedup_role_connections(
     return providers, role_alias
 
 
+def role_providers_head(config: Config) -> str:
+    """Render [providers.*] + [models.fast/heavy] reproducing config's *resolved* roles.
+
+    Single source of truth for both the `synto compare` contestant vault and the SWITCH
+    "apply this config" snippet: the fast and heavy roles can resolve to different
+    providers/accounts and carry distinct per-role params, all preserved here. Only api_key_env
+    (the env-var name) is emitted — never the secret.
+    """
+
+    def _spec(r: ResolvedModel) -> dict:
+        return {
+            "name": r.provider_kind,
+            "url": r.url,
+            "timeout": int(r.timeout),
+            "api_key_env": r.api_key_env,
+            "azure_api_version": r.azure_api_version if r.provider_kind == "azure" else None,
+            "headers": r.headers,
+            "model": r.model,
+            "ctx": r.ctx,
+            "think": r.think,
+            "temperature": r.temperature,
+            "options": r.options,
+        }
+
+    role_specs = {
+        "fast": _spec(config.resolve_role("fast")),
+        "heavy": _spec(config.resolve_role("heavy")),
+    }
+    providers, role_alias = dedup_role_connections(role_specs)
+    models = {
+        role: {
+            "provider": role_alias[role],
+            "model": s["model"],
+            "ctx": s["ctx"],
+            "think": s["think"],
+            "temperature": s["temperature"],
+            "options": s["options"],
+        }
+        for role, s in role_specs.items()
+    }
+    return _provider_models_head(providers, models)
+
+
 def multi_provider_vault_toml(
     providers: list[dict],
     models: dict[str, dict],
@@ -374,6 +430,23 @@ class ResolvedModel:
             self.azure_api_version,
             tuple(sorted(self.headers.items())),
         )
+
+    @property
+    def cache_namespace(self) -> str:
+        """Account-aware cache namespace: the connection_key fields minus timeout (which doesn't
+        change a response). The secret is hashed (sha256), never stored plaintext. Mirrors client
+        identity so cache-sharing == client-sharing — two accounts on one URL never collide."""
+        ident = json.dumps(
+            [
+                self.provider_kind,
+                self.url,
+                self.api_key or "",
+                self.azure_api_version,
+                sorted(self.headers.items()),
+            ],
+            sort_keys=True,
+        )
+        return hashlib.sha256(ident.encode()).hexdigest()
 
 
 class SourceTypeOverride(BaseModel):

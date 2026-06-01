@@ -34,6 +34,7 @@ class AnthropicCompatClient:
         timeout: float = 120.0,
         cache: LLMCache | None = None,
         extra_headers: dict[str, str] | None = None,
+        cache_namespace: str | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.provider_name = provider_name
@@ -47,6 +48,8 @@ class AnthropicCompatClient:
         )
         self._last_stats: dict = {}
         self._cache = cache
+        # Account-aware cache namespace; base_url fallback for direct construction.
+        self._cache_namespace = cache_namespace or self.base_url
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -155,7 +158,7 @@ class AnthropicCompatClient:
             if system:
                 cache_messages.append({"role": "system", "content": system})
             cache_messages.append({"role": "user", "content": prompt})
-            cached = self._cache.get(model, cache_messages, namespace=self.base_url)
+            cached = self._cache.get(model, cache_messages, namespace=self._cache_namespace)
             if cached is not None:
                 self._last_stats = {"latency_ms": 0, "cache_hit": True}
                 return cached
@@ -218,7 +221,7 @@ class AnthropicCompatClient:
             )
 
         if self._cache is not None and cache_messages is not None:
-            self._cache.put(model, cache_messages, content, namespace=self.base_url)
+            self._cache.put(model, cache_messages, content, namespace=self._cache_namespace)
 
         return content
 

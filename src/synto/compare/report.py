@@ -6,7 +6,6 @@ import json
 from dataclasses import asdict
 from enum import Enum
 
-from ..config import _toml_quote
 from .metrics import build_reasons, compute_advisor_metrics, decide_verdict
 from .models import AdvisorVerdict, CompareReport
 
@@ -37,15 +36,9 @@ def render_markdown(report: CompareReport) -> str:
     out.append("## Next Steps")
     out.append("")
     if report.verdict == AdvisorVerdict.SWITCH:
-        switch_toml = render_switch_config_toml(
-            fast_model=report.challenger.fast_model,
-            heavy_model=report.challenger.heavy_model,
-            provider_name=report.challenger.provider_name,
-            provider_url=report.challenger.provider_url,
-        )
         out.append(
             "Edit `synto.toml` in your vault and set the challenger config:\n"
-            f"```toml\n{switch_toml}\n```"
+            f"```toml\n{report.switch_config_toml}\n```"
         )
     elif report.verdict == AdvisorVerdict.KEEP_CURRENT:
         out.append("No change needed. Your current config performed better.")
@@ -130,36 +123,6 @@ def render_summary_json(report: CompareReport) -> str:
         "vault_path": report.vault_path,
     }
     return json.dumps(data, indent=2)
-
-
-def render_switch_config_toml(
-    fast_model: str,
-    heavy_model: str,
-    provider_name: str,
-    provider_url: str,
-) -> str:
-    lines = [
-        "[models]",
-        f"fast = {_toml_quote(fast_model)}",
-        f"heavy = {_toml_quote(heavy_model)}",
-        "",
-    ]
-    if provider_name == "ollama":
-        lines.extend(
-            [
-                "[ollama]",
-                f"url = {_toml_quote(provider_url)}",
-            ]
-        )
-    else:
-        lines.extend(
-            [
-                "[provider]",
-                f"name = {_toml_quote(provider_name)}",
-                f"url = {_toml_quote(provider_url)}",
-            ]
-        )
-    return "\n".join(lines)
 
 
 def _fmt(value) -> str:

@@ -201,3 +201,66 @@ def test_dedup_role_connections_shares_and_splits():
     assert len(providers) == 2
     assert role_alias["fast"] != role_alias["heavy"]
     assert providers[0]["alias"] == "default"
+
+
+def test_nested_options_round_trip_through_toml_writers(tmp_path):
+    # Provider-native options can be nested ({"thinking": {"budget": 1}}) and the runtime accepts
+    # them; the TOML writers must serialize+reload them, not crash.
+    import tomllib
+
+    from synto.compare.runner import _write_effective_compare_toml
+    from synto.config import multi_provider_vault_toml
+
+    providers = [{"alias": "default", "name": "ollama", "url": "http://x", "timeout": 600}]
+    models = {
+        "fast": {"provider": "default", "model": "f", "ctx": 8192},
+        "heavy": {
+            "provider": "default",
+            "model": "h",
+            "ctx": 16384,
+            "options": {"thinking": {"budget": 1}, "stop": ["a", "b"]},
+        },
+    }
+    text = multi_provider_vault_toml(providers, models)
+    parsed = tomllib.loads(text)
+    assert parsed["models"]["heavy"]["options"] == {"thinking": {"budget": 1}, "stop": ["a", "b"]}
+
+    # And through the compare materializer (which goes via resolve_role -> role_providers_head).
+    cfg = Config(
+        vault=str(tmp_path / "active"),
+        providers={"default": {"name": "ollama"}},
+        models={
+            "fast": {"provider": "default", "model": "f"},
+            "heavy": {"provider": "default", "model": "h", "options": {"thinking": {"budget": 1}}},
+        },
+    )
+    d = tmp_path / "contestant"
+    d.mkdir()
+    _write_effective_compare_toml(d, cfg)  # must not raise
+    reloaded = Config.from_vault(d).resolve_role("heavy")
+    assert reloaded.options == {"thinking": {"budget": 1}}
+
+
+def test_role_providers_head_renders_split(tmp_path):
+    # The switch snippet / contestant head must reproduce a fast≠heavy split, not collapse it.
+    from synto.config import role_providers_head
+
+    cfg = Config(
+        vault=str(tmp_path / "v"),
+        providers={
+            "local": {"name": "ollama", "url": "http://localhost:11434"},
+            "cloud": {"name": "groq", "url": "https://api.groq.com/openai/v1"},
+        },
+        models={
+            "fast": {"provider": "local", "model": "f"},
+            "heavy": {"provider": "cloud", "model": "h"},
+        },
+    )
+    head = role_providers_head(cfg)
+    d = tmp_path / "applied"
+    for sub in ("raw", "wiki", "wiki/.drafts", ".synto"):
+        (d / sub).mkdir(parents=True)
+    (d / "synto.toml").write_text(head + "\n[pipeline]\n")
+    applied = Config.from_vault(d)
+    assert applied.resolve_role("fast").provider_kind == "ollama"
+    assert applied.resolve_role("heavy").provider_kind == "groq"

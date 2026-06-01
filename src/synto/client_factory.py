@@ -25,6 +25,7 @@ Role = Literal["fast", "heavy", "embed"]
 def _build_client_for(resolved: ResolvedModel, cache: LLMCache | None) -> LLMClientProtocol:
     """Construct the right client class for one resolved role. Three-way dispatch."""
     headers = resolved.headers or None
+    namespace = resolved.cache_namespace
     if resolved.provider_kind == "ollama":
         from .ollama_client import OllamaClient
 
@@ -33,6 +34,7 @@ def _build_client_for(resolved: ResolvedModel, cache: LLMCache | None) -> LLMCli
             timeout=resolved.timeout,
             cache=cache,
             extra_headers=headers,
+            cache_namespace=namespace,
         )
 
     if resolved.anthropic_compat:
@@ -45,6 +47,7 @@ def _build_client_for(resolved: ResolvedModel, cache: LLMCache | None) -> LLMCli
             timeout=resolved.timeout,
             cache=cache,
             extra_headers=headers,
+            cache_namespace=namespace,
         )
 
     return OpenAICompatClient(
@@ -58,6 +61,7 @@ def _build_client_for(resolved: ResolvedModel, cache: LLMCache | None) -> LLMCli
         azure_api_version=resolved.azure_api_version,
         cache=cache,
         extra_headers=headers,
+        cache_namespace=namespace,
     )
 
 

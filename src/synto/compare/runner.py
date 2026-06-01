@@ -11,7 +11,7 @@ from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ..config import Config, _provider_models_head, _toml_quote
+from ..config import Config, _toml_quote, role_providers_head
 from ..metrics import metrics_sink
 from ..paths import APP_DIR_NAME, CONFIG_FILE_NAME
 from ..vault import extract_wikilinks, parse_note
@@ -83,6 +83,7 @@ def run_compare(
         challenger=challenger_result,
         page_diff=page_diff,
         query_diffs=query_diffs,
+        switch_config_toml=role_providers_head(challenger_config),
     )
     report.current.diagnostics.setdefault("compare_wall_seconds", wall)
     _write_json(results_dir / "raw_report.json", asdict(report))
@@ -219,47 +220,9 @@ def _materialize_compare_vault(
 
 def _write_effective_compare_toml(vault: Path, config: Config) -> None:
     # Materialize the contestant vault from the *resolved* roles so it works on legacy and
-    # new-format active vaults alike (config.models.<role> may be a ModelProfile, and a CLI
-    # --provider override only shows up via resolve_role, not effective_provider). The fast and
-    # heavy roles can resolve to *different* providers/accounts and carry distinct per-role params
-    # (think/temperature/options), so emit the named-provider-block format that preserves both —
-    # not a single legacy block applied to both roles.
-    from ..config import dedup_role_connections
-
-    def _spec(r) -> dict:
-        return {
-            "name": r.provider_kind,
-            "url": r.url,
-            "timeout": int(r.timeout),
-            # api_key_env (the env-var NAME) is reproduced; the secret is resolved at run time
-            # from that env var in the contestant process — never written to the temp vault.
-            "api_key_env": r.api_key_env,
-            "azure_api_version": r.azure_api_version if r.provider_kind == "azure" else None,
-            "headers": r.headers,
-            "model": r.model,
-            "ctx": r.ctx,
-            "think": r.think,
-            "temperature": r.temperature,
-            "options": r.options,
-        }
-
-    role_specs = {
-        "fast": _spec(config.resolve_role("fast")),
-        "heavy": _spec(config.resolve_role("heavy")),
-    }
-    providers, role_alias = dedup_role_connections(role_specs)
-    models = {
-        role: {
-            "provider": role_alias[role],
-            "model": s["model"],
-            "ctx": s["ctx"],
-            "think": s["think"],
-            "temperature": s["temperature"],
-            "options": s["options"],
-        }
-        for role, s in role_specs.items()
-    }
-    head = _provider_models_head(providers, models)
+    # new-format active vaults alike, and so fast/heavy keep their distinct providers/accounts and
+    # per-role params (think/temperature/options) — see config.role_providers_head.
+    head = role_providers_head(config)
 
     # Known pre-existing gap (out of scope): this [pipeline] tail emits a subset of pipeline
     # fields; article_max_tokens / concept_draft_soft_cap / graph_quality_checks / citation

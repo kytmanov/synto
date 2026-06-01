@@ -136,6 +136,7 @@ class OpenAICompatClient:
         azure_api_version: str = "2024-02-15-preview",
         cache: LLMCache | None = None,
         extra_headers: dict[str, str] | None = None,
+        cache_namespace: str | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.provider_name = provider_name
@@ -151,6 +152,9 @@ class OpenAICompatClient:
         )
         self._last_stats: dict = {}
         self._cache = cache
+        # Account-aware cache namespace (folds in api_key/headers). Falls back to base_url for
+        # direct construction so two accounts on one URL never share cached responses.
+        self._cache_namespace = cache_namespace or self.base_url
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -422,7 +426,7 @@ class OpenAICompatClient:
         messages.append({"role": "user", "content": prompt})
 
         if self._cache is not None:
-            cached = self._cache.get(model, messages, namespace=self.base_url)
+            cached = self._cache.get(model, messages, namespace=self._cache_namespace)
             if cached is not None:
                 self._last_stats = {"latency_ms": 0, "cache_hit": True}
                 return cached
@@ -557,7 +561,7 @@ class OpenAICompatClient:
             )
 
         if self._cache is not None:
-            self._cache.put(model, messages, content, namespace=self.base_url)
+            self._cache.put(model, messages, content, namespace=self._cache_namespace)
 
         return content
 

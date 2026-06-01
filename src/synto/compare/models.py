@@ -90,3 +90,6 @@ class CompareReport:
     verdict: AdvisorVerdict = AdvisorVerdict.MANUAL_REVIEW
     reasons: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # Named-provider-block config the user can paste to adopt the challenger — preserves the full
+    # per-role split (no secrets, only api_key_env names). Rendered once from challenger_config.
+    switch_config_toml: str = ""

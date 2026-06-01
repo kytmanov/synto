@@ -112,12 +112,22 @@ def _checkpoint_hash(
     prompt_contexts: list[_PromptConceptContext],
     source_type: str = "notes",
 ) -> str:
+    fast = config.resolve_role("fast")
     payload = {
         "content_hash": content_hash,
         "prompt_version": _ingest_prompt_version(config),
         "source_type": source_type,
         "source_prompt": _source_prompt_fingerprint(source_type),
         "fast_model": config.model_name("fast"),
+        # Fold in the fast-role connection so switching provider/account (same model id) re-ingests.
+        # api_key_env is the env-var NAME, not the secret; rotating the key under the same name is
+        # the same account and intentionally does not bust the checkpoint.
+        "fast_connection": [
+            fast.provider_kind,
+            fast.url,
+            fast.api_key_env or "",
+            sorted(fast.headers.items()),
+        ],
         "contexts": [
             {"canonical": ctx.canonical, "aliases": list(ctx.aliases)} for ctx in prompt_contexts
         ],

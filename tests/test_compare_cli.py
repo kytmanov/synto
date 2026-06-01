@@ -208,6 +208,12 @@ def test_compare_switch_output_includes_provider_config(tmp_path, monkeypatch):
         run_id = "rid"
         verdict = AdvisorVerdict.SWITCH
         reasons = ["test reason"]
+        # The CLI prints the report's precomputed switch snippet verbatim (named-provider format).
+        switch_config_toml = (
+            '[providers.default]\nname = "groq"\nurl = "https://api.groq.com/openai/v1"\n'
+            'timeout = 600\n\n[models.fast]\nprovider = "default"\n'
+            'model = "new-heavy"\nctx = 8192\n'
+        )
 
     monkeypatch.setattr("synto.compare.runner.run_compare", lambda **kwargs: DummyReport())
     monkeypatch.setattr("synto.compare.report.resolve", lambda report: None)
@@ -237,6 +243,6 @@ def test_compare_switch_output_includes_provider_config(tmp_path, monkeypatch):
         ],
     )
     assert result.exit_code == 0
-    assert "[provider]" in result.output
+    assert "[providers.default]" in result.output
     assert 'name = "groq"' in result.output
     assert 'url = "https://api.groq.com/openai/v1"' in result.output

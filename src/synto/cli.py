@@ -957,6 +957,9 @@ def _setup_multi_provider(console) -> None:
             role: ModelProfile(provider=m["provider"], model=m["model"], ctx=m["ctx"])
             for role, m in models.items()
         },
+        # Preserve the user-private per-alias key fallback; rebuilding from scratch would delete it.
+        # The legacy flat single-provider fields are intentionally dropped (is_multi_provider wins).
+        provider_keys=existing.provider_keys if existing else None,
     )
     # Default vault (stored in the global config, used by `synto` without --vault) + citation
     # preference, mirroring the single-provider wizard. The default vault doubles as the
@@ -3525,7 +3528,6 @@ def compare(
         render_json,
         render_markdown,
         render_summary_json,
-        render_switch_config_toml,
         resolve,
     )
 
@@ -3548,16 +3550,7 @@ def compare(
         console.print(f"  · {reason}")
     if report.verdict == AdvisorVerdict.SWITCH:
         console.print(f"\n[bold]Next step:[/bold] edit {CONFIG_FILE_NAME} and set:")
-        _ch_heavy = challenger_config.resolve_role("heavy")
-        console.print(
-            render_switch_config_toml(
-                fast_model=challenger_config.model_name("fast"),
-                heavy_model=challenger_config.model_name("heavy"),
-                provider_name=_ch_heavy.provider_kind,
-                provider_url=_ch_heavy.url,
-            ),
-            markup=False,
-        )
+        console.print(report.switch_config_toml, markup=False)
 
 
 # ── Trace commands ────────────────────────────────────────────────────────────
