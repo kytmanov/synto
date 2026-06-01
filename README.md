@@ -437,6 +437,34 @@ blocks at the same provider with different `api_key_env`) or none at all (local 
 Keys are read from the named env var, the provider's conventional env var, `SYNTO_API_KEY`,
 or the user-private `~/.config/synto/config.toml` — **never** from the vault's `synto.toml`.
 
+#### NVIDIA / NGC
+
+NVIDIA inference is OpenAI-compatible; pick the block that matches how your model is served:
+
+- **Self-hosted NIM** (a model you host with NGC — the NIM container is pulled from NGC and run
+  on your own infra). It exposes `http://<host>:8000/v1` and usually needs **no key** on inference
+  requests. Use `name = "custom"` + your `url` so no environment key is auto-sent:
+
+  ```toml
+  [providers.ngc]
+  name    = "custom"
+  url     = "http://your-host:8000/v1"
+  timeout = 600   # raise for a large self-hosted model — the cloud default is 120s
+
+  [models.heavy]
+  provider = "ngc"
+  model    = "meta/llama-3.1-70b-instruct"
+  ```
+
+- **NVIDIA Cloud Functions (NVCF)** — set the OpenAI-compatible LLM Gateway base URL for your
+  function (from NVIDIA's console, ending in `/v1`) and `api_key_env = "NGC_API_KEY"`.
+- **API Catalog** (`build.nvidia.com`) — `name = "nvidia"` (default URL) with
+  `api_key_env = "NVIDIA_API_KEY"` (an `nvapi-` key).
+
+The legacy `/v2/nvcf/pexec` invocation form is not OpenAI-compatible and is not supported — use
+the LLM Gateway URL. `synto doctor` may list an NVCF model as "not found" if the per-function
+gateway has no `/v1/models`; that doesn't mean inference is broken.
+
 ### Advanced model parameters
 
 These are hand-edit-only (not prompted by `synto setup`):
