@@ -23,6 +23,7 @@ class ProviderInfo:
     default_timeout: float  # seconds; local=600, cloud=120
     env_var: str | None  # conventional env var for API key, e.g. "GROQ_API_KEY"
     azure: bool = False  # uses api-key header + api-version query param
+    anthropic_compat: bool = False  # uses Anthropic Messages API (x-api-key + /v1/messages)
 
 
 # fmt: off
@@ -49,6 +50,8 @@ PROVIDER_REGISTRY: dict[str, ProviderInfo] = {
     "perplexity":  ProviderInfo("perplexity",  "Perplexity",  "https://api.perplexity.ai",               True, False, False, False, 120.0, "PERPLEXITY_API_KEY"),
     "xai":         ProviderInfo("xai",         "xAI (Grok)",  "https://api.x.ai/v1",                    True, True,  False, False, 120.0, "XAI_API_KEY"),
     "azure":       ProviderInfo("azure",       "Azure OpenAI","",                                        True, True,  True,  False, 120.0, "AZURE_OPENAI_API_KEY", azure=True),
+    # ── Anthropic-compatible (x-api-key + /v1/messages) ───────────────────────
+    "kimi":        ProviderInfo("kimi",        "Kimi",        "https://api.kimi.com/coding",             True, False, False, False, 120.0, "KIMI_API_KEY", anthropic_compat=True),
     # ── Custom / unknown provider ─────────────────────────────────────────────
     "custom":      ProviderInfo("custom",      "Custom",      "",                                        False,True,  False, False, 300.0, None),
 }
