@@ -109,3 +109,95 @@ def test_azure_api_version_preserved_in_multi_provider(tmp_path):
     rh = Config.from_vault(d).resolve_role("heavy")
     assert rh.azure is True
     assert rh.azure_api_version == "2025-01-01-preview"
+
+
+def test_provider_models_head_omits_optional_keys_when_absent():
+    # Setup/init callers pass no think/temperature/options/headers — output must stay minimal
+    # (no spurious keys) so their existing round-trips are byte-identical.
+    from synto.config import _provider_models_head
+
+    head = _provider_models_head(
+        [{"alias": "default", "name": "ollama", "url": "http://x", "timeout": 600}],
+        {
+            "fast": {"provider": "default", "model": "f", "ctx": 8192},
+            "heavy": {"provider": "default", "model": "h", "ctx": 16384},
+        },
+    )
+    for absent in ("think", "temperature", "options", "headers"):
+        assert absent not in head
+
+
+def test_provider_models_head_emits_optional_keys_when_present():
+    from synto.config import _provider_models_head
+
+    head = _provider_models_head(
+        [
+            {
+                "alias": "default",
+                "name": "ollama",
+                "url": "http://x",
+                "timeout": 600,
+                "headers": {"X-Org": "acme"},
+            }
+        ],
+        {
+            "fast": {"provider": "default", "model": "f", "ctx": 8192, "think": False},
+            "heavy": {
+                "provider": "default",
+                "model": "h",
+                "ctx": 16384,
+                "think": True,
+                "temperature": 0.5,
+                "options": {"top_p": 0.9},
+            },
+        },
+    )
+    assert 'headers = { "X-Org" = "acme" }' in head
+    assert "think = false" in head and "think = true" in head
+    assert "temperature = 0.5" in head
+    assert 'options = { "top_p" = 0.9 }' in head
+
+
+def test_model_string_override_keeps_role_provider_binding(tmp_path):
+    # `synto compare/query --heavy-model X` overrides only the model id. On a new-format vault
+    # whose alias isn't "default", a naive replace would drop provider="local" and silently fall
+    # back to default/legacy (e.g. Ollama). The role's provider + ctx must survive.
+    d = tmp_path / "v"
+    for sub in ("raw", "wiki", "wiki/.drafts", ".synto"):
+        (d / sub).mkdir(parents=True)
+    (d / "synto.toml").write_text(
+        '[providers.local]\nname = "lm_studio"\nurl = "http://localhost:1234/v1"\ntimeout = 600\n\n'
+        '[models.fast]\nprovider = "local"\nmodel = "f"\nctx = 8192\n\n'
+        '[models.heavy]\nprovider = "local"\nmodel = "h"\nctx = 8192\n'
+    )
+    c = Config.from_vault(d, models={"heavy": "qwen/qwen3.5-9b"})
+    heavy = c.resolve_role("heavy")
+    assert heavy.provider_kind == "lm_studio"  # NOT dropped to ollama/legacy
+    assert heavy.url == "http://localhost:1234/v1"
+    assert heavy.model == "qwen/qwen3.5-9b"  # only the model id changed
+    assert heavy.ctx == 8192  # role ctx preserved
+
+
+def test_dedup_role_connections_shares_and_splits():
+    from synto.config import dedup_role_connections
+
+    # Same connection -> one "default" alias shared by both roles.
+    providers, role_alias = dedup_role_connections(
+        {
+            "fast": {"name": "ollama", "url": "http://x", "timeout": 600, "api_key_env": None},
+            "heavy": {"name": "ollama", "url": "http://x", "timeout": 600, "api_key_env": None},
+        }
+    )
+    assert len(providers) == 1 and providers[0]["alias"] == "default"
+    assert role_alias["fast"] == role_alias["heavy"] == "default"
+
+    # Different api_key_env (a different account) -> two distinct providers.
+    providers, role_alias = dedup_role_connections(
+        {
+            "fast": {"name": "openrouter", "url": "http://x", "api_key_env": "KEY_A"},
+            "heavy": {"name": "openrouter", "url": "http://x", "api_key_env": "KEY_B"},
+        }
+    )
+    assert len(providers) == 2
+    assert role_alias["fast"] != role_alias["heavy"]
+    assert providers[0]["alias"] == "default"

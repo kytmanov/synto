@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from click.testing import CliRunner
 
-from synto.cli import cli
+from synto.cli import _compare_config_summary, cli
 from synto.compare.models import AdvisorVerdict
+from synto.config import Config, ProviderBlock
 
 
 def _make_vault(tmp_path):
@@ -47,6 +48,33 @@ def test_compare_rejects_identical_override(tmp_path):
     )
     assert result.exit_code == 1
     assert "identical to current config" in result.output
+
+
+def test_compare_summary_detects_fast_only_provider_change():
+    # The identical-check must not collapse to the heavy role: a fast-role provider/url change
+    # is a real difference. (CLI flags can't express this yet, so guard the summary directly.)
+    base = Config(
+        vault="/tmp/v",
+        providers={
+            "local": ProviderBlock(name="ollama", url="http://localhost:11434"),
+            "cloud": ProviderBlock(name="groq", url="https://api.groq.com/openai/v1"),
+        },
+        models={
+            "fast": {"provider": "local", "model": "f"},
+            "heavy": {"provider": "cloud", "model": "h"},
+        },
+    )
+    # Same heavy, but fast moved from local ollama to the cloud provider.
+    moved_fast = base.model_copy(
+        update={
+            "models": base.models.model_copy(
+                update={"fast": base.models.fast.model_copy(update={"provider": "cloud"})}
+            )
+        }
+    )
+    assert _compare_config_summary(base) != _compare_config_summary(moved_fast)
+    # Truly identical configs compare equal.
+    assert _compare_config_summary(base) == _compare_config_summary(base.model_copy(deep=True))
 
 
 def test_compare_rejects_out_inside_raw(tmp_path):

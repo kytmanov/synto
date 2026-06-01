@@ -162,3 +162,49 @@ def test_two_accounts_same_provider_get_distinct_keys(monkeypatch):
     assert (fast.api_key, heavy.api_key) == ("aaa", "bbb")
     # Same provider+url but different keys must still be two distinct connections.
     assert fast.connection_key != heavy.connection_key
+
+
+# ── per-invocation CLI overrides (--provider / --provider-url) ────────────────
+
+
+def test_provider_url_override_alone_keeps_kind_and_key(monkeypatch):
+    # `synto query --provider-url http://other` must hit the SAME provider kind at a different
+    # endpoint, keeping the configured api_key_env (it's the same account, just relocated).
+    monkeypatch.setenv("GROQ_KEY", "secret")
+    c = _cfg(
+        providers={
+            "default": ProviderBlock(
+                name="groq", url="https://api.groq.com/openai/v1", api_key_env="GROQ_KEY"
+            )
+        },
+        models={"heavy": {"provider": "default", "model": "m"}},
+        provider_override_url="http://localhost:1234/v1",
+    )
+    r = c.resolve_role("heavy")
+    assert r.provider_kind == "groq"  # kind unchanged
+    assert r.url == "http://localhost:1234/v1"  # only the endpoint moved
+    assert r.api_key == "secret"  # configured key preserved
+    assert r.api_key_env == "GROQ_KEY"
+
+
+def test_provider_override_replaces_kind_and_url():
+    c = _cfg(
+        providers={"default": ProviderBlock(name="ollama")},
+        models={"heavy": {"provider": "default", "model": "m"}},
+        provider_override="groq",
+        provider_override_url="https://api.groq.com/openai/v1",
+    )
+    r = c.resolve_role("heavy")
+    assert r.provider_kind == "groq"
+    assert r.url == "https://api.groq.com/openai/v1"
+
+
+def test_override_preserves_per_role_model_and_params():
+    # An override changes only the connection; per-role model/ctx/think/temperature survive.
+    c = _cfg(
+        models={"heavy": {"model": "big", "ctx": 40000, "think": True, "temperature": 0.3}},
+        provider_override_url="http://relocated/v1",
+    )
+    r = c.resolve_role("heavy")
+    assert (r.model, r.ctx, r.think, r.temperature) == ("big", 40000, True, 0.3)
+    assert r.url == "http://relocated/v1"

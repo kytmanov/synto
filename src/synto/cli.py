@@ -474,6 +474,7 @@ def init(vault_path: str, existing: bool, non_interactive: bool, set_default: bo
                 "timeout": b.timeout,
                 "api_key_env": b.api_key_env,
                 "azure_api_version": b.azure_api_version,
+                "headers": b.headers,
             }
             for alias, b in gcfg.providers.items()
         ]
@@ -482,6 +483,9 @@ def init(vault_path: str, existing: bool, non_interactive: bool, set_default: bo
                 "provider": m.provider or "default",
                 "model": m.model,
                 "ctx": m.ctx or _role_ctx.get(role, 8192),
+                "think": m.think,
+                "temperature": m.temperature,
+                "options": m.options,
             }
             for role, m in (gcfg.models or {}).items()
             if role in ("fast", "heavy")
@@ -907,29 +911,9 @@ def _setup_multi_provider(console) -> None:
     heavy = _collect_role_provider(console, "Heavy", default_model="qwen2.5:14b")
 
     # De-duplicate connections; the first becomes "default" so embed/string roles resolve.
-    providers: list[dict] = []
-    role_alias: dict[str, str] = {}
-    for role, spec in (("fast", fast), ("heavy", heavy)):
-        key = (spec["name"], spec["url"], spec["api_key_env"])
-        match = next(
-            (p for p in providers if (p["name"], p["url"], p.get("api_key_env")) == key), None
-        )
-        if match is None:
-            alias = "default" if not providers else spec["name"]
-            base, n = alias, 2
-            while any(p["alias"] == alias for p in providers):
-                alias = f"{base}{n}"
-                n += 1
-            match = {
-                "alias": alias,
-                "name": spec["name"],
-                "url": spec["url"],
-                "timeout": spec["timeout"],
-                "api_key_env": spec["api_key_env"],
-                "azure_api_version": spec.get("azure_api_version"),
-            }
-            providers.append(match)
-        role_alias[role] = match["alias"]
+    from .config import dedup_role_connections
+
+    providers, role_alias = dedup_role_connections({"fast": fast, "heavy": heavy})
 
     models = {
         "fast": {
@@ -3366,6 +3350,24 @@ def _is_cloud_provider(provider_name: str | None) -> bool:
     return info is not None and not info.is_local
 
 
+def _compare_config_summary(config) -> tuple:
+    """Identity used to reject an identical challenger: both roles' model + provider kind + url.
+
+    Includes the fast role so a fast-only provider/url change is a real difference, not mistaken
+    for "identical".
+    """
+    fast = config.resolve_role("fast")
+    heavy = config.resolve_role("heavy")
+    return (
+        config.model_name("fast"),
+        config.model_name("heavy"),
+        fast.provider_kind,
+        fast.url,
+        heavy.provider_kind,
+        heavy.url,
+    )
+
+
 def _validate_compare_out_dir(out: Path, config) -> Path:
     out = out.expanduser().resolve()
     raw_dir = config.raw_dir.resolve()
@@ -3470,18 +3472,8 @@ def compare(
         sys.exit(1)
     challenger_config = _load_config(vault_str, **challenger_kwargs)
 
-    current_summary = (
-        config.model_name("fast"),
-        config.model_name("heavy"),
-        config.resolve_role("heavy").provider_kind,
-        config.resolve_role("heavy").url,
-    )
-    challenger_summary = (
-        challenger_config.model_name("fast"),
-        challenger_config.model_name("heavy"),
-        challenger_config.resolve_role("heavy").provider_kind,
-        challenger_config.resolve_role("heavy").url,
-    )
+    current_summary = _compare_config_summary(config)
+    challenger_summary = _compare_config_summary(challenger_config)
     if challenger_summary == current_summary:
         err_console.print("Challenger config is identical to current config.")
         sys.exit(1)

@@ -25,6 +25,23 @@ def _toml_quote(value: str) -> str:
     return f'"{escaped}"'
 
 
+def _toml_value(value: Any) -> str:
+    """Serialize a scalar to a TOML value (bool/int/float/str). For options/headers passthrough."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        return _toml_quote(value)
+    raise ValueError(f"unsupported TOML value type for passthrough: {type(value).__name__}")
+
+
+def _toml_inline_table(table: dict[str, Any]) -> str:
+    """Serialize a flat dict to a TOML inline table: { "k" = v, ... }. Keys are always quoted."""
+    items = ", ".join(f"{_toml_quote(str(k))} = {_toml_value(v)}" for k, v in table.items())
+    return f"{{ {items} }}"
+
+
 def default_wiki_toml(
     fast_model: str = "gemma4:e4b",
     heavy_model: str = "qwen2.5:14b",
@@ -128,9 +145,11 @@ def _vault_toml_tail(inline_source_citations: bool) -> str:
 def _provider_models_head(providers: list[dict], models: dict[str, dict]) -> str:
     """Build just the [providers.*] + [models.<role>] sections (no [pipeline] tail).
 
-    providers: list of {alias, name, url, timeout?, api_key_env?}. Include one named
-    "default" so string-form / embed roles resolve to it.
-    models: {role: {provider, model, ctx}} for "fast" and "heavy".
+    providers: list of {alias, name, url, timeout?, api_key_env?, azure_api_version?, headers?}.
+    Include one named "default" so string-form / embed roles resolve to it.
+    models: {role: {provider, model, ctx, think?, temperature?, options?}} for "fast"/"heavy".
+    The optional per-model (think/temperature/options) and per-provider (headers) keys are
+    emitted only when present, so callers that omit them get byte-identical output.
     Secrets are never written — only api_key_env (an env var name).
     """
     blocks: list[str] = []
@@ -145,20 +164,76 @@ def _provider_models_head(providers: list[dict], models: dict[str, dict]) -> str
             lines.append(f"api_key_env = {_toml_quote(p['api_key_env'])}")
         if p.get("name") == "azure" and p.get("azure_api_version"):
             lines.append(f"azure_api_version = {_toml_quote(p['azure_api_version'])}")
+        if p.get("headers"):
+            lines.append(f"headers = {_toml_inline_table(p['headers'])}")
         blocks.append("\n".join(lines))
     provider_section = "\n\n".join(blocks) + "\n"
 
     model_blocks: list[str] = []
     for role in ("fast", "heavy"):
         m = models[role]
-        model_blocks.append(
-            f"[models.{role}]\n"
-            f"provider = {_toml_quote(m['provider'])}\n"
-            f"model = {_toml_quote(m['model'])}\n"
-            f"ctx = {int(m['ctx'])}"
-        )
+        mlines = [
+            f"[models.{role}]",
+            f"provider = {_toml_quote(m['provider'])}",
+            f"model = {_toml_quote(m['model'])}",
+            f"ctx = {int(m['ctx'])}",
+        ]
+        if m.get("think") is not None:
+            mlines.append(f"think = {'true' if m['think'] else 'false'}")
+        if m.get("temperature") is not None:
+            mlines.append(f"temperature = {_toml_value(m['temperature'])}")
+        if m.get("options"):
+            mlines.append(f"options = {_toml_inline_table(m['options'])}")
+        model_blocks.append("\n".join(mlines))
     models_section = "\n\n".join(model_blocks) + "\n"
     return f"{provider_section}\n{models_section}"
+
+
+def dedup_role_connections(
+    roles: dict[str, dict],
+) -> tuple[list[dict], dict[str, str]]:
+    """Collapse per-role connection specs into de-duplicated [providers.*] blocks.
+
+    roles: ordered {role: spec}; spec carries name/url/timeout/api_key_env/azure_api_version/
+    headers. Roles sharing a connection share one alias; the first distinct connection becomes
+    "default" so string-form/embed roles resolve to it. Connections that differ by api_key_env
+    (a different account) or headers stay distinct. Returns (providers_list, {role: alias}).
+    Shared by `synto setup` and the `synto compare` contestant materializer.
+    """
+
+    def _key(spec: dict) -> tuple:
+        return (
+            spec.get("name"),
+            spec.get("url"),
+            spec.get("timeout"),
+            spec.get("api_key_env"),
+            spec.get("azure_api_version"),
+            tuple(sorted((spec.get("headers") or {}).items())),
+        )
+
+    providers: list[dict] = []
+    role_alias: dict[str, str] = {}
+    for role, spec in roles.items():
+        key = _key(spec)
+        match = next((p for p in providers if _key(p) == key), None)
+        if match is None:
+            alias = "default" if not providers else spec["name"]
+            base, n = alias, 2
+            while any(p["alias"] == alias for p in providers):
+                alias = f"{base}{n}"
+                n += 1
+            match = {
+                "alias": alias,
+                "name": spec["name"],
+                "url": spec["url"],
+                "timeout": spec.get("timeout"),
+                "api_key_env": spec.get("api_key_env"),
+                "azure_api_version": spec.get("azure_api_version"),
+                "headers": spec.get("headers") or {},
+            }
+            providers.append(match)
+        role_alias[role] = match["alias"]
+    return providers, role_alias
 
 
 def multi_provider_vault_toml(
@@ -271,6 +346,9 @@ class ResolvedModel:
     provider_kind: str
     url: str
     api_key: str | None
+    # The env-var NAME the key came from (block api_key_env), not the secret. Carried so the
+    # compare materializer can reproduce the contestant's api_key_env without copying secrets.
+    api_key_env: str | None
     timeout: float
     model: str
     ctx: int
@@ -510,9 +588,40 @@ class Config(BaseModel):
         prof = getattr(self.models, role)
         profile = prof if isinstance(prof, ModelProfile) else ModelProfile(model=prof)
 
-        # Pick the connection. A CLI --provider override (for this invocation) wins over the
-        # configured provider for every role; otherwise: explicit alias > "default" block > legacy.
+        # Pick the configured connection: explicit alias > "default" block > legacy [provider]/
+        # [ollama]. CLI --provider/--provider-url overrides are applied as a post-step below.
         alias: str | None
+        if profile.provider is not None:
+            alias = profile.provider
+            block = self.providers[alias]
+        elif "default" in self.providers:
+            alias = "default"
+            block = self.providers["default"]
+        else:
+            alias = None
+            block = None
+
+        if block is not None:
+            kind = block.name
+            url = block.url
+            timeout = block.timeout
+            block_api_key_env = block.api_key_env
+            azure_api_version = block.azure_api_version
+            options = {**block.options, **profile.options}
+            headers = dict(block.headers)
+        else:
+            legacy = self.effective_provider
+            kind = legacy.name
+            url = legacy.url
+            timeout = legacy.timeout
+            block_api_key_env = None
+            azure_api_version = legacy.azure_api_version
+            options = dict(profile.options)
+            headers = {}
+
+        # Per-invocation CLI overrides (this run only). --provider replaces the provider kind
+        # (and endpoint, dropping the configured key/headers — a different account); --provider-url
+        # alone keeps the resolved kind + its api_key_env/headers/options, redirecting only the URL.
         if self.provider_override:
             alias = None
             kind = self.provider_override
@@ -522,34 +631,8 @@ class Config(BaseModel):
             azure_api_version = "2024-02-15-preview"
             options = dict(profile.options)
             headers = {}
-        else:
-            if profile.provider is not None:
-                alias = profile.provider
-                block = self.providers[alias]
-            elif "default" in self.providers:
-                alias = "default"
-                block = self.providers["default"]
-            else:
-                alias = None
-                block = None
-
-            if block is not None:
-                kind = block.name
-                url = block.url
-                timeout = block.timeout
-                block_api_key_env = block.api_key_env
-                azure_api_version = block.azure_api_version
-                options = {**block.options, **profile.options}
-                headers = dict(block.headers)
-            else:
-                legacy = self.effective_provider
-                kind = legacy.name
-                url = legacy.url
-                timeout = legacy.timeout
-                block_api_key_env = None
-                azure_api_version = legacy.azure_api_version
-                options = dict(profile.options)
-                headers = {}
+        elif self.provider_override_url:
+            url = self.provider_override_url
 
         prov_info = get_provider(kind)
         if not url:
@@ -572,6 +655,7 @@ class Config(BaseModel):
             provider_kind=kind,
             url=url,
             api_key=api_key,
+            api_key_env=block_api_key_env,
             timeout=timeout,
             model=profile.model,
             ctx=ctx,
@@ -668,7 +752,23 @@ class Config(BaseModel):
         for key, val in overrides.items():
             if val is None:
                 continue
-            if isinstance(val, dict) and isinstance(file_config.get(key), dict):
+            if (
+                key == "models"
+                and isinstance(val, dict)
+                and isinstance(file_config.get("models"), dict)
+            ):
+                merged = dict(file_config["models"])
+                for role, oval in val.items():
+                    existing = merged.get(role)
+                    # A bare model-string override (--fast-model/--heavy-model) must keep the
+                    # role's configured provider/ctx/params and only swap the model id — otherwise
+                    # it drops the provider binding and silently falls back to default/legacy.
+                    if isinstance(oval, str) and isinstance(existing, dict):
+                        merged[role] = {**existing, "model": oval}
+                    else:
+                        merged[role] = oval
+                file_config["models"] = merged
+            elif isinstance(val, dict) and isinstance(file_config.get(key), dict):
                 file_config[key] = {**file_config[key], **val}
             else:
                 file_config[key] = val

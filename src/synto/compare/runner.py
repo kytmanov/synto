@@ -11,7 +11,7 @@ from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ..config import Config, _toml_quote
+from ..config import Config, _provider_models_head, _toml_quote
 from ..metrics import metrics_sink
 from ..paths import APP_DIR_NAME, CONFIG_FILE_NAME
 from ..vault import extract_wikilinks, parse_note
@@ -220,56 +220,62 @@ def _materialize_compare_vault(
 def _write_effective_compare_toml(vault: Path, config: Config) -> None:
     # Materialize the contestant vault from the *resolved* roles so it works on legacy and
     # new-format active vaults alike (config.models.<role> may be a ModelProfile, and a CLI
-    # --provider override only shows up via resolve_role, not effective_provider).
-    fast = config.resolve_role("fast")
-    heavy = config.resolve_role("heavy")
-    name, url, timeout = heavy.provider_kind, heavy.url, int(heavy.timeout)
-    lines = [
-        "[models]",
-        f"fast = {_toml_quote(config.model_name('fast'))}",
-        f"heavy = {_toml_quote(config.model_name('heavy'))}",
-        "",
-    ]
-    if name == "ollama":
-        lines.extend(
-            [
-                "[ollama]",
-                f"url = {_toml_quote(url)}",
-                f"timeout = {timeout}",
-                f"fast_ctx = {fast.ctx}",
-                f"heavy_ctx = {heavy.ctx}",
-                "",
-            ]
-        )
-    else:
-        lines.extend(
-            [
-                "[provider]",
-                f"name = {_toml_quote(name)}",
-                f"url = {_toml_quote(url)}",
-                f"timeout = {timeout}",
-                f"fast_ctx = {fast.ctx}",
-                f"heavy_ctx = {heavy.ctx}",
-            ]
-        )
-        if name == "azure" and heavy.azure_api_version:
-            lines.append(f"azure_api_version = {_toml_quote(heavy.azure_api_version)}")
-        lines.append("")
+    # --provider override only shows up via resolve_role, not effective_provider). The fast and
+    # heavy roles can resolve to *different* providers/accounts and carry distinct per-role params
+    # (think/temperature/options), so emit the named-provider-block format that preserves both —
+    # not a single legacy block applied to both roles.
+    from ..config import dedup_role_connections
 
-    lines.extend(
-        [
-            "[pipeline]",
-            "auto_approve = true",
-            "auto_commit = false",
-            f"auto_maintain = {str(config.pipeline.auto_maintain).lower()}",
-            f"watch_debounce = {config.pipeline.watch_debounce}",
-            f"max_concepts_per_source = {config.pipeline.max_concepts_per_source}",
-            f"ingest_parallel = {str(config.pipeline.ingest_parallel).lower()}",
-        ]
-    )
+    def _spec(r) -> dict:
+        return {
+            "name": r.provider_kind,
+            "url": r.url,
+            "timeout": int(r.timeout),
+            # api_key_env (the env-var NAME) is reproduced; the secret is resolved at run time
+            # from that env var in the contestant process — never written to the temp vault.
+            "api_key_env": r.api_key_env,
+            "azure_api_version": r.azure_api_version if r.provider_kind == "azure" else None,
+            "headers": r.headers,
+            "model": r.model,
+            "ctx": r.ctx,
+            "think": r.think,
+            "temperature": r.temperature,
+            "options": r.options,
+        }
+
+    role_specs = {
+        "fast": _spec(config.resolve_role("fast")),
+        "heavy": _spec(config.resolve_role("heavy")),
+    }
+    providers, role_alias = dedup_role_connections(role_specs)
+    models = {
+        role: {
+            "provider": role_alias[role],
+            "model": s["model"],
+            "ctx": s["ctx"],
+            "think": s["think"],
+            "temperature": s["temperature"],
+            "options": s["options"],
+        }
+        for role, s in role_specs.items()
+    }
+    head = _provider_models_head(providers, models)
+
+    # Known pre-existing gap (out of scope): this [pipeline] tail emits a subset of pipeline
+    # fields; article_max_tokens / concept_draft_soft_cap / graph_quality_checks / citation
+    # settings are intentionally omitted here (unchanged from before).
+    tail = [
+        "[pipeline]",
+        "auto_approve = true",
+        "auto_commit = false",
+        f"auto_maintain = {str(config.pipeline.auto_maintain).lower()}",
+        f"watch_debounce = {config.pipeline.watch_debounce}",
+        f"max_concepts_per_source = {config.pipeline.max_concepts_per_source}",
+        f"ingest_parallel = {str(config.pipeline.ingest_parallel).lower()}",
+    ]
     if config.pipeline.language:
-        lines.append(f"language = {_toml_quote(config.pipeline.language)}")
-    (vault / CONFIG_FILE_NAME).write_text("\n".join(lines) + "\n")
+        tail.append(f"language = {_toml_quote(config.pipeline.language)}")
+    (vault / CONFIG_FILE_NAME).write_text(head + "\n" + "\n".join(tail) + "\n")
 
 
 def _capture_diagnostics(vault: Path, db, config: Config, events) -> dict:
