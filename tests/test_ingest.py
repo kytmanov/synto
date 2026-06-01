@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from click.testing import CliRunner
+from conftest import as_router
 
 from synto.cli import cli
 from synto.config import Config
@@ -64,10 +65,10 @@ def db(config):
     return StateDB(config.state_db_path)
 
 
-def _make_client(analysis_json: str) -> MagicMock:
+def _make_client(analysis_json: str, config=None):
     client = MagicMock()
     client.generate.return_value = analysis_json
-    return client
+    return as_router(client, config)
 
 
 def _write_raw(vault: Path, name: str, content: str) -> Path:
@@ -718,7 +719,7 @@ def test_ingest_note_rejects_named_reference_matching_concept(vault, config, db)
 
 def test_ingest_note_failure_marks_db_status(vault, config, db):
     path = _write_raw(vault, "fail.md", "# Fail\n\nContent.")
-    client = MagicMock()
+    client = as_router(MagicMock())
     client.generate.side_effect = RuntimeError("Ollama timeout")
     result = ingest_note(path, config, client, db)
     assert result is None
@@ -875,7 +876,7 @@ def test_ingest_note_filters_before_medium_quality_cap(vault, config, db):
 def test_ingest_all_updates_existing_topics_within_run(vault, config, db):
     _write_raw(vault, "a.md", "# A\n\nAlpha content.")
     _write_raw(vault, "b.md", "# B\n\nBeta content.")
-    client = MagicMock()
+    client = as_router(MagicMock())
     client.generate.side_effect = [
         _analysis_json(concepts=["Alpha Concept"]),
         _analysis_json(concepts=["Beta Concept"]),
@@ -890,7 +891,7 @@ def test_ingest_all_updates_existing_topics_within_run(vault, config, db):
 def test_ingest_all_reports_progress(vault, config, db):
     _write_raw(vault, "a.md", "# A\n\nAlpha content.")
     _write_raw(vault, "b.md", "# B\n\nBeta content.")
-    client = MagicMock()
+    client = as_router(MagicMock())
     client.generate.side_effect = [
         _analysis_json(concepts=["Alpha Concept"]),
         _analysis_json(concepts=["Beta Concept"]),
@@ -973,7 +974,7 @@ def test_ingest_all_reuses_seeded_aliases_across_full_run(vault, config, db):
         ),
         encoding="utf-8",
     )
-    client = MagicMock()
+    client = as_router(MagicMock())
     client.generate.side_effect = [
         _analysis_json(concepts=["Alpha Concept"]),
         _analysis_json(concepts=["гибкая разработка"]),
@@ -1095,7 +1096,7 @@ def test_cli_ingest_all_passes_progress_callback(vault, db, monkeypatch):
     _write_raw(vault, "a.md", "# A\n\nAlpha content.")
     captured: dict[str, object] = {}
 
-    def fake_ingest_all(*, config, client, db, force, on_progress):
+    def fake_ingest_all(*, config, router, db, force, on_progress):
         captured["on_progress"] = on_progress
         on_progress(1, 1, "raw/a.md")
         return [(config.raw_dir / "a.md", None)]
@@ -1322,7 +1323,7 @@ def test_analyze_body_with_checkpoints_resumes_after_failure(vault, config, db):
     content_hash = _content_hash(body)
     checkpoint_hash = _checkpoint_hash(content_hash, config2, [])
 
-    client = MagicMock()
+    client = as_router(MagicMock())
     calls = {"count": 0}
 
     def side_effect(**kwargs):

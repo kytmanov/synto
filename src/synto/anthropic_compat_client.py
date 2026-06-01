@@ -33,6 +33,7 @@ class AnthropicCompatClient:
         api_key: str | None = None,
         timeout: float = 120.0,
         cache: LLMCache | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.provider_name = provider_name
@@ -41,7 +42,7 @@ class AnthropicCompatClient:
         self.supports_json_mode = False
         self.supports_embeddings = False
         self._client = httpx.Client(
-            headers=self._build_headers(),
+            headers={**self._build_headers(), **(extra_headers or {})},
             timeout=timeout,
         )
         self._last_stats: dict = {}
@@ -132,6 +133,8 @@ class AnthropicCompatClient:
         num_ctx: int = 8192,
         num_predict: int = -1,
         temperature: float | None = None,
+        think: bool | None = None,
+        options: dict | None = None,
     ) -> str:
         """
         Call /v1/messages (Anthropic Messages API format).
@@ -140,6 +143,8 @@ class AnthropicCompatClient:
         num_ctx is silently ignored.
         num_predict > 0 maps to max_tokens; -1 defaults to 4096.
         format is silently ignored (JSON mode not supported).
+        `think` is a no-op here (Ollama-specific flag); use `options` (e.g. a `thinking`
+        budget object) for Anthropic-style reasoning control.
         """
         messages: list[dict] = [{"role": "user", "content": prompt}]
 
@@ -150,7 +155,7 @@ class AnthropicCompatClient:
             if system:
                 cache_messages.append({"role": "system", "content": system})
             cache_messages.append({"role": "user", "content": prompt})
-            cached = self._cache.get(model, cache_messages)
+            cached = self._cache.get(model, cache_messages, namespace=self.base_url)
             if cached is not None:
                 self._last_stats = {"latency_ms": 0, "cache_hit": True}
                 return cached
@@ -166,6 +171,9 @@ class AnthropicCompatClient:
             payload["system"] = system
         if temperature is not None:
             payload["temperature"] = temperature
+        if options:
+            # Provider-native params (e.g. a `thinking` budget); merged last to override.
+            payload.update(options)
 
         t0 = time.monotonic()
         try:
@@ -210,7 +218,7 @@ class AnthropicCompatClient:
             )
 
         if self._cache is not None and cache_messages is not None:
-            self._cache.put(model, cache_messages, content)
+            self._cache.put(model, cache_messages, content, namespace=self.base_url)
 
         return content
 

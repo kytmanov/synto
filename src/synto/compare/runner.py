@@ -103,7 +103,7 @@ def _run_single_vault(
     queries,
     sample_n: int | None = None,
 ) -> ContestantRunResult:
-    from ..client_factory import build_client
+    from ..client_factory import build_router
     from ..pipeline.orchestrator import PipelineOrchestrator
     from ..pipeline.query import run_query
     from ..state import StateDB
@@ -116,7 +116,7 @@ def _run_single_vault(
         temp_root, source_config.raw_dir, effective_config, sample_n=sample_n
     )
     config = Config.from_vault(temp_root)
-    client = build_client(config)
+    router = build_router(config)
     db = StateDB(config.state_db_path)
     pipeline_report = None
     partial = False
@@ -128,7 +128,7 @@ def _run_single_vault(
         with metrics_sink() as events:
             t0 = time.monotonic()
             try:
-                pipeline_report = PipelineOrchestrator(config, client, db).run(
+                pipeline_report = PipelineOrchestrator(config, router, db).run(
                     auto_approve=True, max_rounds=2
                 )
             except Exception as e:  # noqa: BLE001
@@ -142,7 +142,7 @@ def _run_single_vault(
                     try:
                         query_result = run_query(
                             config=config,
-                            client=client,
+                            router=router,
                             db=db,
                             question=q.question,
                             save=False,
@@ -167,7 +167,7 @@ def _run_single_vault(
         except AttributeError:
             pass
         try:
-            client.close()
+            router.close()
         except AttributeError:
             pass
 

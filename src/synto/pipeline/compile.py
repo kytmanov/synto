@@ -23,6 +23,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import frontmatter as fm_lib
 
@@ -30,7 +31,6 @@ from ..config import Config
 from ..markdown_math import mask_markdown_regions, restore_markdown_regions, sanitize_obsidian_math
 from ..models import ArticlePlan, CompilePlan, PipelineVersion, SingleArticle, WikiArticleRecord
 from ..openai_compat_client import LLMBadRequestError, LLMTruncatedError
-from ..protocols import LLMClientProtocol
 from ..sanitize import sanitize_tags
 from ..state import StateDB
 from ..structured_output import StructuredOutputError, request_structured
@@ -48,6 +48,9 @@ from ..vault import (
     sanitize_filename,
     write_note,
 )
+
+if TYPE_CHECKING:
+    from ..client_factory import ModelRouter
 
 log = logging.getLogger(__name__)
 
@@ -163,8 +166,10 @@ def _structured_compile_error(reason: str, message: str) -> str:
     )
 
 
-def _concept_draft_num_predict(config: Config, prompt: str, system: str) -> int:
-    computed = _article_num_predict(config, prompt, system)
+def _concept_draft_num_predict(
+    config: Config, prompt: str, system: str, heavy_ctx: int | None = None
+) -> int:
+    computed = _article_num_predict(config, prompt, system, heavy_ctx)
     soft_cap = config.pipeline.concept_draft_soft_cap
     if soft_cap == "article_max_tokens":
         return computed
@@ -178,18 +183,25 @@ def _concept_draft_num_predict(config: Config, prompt: str, system: str) -> int:
     return capped
 
 
-def _article_num_predict(config: Config, prompt: str, system: str) -> int:
+def _article_num_predict(
+    config: Config, prompt: str, system: str, heavy_ctx: int | None = None
+) -> int:
     """Return num_predict capped by both user config and remaining context budget.
+
+    heavy_ctx defaults to the legacy global heavy ctx; callers with a resolved heavy-role
+    endpoint pass that role's ctx so per-role provider context windows are honored.
 
     Raises ValueError if the available output budget is below the floor needed for
     reliable structured generation — caller should treat this as a per-article
     failure (sources too large for context), not a global crash.
     """
+    if heavy_ctx is None:
+        heavy_ctx = config.effective_provider.heavy_ctx
     estimated_prompt_tokens = max(1, len(system + prompt) // 4)
-    available_output = config.effective_provider.heavy_ctx - estimated_prompt_tokens - 256
+    available_output = heavy_ctx - estimated_prompt_tokens - 256
     if available_output < _MIN_ARTICLE_PREDICT:
         raise ValueError(
-            f"Source content too large for heavy_ctx={config.effective_provider.heavy_ctx}: "
+            f"Source content too large for heavy_ctx={heavy_ctx}: "
             f"prompt ~{estimated_prompt_tokens} tokens leaves only {available_output} "
             f"for output (need >= {_MIN_ARTICLE_PREDICT}). Reduce sources or raise heavy_ctx."
         )
@@ -839,7 +851,10 @@ def _build_concept_write_prompt(
     vault_schema: str,
     rejection_history: list[str] | None,
     db: StateDB,
+    heavy_ctx: int | None = None,
 ) -> tuple[str, list[str], float, str | None]:
+    if heavy_ctx is None:
+        heavy_ctx = config.effective_provider.heavy_ctx
     source_refs = (
         _build_source_refs(source_paths, config.vault)
         if config.pipeline.inline_source_citations
@@ -848,7 +863,7 @@ def _build_concept_write_prompt(
     sources_text, resolved_paths = _gather_sources(
         source_paths,
         config.vault,
-        max_chars=config.effective_provider.heavy_ctx // 2,
+        max_chars=heavy_ctx // 2,
         source_refs=source_refs,
     )
     confidence = _compute_confidence(resolved_paths, db)
@@ -868,7 +883,7 @@ def _build_concept_write_prompt(
 
 def compile_concepts(
     config: Config,
-    client: LLMClientProtocol,
+    router: ModelRouter,
     db: StateDB,
     force: bool = False,
     dry_run: bool = False,
@@ -904,6 +919,9 @@ def compile_concepts(
         log.info("No concepts needing compile")
         return [], [], {}
 
+    fast = router.endpoint("fast")
+    heavy = router.endpoint("heavy")
+
     # Start compile run tracking
     try:
         import ulid as _ulid_mod
@@ -913,10 +931,15 @@ def compile_concepts(
         import uuid
 
         run_ulid = uuid.uuid4().hex.upper()
-    pipeline = PipelineVersion(fast_model=config.models.fast, heavy_model=config.models.heavy)
+    pipeline = PipelineVersion(
+        fast_model=config.model_name("fast"), heavy_model=config.model_name("heavy")
+    )
     if not dry_run and db._has_table("compile_runs"):
         db.start_compile_run(
-            run_ulid, pipeline.model_dump_json(), config.models.fast, config.models.heavy
+            run_ulid,
+            pipeline.model_dump_json(),
+            config.model_name("fast"),
+            config.model_name("heavy"),
         )
 
     log.info("Compiling %d concept(s)", len(concept_names))
@@ -1004,15 +1027,17 @@ def compile_concepts(
             )
             try:
                 result: SingleArticle = request_structured(
-                    client=client,
+                    client=fast.client,
                     prompt=stub_prompt,
                     model_class=SingleArticle,
-                    model=config.models.fast,
+                    model=fast.model,
                     system=_STUB_WRITE_SYSTEM,
-                    num_ctx=config.effective_provider.fast_ctx,
-                    num_predict=min(_MAX_STUB_PREDICT, config.effective_provider.fast_ctx),
+                    num_ctx=fast.ctx,
+                    num_predict=min(_MAX_STUB_PREDICT, fast.ctx),
                     stage="compile_article",
                     model_role="fast",
+                    think=fast.think,
+                    options=fast.options,
                 )
             except (StructuredOutputError, LLMBadRequestError, LLMTruncatedError) as e:
                 log.error("Failed to write stub '%s': %s", name, e)
@@ -1070,6 +1095,7 @@ def compile_concepts(
             vault_schema,
             rejection_history,
             db,
+            heavy_ctx=heavy.ctx,
         )
         if not resolved_paths:
             log.warning("No readable sources for concept '%s', skipping", name)
@@ -1093,6 +1119,7 @@ def compile_concepts(
                     if config.pipeline.inline_source_citations
                     else _WRITE_SYSTEM
                 ),
+                heavy_ctx=heavy.ctx,
             )
         except ValueError as e:
             log.error("Failed to write '%s': %s", name, e)
@@ -1107,27 +1134,29 @@ def compile_concepts(
 
         try:
             result = request_structured(
-                client=client,
+                client=heavy.client,
                 prompt=write_prompt,
                 model_class=SingleArticle,
-                model=config.models.heavy,
+                model=heavy.model,
                 system=(
                     _WRITE_SYSTEM_WITH_CITATIONS
                     if config.pipeline.inline_source_citations
                     else _WRITE_SYSTEM
                 ),
-                num_ctx=config.effective_provider.heavy_ctx,
+                num_ctx=heavy.ctx,
                 num_predict=num_predict,
                 stage="compile_article",
                 model_role="heavy",
+                think=heavy.think,
+                options=heavy.options,
             )
         except (StructuredOutputError, LLMBadRequestError, LLMTruncatedError) as e:
             retry_succeeded = False
             if _is_prompt_context_overflow(e):
                 retry_plan = [
-                    (max(512, config.effective_provider.heavy_ctx // 4), 1000),
-                    (max(512, config.effective_provider.heavy_ctx // 8), 500),
-                    (max(512, config.effective_provider.heavy_ctx // 16), 0),
+                    (max(512, heavy.ctx // 4), 1000),
+                    (max(512, heavy.ctx // 8), 500),
+                    (max(512, heavy.ctx // 16), 0),
                     (512, 0),
                 ]
                 source_refs = (
@@ -1177,25 +1206,28 @@ def compile_concepts(
                                 if config.pipeline.inline_source_citations
                                 else _WRITE_SYSTEM
                             ),
+                            heavy_ctx=heavy.ctx,
                         )
                     except ValueError as retry_error:
                         e = retry_error
                         continue
                     try:
                         result = request_structured(
-                            client=client,
+                            client=heavy.client,
                             prompt=fallback_prompt,
                             model_class=SingleArticle,
-                            model=config.models.heavy,
+                            model=heavy.model,
                             system=(
                                 _WRITE_SYSTEM_WITH_CITATIONS
                                 if config.pipeline.inline_source_citations
                                 else _WRITE_SYSTEM
                             ),
-                            num_ctx=config.effective_provider.heavy_ctx,
+                            num_ctx=heavy.ctx,
                             num_predict=fallback_num_predict,
                             stage="compile_article",
                             model_role="heavy",
+                            think=heavy.think,
+                            options=heavy.options,
                         )
                         resolved_paths = fallback_resolved_paths
                         confidence = _compute_confidence(resolved_paths, db)
@@ -1312,7 +1344,7 @@ def _write_prompt_legacy(
 
 def compile_notes(
     config: Config,
-    client: LLMClientProtocol,
+    router: ModelRouter,
     db: StateDB,
     rag=None,
     source_paths: list[str] | None = None,
@@ -1333,6 +1365,9 @@ def compile_notes(
         log.info("No ingested notes to compile")
         return [], []
 
+    fast = router.endpoint("fast")
+    heavy = router.endpoint("heavy")
+
     # Build source summary for planning (use fast model — keep it short)
     summaries = []
     for p in paths:
@@ -1352,14 +1387,16 @@ def compile_notes(
 
     try:
         plan: CompilePlan = request_structured(
-            client=client,
+            client=fast.client,
             prompt=plan_prompt,
             model_class=CompilePlan,
-            model=config.models.fast,
+            model=fast.model,
             system=_PLAN_SYSTEM,
-            num_ctx=config.effective_provider.fast_ctx,
+            num_ctx=fast.ctx,
             stage="compile_plan",
             model_role="fast",
+            think=fast.think,
+            options=fast.options,
         )
     except (StructuredOutputError, LLMBadRequestError, LLMTruncatedError) as e:
         log.error("Planning failed: %s", e)
@@ -1394,7 +1431,7 @@ def compile_notes(
         sources_text, resolved_paths = _gather_sources(
             relevant,
             config.vault,
-            max_chars=config.effective_provider.heavy_ctx // 2,
+            max_chars=heavy.ctx // 2,
         )
 
         lang = _resolve_language([str(p) for p in resolved_paths], db, config)
@@ -1404,7 +1441,9 @@ def compile_notes(
             # Legacy compile intentionally follows only article_max_tokens plus remaining
             # context budget. concept_draft_soft_cap applies to the default concept-driven
             # path and does not change --legacy behavior.
-            num_predict = _article_num_predict(config, write_prompt, _WRITE_SYSTEM)
+            num_predict = _article_num_predict(
+                config, write_prompt, _WRITE_SYSTEM, heavy_ctx=heavy.ctx
+            )
         except ValueError as e:
             log.error("Failed to write '%s': %s", article.title, e)
             failed.append(article.title)
@@ -1413,15 +1452,17 @@ def compile_notes(
 
         try:
             result: SingleArticle = request_structured(
-                client=client,
+                client=heavy.client,
                 prompt=write_prompt,
                 model_class=SingleArticle,
-                model=config.models.heavy,
+                model=heavy.model,
                 system=_WRITE_SYSTEM,
-                num_ctx=config.effective_provider.heavy_ctx,
+                num_ctx=heavy.ctx,
                 num_predict=num_predict,
                 stage="compile_article",
                 model_role="heavy",
+                think=heavy.think,
+                options=heavy.options,
             )
         except (StructuredOutputError, LLMBadRequestError, LLMTruncatedError) as e:
             log.error("Failed to write '%s': %s", article.title, e)

@@ -18,6 +18,7 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import frontmatter
 
@@ -27,7 +28,6 @@ from ..indexer import append_log, generate_index
 from ..markdown_math import sanitize_obsidian_math
 from ..metrics import AppEvent, emit_app_event
 from ..models import PageSelection, QueryAnswer, WikiArticleRecord
-from ..protocols import LLMClientProtocol
 from ..readers import VaultReader
 from ..state import (
     DuplicateArticlePathError,
@@ -44,6 +44,9 @@ from ..vault import (
     sanitize_filename,
     write_note,
 )
+
+if TYPE_CHECKING:
+    from ..client_factory import ModelRouter, RoleEndpoint
 
 MAX_PAGES = 5
 MAX_CHARS_PER_PAGE = 8_000
@@ -659,8 +662,8 @@ def _emit_synthesis_event(question: str, source_pages: list[str], result: QueryS
 
 def _query_core(
     config: Config,
-    fast_client: LLMClientProtocol,
-    heavy_client: LLMClientProtocol,
+    fast_ep: RoleEndpoint,
+    heavy_ep: RoleEndpoint,
     db: StateDB | None,
     question: str,
     *,
@@ -704,14 +707,16 @@ def _query_core(
         'Return JSON: {"pages": ["Title 1", "Title 2"]}'
     )
     selection = request_structured(
-        client=fast_client,
+        client=fast_ep.client,
         prompt=selection_prompt,
         model_class=PageSelection,
-        model=config.models.fast,
-        num_ctx=config.effective_provider.fast_ctx,
+        model=fast_ep.model,
+        num_ctx=fast_ep.ctx,
         max_retries=2,
         stage="query_select",
         model_role="fast",
+        think=fast_ep.think,
+        options=fast_ep.options,
     )
 
     context = _load_pages(config, selection.pages, db=db, max_pages=max_pages)
@@ -729,14 +734,16 @@ def _query_core(
         'Return JSON: {"answer": "your full markdown answer here", "title": "short title"}'
     )
     result = request_structured(
-        client=heavy_client,
+        client=heavy_ep.client,
         prompt=answer_prompt,
         model_class=QueryAnswer,
-        model=config.models.heavy,
-        num_ctx=config.effective_provider.heavy_ctx,
+        model=heavy_ep.model,
+        num_ctx=heavy_ep.ctx,
         max_retries=2,
         stage="query_answer",
         model_role="heavy",
+        think=heavy_ep.think,
+        options=heavy_ep.options,
     )
 
     sanitized_answer = _sanitize_query_answer(result.answer, selection.pages, known_title_list)
@@ -752,7 +759,7 @@ def _query_core(
 
 def run_query(
     config: Config,
-    client: LLMClientProtocol,
+    router: ModelRouter,
     db: StateDB,
     question: str,
     save: bool = False,
@@ -765,8 +772,8 @@ def run_query(
     """
     engine = QueryEngine(
         reader=VaultReader(config.vault),
-        fast_client=client,
-        heavy_client=client,
+        fast_ep=router.endpoint("fast"),
+        heavy_ep=router.endpoint("heavy"),
         config=config,
         db=db,
         query_config=QueryConfig(max_pages=MAX_PAGES),

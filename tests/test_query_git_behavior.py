@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 from click.testing import CliRunner
+from conftest import as_router
 
 from synto.cli import cli
 from synto.config import Config
@@ -61,7 +62,7 @@ def test_query_synthesize_creates_no_new_auto_commit(tmp_path, monkeypatch):
     answer_json = json.dumps({"answer": "Answer.", "title": "Topic Overview"})
     client = _make_client(selection_json, answer_json)
 
-    monkeypatch.setattr("synto.cli._load_deps", lambda cfg: (client, db))
+    monkeypatch.setattr("synto.cli._load_deps", lambda cfg: (as_router(client), db))
     monkeypatch.setattr("sys.stdin.isatty", lambda: False)
     monkeypatch.setattr("sys.stdout.isatty", lambda: False)
 

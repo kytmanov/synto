@@ -66,6 +66,18 @@ def test_cache_key_includes_model(tmp_path: Path) -> None:
     assert cache.get("model-b", messages) == "response-b"
 
 
+def test_cache_key_namespaced_by_connection(tmp_path: Path) -> None:
+    # Same model name on two different endpoints/accounts must not collide — otherwise
+    # a per-role split (or two compare contestants) would return each other's responses.
+    db = StateDB(tmp_path / "state.db")
+    cache = LLMCache(db)
+    messages = [{"role": "user", "content": "hello"}]
+    cache.put("qwen2.5:14b", messages, "from-A", namespace="http://host-a")
+    cache.put("qwen2.5:14b", messages, "from-B", namespace="http://host-b")
+    assert cache.get("qwen2.5:14b", messages, namespace="http://host-a") == "from-A"
+    assert cache.get("qwen2.5:14b", messages, namespace="http://host-b") == "from-B"
+
+
 def test_cache_hit_increments_hit_count(tmp_path: Path) -> None:
     db = StateDB(tmp_path / "state.db")
     cache = LLMCache(db)
@@ -132,9 +144,9 @@ def test_ollama_cache_hit_skips_http(tmp_path: Path) -> None:
     db = StateDB(tmp_path / "state.db")
     cache = LLMCache(db)
     messages = [{"role": "user", "content": "hello"}]
-    cache.put("gemma4:e4b", messages, "cached response")
-
     client = OllamaClient(cache=cache)
+    cache.put("gemma4:e4b", messages, "cached response", namespace=client.base_url)
+
     with patch.object(client._client, "post") as mock_post:
         result = client.generate("hello", "gemma4:e4b")
         mock_post.assert_not_called()
@@ -161,7 +173,9 @@ def test_ollama_cache_stores_response(tmp_path: Path) -> None:
         result = client.generate("hello", "gemma4:e4b")
 
     assert result == "live response"
-    cached = cache.get("gemma4:e4b", [{"role": "user", "content": "hello"}])
+    cached = cache.get(
+        "gemma4:e4b", [{"role": "user", "content": "hello"}], namespace=client.base_url
+    )
     assert cached == "live response"
 
 
@@ -171,9 +185,9 @@ def test_openai_compat_cache_hit_skips_http(tmp_path: Path) -> None:
     db = StateDB(tmp_path / "state.db")
     cache = LLMCache(db)
     messages = [{"role": "user", "content": "hi"}]
-    cache.put("gpt-4o", messages, "cached openai")
-
     client = OpenAICompatClient(base_url="http://localhost:1234/v1", cache=cache)
+    cache.put("gpt-4o", messages, "cached openai", namespace=client.base_url)
+
     with patch.object(client._client, "post") as mock_post:
         result = client.generate("hi", "gpt-4o")
         mock_post.assert_not_called()

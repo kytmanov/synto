@@ -309,13 +309,13 @@ def _resolve_draft_arg(config, raw_path: str | Path) -> Path:
 
 def _load_deps(config):
     from .cache import LLMCache
-    from .client_factory import LLMError, build_client
+    from .client_factory import LLMError, build_router
 
     db = _load_db(config)
     cache = LLMCache(db)
-    client = build_client(config, cache=cache)
+    router = build_router(config, cache=cache)
     try:
-        client.require_healthy()
+        router.require_healthy()
     except LLMError as e:
         err_console.print(str(e))
         db.close()
@@ -326,8 +326,8 @@ def _load_deps(config):
         metrics_cm.__enter__()
         ctx.call_on_close(lambda cm=metrics_cm: cm.__exit__(None, None, None))
         ctx.call_on_close(db.close)
-        ctx.call_on_close(client.close)
-    return client, db
+        ctx.call_on_close(router.close)
+    return router, db
 
 
 # ── CLI root ──────────────────────────────────────────────────────────────────
@@ -581,20 +581,26 @@ def _sync_wiki_toml_models(
         replacement = rf'\1\2"{escaped_val}"'
         return re.sub(pattern, replacement, t, flags=re.MULTILINE | re.DOTALL)
 
+    # Legacy format: [models] fast/heavy scalars + url in [ollama]/[provider].
     text = _replace_value(text, "fast", fast)
     text = _replace_value(text, "heavy", heavy)
-    # Update URL only in [ollama] or [provider] sections to avoid clobbering other urls
     for section in ("ollama", "provider"):
         text = _replace_in_section(text, section, "url", ollama_url)
+    # New named-provider-block format: model under [models.<role>], url under [providers.default].
+    text = _replace_in_section(text, "models.fast", "model", fast)
+    text = _replace_in_section(text, "models.heavy", "model", heavy)
+    text = _replace_in_section(text, "providers.default", "url", ollama_url)
     if provider_name is not None:
-        if "[provider]" not in text:
+        if "[provider]" in text:
+            text = _replace_in_section(text, "provider", "name", provider_name)
+        elif "[providers.default]" in text:
+            text = _replace_in_section(text, "providers.default", "name", provider_name)
+        else:
             console.print(
-                f"  [yellow]Warning:[/yellow] {CONFIG_FILE_NAME} has no [provider] section — "
+                f"  [yellow]Warning:[/yellow] {CONFIG_FILE_NAME} has no provider section — "
                 f"provider '{provider_name}' not applied. "
                 f"Delete {CONFIG_FILE_NAME} and re-run [bold]synto init[/bold] to regenerate it."
             )
-        else:
-            text = _replace_in_section(text, "provider", "name", provider_name)
 
     if text != original:
         toml_path.write_text(text, encoding="utf-8")
@@ -1234,7 +1240,7 @@ def ingest(
 
     overrides = _model_override_kwargs(fast_model, heavy_model, provider_name, provider_url)
     config = _load_config(vault_str, **overrides)
-    client, db = _load_deps(config)
+    router, db = _load_deps(config)
 
     all_raw = bool(ingest_all)
     if all_raw:
@@ -1276,7 +1282,7 @@ def ingest(
 
             results = _ingest_all(
                 config=config,
-                client=client,
+                router=router,
                 db=db,
                 force=force,
                 on_progress=_update_ingest_progress,
@@ -1312,7 +1318,7 @@ def ingest(
                 result = _ingest_note(
                     path=path,
                     config=config,
-                    client=client,
+                    router=router,
                     db=db,
                     force=force,
                 )
@@ -1399,7 +1405,7 @@ def compile(
 
     overrides = _model_override_kwargs(fast_model, heavy_model, provider_name, provider_url)
     config = _load_config(vault_str, **overrides)
-    client, db = _load_deps(config)
+    router, db = _load_deps(config)
 
     explicit_concepts: list[str] | None = None
     if concepts:
@@ -1442,7 +1448,7 @@ def compile(
                     console.print(f"  [red]Not found, skipping:[/red] {rec.path}")
                     continue
                 db.mark_raw_status(rec.path, "new")
-                result = _ingest_note(path=p, config=config, client=client, db=db, force=True)
+                result = _ingest_note(path=p, config=config, router=router, db=db, force=True)
                 if result is not None:
                     retried += 1
             console.print(f"[green]Re-ingested {retried}/{len(failed_recs)} note(s).[/green]")
@@ -1474,7 +1480,7 @@ def compile(
             task = progress.add_task("Planning compilation (legacy)...", total=None)
             draft_paths, failed = compile_notes(
                 config=config,
-                client=client,
+                router=router,
                 db=db,
                 dry_run=dry_run,
             )
@@ -1491,7 +1497,7 @@ def compile(
 
             draft_paths, failed, _ = compile_concepts(
                 config=config,
-                client=client,
+                router=router,
                 db=db,
                 force=force,
                 dry_run=dry_run,
@@ -2077,12 +2083,11 @@ def _render_mcp_backlog(db, since: str) -> None:
 )
 def doctor(vault_str, backlog, since):
     """Check LLM provider connection, model availability, and vault health."""
-    from .client_factory import LLMError, build_client
+    from .client_factory import LLMError, build_router
 
     config = _load_config(vault_str)
     db = _load_db(config)
     ok = True
-    prov = config.effective_provider
 
     console.print("[bold]synto doctor[/bold]\n")
 
@@ -2125,34 +2130,57 @@ def doctor(vault_str, backlog, since):
         else:
             console.print(f"  [yellow]![/yellow] {name} missing (run [bold]synto init[/bold])")
 
-    # ── Provider connection ───────────────────────────────────────────────────
-    console.print(f"\n[bold]{prov.name}[/bold]")
-    client = build_client(config)
+    # ── Providers & models (per role) ─────────────────────────────────────────
+    # Each role can target a different provider/account. Healthcheck and list models
+    # once per unique connection; check each role's model against its own connection.
+    router = build_router(config)
+    think_label = {True: "think=on", False: "think=off", None: "think=default"}
+    # connection_key -> (healthy: bool, models: list[str])
+    conn_state: dict[tuple, tuple[bool, list[str]]] = {}
+    console.print("\n[bold]Providers & models[/bold]")
     try:
-        client.require_healthy()
-        console.print(f"  [green]✓[/green] Reachable at {prov.url}")
-    except LLMError as e:
-        console.print(f"  [red]✗[/red] {e}")
-        ok = False
-
-    # ── Model availability ────────────────────────────────────────────────────
-    console.print("\n[bold]Models[/bold]")
-    try:
-        available_models = client.list_models()
-    except Exception:
-        available_models = []
-
-    for label, model_name in [("fast", config.models.fast), ("heavy", config.models.heavy)]:
-        if any(model_name in a for a in available_models):
-            console.print(f"  [green]✓[/green] {label}: {model_name}")
-        else:
-            pull_hint = (
-                f"run: [bold]ollama pull {model_name}[/bold]"
-                if prov.name == "ollama"
-                else "check provider model list"
-            )
-            console.print(f"  [yellow]![/yellow] {label}: {model_name} not found — {pull_hint}")
-            ok = False
+        for role in ("fast", "heavy", "embed"):
+            resolved = config.resolve_role(role)
+            key = resolved.connection_key
+            if key not in conn_state:
+                ep = router.endpoint(role)
+                healthy = False
+                models: list[str] = []
+                try:
+                    ep.client.require_healthy()
+                    healthy = True
+                except LLMError:
+                    healthy = False
+                if healthy:
+                    try:
+                        models = ep.client.list_models()
+                    except Exception:
+                        models = []
+                conn_state[key] = (healthy, models)
+            healthy, models = conn_state[key]
+            conn = f"{resolved.provider_kind} @ {resolved.url}"
+            think_str = "" if role == "embed" else f"  [dim]{think_label[resolved.think]}[/dim]"
+            if not healthy:
+                console.print(f"  [red]✗[/red] {role}: {resolved.model} — {conn} unreachable")
+                ok = False
+                continue
+            if any(resolved.model in m for m in models):
+                console.print(
+                    f"  [green]✓[/green] {role}: {resolved.model}  [dim]{conn}[/dim]{think_str}"
+                )
+            else:
+                pull_hint = (
+                    f"run: [bold]ollama pull {resolved.model}[/bold]"
+                    if resolved.provider_kind == "ollama"
+                    else "check provider model list"
+                )
+                console.print(
+                    f"  [yellow]![/yellow] {role}: {resolved.model} not found "
+                    f"[dim]({conn})[/dim] — {pull_hint}"
+                )
+                ok = False
+    finally:
+        router.close()
 
     # ── Vault stats ───────────────────────────────────────────────────────────
     console.print("\n[bold]Vault stats[/bold]")
@@ -2284,7 +2312,7 @@ def query(vault_str, question, save, synthesize):
     from .pipeline.query import SynthesisSaveError, find_existing_synthesis, run_query
 
     config = _load_config(vault_str)
-    client, db = _load_deps(config)
+    router, db = _load_deps(config)
     duplicate_strategy = "keep_existing"
     if (
         synthesize
@@ -2312,7 +2340,7 @@ def query(vault_str, question, save, synthesize):
         try:
             result = run_query(
                 config,
-                client,
+                router,
                 db,
                 question,
                 save=save,
@@ -2353,8 +2381,8 @@ def watch(vault_str, auto_approve):
     from .watcher import watch as _watch
 
     config = _load_config(vault_str)
-    client, db = _load_deps(config)
-    orchestrator = PipelineOrchestrator(config, client, db)
+    router, db = _load_deps(config)
+    orchestrator = PipelineOrchestrator(config, router, db)
 
     debounce = config.pipeline.watch_debounce
     console.print(f"[bold]Watching[/bold] {config.raw_dir}  (debounce={debounce:.0f}s)")
@@ -2397,7 +2425,7 @@ def watch(vault_str, auto_approve):
         if report.stubs_created:
             console.print(f"  [dim]Created {report.stubs_created} stub(s) for broken links[/dim]")
 
-    _watch(config=config, client=client, db=db, on_event=_on_event)
+    _watch(config=config, router=router, db=db, on_event=_on_event)
 
 
 # ── serve ─────────────────────────────────────────────────────────────────────
@@ -2459,7 +2487,7 @@ def run(
 
     overrides = _model_override_kwargs(fast_model, heavy_model, provider_name, provider_url)
     config = _load_config(vault_str, **overrides)
-    client, db = _load_deps(config)
+    router, db = _load_deps(config)
 
     if dry_run:
         console.print("[dim]Dry run — no changes will be made.[/dim]\n")
@@ -2468,7 +2496,7 @@ def run(
         if not acquired:
             err_console.print("Pipeline already running — lock held. Check `synto status`.")
             sys.exit(1)
-        orchestrator = PipelineOrchestrator(config, client, db)
+        orchestrator = PipelineOrchestrator(config, router, db)
         report = orchestrator.run(
             auto_approve=auto_approve,
             fix=fix,

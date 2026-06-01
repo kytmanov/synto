@@ -19,6 +19,7 @@ from unittest.mock import MagicMock
 
 import frontmatter as fm_lib
 import pytest
+from conftest import as_router
 
 from synto.config import Config
 from synto.models import RawNoteRecord, WikiArticleRecord
@@ -54,10 +55,10 @@ def db(config):
     return StateDB(config.state_db_path)
 
 
-def _mock_client(article_json: str) -> MagicMock:
+def _mock_client(article_json: str):
     client = MagicMock()
     client.generate.return_value = article_json
-    return client
+    return as_router(client)
 
 
 # ── vault.py: build_wiki_frontmatter ──────────────────────────────────────
@@ -181,7 +182,7 @@ def test_compile_draft_single_source(vault, config, db):
     db.upsert_concepts("raw/note.md", ["Test Concept"])
 
     client = _mock_client(ARTIFACT_JSON)
-    drafts, _, _ = compile_concepts(config=config, client=client, db=db)
+    drafts, _, _ = compile_concepts(config=config, router=client, db=db)
     assert len(drafts) == 1
 
     meta, _ = parse_note(drafts[0])
@@ -207,7 +208,7 @@ def test_compile_draft_multi_source(vault, config, db):
     db.upsert_concepts("raw/note2.md", ["Test Concept"])
 
     client = _mock_client(ARTIFACT_JSON)
-    drafts, _, _ = compile_concepts(config=config, client=client, db=db)
+    drafts, _, _ = compile_concepts(config=config, router=client, db=db)
     assert len(drafts) == 1
 
     meta, _ = parse_note(drafts[0])
@@ -231,7 +232,7 @@ def test_compile_draft_source_quality_best_of(vault, config, db):
         db.upsert_concepts(p, ["Test Concept"])
 
     client = _mock_client(ARTIFACT_JSON)
-    drafts, _, _ = compile_concepts(config=config, client=client, db=db)
+    drafts, _, _ = compile_concepts(config=config, router=client, db=db)
     assert len(drafts) == 1
 
     meta, _ = parse_note(drafts[0])
@@ -249,7 +250,7 @@ def test_compile_draft_zero_sources(vault, config, db):
         }
     )
     client = _mock_client(stub_json)
-    drafts, _, _ = compile_concepts(config=config, client=client, db=db)
+    drafts, _, _ = compile_concepts(config=config, router=client, db=db)
     assert len(drafts) == 1
 
     meta, _ = parse_note(drafts[0])
@@ -631,7 +632,7 @@ def test_compile_single_source_from_one_document(vault, config, db):
     for p in ["raw/chunk0.md", "raw/chunk1.md"]:
         db.upsert_concepts(p, ["Test Concept"])
 
-    drafts, _, _ = compile_concepts(config=config, client=_mock_client(ARTIFACT_JSON), db=db)
+    drafts, _, _ = compile_concepts(config=config, router=_mock_client(ARTIFACT_JSON), db=db)
     meta, _ = parse_note(drafts[0])
     assert meta["source_count"] == 2
     assert meta["single_source"] is True
@@ -657,7 +658,7 @@ def test_compile_multi_source_from_two_documents(vault, config, db):
     for p in ["raw/chunk0.md", "raw/chunk1.md"]:
         db.upsert_concepts(p, ["Test Concept"])
 
-    drafts, _, _ = compile_concepts(config=config, client=_mock_client(ARTIFACT_JSON), db=db)
+    drafts, _, _ = compile_concepts(config=config, router=_mock_client(ARTIFACT_JSON), db=db)
     meta, _ = parse_note(drafts[0])
     assert meta["source_count"] == 2
     assert meta["single_source"] is False
@@ -685,7 +686,7 @@ def test_compile_falls_back_to_path_uniqueness_when_origin_uri_missing(vault, co
     for p in ["raw/note0.md", "raw/note1.md"]:
         db.upsert_concepts(p, ["Test Concept"])
 
-    drafts, _, _ = compile_concepts(config=config, client=_mock_client(ARTIFACT_JSON), db=db)
+    drafts, _, _ = compile_concepts(config=config, router=_mock_client(ARTIFACT_JSON), db=db)
     meta, _ = parse_note(drafts[0])
     assert meta["source_count"] == 2
     assert meta["single_source"] is False
@@ -713,7 +714,7 @@ def test_compile_fallback_when_some_sources_lack_source_documents_row(vault, con
     for p in ["raw/note0.md", "raw/note1.md"]:
         db.upsert_concepts(p, ["Test Concept"])
 
-    drafts, _, _ = compile_concepts(config=config, client=_mock_client(ARTIFACT_JSON), db=db)
+    drafts, _, _ = compile_concepts(config=config, router=_mock_client(ARTIFACT_JSON), db=db)
     meta, _ = parse_note(drafts[0])
     # Mixed source_documents coverage → path-uniqueness fallback says false.
     assert meta["single_source"] is False

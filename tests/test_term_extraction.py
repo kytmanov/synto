@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
+from conftest import as_endpoint
+
 from synto.models import TermExtractionResult, TermRecord
 from synto.state import StateDB
 
@@ -114,7 +116,7 @@ def test_extract_terms_empty_response(tmp_path: Path, config) -> None:
         text="Machine learning uses gradient descent.",
     )
     client = _mock_client('{"terms": []}')
-    result = extract_terms(segment, client, config)
+    result = extract_terms(segment, as_endpoint(client, model=config.model_name("fast")), config)
     assert isinstance(result, TermExtractionResult)
     assert result.terms == []
     assert result.source_segment_id == segment.id
@@ -155,7 +157,7 @@ def test_extract_terms_two_terms(tmp_path: Path, config) -> None:
         }
     )
     client = _mock_client(response)
-    result = extract_terms(segment, client, config)
+    result = extract_terms(segment, as_endpoint(client, model=config.model_name("fast")), config)
     assert len(result.terms) == 2
     assert result.terms[0].name == "Backpropagation"
     assert result.terms[0].source_segment_id == segment.id

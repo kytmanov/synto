@@ -13,12 +13,15 @@ class LLMCache:
     def __init__(self, db: StateDB) -> None:
         self._db = db
 
-    def _key(self, model: str, messages: list[dict]) -> str:
-        data = model + json.dumps(messages, sort_keys=True)
+    def _key(self, model: str, messages: list[dict], namespace: str = "") -> str:
+        # namespace (the client's base_url) keeps the same model name on different
+        # endpoints/accounts from colliding — otherwise two providers serving an
+        # identically-named model would return each other's cached responses.
+        data = namespace + "\x00" + model + json.dumps(messages, sort_keys=True)
         return hashlib.sha256(data.encode()).hexdigest()
 
-    def get(self, model: str, messages: list[dict]) -> str | None:
-        key = self._key(model, messages)
+    def get(self, model: str, messages: list[dict], namespace: str = "") -> str | None:
+        key = self._key(model, messages, namespace)
         row = self._db._conn.execute(
             "SELECT response_json FROM llm_cache WHERE cache_key = ?", (key,)
         ).fetchone()
@@ -31,8 +34,8 @@ class LLMCache:
         self._db._conn.commit()
         return row["response_json"]
 
-    def put(self, model: str, messages: list[dict], response: str) -> None:
-        key = self._key(model, messages)
+    def put(self, model: str, messages: list[dict], response: str, namespace: str = "") -> None:
+        key = self._key(model, messages, namespace)
         self._db._conn.execute(
             "INSERT OR REPLACE INTO llm_cache (cache_key, model, response_json, created_at) "
             "VALUES (?, ?, ?, ?)",

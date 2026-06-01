@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from conftest import as_router
 
 from synto.config import Config
 from synto.models import RawNoteRecord
@@ -38,12 +39,12 @@ def db(config: Config) -> StateDB:
     return StateDB(config.state_db_path)
 
 
-def make_mock_client(response: str = "{}") -> MagicMock:
+def make_mock_client(response: str = "{}"):
     from synto.ollama_client import OllamaClient
 
     client = MagicMock(spec=OllamaClient)
     client.generate.return_value = response
-    return client
+    return as_router(client)
 
 
 # ── PipelineReport ────────────────────────────────────────────────────────────
@@ -343,7 +344,7 @@ def test_orchestrator_selective_recompile_with_absolute_paths(config, db):
 
     original_ingest = ingest_mod.ingest_note
 
-    def fake_ingest(path, config, client, db):
+    def fake_ingest(path, config, router, db):
         return object()  # truthy — simulates successful ingest
 
     ingest_mod.ingest_note = fake_ingest

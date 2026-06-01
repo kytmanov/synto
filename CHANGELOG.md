@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### Added
+
+- Per-role LLM providers (#24). Each model role (`fast` / `heavy` / `embed`) can now
+  target a different provider and account via named `[providers.<alias>]` blocks that
+  roles reference, e.g. the heavy model on a cloud endpoint and the fast model on local
+  Ollama. Each block carries its own connection and API key (`api_key_env`, or a
+  per-alias key in the user-private global config) — a different key per model, or none
+  for local providers. `synto init` now emits this format by default; legacy `[ollama]` /
+  `[provider]` vaults keep working unchanged. Added an `nvidia` (NVIDIA NIM) provider.
+- Per-model parameters (#31). Each role accepts `ctx`, `temperature`, an Ollama `think`
+  flag, and an `options`/`headers` passthrough for any provider-native parameter (e.g.
+  `top_p`, `reasoning_effort`) with no code change. Thinking-model control resolves the
+  ingest timeout: the `fast` role defaults to `think=false` (structured extraction wastes
+  reasoning and could exhaust the budget), while `heavy`/answer roles keep thinking on.
+  All knobs are overridable per role in `synto.toml`.
+
 ### Fixed
 
 - `synto compile` no longer crashes (and `synto ingest` no longer fails notes with

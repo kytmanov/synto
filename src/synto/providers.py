@@ -49,6 +49,7 @@ PROVIDER_REGISTRY: dict[str, ProviderInfo] = {
     "siliconflow": ProviderInfo("siliconflow", "SiliconFlow", "https://api.siliconflow.cn/v1",           True, True,  True,  False, 120.0, "SILICONFLOW_API_KEY"),
     "perplexity":  ProviderInfo("perplexity",  "Perplexity",  "https://api.perplexity.ai",               True, False, False, False, 120.0, "PERPLEXITY_API_KEY"),
     "xai":         ProviderInfo("xai",         "xAI (Grok)",  "https://api.x.ai/v1",                    True, True,  False, False, 120.0, "XAI_API_KEY"),
+    "nvidia":      ProviderInfo("nvidia",      "NVIDIA NIM",  "https://integrate.api.nvidia.com/v1",     True, True,  False, False, 120.0, "NVIDIA_API_KEY"),
     "azure":       ProviderInfo("azure",       "Azure OpenAI","",                                        True, True,  True,  False, 120.0, "AZURE_OPENAI_API_KEY", azure=True),
     # ── Anthropic-compatible (x-api-key + /v1/messages) ───────────────────────
     "kimi":        ProviderInfo("kimi",        "Kimi",        "https://api.kimi.com/coding",             True, False, False, False, 120.0, "KIMI_API_KEY", anthropic_compat=True),

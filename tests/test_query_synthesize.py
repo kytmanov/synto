@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from conftest import as_router
 
 from synto.config import Config
 from synto.metrics import app_event_sink
@@ -25,7 +26,7 @@ def _make_client(selection_json: str, answer_json: str) -> MagicMock:
         return selection_json if call_count[0] == 1 else answer_json
 
     client.generate.side_effect = side_effect
-    return client
+    return as_router(client)
 
 
 def _make_vault(tmp_path: Path) -> tuple[Path, Config, StateDB]:

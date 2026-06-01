@@ -432,17 +432,17 @@ def test_add_cleans_up_partial_import_when_raw_note_write_fails(
 # ---------------------------------------------------------------------------
 
 
-def test_load_deps_passes_cache_to_build_client(config: Config) -> None:
-    """_load_deps must pass a non-None LLMCache to build_client."""
+def test_load_deps_passes_cache_to_build_router(config: Config) -> None:
+    """_load_deps must pass a non-None LLMCache to build_router."""
     from synto.cli import _load_deps
 
-    mock_client = MagicMock()
-    mock_client.require_healthy.return_value = None
+    mock_router = MagicMock()
+    mock_router.require_healthy.return_value = None
 
-    # Patch at the source module since _load_deps imports build_client locally
-    with patch("synto.client_factory.build_client", return_value=mock_client) as mock_build:
+    # Patch at the source module since _load_deps imports build_router locally
+    with patch("synto.client_factory.build_router", return_value=mock_router) as mock_build:
         _load_deps(config)
 
     _args, kwargs = mock_build.call_args
-    assert "cache" in kwargs, "build_client must be called with cache= keyword"
+    assert "cache" in kwargs, "build_router must be called with cache= keyword"
     assert kwargs["cache"] is not None, "cache must be a live LLMCache, not None"

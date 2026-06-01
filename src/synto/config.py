@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import logging
 import tomllib
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .paths import APP_DIR_NAME, LEGACY_CONFIG_FILE_NAME, effective_config_path
+from .providers import get_provider
 
 
 def _toml_quote(value: str) -> str:
@@ -34,43 +37,60 @@ def default_wiki_toml(
 ) -> str:
     """Generate Synto vault config content, optionally pre-filled from global config.
 
-    When provider_name is "ollama" (default), emits the legacy [ollama] section
-    so existing vaults keep working unchanged. Non-Ollama providers emit [provider].
+    Emits the named-provider-block format: one [providers.default] connection that both
+    model roles reference. Legacy [ollama]/[provider] vaults keep working (the config
+    resolver migrates them), but new vaults use this format so per-role providers (#24)
+    are an obvious hand-edit.
     """
     if provider_name == "ollama":
         url = provider_url or ollama_url
-        provider_section = (
-            f"[ollama]\n"
-            f"url = {_toml_quote(url)}\n"
-            f"timeout = 600\n"
-            f"fast_ctx = 16384                  # context window for fast model (tokens)\n"
-            f"heavy_ctx = 32768                 # context window for heavy model (tokens)\n"
-        )
+        fast_ctx, heavy_ctx = 16384, 32768
+        timeout_int = 600
     else:
         url = provider_url or ""
+        fast_ctx, heavy_ctx = 8192, 32768
         timeout_int = int(provider_timeout)
-        provider_section = (
-            f"[provider]\n"
-            f"name = {_toml_quote(provider_name)}\n"
-            f"url = {_toml_quote(url)}\n"
-            f"timeout = {timeout_int}\n"
-            f"fast_ctx = 8192                   # context window hint (tokens)\n"
-            f"heavy_ctx = 32768                 # context window hint (tokens)\n"
+
+    provider_lines = [
+        "[providers.default]",
+        f"name = {_toml_quote(provider_name)}",
+        f"url = {_toml_quote(url)}",
+        f"timeout = {timeout_int}",
+    ]
+    if provider_name == "azure":
+        api_ver = azure_api_version or "2024-02-15-preview"
+        provider_lines.append(f"azure_api_version = {_toml_quote(api_ver)}")
+    if provider_name != "ollama":
+        prov_info = get_provider(provider_name)
+        env_hint = prov_info.env_var if prov_info and prov_info.env_var else "PROVIDER_API_KEY"
+        provider_lines.append(
+            f'# api_key_env = "{env_hint}"  '
+            f"# or set that env var / store the key in ~/.config/synto/config.toml"
         )
-        if provider_name == "azure":
-            api_ver = azure_api_version or "2024-02-15-preview"
-            provider_section += f"azure_api_version = {_toml_quote(api_ver)}\n"
+    provider_section = "\n".join(provider_lines) + "\n"
+
+    models_section = (
+        f"[models.fast]\n"
+        f'provider = "default"\n'
+        f"model = {_toml_quote(fast_model)}\n"
+        f"ctx = {fast_ctx}                  # context window for fast model (tokens)\n\n"
+        f"[models.heavy]\n"
+        f'provider = "default"\n'
+        f"model = {_toml_quote(heavy_model)}\n"
+        f"ctx = {heavy_ctx}                 # context window for heavy model (tokens)\n"
+        f"# Advanced (optional, hand-edit): temperature, think, "
+        f"[models.<role>.options] — see README\n"
+        f"# Split providers: add another [providers.<alias>] block and set this role's "
+        f'provider = "<alias>"\n'
+    )
     citation_line = (
         "inline_source_citations = true  # Experimental: add inline source links\n"
         if inline_source_citations
         else "# inline_source_citations = false  # Experimental: add inline source links\n"
     )
     return (
-        f"[models]\n"
-        f"fast = {_toml_quote(fast_model)}\n"
-        f"heavy = {_toml_quote(heavy_model)}\n"
-        f"# Optional: set heavy = fast to use a single model for everything\n\n"
         f"{provider_section}\n"
+        f"{models_section}\n"
         f"[pipeline]\n"
         f"auto_approve = false\n"
         f"auto_commit = true\n"
@@ -102,10 +122,48 @@ def default_wiki_toml(
     )
 
 
+class ProviderBlock(BaseModel):
+    """A named provider connection (= one account). Roles reference it by alias.
+
+    Lives under [providers.<alias>]. `name` is the registry kind (ollama, groq, kimi,
+    custom, ...). Secrets are never stored here — only `api_key_env` (an env var name).
+    `options`/`headers` are passthrough escape hatches for provider-native params.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = "ollama"
+    url: str | None = None  # None -> registry default_url for `name`
+    timeout: float | None = None  # None -> registry default_timeout
+    api_key_env: str | None = None
+    azure_api_version: str = "2024-02-15-preview"
+    options: dict[str, Any] = Field(default_factory=dict)
+    headers: dict[str, str] = Field(default_factory=dict)
+
+
+class ModelProfile(BaseModel):
+    """Per-role model config (table form of [models.<role>]).
+
+    First-class fields get resolver logic (role-aware `think`, `ctx` budget math,
+    `temperature` override). Any other provider-native param goes in `options`.
+    extra="forbid" turns a misspelled top-level key into a loud load-time error.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str
+    provider: str | None = None  # alias into [providers.*]; None -> default/legacy
+    ctx: int | None = None
+    think: bool | None = None
+    temperature: float | None = None
+    options: dict[str, Any] = Field(default_factory=dict)
+
+
 class ModelsConfig(BaseModel):
-    fast: str = "gemma4:e4b"
-    heavy: str = "qwen2.5:14b"
-    embed: str = "nomic-embed-text"  # used only when RAG optional dependency is installed
+    # str form (legacy/simple) uses the default/global provider; table form is a ModelProfile.
+    fast: str | ModelProfile = "gemma4:e4b"
+    heavy: str | ModelProfile = "qwen2.5:14b"
+    embed: str | ModelProfile = "nomic-embed-text"  # used only when RAG optional dep installed
 
 
 class OllamaConfig(BaseModel):
@@ -116,7 +174,7 @@ class OllamaConfig(BaseModel):
 
 
 class ProviderConfig(BaseModel):
-    """New per-vault provider config. Supersedes [ollama] when present."""
+    """Legacy per-vault provider config. Supersedes [ollama] when present."""
 
     name: str = "ollama"
     url: str = "http://localhost:11434"
@@ -124,6 +182,40 @@ class ProviderConfig(BaseModel):
     fast_ctx: int = 16384
     heavy_ctx: int = 32768
     azure_api_version: str = "2024-02-15-preview"
+
+
+@dataclass
+class ResolvedModel:
+    """Everything a client needs for one role, after folding config + registry defaults."""
+
+    provider_kind: str
+    url: str
+    api_key: str | None
+    timeout: float
+    model: str
+    ctx: int
+    think: bool | None
+    temperature: float | None
+    supports_json_mode: bool
+    supports_embeddings: bool
+    azure: bool
+    azure_api_version: str
+    anthropic_compat: bool
+    options: dict[str, Any] = dataclass_field(default_factory=dict)
+    headers: dict[str, str] = dataclass_field(default_factory=dict)
+
+    @property
+    def connection_key(self) -> tuple:
+        """Identity for client de-duplication across roles."""
+        return (
+            self.provider_kind,
+            self.url,
+            self.api_key,
+            self.timeout,
+            self.azure,
+            self.azure_api_version,
+            tuple(sorted(self.headers.items())),
+        )
 
 
 class SourceTypeOverride(BaseModel):
@@ -280,6 +372,7 @@ class Config(BaseModel):
     models: ModelsConfig = ModelsConfig()
     ollama: OllamaConfig = OllamaConfig()
     provider: ProviderConfig | None = None  # supersedes [ollama] when present
+    providers: dict[str, ProviderBlock] = Field(default_factory=dict)  # named connections
     pipeline: PipelineConfig = PipelineConfig()
     rag: RagConfig = RagConfig()
     metrics: MetricsConfig = MetricsConfig()
@@ -290,6 +383,25 @@ class Config(BaseModel):
     @classmethod
     def resolve_vault(cls, v: str | Path) -> Path:
         return Path(v).expanduser().resolve()
+
+    @model_validator(mode="after")
+    def _validate_provider_refs(self) -> Config:
+        """Fail loud at load: bad alias refs and unknown provider kinds without a url."""
+        for role in ("fast", "heavy", "embed"):
+            prof = getattr(self.models, role)
+            if isinstance(prof, ModelProfile) and prof.provider is not None:
+                if prof.provider not in self.providers:
+                    raise ValueError(
+                        f"[models.{role}] references provider '{prof.provider}', "
+                        f"which is not defined under [providers.*]"
+                    )
+        for alias, block in self.providers.items():
+            if get_provider(block.name) is None and not block.url:
+                raise ValueError(
+                    f"[providers.{alias}] has unknown provider name '{block.name}' "
+                    f"and no url; set a known name or provide a url (custom provider)"
+                )
+        return self
 
     @property
     def effective_provider(self) -> ProviderConfig:
@@ -303,6 +415,93 @@ class Config(BaseModel):
             fast_ctx=self.ollama.fast_ctx,
             heavy_ctx=self.ollama.heavy_ctx,
         )
+
+    def resolve_role(
+        self, role: Literal["fast", "heavy", "embed"], *, api_key_env: str | None = None
+    ) -> ResolvedModel:
+        """Fold config + provider registry into a single per-role connection + params spec."""
+        from .api_keys import resolve_api_key
+
+        prof = getattr(self.models, role)
+        profile = prof if isinstance(prof, ModelProfile) else ModelProfile(model=prof)
+
+        # Pick the connection. Precedence: explicit alias > a block named "default" > legacy.
+        alias: str | None
+        if profile.provider is not None:
+            alias = profile.provider
+            block = self.providers[alias]
+        elif "default" in self.providers:
+            alias = "default"
+            block = self.providers["default"]
+        else:
+            alias = None
+            block = None
+
+        if block is not None:
+            kind = block.name
+            url = block.url
+            timeout = block.timeout
+            block_api_key_env = block.api_key_env
+            azure_api_version = block.azure_api_version
+            options = {**block.options, **profile.options}
+            headers = dict(block.headers)
+        else:
+            legacy = self.effective_provider
+            kind = legacy.name
+            url = legacy.url
+            timeout = legacy.timeout
+            block_api_key_env = None
+            azure_api_version = legacy.azure_api_version
+            options = dict(profile.options)
+            headers = {}
+
+        prov_info = get_provider(kind)
+        if not url:
+            url = prov_info.default_url if prov_info else ""
+        if timeout is None:
+            timeout = prov_info.default_timeout if prov_info else 600.0
+
+        ctx = profile.ctx if profile.ctx is not None else self._legacy_role_ctx(role)
+
+        # Role-aware think default: fast extraction off; heavy/embed leave the model's default.
+        think = profile.think
+        if think is None and role == "fast":
+            think = False
+
+        api_key = resolve_api_key(
+            kind, alias=alias, block_api_key_env=block_api_key_env, api_key_env_override=api_key_env
+        )
+
+        return ResolvedModel(
+            provider_kind=kind,
+            url=url,
+            api_key=api_key,
+            timeout=timeout,
+            model=profile.model,
+            ctx=ctx,
+            think=think,
+            temperature=profile.temperature,
+            supports_json_mode=prov_info.supports_json_mode if prov_info else True,
+            supports_embeddings=prov_info.supports_embeddings if prov_info else False,
+            azure=prov_info.azure if prov_info else False,
+            azure_api_version=azure_api_version,
+            anthropic_compat=prov_info.anthropic_compat if prov_info else False,
+            options=options,
+            headers=headers,
+        )
+
+    def _legacy_role_ctx(self, role: str) -> int:
+        prov = self.effective_provider
+        return prov.fast_ctx if role in ("fast", "embed") else prov.heavy_ctx
+
+    def model_name(self, role: Literal["fast", "heavy", "embed"]) -> str:
+        """Return just the model id for a role (no provider/key resolution, no I/O).
+
+        For metrics, checkpoint hashing, pipeline version and display — anywhere the old
+        `config.models.<role>` string was used outside an actual LLM call.
+        """
+        prof = getattr(self.models, role)
+        return prof.model if isinstance(prof, ModelProfile) else prof
 
     @property
     def raw_dir(self) -> Path:

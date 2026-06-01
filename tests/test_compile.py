@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import pytest
+from conftest import as_router
 
 from synto.config import Config
 from synto.models import RawNoteRecord
@@ -40,7 +41,7 @@ def db(config):
     return StateDB(config.state_db_path)
 
 
-def _make_client(plan_json: str, article_json: str):
+def _make_client(plan_json: str, article_json: str, config=None):
     """Mock client: first call returns plan, subsequent return article."""
     client = MagicMock()
     call_count = [0]
@@ -52,7 +53,7 @@ def _make_client(plan_json: str, article_json: str):
         return article_json
 
     client.generate.side_effect = generate_side_effect
-    return client
+    return as_router(client, config)
 
 
 def test_compile_creates_draft(vault, config, db, fixtures_dir):
@@ -71,7 +72,7 @@ def test_compile_creates_draft(vault, config, db, fixtures_dir):
     article_json = (fixtures_dir / "single_article_valid.json").read_text()
     client = _make_client(plan_json, article_json)
 
-    drafts, failed = compile_notes(config=config, client=client, db=db)
+    drafts, failed = compile_notes(config=config, router=client, db=db)
 
     assert len(drafts) == 1
     assert len(failed) == 0
@@ -88,7 +89,7 @@ def test_draft_has_correct_frontmatter(vault, config, db, fixtures_dir):
     article_json = (fixtures_dir / "single_article_valid.json").read_text()
     client = _make_client(plan_json, article_json)
 
-    drafts, _ = compile_notes(config=config, client=client, db=db)
+    drafts, _ = compile_notes(config=config, router=client, db=db)
     assert drafts
 
     from synto.vault import parse_note
@@ -109,7 +110,7 @@ def test_dry_run_writes_nothing(vault, config, db, fixtures_dir):
     article_json = (fixtures_dir / "single_article_valid.json").read_text()
     client = _make_client(plan_json, article_json)
 
-    drafts, _ = compile_notes(config=config, client=client, db=db, dry_run=True)
+    drafts, _ = compile_notes(config=config, router=client, db=db, dry_run=True)
     assert drafts == []
     assert list(config.drafts_dir.glob("*.md")) == []
 
@@ -127,9 +128,9 @@ def test_legacy_compile_uses_article_max_tokens_from_config(vault, config, db, f
 
     plan_json = (fixtures_dir / "compile_plan_valid.json").read_text()
     article_json = (fixtures_dir / "single_article_valid.json").read_text()
-    client = _make_client(plan_json, article_json)
+    client = _make_client(plan_json, article_json, config)
 
-    compile_notes(config=config, client=client, db=db)
+    compile_notes(config=config, router=client, db=db)
 
     # Find the article-write call (second generate call) and inspect num_predict
     write_calls = [c for c in client.generate.call_args_list if c.kwargs.get("num_predict")]
@@ -150,9 +151,9 @@ def test_legacy_compile_ignores_concept_draft_soft_cap(vault, config, db, fixtur
 
     plan_json = (fixtures_dir / "compile_plan_valid.json").read_text()
     article_json = (fixtures_dir / "single_article_valid.json").read_text()
-    client = _make_client(plan_json, article_json)
+    client = _make_client(plan_json, article_json, config)
 
-    compile_notes(config=config, client=client, db=db)
+    compile_notes(config=config, router=client, db=db)
 
     write_calls = [c for c in client.generate.call_args_list if c.kwargs.get("num_predict")]
     assert write_calls, "expected at least one generate call with num_predict"
@@ -215,7 +216,7 @@ def _make_concept_client(article_json: str):
     """Mock client that returns a single article for any generate() call."""
     client = MagicMock()
     client.generate.return_value = article_json
-    return client
+    return as_router(client)
 
 
 def test_compile_concepts_creates_draft(vault, config, db, fixtures_dir):
@@ -231,7 +232,7 @@ def test_compile_concepts_creates_draft(vault, config, db, fixtures_dir):
     article_json = (fixtures_dir / "single_article_valid.json").read_text()
     client = _make_concept_client(article_json)
 
-    drafts, failed, _ = compile_concepts(config=config, client=client, db=db)
+    drafts, failed, _ = compile_concepts(config=config, router=client, db=db)
 
     assert len(drafts) == 1
     assert len(failed) == 0
@@ -248,8 +249,8 @@ def test_compile_concepts_skips_when_no_concepts_needing_compile(vault, config, 
     db.upsert_concepts("raw/note.md", ["Some Concept"])
     db.mark_concept_compile_state("Some Concept", ["raw/note.md"], "compiled")
 
-    client = MagicMock()
-    drafts, failed, _ = compile_concepts(config=config, client=client, db=db)
+    client = as_router(MagicMock())
+    drafts, failed, _ = compile_concepts(config=config, router=client, db=db)
 
     assert drafts == []
     assert failed == []
@@ -266,8 +267,8 @@ def test_compile_concepts_dry_run(vault, config, db, fixtures_dir, capsys):
     )
     db.upsert_concepts("raw/note.md", ["Concept A"])
 
-    client = MagicMock()
-    drafts, _, _ = compile_concepts(config=config, client=client, db=db, dry_run=True)
+    client = as_router(MagicMock())
+    drafts, _, _ = compile_concepts(config=config, router=client, db=db, dry_run=True)
 
     assert drafts == []
     assert list(config.drafts_dir.glob("*.md")) == []
@@ -304,7 +305,7 @@ def test_compile_concepts_manual_edit_protection(vault, config, db, fixtures_dir
     article_json = (fixtures_dir / "single_article_valid.json").read_text()
     client = _make_concept_client(article_json)
 
-    drafts, failed, _ = compile_concepts(config=config, client=client, db=db)
+    drafts, failed, _ = compile_concepts(config=config, router=client, db=db)
 
     # Should skip the manually-edited article
     assert drafts == []
@@ -339,7 +340,7 @@ def test_compile_concepts_force_overrides_edit_protection(vault, config, db, fix
     article_json = (fixtures_dir / "single_article_valid.json").read_text()
     client = _make_concept_client(article_json)
 
-    drafts, failed, _ = compile_concepts(config=config, client=client, db=db, force=True)
+    drafts, failed, _ = compile_concepts(config=config, router=client, db=db, force=True)
 
     assert len(drafts) == 1
 
@@ -377,7 +378,7 @@ def test_compile_concepts_marks_sources_compiled(vault, config, db, fixtures_dir
     article_json = (fixtures_dir / "single_article_valid.json").read_text()
     client = _make_concept_client(article_json)
 
-    compile_concepts(config=config, client=client, db=db)
+    compile_concepts(config=config, router=client, db=db)
 
     record = db.get_raw("raw/note.md")
     assert record.status == "compiled"
@@ -390,7 +391,7 @@ def test_compile_concepts_failed_same_source_stays_queued(vault, config, db):
     db.upsert_concepts("raw/note.md", ["Alpha", "Beta"])
     (vault / "raw" / "note.md").write_text("Body.")
 
-    client = MagicMock()
+    client = as_router(MagicMock())
     client.generate.side_effect = [
         json.dumps({"title": "Alpha", "content": "Alpha content.", "tags": []}),
         "not valid json",
@@ -398,7 +399,7 @@ def test_compile_concepts_failed_same_source_stays_queued(vault, config, db):
         "not valid json",
     ]
 
-    drafts, failed, _ = compile_concepts(config=config, client=client, db=db)
+    drafts, failed, _ = compile_concepts(config=config, router=client, db=db)
 
     assert len(drafts) == 1
     assert failed == ["Beta"]
@@ -415,10 +416,10 @@ def test_compile_concepts_isolates_provider_error(vault, config, db):
     db.upsert_concepts("raw/note.md", ["Alpha"])
     (vault / "raw" / "note.md").write_text("Body.")
 
-    client = MagicMock()
+    client = as_router(MagicMock())
     client.generate.side_effect = LLMBadRequestError("openrouter: Rate limit exceeded (code=429)")
 
-    drafts, failed, _ = compile_concepts(config=config, client=client, db=db)
+    drafts, failed, _ = compile_concepts(config=config, router=client, db=db)
 
     assert drafts == []
     assert failed == ["Alpha"]

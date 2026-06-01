@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from conftest import as_endpoint
 
 from synto.config import Config
 from synto.pipeline.query import _expand_query, _query_core
@@ -66,24 +67,24 @@ def _write_concept_page(config: Config, title: str, body: str = "") -> Path:
     return path
 
 
-def _fast_client(pages: list[str]) -> MagicMock:
+def _fast_client(pages: list[str]):
     c = MagicMock()
     c.generate.return_value = json.dumps({"pages": pages})
-    return c
+    return as_endpoint(c)
 
 
-def _heavy_client(answer: str = "Answer.", title: str = "Topic") -> MagicMock:
+def _heavy_client(answer: str = "Answer.", title: str = "Topic"):
     c = MagicMock()
     c.generate.return_value = json.dumps({"answer": answer, "title": title})
-    return c
+    return as_endpoint(c)
 
 
-def _routing_prompt(fast_mock: MagicMock) -> str:
-    return fast_mock.generate.call_args.kwargs["prompt"]
+def _routing_prompt(fast_ep) -> str:
+    return fast_ep.client.generate.call_args.kwargs["prompt"]
 
 
-def _answer_prompt(heavy_mock: MagicMock) -> str:
-    return heavy_mock.generate.call_args.kwargs["prompt"]
+def _answer_prompt(heavy_ep) -> str:
+    return heavy_ep.client.generate.call_args.kwargs["prompt"]
 
 
 # ── Stage 1: StateDB.load_concept_alias_map() ─────────────────────────────────

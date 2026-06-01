@@ -399,10 +399,62 @@ idle — that is expected, not a hang.
 | Llamafile | SiliconFlow |
 | Lemonade | Perplexity |
 | | xAI (Grok) |
+| | NVIDIA NIM |
 | | Azure OpenAI |
+| | Kimi (Anthropic-compatible) |
 | | Custom OpenAI-compatible |
 
 Any OpenAI-compatible endpoint works. Use `synto setup` to configure interactively, or edit `~/.config/synto/config.toml` directly.
+
+### Per-role providers
+
+Each model role can use a different provider and account. Define connections as named
+`[providers.<alias>]` blocks and point roles at them — for example, the fast model on local
+Ollama and the heavy model on a cloud account:
+
+```toml
+[providers.default]
+name = "ollama"
+url  = "http://localhost:11434"
+
+[providers.ngc]
+name = "nvidia"
+url  = "https://integrate.api.nvidia.com/v1"
+api_key_env = "NVIDIA_API_KEY"   # env var name only — never the key itself
+
+[models.fast]
+provider = "default"
+model    = "gemma4:e4b"
+
+[models.heavy]
+provider = "ngc"
+model    = "qwen2.5:14b"
+ctx      = 32768
+```
+
+The API key belongs to the provider block, so each model can have its own key (point two
+blocks at the same provider with different `api_key_env`) or none at all (local providers).
+Keys are read from the named env var, the provider's conventional env var, `SYNTO_API_KEY`,
+or the user-private `~/.config/synto/config.toml` — **never** from the vault's `synto.toml`.
+
+### Advanced model parameters
+
+These are hand-edit-only (not prompted by `synto setup`):
+
+```toml
+[models.heavy]
+model       = "qwen3.5:9b"
+think       = true     # Ollama thinking models: on for heavy by default, off for fast
+temperature = 0.3      # override the per-stage default
+
+[models.heavy.options]   # raw passthrough — any provider-native parameter
+top_p = 0.9
+```
+
+`think` controls Ollama's reasoning flag (a no-op on OpenAI/Anthropic-compatible providers;
+use `options` for those). Keys under `[models.<role>.options]` are merged into the provider
+request as-is and override the matching first-class field, so set computed values like
+`num_predict` only if you mean to.
 
 ---
 
