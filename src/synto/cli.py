@@ -786,6 +786,154 @@ def _pick_model(
         return raw if raw else default_fallback
 
 
+def _collect_role_provider(console, role_label: str, default_model: str = "") -> dict:
+    """Prompt for one role's provider, URL, API-key env var, and model."""
+    from .providers import PROVIDER_REGISTRY, list_all_providers
+
+    console.print(f"  [bold]{role_label} model[/bold]")
+    provs = list_all_providers()
+    idx_map: dict[int, str] = {}
+    for i, p in enumerate(provs, 1):
+        tag = "  [default]" if p.name == "ollama" else ""
+        console.print(f"    {i:2}. {p.display_name:<14} {p.default_url or '(custom URL)'}{tag}")
+        idx_map[i] = p.name
+    raw = Prompt.ask("    Provider (number or name)", default="1", console=console).strip()
+    if raw.isdigit():
+        name = idx_map.get(int(raw), "ollama")
+    elif raw in PROVIDER_REGISTRY:
+        name = raw
+    else:
+        console.print(f"    [yellow]Unknown '{raw}', using Ollama.[/yellow]")
+        name = "ollama"
+    prov = PROVIDER_REGISTRY[name]
+    url = (
+        Prompt.ask("    Base URL", default=prov.default_url or "", console=console).strip()
+        or prov.default_url
+        or ""
+    )
+    api_key_env: str | None = None
+    if name != "ollama":
+        default_env = prov.env_var or "PROVIDER_API_KEY"
+        console.print(
+            "    [dim]Enter the env var name that holds the key (not the key itself).[/dim]"
+        )
+        api_key_env = (
+            Prompt.ask("    API key env var", default=default_env, console=console).strip() or None
+        )
+    model = Prompt.ask(
+        "    Model name", default=default_model if name == "ollama" else "", console=console
+    ).strip()
+    while not model:
+        model = Prompt.ask("    Model name (required)", console=console).strip()
+    return {
+        "name": name,
+        "url": url,
+        "api_key_env": api_key_env,
+        "model": model,
+        "timeout": int(prov.default_timeout),
+    }
+
+
+def _setup_multi_provider(console) -> None:
+    """Configure a different provider per role and write the new format to a vault.
+
+    Writes only env-var references (api_key_env) — never raw keys — and targets an
+    existing vault's synto.toml (preserving [pipeline] etc.), matching the documented
+    secure path. Requires the vault to exist; run `synto init` first if it doesn't.
+    """
+    from .config import apply_providers_to_existing_toml, multi_provider_vault_toml
+    from .vault import atomic_write
+
+    console.print(
+        "\n  [bold]Per-role providers[/bold]  "
+        "[dim](fast = analysis & routing, heavy = article writing)[/dim]\n"
+    )
+    fast = _collect_role_provider(console, "Fast", default_model="gemma4:e4b")
+    console.print()
+    heavy = _collect_role_provider(console, "Heavy", default_model="qwen2.5:14b")
+
+    # De-duplicate connections; the first becomes "default" so embed/string roles resolve.
+    providers: list[dict] = []
+    role_alias: dict[str, str] = {}
+    for role, spec in (("fast", fast), ("heavy", heavy)):
+        key = (spec["name"], spec["url"], spec["api_key_env"])
+        match = next(
+            (p for p in providers if (p["name"], p["url"], p.get("api_key_env")) == key), None
+        )
+        if match is None:
+            alias = "default" if not providers else spec["name"]
+            base, n = alias, 2
+            while any(p["alias"] == alias for p in providers):
+                alias = f"{base}{n}"
+                n += 1
+            match = {
+                "alias": alias,
+                "name": spec["name"],
+                "url": spec["url"],
+                "timeout": spec["timeout"],
+                "api_key_env": spec["api_key_env"],
+            }
+            providers.append(match)
+        role_alias[role] = match["alias"]
+
+    models = {
+        "fast": {
+            "provider": role_alias["fast"],
+            "model": fast["model"],
+            "ctx": 16384 if fast["name"] == "ollama" else 8192,
+        },
+        "heavy": {
+            "provider": role_alias["heavy"],
+            "model": heavy["model"],
+            "ctx": 32768,
+        },
+    }
+
+    console.print()
+    vault_input = Prompt.ask("  Vault path to write synto.toml", console=console).strip()
+    if not vault_input:
+        console.print("  [red]A vault path is required for multi-provider setup.[/red]")
+        sys.exit(1)
+    vault = Path(vault_input).expanduser().resolve()
+    toml_path = vault / CONFIG_FILE_NAME
+    legacy_path = vault / LEGACY_CONFIG_FILE_NAME
+
+    if toml_path.exists():
+        new_text = apply_providers_to_existing_toml(
+            toml_path.read_text(encoding="utf-8"), providers, models
+        )
+        action = "Updated"
+    elif legacy_path.exists():
+        toml_path = legacy_path
+        new_text = apply_providers_to_existing_toml(
+            legacy_path.read_text(encoding="utf-8"), providers, models
+        )
+        action = "Updated"
+    elif vault.exists():
+        new_text = multi_provider_vault_toml(providers, models)
+        action = "Wrote"
+    else:
+        console.print(
+            f"  [red]{vault} not found.[/red] Run [bold]synto init {vault}[/bold] first, "
+            f"then re-run [bold]synto setup[/bold]."
+        )
+        sys.exit(1)
+
+    atomic_write(toml_path, new_text)
+
+    lines = [f"[green]✓[/green]  {action} {toml_path}\n"]
+    for p in providers:
+        key_note = f"  key: ${p['api_key_env']}" if p.get("api_key_env") else "  (no key)"
+        lines.append(f"  [bold]{p['alias']}[/bold]: {p['name']} @ {p['url']}{key_note}")
+    lines.append(f"  fast  → {role_alias['fast']} / {fast['model']}")
+    lines.append(f"  heavy → {role_alias['heavy']} / {heavy['model']}")
+    if any(p.get("api_key_env") for p in providers):
+        lines.append("")
+        lines.append("  [dim]Set the API-key env var(s) above before running synto.[/dim]")
+    console.print()
+    console.print(Panel("\n".join(lines), border_style="green", expand=False, padding=(0, 2)))
+
+
 @cli.command()
 @click.option("--non-interactive", is_flag=True, help="Print current config and exit")
 @click.option("--reset", is_flag=True, help="Clear saved config and re-run wizard")
@@ -868,6 +1016,23 @@ def setup(non_interactive: bool, reset: bool, provider_preset: str | None):
         console.print()
 
         all_providers = list_all_providers()
+
+        # ── Multi-provider branch: a different provider per model role (#24) ──
+        if not provider_preset:
+            same_provider = (
+                Prompt.ask(
+                    "  Use the same provider for all models?",
+                    choices=["y", "n"],
+                    default="y",
+                    show_choices=False,
+                    console=console,
+                )
+                .strip()
+                .lower()
+            )
+            if same_provider == "n":
+                _setup_multi_provider(console)
+                return
 
         # ── Step 1 — Provider selection ───────────────────────────────────────
         if provider_preset:

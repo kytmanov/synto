@@ -273,7 +273,7 @@ def test_setup_reset_clears_config(runner: CliRunner, cfg_dir: Path):
     result = runner.invoke(
         cli,
         ["setup", "--reset"],
-        input="\n\n\n\n\n\n",
+        input="y\n\n\n\n\n\n\n",
         catch_exceptions=False,
     )
     assert result.exit_code == 0
@@ -298,7 +298,7 @@ def test_setup_wizard_saves_config(runner: CliRunner, cfg_dir: Path):
             cli,
             ["setup"],
             # provider default, URL default, fast, heavy, no vault, citations off
-            input="\n\ngemma4:e4b\nqwen2.5:14b\n\n\n",
+            input="y\n\n\ngemma4:e4b\nqwen2.5:14b\n\n\n",
             catch_exceptions=False,
         )
 
@@ -320,7 +320,7 @@ def test_setup_wizard_saves_experimental_inline_source_citations(runner: CliRunn
         result = runner.invoke(
             cli,
             ["setup"],
-            input="\n\ngemma4:e4b\nqwen2.5:14b\n\ny\n",
+            input="y\n\n\ngemma4:e4b\nqwen2.5:14b\n\ny\n",
             catch_exceptions=False,
         )
 
@@ -343,7 +343,7 @@ def test_setup_wizard_summary_says_uninitialized_vault_will_use_preference(
         result = runner.invoke(
             cli,
             ["setup"],
-            input=f"\n\ngemma4:e4b\nqwen2.5:14b\n{vault}\ny\n",
+            input=f"y\n\n\ngemma4:e4b\nqwen2.5:14b\n{vault}\ny\n",
             catch_exceptions=False,
         )
 
@@ -363,7 +363,7 @@ def test_setup_wizard_summary_mentions_support_and_metrics(runner: CliRunner, cf
         result = runner.invoke(
             cli,
             ["setup"],
-            input="\n\ngemma4:e4b\nqwen2.5:14b\n\n\n",
+            input="y\n\n\ngemma4:e4b\nqwen2.5:14b\n\n\n",
             catch_exceptions=False,
         )
 
@@ -388,7 +388,7 @@ def test_setup_wizard_model_number_selection(runner: CliRunner, cfg_dir: Path):
             cli,
             ["setup"],
             # provider default, URL default, pick #1 fast, pick #2 heavy, no vault, citations off
-            input="\n\n1\n2\n\n\n",
+            input="y\n\n\n1\n2\n\n\n",
             catch_exceptions=False,
         )
 
@@ -412,7 +412,7 @@ def test_setup_wizard_whitespace_input_uses_default(runner: CliRunner, cfg_dir: 
             cli,
             ["setup"],
             # provider default, URL default, blank models, no vault, citations off
-            input="\n\n   \n   \n\n\n",
+            input="y\n\n\n   \n   \n\n\n",
             catch_exceptions=False,
         )
 
@@ -437,7 +437,7 @@ def test_setup_wizard_with_vault(runner: CliRunner, cfg_dir: Path, tmp_path: Pat
         result = runner.invoke(
             cli,
             ["setup"],
-            input=f"\n\ngemma4:e4b\nqwen2.5:14b\n{vault}\n\n",
+            input=f"y\n\n\ngemma4:e4b\nqwen2.5:14b\n{vault}\n\n",
             catch_exceptions=False,
         )
 

@@ -83,14 +83,17 @@ def default_wiki_toml(
         f"# Split providers: add another [providers.<alias>] block and set this role's "
         f'provider = "<alias>"\n'
     )
+    return f"{provider_section}\n{models_section}\n{_vault_toml_tail(inline_source_citations)}"
+
+
+def _vault_toml_tail(inline_source_citations: bool) -> str:
+    """The [pipeline] + ingest-overrides section shared by all vault config writers."""
     citation_line = (
         "inline_source_citations = true  # Experimental: add inline source links\n"
         if inline_source_citations
         else "# inline_source_citations = false  # Experimental: add inline source links\n"
     )
     return (
-        f"{provider_section}\n"
-        f"{models_section}\n"
         f"[pipeline]\n"
         f"auto_approve = false\n"
         f"auto_commit = true\n"
@@ -120,6 +123,81 @@ def default_wiki_toml(
         f"# [pipeline.source_overrides.paper]\n"
         f"# max_concepts_per_source = 15  # default: 8\n"
     )
+
+
+def _provider_models_head(providers: list[dict], models: dict[str, dict]) -> str:
+    """Build just the [providers.*] + [models.<role>] sections (no [pipeline] tail).
+
+    providers: list of {alias, name, url, timeout?, api_key_env?}. Include one named
+    "default" so string-form / embed roles resolve to it.
+    models: {role: {provider, model, ctx}} for "fast" and "heavy".
+    Secrets are never written — only api_key_env (an env var name).
+    """
+    blocks: list[str] = []
+    for p in providers:
+        lines = [
+            f"[providers.{p['alias']}]",
+            f"name = {_toml_quote(p['name'])}",
+            f"url = {_toml_quote(p['url'])}",
+            f"timeout = {int(p.get('timeout') or 600)}",
+        ]
+        if p.get("api_key_env"):
+            lines.append(f"api_key_env = {_toml_quote(p['api_key_env'])}")
+        blocks.append("\n".join(lines))
+    provider_section = "\n\n".join(blocks) + "\n"
+
+    model_blocks: list[str] = []
+    for role in ("fast", "heavy"):
+        m = models[role]
+        model_blocks.append(
+            f"[models.{role}]\n"
+            f"provider = {_toml_quote(m['provider'])}\n"
+            f"model = {_toml_quote(m['model'])}\n"
+            f"ctx = {int(m['ctx'])}"
+        )
+    models_section = "\n\n".join(model_blocks) + "\n"
+    return f"{provider_section}\n{models_section}"
+
+
+def multi_provider_vault_toml(
+    providers: list[dict],
+    models: dict[str, dict],
+    inline_source_citations: bool = False,
+) -> str:
+    """Full vault synto.toml with several [providers.*] blocks + per-role refs."""
+    head = _provider_models_head(providers, models)
+    return f"{head}\n{_vault_toml_tail(inline_source_citations)}"
+
+
+def strip_provider_model_sections(text: str) -> str:
+    """Drop [models]/[models.*], [ollama], [provider], [providers.*] sections.
+
+    Every other section ([pipeline], [mcp], ...) and any leading content is preserved
+    verbatim, so re-applying a provider choice to an existing vault keeps user settings.
+    """
+    import re
+
+    header_re = re.compile(r"^\s*\[([^\]]+)\]")
+    drop = {"models", "ollama", "provider", "providers"}
+    out: list[str] = []
+    skipping = False
+    for line in text.splitlines(keepends=True):
+        m = header_re.match(line)
+        if m:
+            top = m.group(1).strip().split(".", 1)[0]
+            skipping = top in drop
+        if not skipping:
+            out.append(line)
+    return "".join(out)
+
+
+def apply_providers_to_existing_toml(
+    existing_text: str, providers: list[dict], models: dict[str, dict]
+) -> str:
+    """Replace the provider/model sections of an existing synto.toml, keeping the rest."""
+    head = _provider_models_head(providers, models)
+    remainder = strip_provider_model_sections(existing_text).lstrip("\n")
+    return f"{head}\n{remainder}" if remainder.strip() else f"{head}\n"
 
 
 class ProviderBlock(BaseModel):

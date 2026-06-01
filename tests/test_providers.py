@@ -726,7 +726,7 @@ def test_setup_wizard_cloud_provider_empty_api_key(tmp_path, cfg_dir):
         result = runner.invoke(
             cli,
             ["setup"],
-            input=f"{groq_number}\n\n\nllama3\nllama3\n\n\n",
+            input=f"y\n{groq_number}\n\n\nllama3\nllama3\n\n\n",
             catch_exceptions=False,
         )
 
@@ -760,7 +760,7 @@ def test_setup_wizard_azure_saves_provider_name(tmp_path, cfg_dir):
             ["setup"],
             # provider=azure, URL, api key, fast model, heavy model, no vault, citations off
             input=(
-                f"{azure_number}\nhttps://myres.openai.azure.com/openai/deployments/gpt4\n"
+                f"y\n{azure_number}\nhttps://myres.openai.azure.com/openai/deployments/gpt4\n"
                 "my-key\nmodel-a\nmodel-b\n\n\n"
             ),
             catch_exceptions=False,
