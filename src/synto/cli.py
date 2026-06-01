@@ -461,46 +461,91 @@ def init(vault_path: str, existing: bool, non_interactive: bool, set_default: bo
     from .global_config import GlobalConfig, load_global_config, save_global_config
 
     gcfg = load_global_config()
-    provider_name = gcfg.provider_name if gcfg and gcfg.provider_name else "ollama"
-    # Only fall back to Ollama-specific model names when using Ollama; cloud providers
-    # must have been configured explicitly via `synto setup`.
-    _ollama = provider_name == "ollama"
-    fast = gcfg.fast_model if gcfg and gcfg.fast_model else ("gemma4:e4b" if _ollama else "")
-    heavy = gcfg.heavy_model if gcfg and gcfg.heavy_model else ("qwen2.5:14b" if _ollama else "")
-    provider_url = gcfg.provider_url if gcfg and gcfg.provider_url else None
-    ollama_url = gcfg.ollama_url if gcfg and gcfg.ollama_url else "http://localhost:11434"
-    effective_url = provider_url or ollama_url
-    azure_api_version = gcfg.azure_api_version if gcfg and gcfg.azure_api_version else None
 
-    if not toml_path.exists():
-        from .providers import get_provider
+    if gcfg and gcfg.is_multi_provider:
+        # Reproduce the per-role multi-provider setup saved by `synto setup`.
+        from .config import apply_providers_to_existing_toml, multi_provider_vault_toml
 
-        prov_info = get_provider(provider_name)
-        timeout = prov_info.default_timeout if prov_info else 600.0
-        toml_path.write_text(
-            default_wiki_toml(
-                fast,
-                heavy,
-                ollama_url=ollama_url,
-                provider_name=provider_name,
-                provider_url=effective_url if provider_name != "ollama" else None,
-                provider_timeout=timeout,
-                azure_api_version=azure_api_version,
-                inline_source_citations=(
-                    bool(gcfg.experimental_inline_source_citations) if gcfg else False
+        _role_ctx = {"fast": 16384, "heavy": 32768, "embed": 16384}
+        prov_list = [
+            {
+                "alias": alias,
+                "name": b.name,
+                "url": b.url or "",
+                "timeout": b.timeout,
+                "api_key_env": b.api_key_env,
+            }
+            for alias, b in gcfg.providers.items()
+        ]
+        mdl = {
+            role: {
+                "provider": m.provider or "default",
+                "model": m.model,
+                "ctx": m.ctx or _role_ctx.get(role, 8192),
+            }
+            for role, m in (gcfg.models or {}).items()
+            if role in ("fast", "heavy")
+        }
+        if not toml_path.exists():
+            toml_path.write_text(
+                multi_provider_vault_toml(
+                    prov_list,
+                    mdl,
+                    inline_source_citations=bool(gcfg.experimental_inline_source_citations),
+                )
+            )
+        else:
+            from .vault import atomic_write
+
+            atomic_write(
+                toml_path,
+                apply_providers_to_existing_toml(
+                    toml_path.read_text(encoding="utf-8"), prov_list, mdl
                 ),
             )
-        )
     else:
-        # Existing vault: patch model/URL fields from global config so that
-        # synto setup changes are reflected without overwriting pipeline settings.
-        _sync_wiki_toml_models(
-            toml_path,
-            fast,
-            heavy,
-            effective_url,
-            provider_name=provider_name if provider_name != "ollama" else None,
+        provider_name = gcfg.provider_name if gcfg and gcfg.provider_name else "ollama"
+        # Only fall back to Ollama-specific model names when using Ollama; cloud providers
+        # must have been configured explicitly via `synto setup`.
+        _ollama = provider_name == "ollama"
+        fast = gcfg.fast_model if gcfg and gcfg.fast_model else ("gemma4:e4b" if _ollama else "")
+        heavy = (
+            gcfg.heavy_model if gcfg and gcfg.heavy_model else ("qwen2.5:14b" if _ollama else "")
         )
+        provider_url = gcfg.provider_url if gcfg and gcfg.provider_url else None
+        ollama_url = gcfg.ollama_url if gcfg and gcfg.ollama_url else "http://localhost:11434"
+        effective_url = provider_url or ollama_url
+        azure_api_version = gcfg.azure_api_version if gcfg and gcfg.azure_api_version else None
+
+        if not toml_path.exists():
+            from .providers import get_provider
+
+            prov_info = get_provider(provider_name)
+            timeout = prov_info.default_timeout if prov_info else 600.0
+            toml_path.write_text(
+                default_wiki_toml(
+                    fast,
+                    heavy,
+                    ollama_url=ollama_url,
+                    provider_name=provider_name,
+                    provider_url=effective_url if provider_name != "ollama" else None,
+                    provider_timeout=timeout,
+                    azure_api_version=azure_api_version,
+                    inline_source_citations=(
+                        bool(gcfg.experimental_inline_source_citations) if gcfg else False
+                    ),
+                )
+            )
+        else:
+            # Existing vault: patch model/URL fields from global config so that
+            # synto setup changes are reflected without overwriting pipeline settings.
+            _sync_wiki_toml_models(
+                toml_path,
+                fast,
+                heavy,
+                effective_url,
+                provider_name=provider_name if provider_name != "ollama" else None,
+            )
 
     # Init git
     git_init(vault)
@@ -889,46 +934,79 @@ def _setup_multi_provider(console) -> None:
         },
     }
 
+    # Persist to the global config so `synto init` reproduces this multi-provider setup
+    # for any new vault. Provider blocks store api_key_env references only — never raw keys.
+    from .config import ModelProfile, ProviderBlock
+    from .global_config import GlobalConfig, load_global_config, save_global_config
+
+    existing = load_global_config()
+    gcfg = GlobalConfig(
+        vault=existing.vault if existing else None,
+        experimental_inline_source_citations=(
+            existing.experimental_inline_source_citations if existing else None
+        ),
+        providers={
+            p["alias"]: ProviderBlock(
+                name=p["name"],
+                url=p["url"] or None,
+                timeout=p.get("timeout"),
+                api_key_env=p.get("api_key_env"),
+            )
+            for p in providers
+        },
+        models={
+            role: ModelProfile(provider=m["provider"], model=m["model"], ctx=m["ctx"])
+            for role, m in models.items()
+        },
+    )
+    save_global_config(gcfg)
+
+    # Optionally apply to a vault now (otherwise `synto init` will reproduce it).
     console.print()
-    vault_input = Prompt.ask("  Vault path to write synto.toml", console=console).strip()
-    if not vault_input:
-        console.print("  [red]A vault path is required for multi-provider setup.[/red]")
-        sys.exit(1)
-    vault = Path(vault_input).expanduser().resolve()
-    toml_path = vault / CONFIG_FILE_NAME
-    legacy_path = vault / LEGACY_CONFIG_FILE_NAME
+    vault_input = Prompt.ask(
+        "  Apply to an existing vault now? (path, or Enter to skip)", default="", console=console
+    ).strip()
+    applied_to: Path | None = None
+    if vault_input:
+        vault = Path(vault_input).expanduser().resolve()
+        toml_path = vault / CONFIG_FILE_NAME
+        legacy_path = vault / LEGACY_CONFIG_FILE_NAME
+        if toml_path.exists():
+            atomic_write(
+                toml_path,
+                apply_providers_to_existing_toml(
+                    toml_path.read_text(encoding="utf-8"), providers, models
+                ),
+            )
+            applied_to = toml_path
+        elif legacy_path.exists():
+            atomic_write(
+                legacy_path,
+                apply_providers_to_existing_toml(
+                    legacy_path.read_text(encoding="utf-8"), providers, models
+                ),
+            )
+            applied_to = legacy_path
+        elif vault.exists():
+            atomic_write(toml_path, multi_provider_vault_toml(providers, models))
+            applied_to = toml_path
+        else:
+            console.print(
+                f"  [yellow]{vault} not found[/yellow] — saved to global config only; "
+                f"run [bold]synto init {vault}[/bold] to create it."
+            )
 
-    if toml_path.exists():
-        new_text = apply_providers_to_existing_toml(
-            toml_path.read_text(encoding="utf-8"), providers, models
-        )
-        action = "Updated"
-    elif legacy_path.exists():
-        toml_path = legacy_path
-        new_text = apply_providers_to_existing_toml(
-            legacy_path.read_text(encoding="utf-8"), providers, models
-        )
-        action = "Updated"
-    elif vault.exists():
-        new_text = multi_provider_vault_toml(providers, models)
-        action = "Wrote"
-    else:
-        console.print(
-            f"  [red]{vault} not found.[/red] Run [bold]synto init {vault}[/bold] first, "
-            f"then re-run [bold]synto setup[/bold]."
-        )
-        sys.exit(1)
-
-    atomic_write(toml_path, new_text)
-
-    lines = [f"[green]✓[/green]  {action} {toml_path}\n"]
+    lines = ["[green]✓[/green]  Per-role providers saved to global config\n"]
     for p in providers:
         key_note = f"  key: ${p['api_key_env']}" if p.get("api_key_env") else "  (no key)"
         lines.append(f"  [bold]{p['alias']}[/bold]: {p['name']} @ {p['url']}{key_note}")
     lines.append(f"  fast  → {role_alias['fast']} / {fast['model']}")
     lines.append(f"  heavy → {role_alias['heavy']} / {heavy['model']}")
+    lines.append("")
+    if applied_to is not None:
+        lines.append(f"  Applied to: {applied_to}")
+    lines.append("  Next: [bold]synto init <vault>[/bold] reproduces this split for new vaults.")
     if any(p.get("api_key_env") for p in providers):
-        lines.append("")
         lines.append("  [dim]Set the API-key env var(s) above before running synto.[/dim]")
     console.print()
     console.print(Panel("\n".join(lines), border_style="green", expand=False, padding=(0, 2)))

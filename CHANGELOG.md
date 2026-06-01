@@ -11,6 +11,9 @@
   per-alias key in the user-private global config) — a different key per model, or none
   for local providers. `synto init` now emits this format by default; legacy `[ollama]` /
   `[provider]` vaults keep working unchanged. Added an `nvidia` (NVIDIA NIM) provider.
+  `synto setup` gains a "different provider per model" branch that saves the split to the
+  user-private global config (api_key_env references, never raw keys), so `synto init`
+  reproduces a multi-provider vault — symmetric with single-provider setup.
 - Per-model parameters (#31). Each role accepts `ctx`, `temperature`, an Ollama `think`
   flag, and an `options`/`headers` passthrough for any provider-native parameter (e.g.
   `top_p`, `reasoning_effort`) with no code change. Thinking-model control resolves the
