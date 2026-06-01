@@ -31,8 +31,8 @@ def _run(answers: list[str]):
 
 
 def test_persists_per_role_split_to_global_config():
-    # fast=ollama (no key prompt), heavy=nvidia (key env), then skip the vault-apply prompt.
-    _run(["1", "", "gemma4:e4b", "nvidia", "", "NVIDIA_API_KEY", "qwen2.5:14b", ""])
+    # fast=ollama (no key prompt), heavy=nvidia (key env), then skip default-vault + citations.
+    _run(["1", "", "gemma4:e4b", "nvidia", "", "NVIDIA_API_KEY", "qwen2.5:14b", "", "n"])
 
     g = load_global_config()
     assert g is not None and g.is_multi_provider
@@ -55,7 +55,7 @@ def test_optionally_applies_to_existing_vault_preserving_pipeline(tmp_path):
         '[models.heavy]\nprovider = "default"\nmodel = "old"\nctx = 32768\n\n'
         "[pipeline]\nmax_concepts_per_source = 25\nauto_commit = true\n"
     )
-    _run(["1", "", "gemma4:e4b", "groq", "", "GROQ_API_KEY", "llama-3.3-70b", str(vault)])
+    _run(["1", "", "gemma4:e4b", "groq", "", "GROQ_API_KEY", "llama-3.3-70b", str(vault), "n"])
 
     # Global config persisted...
     assert load_global_config().is_multi_provider
@@ -65,3 +65,22 @@ def test_optionally_applies_to_existing_vault_preserving_pipeline(tmp_path):
     assert data["pipeline"]["max_concepts_per_source"] == 25
     heavy = Config.from_vault(vault).resolve_role("heavy")
     assert heavy.provider_kind == "groq" and heavy.model == "llama-3.3-70b"
+
+
+def test_applies_to_legacy_wiki_toml_vault_writes_loadable_synto_toml(tmp_path):
+    """#3: a legacy-only (wiki.toml) vault must end up loadable — setup writes synto.toml,
+    not a rewritten wiki.toml that Config.from_vault would still refuse."""
+    vault = tmp_path / "legacy"
+    vault.mkdir()
+    (vault / "wiki.toml").write_text(
+        '[models]\nfast = "old"\nheavy = "old"\n\n'
+        '[ollama]\nurl = "http://localhost:11434"\n\n'
+        "[pipeline]\nmax_concepts_per_source = 12\n"
+    )
+    _run(["1", "", "gemma4:e4b", "groq", "", "GROQ_API_KEY", "llama-3.3-70b", str(vault), "n"])
+
+    assert (vault / "synto.toml").exists(), "setup must write synto.toml for a legacy vault"
+    c = Config.from_vault(vault)  # must not raise on the legacy-only-vault guard
+    assert c.resolve_role("heavy").provider_kind == "groq"
+    data = tomllib.loads((vault / "synto.toml").read_text())
+    assert data["pipeline"]["max_concepts_per_source"] == 12  # legacy [pipeline] migrated forward

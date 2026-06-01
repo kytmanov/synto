@@ -87,3 +87,21 @@ def test_init_reproduces_multi_provider_vault(tmp_path):
     assert heavy.provider_kind == "nvidia"
     assert heavy.model == "qwen2.5:14b"
     assert heavy.url == "https://integrate.api.nvidia.com/v1"
+
+
+def test_provider_keys_roundtrip_and_resolution(monkeypatch):
+    """#4: per-alias raw key in the global config round-trips and is used by resolution."""
+    from synto.api_keys import resolve_api_key
+
+    for var in ("NGC_API_KEY", "NVIDIA_API_KEY", "SYNTO_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    g = _multi()
+    g.provider_keys = {"ngc": "nvapi-secret"}
+    save_global_config(g)
+
+    loaded = load_global_config()
+    assert loaded.provider_keys == {"ngc": "nvapi-secret"}
+    assert "[provider_keys]" in _global_config_path().read_text()
+    # Per-alias key is used when no env var is set; aliases without a key resolve to None.
+    assert resolve_api_key("nvidia", alias="ngc") == "nvapi-secret"
+    assert resolve_api_key("ollama", alias="default") is None

@@ -183,10 +183,10 @@ def _run_single_vault(
 
     return ContestantRunResult(
         role=role,
-        fast_model=effective_config.models.fast,
-        heavy_model=effective_config.models.heavy,
-        provider_name=effective_config.effective_provider.name,
-        provider_url=effective_config.effective_provider.url,
+        fast_model=effective_config.model_name("fast"),
+        heavy_model=effective_config.model_name("heavy"),
+        provider_name=effective_config.resolve_role("heavy").provider_kind,
+        provider_url=effective_config.resolve_role("heavy").url,
         partial=partial,
         pipeline_report=_serialize_pipeline_report(pipeline_report),
         queries=query_results,
@@ -218,21 +218,26 @@ def _materialize_compare_vault(
 
 
 def _write_effective_compare_toml(vault: Path, config: Config) -> None:
-    prov = config.effective_provider
+    # Materialize the contestant vault from the *resolved* roles so it works on legacy and
+    # new-format active vaults alike (config.models.<role> may be a ModelProfile, and a CLI
+    # --provider override only shows up via resolve_role, not effective_provider).
+    fast = config.resolve_role("fast")
+    heavy = config.resolve_role("heavy")
+    name, url, timeout = heavy.provider_kind, heavy.url, int(heavy.timeout)
     lines = [
         "[models]",
-        f"fast = {_toml_quote(config.models.fast)}",
-        f"heavy = {_toml_quote(config.models.heavy)}",
+        f"fast = {_toml_quote(config.model_name('fast'))}",
+        f"heavy = {_toml_quote(config.model_name('heavy'))}",
         "",
     ]
-    if prov.name == "ollama":
+    if name == "ollama":
         lines.extend(
             [
                 "[ollama]",
-                f"url = {_toml_quote(prov.url)}",
-                f"timeout = {int(prov.timeout)}",
-                f"fast_ctx = {prov.fast_ctx}",
-                f"heavy_ctx = {prov.heavy_ctx}",
+                f"url = {_toml_quote(url)}",
+                f"timeout = {timeout}",
+                f"fast_ctx = {fast.ctx}",
+                f"heavy_ctx = {heavy.ctx}",
                 "",
             ]
         )
@@ -240,15 +245,15 @@ def _write_effective_compare_toml(vault: Path, config: Config) -> None:
         lines.extend(
             [
                 "[provider]",
-                f"name = {_toml_quote(prov.name)}",
-                f"url = {_toml_quote(prov.url)}",
-                f"timeout = {int(prov.timeout)}",
-                f"fast_ctx = {prov.fast_ctx}",
-                f"heavy_ctx = {prov.heavy_ctx}",
+                f"name = {_toml_quote(name)}",
+                f"url = {_toml_quote(url)}",
+                f"timeout = {timeout}",
+                f"fast_ctx = {fast.ctx}",
+                f"heavy_ctx = {heavy.ctx}",
             ]
         )
-        if prov.name == "azure":
-            lines.append(f"azure_api_version = {_toml_quote(prov.azure_api_version)}")
+        if name == "azure" and heavy.azure_api_version:
+            lines.append(f"azure_api_version = {_toml_quote(heavy.azure_api_version)}")
         lines.append("")
 
     lines.extend(
@@ -417,12 +422,12 @@ def _serialize_pipeline_report(report) -> dict | None:
 
 
 def _config_summary(config: Config) -> dict[str, str]:
-    prov = config.effective_provider
+    heavy = config.resolve_role("heavy")
     return {
-        "fast_model": config.models.fast,
-        "heavy_model": config.models.heavy,
-        "provider": prov.name,
-        "provider_url": prov.url,
+        "fast_model": config.model_name("fast"),
+        "heavy_model": config.model_name("heavy"),
+        "provider": heavy.provider_kind,
+        "provider_url": heavy.url,
     }
 
 

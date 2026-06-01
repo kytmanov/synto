@@ -717,6 +717,7 @@ def _query_core(
         model_role="fast",
         think=fast_ep.think,
         options=fast_ep.options,
+        temperature=fast_ep.temperature,
     )
 
     context = _load_pages(config, selection.pages, db=db, max_pages=max_pages)
@@ -744,6 +745,7 @@ def _query_core(
         model_role="heavy",
         think=heavy_ep.think,
         options=heavy_ep.options,
+        temperature=heavy_ep.temperature,
     )
 
     sanitized_answer = _sanitize_query_answer(result.answer, selection.pages, known_title_list)

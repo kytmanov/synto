@@ -27,9 +27,12 @@ class GlobalConfig(BaseModel):
     experimental_inline_source_citations: bool | None = None  # new-vault default only
     # Multi-provider (per-role) defaults: when both are set they supersede the flat
     # single-provider fields above, and `synto init` reproduces a multi-provider vault.
-    # Secrets are never stored here — provider blocks carry api_key_env references only.
+    # Provider blocks carry api_key_env references (the recommended path).
     providers: dict[str, ProviderBlock] = Field(default_factory=dict)
     models: dict[str, ModelProfile] | None = None
+    # Optional raw API key per provider alias (user-private — same trust as the legacy
+    # `api_key` above). Used as a fallback when no env var is set. `api_key_env` is preferred.
+    provider_keys: dict[str, str] | None = None
 
     @property
     def is_multi_provider(self) -> bool:
@@ -102,6 +105,11 @@ def save_global_config(cfg: GlobalConfig) -> None:
         lines.append(f"model = {_toml_str(prof.model)}")
         if prof.ctx is not None:
             lines.append(f"ctx = {int(prof.ctx)}")
+    if cfg.provider_keys:
+        lines.append("")
+        lines.append("[provider_keys]")
+        for key_alias, key_value in cfg.provider_keys.items():
+            lines.append(f"{_toml_str(key_alias)} = {_toml_str(key_value)}")
     path.write_text("\n".join(lines) + "\n" if lines else "", encoding="utf-8")
 
 

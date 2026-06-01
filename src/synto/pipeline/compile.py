@@ -1038,6 +1038,7 @@ def compile_concepts(
                     model_role="fast",
                     think=fast.think,
                     options=fast.options,
+                    temperature=fast.temperature,
                 )
             except (StructuredOutputError, LLMBadRequestError, LLMTruncatedError) as e:
                 log.error("Failed to write stub '%s': %s", name, e)
@@ -1149,6 +1150,7 @@ def compile_concepts(
                 model_role="heavy",
                 think=heavy.think,
                 options=heavy.options,
+                temperature=heavy.temperature,
             )
         except (StructuredOutputError, LLMBadRequestError, LLMTruncatedError) as e:
             retry_succeeded = False
@@ -1228,6 +1230,7 @@ def compile_concepts(
                             model_role="heavy",
                             think=heavy.think,
                             options=heavy.options,
+                            temperature=heavy.temperature,
                         )
                         resolved_paths = fallback_resolved_paths
                         confidence = _compute_confidence(resolved_paths, db)
@@ -1397,6 +1400,7 @@ def compile_notes(
             model_role="fast",
             think=fast.think,
             options=fast.options,
+            temperature=fast.temperature,
         )
     except (StructuredOutputError, LLMBadRequestError, LLMTruncatedError) as e:
         log.error("Planning failed: %s", e)
@@ -1463,6 +1467,7 @@ def compile_notes(
                 model_role="heavy",
                 think=heavy.think,
                 options=heavy.options,
+                temperature=heavy.temperature,
             )
         except (StructuredOutputError, LLMBadRequestError, LLMTruncatedError) as e:
             log.error("Failed to write '%s': %s", article.title, e)

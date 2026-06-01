@@ -112,3 +112,31 @@ def test_close_closes_each_client_once():
         router.close()
         assert len(fake_clients) == 1
         fake_clients[0].close.assert_called_once()
+
+
+def test_require_healthy_skips_distinct_embed_endpoint():
+    # embed on its own connection must NOT be probed by require_healthy (RAG is optional;
+    # a down embed endpoint must not block ingest/compile).
+    cfg = _cfg(
+        providers={
+            "local": ProviderBlock(name="ollama"),
+            "emb": ProviderBlock(name="lm_studio", url="http://emb-host:1234/v1"),
+        },
+        models={
+            "fast": {"provider": "local", "model": "f"},
+            "heavy": {"provider": "local", "model": "h"},
+            "embed": {"provider": "emb", "model": "e"},
+        },
+    )
+    built_kinds: list[str] = []
+
+    def fake_build(resolved, cache):
+        built_kinds.append(resolved.provider_kind)
+        return MagicMock()
+
+    with patch("synto.client_factory._build_client_for", side_effect=fake_build):
+        ModelRouter(cfg).require_healthy()
+    # Only the fast/heavy connection ("local"/ollama) is built+probed; the embed connection
+    # ("emb"/lm_studio) is never touched.
+    assert "lm_studio" not in built_kinds
+    assert built_kinds == ["ollama"]

@@ -25,13 +25,15 @@ def test_both_models():
 
 
 def test_provider_only_without_url():
+    # --provider maps to a per-invocation provider_override (supersedes the configured provider
+    # for all roles, on legacy and new-format vaults alike).
     kw = _model_override_kwargs(None, None, "groq", None)
-    assert kw == {"provider": {"name": "groq"}}
+    assert kw == {"provider_override": "groq"}
 
 
 def test_provider_url_only_without_name():
     kw = _model_override_kwargs(None, None, None, "http://localhost:1234/v1")
-    assert kw == {"provider": {"url": "http://localhost:1234/v1"}}
+    assert kw == {"provider_override_url": "http://localhost:1234/v1"}
 
 
 def test_all_flags_together():
@@ -43,5 +45,6 @@ def test_all_flags_together():
     )
     assert kw == {
         "models": {"fast": "gemma4:e4b", "heavy": "qwen2.5:14b"},
-        "provider": {"name": "groq", "url": "https://api.groq.com/openai/v1"},
+        "provider_override": "groq",
+        "provider_override_url": "https://api.groq.com/openai/v1",
     }

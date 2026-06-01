@@ -283,13 +283,12 @@ def _model_override_kwargs(
         models["heavy"] = heavy_model
     if models:
         kwargs["models"] = models
-    provider: dict = {}
+    # --provider/--provider-url are a per-invocation override that supersedes the configured
+    # provider for ALL roles (works regardless of vault format, incl. new [providers.*] vaults).
     if provider_name:
-        provider["name"] = provider_name
+        kwargs["provider_override"] = provider_name
     if provider_url:
-        provider["url"] = provider_url
-    if provider:
-        kwargs["provider"] = provider
+        kwargs["provider_override_url"] = provider_url
     return kwargs
 
 
@@ -474,6 +473,7 @@ def init(vault_path: str, existing: bool, non_interactive: bool, set_default: bo
                 "url": b.url or "",
                 "timeout": b.timeout,
                 "api_key_env": b.api_key_env,
+                "azure_api_version": b.azure_api_version,
             }
             for alias, b in gcfg.providers.items()
         ]
@@ -865,6 +865,14 @@ def _collect_role_provider(console, role_label: str, default_model: str = "") ->
         api_key_env = (
             Prompt.ask("    API key env var", default=default_env, console=console).strip() or None
         )
+    azure_api_version: str | None = None
+    if name == "azure":
+        azure_api_version = (
+            Prompt.ask(
+                "    Azure API version", default="2024-02-15-preview", console=console
+            ).strip()
+            or "2024-02-15-preview"
+        )
     model = Prompt.ask(
         "    Model name", default=default_model if name == "ollama" else "", console=console
     ).strip()
@@ -874,6 +882,7 @@ def _collect_role_provider(console, role_label: str, default_model: str = "") ->
         "name": name,
         "url": url,
         "api_key_env": api_key_env,
+        "azure_api_version": azure_api_version,
         "model": model,
         "timeout": int(prov.default_timeout),
     }
@@ -917,6 +926,7 @@ def _setup_multi_provider(console) -> None:
                 "url": spec["url"],
                 "timeout": spec["timeout"],
                 "api_key_env": spec["api_key_env"],
+                "azure_api_version": spec.get("azure_api_version"),
             }
             providers.append(match)
         role_alias[role] = match["alias"]
@@ -951,6 +961,11 @@ def _setup_multi_provider(console) -> None:
                 url=p["url"] or None,
                 timeout=p.get("timeout"),
                 api_key_env=p.get("api_key_env"),
+                **(
+                    {"azure_api_version": p["azure_api_version"]}
+                    if p.get("azure_api_version")
+                    else {}
+                ),
             )
             for p in providers
         },
@@ -959,13 +974,31 @@ def _setup_multi_provider(console) -> None:
             for role, m in models.items()
         },
     )
-    save_global_config(gcfg)
-
-    # Optionally apply to a vault now (otherwise `synto init` will reproduce it).
+    # Default vault (stored in the global config, used by `synto` without --vault) + citation
+    # preference, mirroring the single-provider wizard. The default vault doubles as the
+    # apply-now target: if it already exists, write the split into it immediately.
     console.print()
     vault_input = Prompt.ask(
-        "  Apply to an existing vault now? (path, or Enter to skip)", default="", console=console
+        "  Default vault path (Enter to skip)",
+        default=(existing.vault if existing and existing.vault else ""),
+        console=console,
     ).strip()
+    citations = (
+        Prompt.ask(
+            "  Enable inline source citations for new vaults?",
+            choices=["y", "n"],
+            default="y" if (existing and existing.experimental_inline_source_citations) else "n",
+            show_choices=False,
+            console=console,
+        )
+        .strip()
+        .lower()
+        == "y"
+    )
+    gcfg.vault = vault_input or (existing.vault if existing else None)
+    gcfg.experimental_inline_source_citations = citations
+    save_global_config(gcfg)
+
     applied_to: Path | None = None
     if vault_input:
         vault = Path(vault_input).expanduser().resolve()
@@ -980,15 +1013,20 @@ def _setup_multi_provider(console) -> None:
             )
             applied_to = toml_path
         elif legacy_path.exists():
+            # Write the new format into synto.toml (Config.from_vault prefers it and hard-fails
+            # on a legacy-only vault); migrate the legacy file's non-provider sections forward.
             atomic_write(
-                legacy_path,
+                toml_path,
                 apply_providers_to_existing_toml(
                     legacy_path.read_text(encoding="utf-8"), providers, models
                 ),
             )
-            applied_to = legacy_path
+            applied_to = toml_path
         elif vault.exists():
-            atomic_write(toml_path, multi_provider_vault_toml(providers, models))
+            atomic_write(
+                toml_path,
+                multi_provider_vault_toml(providers, models, inline_source_citations=citations),
+            )
             applied_to = toml_path
         else:
             console.print(
@@ -1037,12 +1075,24 @@ def setup(non_interactive: bool, reset: bool, provider_preset: str | None):
         table = Table(title="Global config", show_header=False, box=None, padding=(0, 2))
         table.add_column("Key", style="bold")
         table.add_column("Value")
-        prov_display = gcfg.provider_name or (gcfg.ollama_url and "ollama") or "[dim]not set[/dim]"
-        table.add_row("Provider", prov_display)
-        table.add_row("URL", gcfg.provider_url or gcfg.ollama_url or "[dim]not set[/dim]")
-        table.add_row("API key", "***" if gcfg.api_key else "[dim]not set[/dim]")
-        table.add_row("Fast model", gcfg.fast_model or "[dim]not set[/dim]")
-        table.add_row("Heavy model", gcfg.heavy_model or "[dim]not set[/dim]")
+        if gcfg.is_multi_provider:
+            for alias, block in gcfg.providers.items():
+                key_note = f"  key: ${block.api_key_env}" if block.api_key_env else ""
+                table.add_row(
+                    f"Provider [{alias}]",
+                    f"{block.name} @ {block.url or '(default url)'}{key_note}",
+                )
+            for role, prof in (gcfg.models or {}).items():
+                table.add_row(f"Model [{role}]", f"{prof.provider} / {prof.model}")
+        else:
+            prov_display = (
+                gcfg.provider_name or (gcfg.ollama_url and "ollama") or "[dim]not set[/dim]"
+            )
+            table.add_row("Provider", prov_display)
+            table.add_row("URL", gcfg.provider_url or gcfg.ollama_url or "[dim]not set[/dim]")
+            table.add_row("API key", "***" if gcfg.api_key else "[dim]not set[/dim]")
+            table.add_row("Fast model", gcfg.fast_model or "[dim]not set[/dim]")
+            table.add_row("Heavy model", gcfg.heavy_model or "[dim]not set[/dim]")
         table.add_row("Default vault", gcfg.vault or "[dim]not set[/dim]")
         table.add_row(
             "Inline source citations for new vaults",
@@ -3421,16 +3471,16 @@ def compare(
     challenger_config = _load_config(vault_str, **challenger_kwargs)
 
     current_summary = (
-        config.models.fast,
-        config.models.heavy,
-        config.effective_provider.name,
-        config.effective_provider.url,
+        config.model_name("fast"),
+        config.model_name("heavy"),
+        config.resolve_role("heavy").provider_kind,
+        config.resolve_role("heavy").url,
     )
     challenger_summary = (
-        challenger_config.models.fast,
-        challenger_config.models.heavy,
-        challenger_config.effective_provider.name,
-        challenger_config.effective_provider.url,
+        challenger_config.model_name("fast"),
+        challenger_config.model_name("heavy"),
+        challenger_config.resolve_role("heavy").provider_kind,
+        challenger_config.resolve_role("heavy").url,
     )
     if challenger_summary == current_summary:
         err_console.print("Challenger config is identical to current config.")
@@ -3438,7 +3488,11 @@ def compare(
 
     _validate_compare_inputs(config, queries_path)
 
-    if _is_cloud_provider(challenger_config.effective_provider.name) and not allow_cloud_upload:
+    challenger_kinds = {
+        challenger_config.resolve_role("fast").provider_kind,
+        challenger_config.resolve_role("heavy").provider_kind,
+    }
+    if any(_is_cloud_provider(k) for k in challenger_kinds) and not allow_cloud_upload:
         err_console.print(
             "Cloud challenger requires --allow-cloud-upload "
             "(your raw notes will be sent to the provider)."
@@ -3456,11 +3510,11 @@ def compare(
     console.print(
         f"[bold]synto compare[/bold] — active vault preview\n"
         f"  vault={config.vault}\n"
-        f"  current: fast={config.models.fast} heavy={config.models.heavy} "
-        f"provider={config.effective_provider.name}\n"
-        f"  challenger: fast={challenger_config.models.fast} "
-        f"heavy={challenger_config.models.heavy} "
-        f"provider={challenger_config.effective_provider.name}\n"
+        f"  current: fast={config.model_name('fast')} heavy={config.model_name('heavy')} "
+        f"provider={config.resolve_role('heavy').provider_kind}\n"
+        f"  challenger: fast={challenger_config.model_name('fast')} "
+        f"heavy={challenger_config.model_name('heavy')} "
+        f"provider={challenger_config.resolve_role('heavy').provider_kind}\n"
         f"  queries={'enabled' if queries_path else 'disabled'}\n"
         f"  scope={sample_label}\n"
         f"  Active vault will not be modified."
@@ -3502,12 +3556,13 @@ def compare(
         console.print(f"  · {reason}")
     if report.verdict == AdvisorVerdict.SWITCH:
         console.print(f"\n[bold]Next step:[/bold] edit {CONFIG_FILE_NAME} and set:")
+        _ch_heavy = challenger_config.resolve_role("heavy")
         console.print(
             render_switch_config_toml(
-                fast_model=challenger_config.models.fast,
-                heavy_model=challenger_config.models.heavy,
-                provider_name=challenger_config.effective_provider.name,
-                provider_url=challenger_config.effective_provider.url,
+                fast_model=challenger_config.model_name("fast"),
+                heavy_model=challenger_config.model_name("heavy"),
+                provider_name=_ch_heavy.provider_kind,
+                provider_url=_ch_heavy.url,
             ),
             markup=False,
         )

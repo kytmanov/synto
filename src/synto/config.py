@@ -143,6 +143,8 @@ def _provider_models_head(providers: list[dict], models: dict[str, dict]) -> str
         ]
         if p.get("api_key_env"):
             lines.append(f"api_key_env = {_toml_quote(p['api_key_env'])}")
+        if p.get("name") == "azure" and p.get("azure_api_version"):
+            lines.append(f"azure_api_version = {_toml_quote(p['azure_api_version'])}")
         blocks.append("\n".join(lines))
     provider_section = "\n\n".join(blocks) + "\n"
 
@@ -451,6 +453,11 @@ class Config(BaseModel):
     ollama: OllamaConfig = OllamaConfig()
     provider: ProviderConfig | None = None  # supersedes [ollama] when present
     providers: dict[str, ProviderBlock] = Field(default_factory=dict)  # named connections
+    # Per-invocation CLI override (--provider / --provider-url): when set, supersedes the
+    # configured provider connection for ALL roles this run (each role keeps its own model /
+    # ctx / think / temperature). Set programmatically from CLI flags, not from synto.toml.
+    provider_override: str | None = None
+    provider_override_url: str | None = None
     pipeline: PipelineConfig = PipelineConfig()
     rag: RagConfig = RagConfig()
     metrics: MetricsConfig = MetricsConfig()
@@ -503,35 +510,46 @@ class Config(BaseModel):
         prof = getattr(self.models, role)
         profile = prof if isinstance(prof, ModelProfile) else ModelProfile(model=prof)
 
-        # Pick the connection. Precedence: explicit alias > a block named "default" > legacy.
+        # Pick the connection. A CLI --provider override (for this invocation) wins over the
+        # configured provider for every role; otherwise: explicit alias > "default" block > legacy.
         alias: str | None
-        if profile.provider is not None:
-            alias = profile.provider
-            block = self.providers[alias]
-        elif "default" in self.providers:
-            alias = "default"
-            block = self.providers["default"]
-        else:
+        if self.provider_override:
             alias = None
-            block = None
-
-        if block is not None:
-            kind = block.name
-            url = block.url
-            timeout = block.timeout
-            block_api_key_env = block.api_key_env
-            azure_api_version = block.azure_api_version
-            options = {**block.options, **profile.options}
-            headers = dict(block.headers)
-        else:
-            legacy = self.effective_provider
-            kind = legacy.name
-            url = legacy.url
-            timeout = legacy.timeout
+            kind = self.provider_override
+            url = self.provider_override_url  # None -> registry default below
+            timeout = None  # -> registry default below
             block_api_key_env = None
-            azure_api_version = legacy.azure_api_version
+            azure_api_version = "2024-02-15-preview"
             options = dict(profile.options)
             headers = {}
+        else:
+            if profile.provider is not None:
+                alias = profile.provider
+                block = self.providers[alias]
+            elif "default" in self.providers:
+                alias = "default"
+                block = self.providers["default"]
+            else:
+                alias = None
+                block = None
+
+            if block is not None:
+                kind = block.name
+                url = block.url
+                timeout = block.timeout
+                block_api_key_env = block.api_key_env
+                azure_api_version = block.azure_api_version
+                options = {**block.options, **profile.options}
+                headers = dict(block.headers)
+            else:
+                legacy = self.effective_provider
+                kind = legacy.name
+                url = legacy.url
+                timeout = legacy.timeout
+                block_api_key_env = None
+                azure_api_version = legacy.azure_api_version
+                options = dict(profile.options)
+                headers = {}
 
         prov_info = get_provider(kind)
         if not url:
