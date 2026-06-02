@@ -462,7 +462,23 @@ def init(vault_path: str, existing: bool, non_interactive: bool, set_default: bo
 
     gcfg = load_global_config()
 
-    if gcfg and gcfg.is_multi_provider:
+    # Respect a vault explicitly configured for a different provider than the global default:
+    # re-syncing it from global config would silently switch providers — and, before the regex fix
+    # below, corrupted the file (e.g. an lm_studio block getting Ollama's URL). New or
+    # undeterminable vaults fall through to the normal write/sync paths.
+    existing_provider = _vault_provider_name(toml_path) if toml_path.exists() else None
+    global_provider = _global_default_provider_name(gcfg)
+    if (
+        existing_provider is not None
+        and global_provider is not None
+        and (existing_provider != global_provider)
+    ):
+        console.print(
+            f"[dim]{CONFIG_FILE_NAME} is configured for '{existing_provider}' "
+            f"(global default: '{global_provider}') — leaving its provider and models unchanged. "
+            f"Edit {CONFIG_FILE_NAME} or run [bold]{CLI_NAME} setup[/bold] to change.[/dim]"
+        )
+    elif gcfg and gcfg.is_multi_provider:
         # Reproduce the per-role multi-provider setup saved by `synto setup`. gcfg.providers and
         # gcfg.models are already Pydantic models, so we dump them directly — no field enumeration,
         # so headers/options/think/temperature and any role (incl. embed) carry through verbatim.
@@ -530,8 +546,9 @@ def init(vault_path: str, existing: bool, non_interactive: bool, set_default: bo
                 )
             )
         else:
-            # Existing vault: patch model/URL fields from global config so that
-            # synto setup changes are reflected without overwriting pipeline settings.
+            # Existing vault with a matching provider: patch model/URL fields from global config so
+            # synto setup changes are reflected, without overwriting pipeline settings. (A divergent
+            # provider was already handled by the respect-the-vault short-circuit above.)
             _sync_wiki_toml_models(
                 toml_path,
                 fast,
@@ -602,6 +619,50 @@ def init(vault_path: str, existing: bool, non_interactive: bool, set_default: bo
         )
 
 
+def _vault_provider_name(toml_path: Path) -> str | None:
+    """Best-effort read of a vault's configured provider for init's match check.
+
+    Returns the name from [providers.default] or legacy [provider]; "ollama" for a legacy
+    [ollama]/[models] vault; None if undeterminable (then init proceeds and syncs as before).
+    """
+    try:
+        with open(toml_path, "rb") as f:
+            data = tomllib.load(f)
+    except Exception:
+        return None
+    providers = data.get("providers")
+    if isinstance(providers, dict):
+        default = providers.get("default")
+        if isinstance(default, dict) and default.get("name"):
+            return str(default["name"])
+    provider = data.get("provider")
+    if isinstance(provider, dict) and provider.get("name"):
+        return str(provider["name"])
+    if "ollama" in data or "models" in data:
+        return "ollama"
+    return None
+
+
+def _global_default_provider_name(gcfg) -> str | None:
+    """The provider name the global config would apply to a vault's default connection.
+
+    For a multi-provider config that's the `default` block's name (or the first block); for a
+    single-provider config it's `provider_name`, defaulting to "ollama" (init's own default).
+    Returns None only when there's no global config to compare against.
+    """
+    if gcfg is None:
+        return None
+    if gcfg.is_multi_provider and gcfg.providers:
+        default = gcfg.providers.get("default")
+        if default is not None and getattr(default, "name", None):
+            return str(default.name)
+        for block in gcfg.providers.values():
+            if getattr(block, "name", None):
+                return str(block.name)
+        return None
+    return gcfg.provider_name or "ollama"
+
+
 def _sync_wiki_toml_models(
     toml_path: Path,
     fast: str,
@@ -624,8 +685,10 @@ def _sync_wiki_toml_models(
 
     def _replace_value(t: str, key: str, value: str) -> str:
         escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        # `[^"\n]*` keeps the match on the value's own line — a greedy `.+` would swallow a trailing
+        # inline comment's quotes (or, with DOTALL, the rest of the file).
         return re.sub(
-            rf'^({re.escape(key)}\s*=\s*)".+"',
+            rf'^({re.escape(key)}\s*=\s*)"[^"\n]*"',
             rf'\g<1>"{escaped}"',
             t,
             flags=re.MULTILINE,
@@ -634,10 +697,12 @@ def _sync_wiki_toml_models(
     def _replace_in_section(t: str, section: str, key: str, value: str) -> str:
         """Replace key=value only within the named TOML section."""
         escaped_val = value.replace("\\", "\\\\").replace('"', '\\"')
-        # Match the section header then capture everything until the next section or EOF
-        pattern = rf'(\[{re.escape(section)}\][^\[]*?)^({re.escape(key)}\s*=\s*)".+"'
+        # `[^\[]*?` (lazy, can't cross into the next [section]) finds the key; the value match is
+        # `"[^"\n]*"`, bounded to one line. The previous greedy `".+"` under re.DOTALL matched
+        # through to the file's LAST quote, deleting every [section] in between — see test.
+        pattern = rf'(\[{re.escape(section)}\][^\[]*?)^({re.escape(key)}\s*=\s*)"[^"\n]*"'
         replacement = rf'\1\2"{escaped_val}"'
-        return re.sub(pattern, replacement, t, flags=re.MULTILINE | re.DOTALL)
+        return re.sub(pattern, replacement, t, flags=re.MULTILINE)
 
     # Legacy format: [models] fast/heavy scalars + url in [ollama]/[provider].
     text = _replace_value(text, "fast", fast)

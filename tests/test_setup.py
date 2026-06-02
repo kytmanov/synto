@@ -686,6 +686,103 @@ def test_init_syncs_models_into_existing_wiki_toml(
     assert "auto_approve = false" in content
 
 
+def _new_format_vault_toml(provider: str, url: str) -> str:
+    from synto.config import ModelProfile, ProviderBlock, multi_provider_vault_toml
+
+    return multi_provider_vault_toml(
+        {"default": ProviderBlock(name=provider, url=url)},
+        {
+            "fast": ModelProfile(provider="default", model="m-fast", ctx=8192),
+            "heavy": ModelProfile(provider="default", model="m-heavy", ctx=32768),
+        },
+        inline_source_citations=False,
+    )
+
+
+def test_init_sync_preserves_new_format_sections(runner: CliRunner, cfg_dir: Path, tmp_path: Path):
+    """Regression: syncing a new-format vault must not destroy it. The old _replace_in_section
+    used a greedy `.+` under re.DOTALL, so patching [providers.default].url matched through to the
+    file's last quote (the `# language = "en"` comment), deleting every [models.*]/[pipeline]
+    section in between. With a matching provider the sync runs — and must leave valid TOML."""
+    vault = tmp_path / "newfmt-vault"
+    vault.mkdir()
+    # Provider matches the global default (ollama) so the sync runs and exercises the regex.
+    (vault / "synto.toml").write_text(_new_format_vault_toml("ollama", "http://localhost:11434"))
+
+    save_global_config(
+        GlobalConfig(
+            provider_name="ollama",
+            fast_model="new-fast",
+            heavy_model="new-heavy",
+            ollama_url="http://localhost:9999",
+        )
+    )
+    result = runner.invoke(cli, ["init", str(vault)])
+    assert result.exit_code == 0
+
+    content = (vault / "synto.toml").read_text()
+    parsed = tomllib.loads(content)  # must still be valid TOML, not a mangled fragment
+    assert "fast" in parsed["models"] and "heavy" in parsed["models"]
+    assert parsed["pipeline"]["graph_quality_checks"] is True
+    # The url + models were patched in place without swallowing the rest of the file.
+    assert parsed["providers"]["default"]["url"] == "http://localhost:9999"
+    assert parsed["models"]["fast"]["model"] == "new-fast"
+
+
+def test_init_respects_vault_provider_on_mismatch(runner: CliRunner, cfg_dir: Path, tmp_path: Path):
+    """If the vault is configured for a different provider than the global default, init must leave
+    its provider/url/models untouched — never write the global provider's URL into a foreign block
+    (the bug that pointed lm_studio at Ollama's port)."""
+    vault = tmp_path / "lmstudio-vault"
+    vault.mkdir()
+    (vault / "synto.toml").write_text(
+        _new_format_vault_toml("lm_studio", "http://localhost:1234/v1")
+    )
+
+    # Global default is Ollama — a different provider.
+    save_global_config(
+        GlobalConfig(provider_name="ollama", fast_model="g", heavy_model="g", ollama_url="x:11434")
+    )
+    result = runner.invoke(cli, ["init", str(vault)])
+    assert result.exit_code == 0
+    assert "configured for 'lm_studio'" in result.output
+
+    parsed = tomllib.loads((vault / "synto.toml").read_text())
+    # Vault config is respected: LM Studio URL and models intact, no Ollama bleed-through.
+    assert parsed["providers"]["default"]["name"] == "lm_studio"
+    assert parsed["providers"]["default"]["url"] == "http://localhost:1234/v1"
+    assert parsed["models"]["fast"]["model"] == "m-fast"
+
+
+def test_init_respects_vault_provider_against_multi_provider_global(
+    runner: CliRunner, cfg_dir: Path, tmp_path: Path
+):
+    """Respect-the-vault also guards the multi-provider 'reproduce' path: a vault set up for one
+    provider must not be silently rewritten to the global multi-provider default."""
+    from synto.config import ModelProfile, ProviderBlock
+
+    vault = tmp_path / "lmstudio-vault"
+    vault.mkdir()
+    (vault / "synto.toml").write_text(
+        _new_format_vault_toml("lm_studio", "http://localhost:1234/v1")
+    )
+
+    # Global default is a multi-provider Ollama split — a different provider than the vault.
+    save_global_config(
+        GlobalConfig(
+            providers={"default": ProviderBlock(name="ollama", url="http://localhost:11434")},
+            models={"fast": ModelProfile(provider="default", model="gemma4:e4b")},
+        )
+    )
+    result = runner.invoke(cli, ["init", str(vault)])
+    assert result.exit_code == 0
+    assert "configured for 'lm_studio'" in result.output
+
+    parsed = tomllib.loads((vault / "synto.toml").read_text())
+    assert parsed["providers"]["default"]["name"] == "lm_studio"
+    assert parsed["providers"]["default"]["url"] == "http://localhost:1234/v1"
+
+
 # ── default_wiki_toml pipeline fields ────────────────────────────────────────
 
 
