@@ -596,6 +596,35 @@ def test_init_uses_global_config_models(runner: CliRunner, cfg_dir: Path, tmp_pa
     assert "192.168.1.5" in content
 
 
+def test_init_non_default_vault_shows_vault_flag_and_default_tip(
+    runner: CliRunner, cfg_dir: Path, tmp_path: Path
+):
+    """When no default vault is configured, next-steps must carry --vault and hint at --default
+    so the user isn't left retyping the long absolute path on every command."""
+    vault = tmp_path / "fresh-vault"
+    result = runner.invoke(cli, ["init", str(vault)])
+    assert result.exit_code == 0
+    # Commands carry the flag; the tip points at --default. (Rich may wrap the long path, so match
+    # on the contiguous command prefix rather than the full path.)
+    assert "run --vault" in result.output
+    assert "--default" in result.output
+
+
+def test_init_when_vault_already_global_default_drops_vault_flag(
+    runner: CliRunner, cfg_dir: Path, tmp_path: Path
+):
+    """If the global config already points here (e.g. set by `synto setup`), re-initialising must
+    recognise it as the default and emit clean commands — no redundant --vault flags."""
+    vault = tmp_path / "default-vault"
+    save_global_config(GlobalConfig(vault=str(vault.resolve())))
+    result = runner.invoke(cli, ["init", str(vault)])
+    assert result.exit_code == 0
+    assert "Already your default vault" in result.output
+    # Commands must be clean — no --vault on any step (the only mention is the "needed" note).
+    assert "run --vault" not in result.output
+    assert "review --vault" not in result.output
+
+
 def test_init_applies_experimental_inline_source_citations_preference(
     runner: CliRunner, cfg_dir: Path, tmp_path: Path
 ):

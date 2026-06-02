@@ -565,12 +565,24 @@ def init(vault_path: str, existing: bool, non_interactive: bool, set_default: bo
         except Exception:
             console.print("[yellow]⚠ Could not save default vault to global config.[/yellow]")
 
+    # The --vault flag is only needed when this vault isn't the resolved default. It's the default
+    # if --default was just passed, or if the global config (e.g. set by `synto setup`) already
+    # points here — in which case the next steps must drop the noisy, redundant --vault flags.
+    vault_is_default = set_default
+    if not vault_is_default and gcfg is not None and gcfg.vault:
+        try:
+            vault_is_default = Path(gcfg.vault).expanduser().resolve() == vault
+        except Exception:
+            vault_is_default = False
+
     console.print(f"[green]Vault initialised:[/green] {vault}")
     if set_default:
         console.print("[dim]Set as default vault — no --vault flag needed.[/dim]")
+    elif vault_is_default:
+        console.print("[dim]Already your default vault — no --vault flag needed.[/dim]")
     console.print("Next steps:")
     console.print("  1. Drop .md notes into [bold]raw/[/bold]")
-    if set_default:
+    if vault_is_default:
         console.print(f"     (or import PDFs/text: [bold]{CLI_NAME} add <file>[/bold])")
         console.print(f"  2. Run [bold]{CLI_NAME} run[/bold]")
         console.print(f"  3. Review drafts: [bold]{CLI_NAME} review[/bold]")
@@ -583,6 +595,10 @@ def init(vault_path: str, existing: bool, non_interactive: bool, set_default: bo
         console.print(f"  3. Review drafts: [bold]{CLI_NAME} review --vault {vault}[/bold]")
         console.print(
             f"  4. Publish all drafts: [bold]{CLI_NAME} approve --all --vault {vault}[/bold]"
+        )
+        console.print(
+            f"[dim]Tip: re-run with [bold]{CLI_NAME} init {vault_path} --default[/bold] to make "
+            "this the default vault and drop the --vault flag.[/dim]"
         )
 
 
