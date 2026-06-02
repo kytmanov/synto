@@ -423,8 +423,21 @@ def _repair_bare_bracket_links(content: str, known_titles: list[str] | None = No
     return _restore_masked_regions(bare_link_re.sub(replace, masked), replacements)
 
 
-def _strip_unknown_wikilinks(content: str, known_titles: list[str]) -> str:
-    """Unwrap wikilinks that do not target an existing wiki/source page."""
+def _strip_unknown_wikilinks(
+    content: str,
+    known_titles: list[str],
+    stem_to_title: dict[str, str] | None = None,
+) -> str:
+    """Resolve concept links to their filename stem; unwrap links to no existing page.
+
+    A wikilink resolves only to a note's filename stem, so a concept whose title carries
+    filename-forbidden chars (e.g. "TCP/IP" -> TCPIP.md) is matched by stem, not by raw
+    title. ``stem_to_title`` maps ``sanitize_filename(title).lower()`` -> title; a link whose
+    target sanitizes to a known stem is rewritten to ``[[<stem>|<title>]]`` (so it resolves
+    and stays readable), whether the body wrote ``[[TCPIP]]`` or ``[[TCP/IP]]``. Links that
+    resolve to no known concept or source page are unwrapped to plain text.
+    """
+    stem_map = stem_to_title or {}
     masked, replacements = _mask_code_blocks(content)
     known = {title.lower() for title in known_titles}
     wikilink_re = re.compile(r"\[\[([^\]|#]+)(#[^\]|]*)?(?:\|([^\]]*))?\]\]")
@@ -433,6 +446,17 @@ def _strip_unknown_wikilinks(content: str, known_titles: list[str]) -> str:
         target = match.group(1).strip()
         fragment = match.group(2) or ""
         display = match.group(3)
+        # Concept resolution by stem wins first, so a raw [[TCP/IP]] is rewritten to its
+        # resolving target rather than kept as a broken link by the raw-title fast path.
+        stem = sanitize_filename(target)
+        canonical = stem_map.get(stem.lower())
+        if canonical is not None:
+            if target == stem:
+                # Target already equals its filename stem → it resolves; leave verbatim
+                # (covers normal titles and case variants — only forbidden-char links change).
+                return match.group(0)
+            new_display = display if display is not None else canonical
+            return f"[[{stem}{fragment}|{new_display}]]"
         if target.lower().startswith("sources/") or target.lower() in known:
             return match.group(0)
         return display or f"{target}{fragment}"
@@ -441,13 +465,17 @@ def _strip_unknown_wikilinks(content: str, known_titles: list[str]) -> str:
 
 
 def _strip_self_wikilinks(content: str, article_title: str) -> str:
-    """Unwrap links that point to the article itself."""
-    title_key = article_title.lower()
+    """Unwrap links that point to the article itself.
+
+    Compares on filename stem so a resolved self-link (e.g. [[TCPIP]] for an article
+    titled "TCP/IP") is still recognized.
+    """
+    title_key = sanitize_filename(article_title).lower()
     wikilink_re = re.compile(r"\[\[([^\]|#]+)(#[^\]|]*)?(?:\|([^\]]*))?\]\]")
 
     def replace(match: re.Match[str]) -> str:
         target = match.group(1).strip()
-        if target.lower() != title_key:
+        if sanitize_filename(target).lower() != title_key:
             return match.group(0)
         display = match.group(3)
         return display or target
@@ -700,7 +728,12 @@ def _write_draft(
     source_targets = [ref.wiki_target for ref in source_refs]
     body = _repair_malformed_wikilinks(body, (existing_titles or []) + source_targets)
     body = _repair_wikilink_placeholders(body)
-    body = _strip_unknown_wikilinks(body, (existing_titles or []) + source_targets)
+    # Resolve concept links by filename stem so titles with forbidden chars (e.g. "TCP/IP"
+    # -> TCPIP.md) survive as readable [[stem|title]] links instead of being stripped.
+    stem_to_title: dict[str, str] = {}
+    for t in existing_titles or []:
+        stem_to_title.setdefault(sanitize_filename(t).lower(), t)
+    body = _strip_unknown_wikilinks(body, (existing_titles or []) + source_targets, stem_to_title)
     body = _strip_self_wikilinks(body, article_title)
     body = _strip_empty_wikilinks(body)
     body = _repair_malformed_embeds(body)

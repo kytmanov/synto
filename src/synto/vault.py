@@ -110,16 +110,25 @@ def ensure_wikilinks(content: str, targets: list[str]) -> str:
     masked, spans = _mask_code_blocks(content)
 
     for target in targets:
-        # Already linked? Skip.
-        if f"[[{target}]]" in masked or f"[[{target}|" in masked:
+        # Match the raw title in the body, but emit the normalized link target so it
+        # resolves to the sanitized filename (e.g. body "\int" → "[[int]]" → int.md).
+        safe_target = sanitize_wikilink_target(target)
+        # Already linked? Skip — check both the raw form and the target we emit.
+        if (
+            f"[[{target}]]" in masked
+            or f"[[{target}|" in masked
+            or f"[[{safe_target}]]" in masked
+            or f"[[{safe_target}|" in masked
+        ):
             continue
         # Whole-word boundary match, case-sensitive, first occurrence only
         pattern = re.compile(r"(?<!\[)(?<!\|)\b" + re.escape(target) + r"\b(?!\])")
-        # Escape backslashes in replacement to prevent re.sub interpreting
-        # them as group references (e.g. \1) — titles with LaTeX like \int
-        # would otherwise raise re.PatternError.
-        repl = f"[[{target}]]".replace("\\", "\\\\")
-        masked = pattern.sub(repl, masked, count=1)
+        # When the title carries filename-forbidden chars, emit a display-preserving link so
+        # it resolves to the sanitized filename yet stays readable (body "TCP/IP" →
+        # "[[TCPIP|TCP/IP]]" → TCPIP.md). Escape the replacement: the raw title may contain a
+        # backslash (LaTeX like \int) that re.sub would otherwise read as a group reference.
+        repl = f"[[{safe_target}|{target}]]" if safe_target != target else f"[[{safe_target}]]"
+        masked = pattern.sub(repl.replace("\\", "\\\\"), masked, count=1)
 
     return _restore_code_blocks(masked, spans)
 
@@ -184,12 +193,16 @@ def is_synthesis_article_path(relative_path: str) -> bool:
 
 # ── Wikilink target safety ────────────────────────────────────────────────────
 
-_WIKILINK_UNSAFE = re.compile(r"[\\\[\]|#^]")
-
 
 def sanitize_wikilink_target(name: str) -> str:
-    """Remove characters that break [[wikilink]] syntax, including backslashes."""
-    return _WIKILINK_UNSAFE.sub("", name).strip()
+    """Normalize a title to the bare [[target]] that resolves to its file.
+
+    A wikilink ``[[X]]`` resolves only when ``X`` equals the note's filename stem,
+    and that stem is ``sanitize_filename(title)``. Deriving the link target from the
+    same normalization guarantees they never diverge — otherwise a title like
+    ``TCP/IP`` (file ``TCPIP.md``) or ``\\int`` (file ``int.md``) yields a broken link.
+    """
+    return sanitize_filename(name)
 
 
 # ── Filename safety ───────────────────────────────────────────────────────────

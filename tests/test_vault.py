@@ -164,16 +164,48 @@ def test_ensure_wikilinks_empty_targets():
     assert ensure_wikilinks(content, []) == content
 
 
-def test_ensure_wikilinks_backslash_target():
-    # LaTeX titles like \int crashed re.sub via a bad group escape (\i);
-    # the replacement must be backslash-escaped so the link is inserted literally.
-    assert ensure_wikilinks(r"x\int y", [r"\int"]) == r"x[[\int]] y"
+def test_ensure_wikilinks_backslash_target_emits_filename_target():
+    # A LaTeX title \int is written to int.md (sanitize_filename strips "\"), so the link
+    # target must be int to resolve; the raw title is kept as display: [[int|\int]].
+    assert ensure_wikilinks(r"x\int y", [r"\int"]) == r"x[[int|\int]] y"
+
+
+def test_ensure_wikilinks_target_matches_filename_stem():
+    # The link target must equal the file sanitize_filename() would create, for any title
+    # carrying filename-forbidden chars (here "/"); the raw title is preserved as display.
+    title = "TCP/IP"
+    result = ensure_wikilinks("see TCP/IP here", [title])
+    assert result == f"see [[{sanitize_filename(title)}|{title}]] here"
+    assert result == "see [[TCPIP|TCP/IP]] here"
+
+
+def test_ensure_wikilinks_idempotent_for_normalized_target():
+    # Re-running over an already-normalized link must not double-wrap it.
+    once = ensure_wikilinks(r"x\int y", [r"\int"])
+    assert ensure_wikilinks(once, [r"\int"]) == once
 
 
 def test_ensure_wikilinks_backslash_target_no_match_does_not_raise():
     # re.sub parses the replacement template eagerly, so a backslash title raised
     # re.PatternError even when the body never matched the pattern.
     assert ensure_wikilinks("no latex here", [r"\int"]) == "no latex here"
+
+
+def test_ensure_wikilinks_multi_occurrence_idempotent():
+    # The guard skips a title once its emitted (normalized) form exists anywhere — without
+    # that, each run would link one more plain occurrence (run1→1st, run2→2nd, …). Only the
+    # first mention is linked, and re-running is a no-op.
+    once = ensure_wikilinks("TCP/IP is great. TCP/IP rules.", ["TCP/IP"])
+    assert once == "[[TCPIP|TCP/IP]] is great. TCP/IP rules."
+    assert ensure_wikilinks(once, ["TCP/IP"]) == once
+
+
+def test_ensure_wikilinks_skips_already_linked_normalized():
+    # Reviewer scenario: with the normalized link already present, the remaining plain
+    # mention stays plain — identical to how a normal title behaves (link-once), e.g.
+    # ensure_wikilinks("[[Python]] and Python", ["Python"]) is also a no-op.
+    body = "[[TCPIP]] and TCP/IP"
+    assert ensure_wikilinks(body, ["TCP/IP"]) == body
 
 
 # ── chunk_text ────────────────────────────────────────────────────────────────
@@ -318,9 +350,18 @@ def test_sanitize_wikilink_target_passthrough():
     assert sanitize_wikilink_target("Normal Title") == "Normal Title"
 
 
-def test_sanitize_wikilink_target_preserves_colon():
-    # Colons are fine inside wikilinks
-    assert sanitize_wikilink_target("Python: Guide") == "Python: Guide"
+def test_sanitize_wikilink_target_strips_filename_forbidden_chars():
+    # A link target must equal the filename stem to resolve. Chars that sanitize_filename
+    # strips (here ":", "/", "*") must be stripped from the target too — otherwise the
+    # link points at a name no file has.
+    for title in ["Python: Guide", "TCP/IP", "C*", r"\int", 'A*B"C/D']:
+        assert sanitize_wikilink_target(title) == sanitize_filename(title)
+
+
+def test_sanitize_wikilink_target_strips_colon():
+    # Regression for the old "preserves colon" behavior: "Python: Guide" is written to
+    # "Python Guide.md", so the link target must be "Python Guide", not "Python: Guide".
+    assert sanitize_wikilink_target("Python: Guide") == "Python Guide"
 
 
 # ── build_wiki_frontmatter ────────────────────────────────────────────────────
