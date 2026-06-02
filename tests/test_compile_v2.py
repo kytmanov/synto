@@ -36,6 +36,7 @@ from synto.pipeline.compile import (
     reject_draft,
 )
 from synto.state import StateDB
+from synto.vault import ensure_wikilinks, sanitize_filename
 
 
 def test_sanitize_obsidian_math_converts_display_math_before_link_repairs():
@@ -379,6 +380,53 @@ def test_strip_self_wikilinks_unwraps_self_links():
     body = _strip_self_wikilinks("[[Scrum]] and [[Scrum|this page]] link to [[Kanban]].", "Scrum")
 
     assert body == "Scrum and this page link to [[Kanban]]."
+
+
+def test_strip_unknown_resolves_concept_by_stem():
+    # A concept titled "TCP/IP" lives at TCPIP.md. An already-resolving [[TCPIP]] is kept
+    # verbatim; a raw [[TCP/IP]] (LLM-authored, non-resolving) is rewritten to the stem with
+    # the raw title as display — neither is stripped.
+    body = _strip_unknown_wikilinks(
+        "Use [[TCPIP]] and [[TCP/IP]] and [[TCP/IP|the protocol]].",
+        ["TCP/IP"],
+        {"tcpip": "TCP/IP"},
+    )
+    assert body == "Use [[TCPIP]] and [[TCPIP|TCP/IP]] and [[TCPIP|the protocol]]."
+
+
+def test_strip_unknown_without_stem_map_strips_normalized_link():
+    # Documents the defect this fix addresses: without stem resolution, [[TCPIP]] is not in
+    # the raw known set {"tcp/ip"} and gets unwrapped, mangling prose to "TCPIP".
+    assert _strip_unknown_wikilinks("Use [[TCPIP]] here.", ["TCP/IP"]) == "Use TCPIP here."
+
+
+def test_strip_unknown_leaves_normal_titles_unchanged():
+    # Normal title (stem == title): no display is added, link kept verbatim.
+    body = _strip_unknown_wikilinks(
+        "[[API Testing]].", ["API Testing"], {"api testing": "API Testing"}
+    )
+    assert body == "[[API Testing]]."
+
+
+def test_strip_self_wikilinks_stem_aware():
+    # A self-link resolved to the stem ([[TCPIP]] for article "TCP/IP") is still unwrapped.
+    body = _strip_self_wikilinks("[[TCPIP]] and [[TCP/IP|this]] vs [[Kanban]].", "TCP/IP")
+    assert body == "TCPIP and this vs [[Kanban]]."
+
+
+def test_pipeline_links_forbidden_char_title_end_to_end():
+    # End-to-end through the link-processing order used by _write_draft: a concept titled
+    # "TCP/IP" must come out as a working [[TCPIP|TCP/IP]] link whether the body mentioned
+    # it in plain text or as an LLM-authored [[TCP/IP]] — and never stripped or mangled.
+    existing_titles = ["TCP/IP"]
+    stem_to_title = {"tcpip": "TCP/IP"}
+    for raw_body in ("Networks use TCP/IP heavily.", "See [[TCP/IP]] now."):
+        body = ensure_wikilinks(raw_body, existing_titles)
+        body = _strip_unknown_wikilinks(body, existing_titles, stem_to_title)
+        body = _strip_self_wikilinks(body, "Some Other Article")
+        assert "[[TCPIP|TCP/IP]]" in body
+        # The target equals the on-disk filename stem, so the link resolves in Obsidian.
+        assert sanitize_filename("TCP/IP") == "TCPIP"
 
 
 def test_strip_empty_wikilinks_removes_empty_targets():

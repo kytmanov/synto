@@ -1182,9 +1182,14 @@ def _create_source_summary_page(
     concept_names = (
         canonical_concepts if canonical_concepts is not None else [c.name for c in result.concepts]
     )
-    concept_lines = "\n".join(
-        f"- [[{sanitize_wikilink_target(name)}]]" for name in concept_names[:8] if name.strip()
-    )
+
+    # Keep the raw name as display when the stem differs (e.g. "TCP/IP" -> TCPIP.md), so the
+    # link both resolves and stays readable. Source pages skip the compile pipeline.
+    def _concept_link(name: str) -> str:
+        stem = sanitize_wikilink_target(name)
+        return f"- [[{stem}|{name}]]" if stem != name else f"- [[{stem}]]"
+
+    concept_lines = "\n".join(_concept_link(name) for name in concept_names[:8] if name.strip())
 
     out_meta: dict = {
         "title": title,

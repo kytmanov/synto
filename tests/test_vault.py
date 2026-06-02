@@ -165,18 +165,18 @@ def test_ensure_wikilinks_empty_targets():
 
 
 def test_ensure_wikilinks_backslash_target_emits_filename_target():
-    # A LaTeX title \int is written to int.md (sanitize_filename strips "\"), so the
-    # body link must be [[int]] to resolve. Emitting [[\int]] would be a broken link.
-    assert ensure_wikilinks(r"x\int y", [r"\int"]) == r"x[[int]] y"
+    # A LaTeX title \int is written to int.md (sanitize_filename strips "\"), so the link
+    # target must be int to resolve; the raw title is kept as display: [[int|\int]].
+    assert ensure_wikilinks(r"x\int y", [r"\int"]) == r"x[[int|\int]] y"
 
 
 def test_ensure_wikilinks_target_matches_filename_stem():
-    # The emitted link target must equal the file sanitize_filename() would create,
-    # for any title carrying filename-forbidden chars (here "/").
+    # The link target must equal the file sanitize_filename() would create, for any title
+    # carrying filename-forbidden chars (here "/"); the raw title is preserved as display.
     title = "TCP/IP"
     result = ensure_wikilinks("see TCP/IP here", [title])
-    assert result == f"see [[{sanitize_filename(title)}]] here"
-    assert result == "see [[TCPIP]] here"
+    assert result == f"see [[{sanitize_filename(title)}|{title}]] here"
+    assert result == "see [[TCPIP|TCP/IP]] here"
 
 
 def test_ensure_wikilinks_idempotent_for_normalized_target():
@@ -189,6 +189,23 @@ def test_ensure_wikilinks_backslash_target_no_match_does_not_raise():
     # re.sub parses the replacement template eagerly, so a backslash title raised
     # re.PatternError even when the body never matched the pattern.
     assert ensure_wikilinks("no latex here", [r"\int"]) == "no latex here"
+
+
+def test_ensure_wikilinks_multi_occurrence_idempotent():
+    # The guard skips a title once its emitted (normalized) form exists anywhere — without
+    # that, each run would link one more plain occurrence (run1→1st, run2→2nd, …). Only the
+    # first mention is linked, and re-running is a no-op.
+    once = ensure_wikilinks("TCP/IP is great. TCP/IP rules.", ["TCP/IP"])
+    assert once == "[[TCPIP|TCP/IP]] is great. TCP/IP rules."
+    assert ensure_wikilinks(once, ["TCP/IP"]) == once
+
+
+def test_ensure_wikilinks_skips_already_linked_normalized():
+    # Reviewer scenario: with the normalized link already present, the remaining plain
+    # mention stays plain — identical to how a normal title behaves (link-once), e.g.
+    # ensure_wikilinks("[[Python]] and Python", ["Python"]) is also a no-op.
+    body = "[[TCPIP]] and TCP/IP"
+    assert ensure_wikilinks(body, ["TCP/IP"]) == body
 
 
 # ── chunk_text ────────────────────────────────────────────────────────────────

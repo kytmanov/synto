@@ -123,10 +123,12 @@ def ensure_wikilinks(content: str, targets: list[str]) -> str:
             continue
         # Whole-word boundary match, case-sensitive, first occurrence only
         pattern = re.compile(r"(?<!\[)(?<!\|)\b" + re.escape(target) + r"\b(?!\])")
-        # safe_target is filename-sanitized so it carries no backslashes, which keeps
-        # the re.sub replacement free of accidental group references (e.g. \1).
-        repl = f"[[{safe_target}]]"
-        masked = pattern.sub(repl, masked, count=1)
+        # When the title carries filename-forbidden chars, emit a display-preserving link so
+        # it resolves to the sanitized filename yet stays readable (body "TCP/IP" →
+        # "[[TCPIP|TCP/IP]]" → TCPIP.md). Escape the replacement: the raw title may contain a
+        # backslash (LaTeX like \int) that re.sub would otherwise read as a group reference.
+        repl = f"[[{safe_target}|{target}]]" if safe_target != target else f"[[{safe_target}]]"
+        masked = pattern.sub(repl.replace("\\", "\\\\"), masked, count=1)
 
     return _restore_code_blocks(masked, spans)
 
