@@ -778,6 +778,86 @@ def migrate_olw(vault_str: Path) -> None:
 # ── setup ─────────────────────────────────────────────────────────────────────
 
 
+def _select_provider(console):
+    """Render the Local/Cloud/Custom provider list and return (provider, name).
+
+    The numbered ordering matches the historical Step-1 list so number-based selection
+    stays stable across the wizard and tests. The caller prints its own section header.
+    """
+    from .providers import PROVIDER_REGISTRY, list_all_providers
+
+    all_providers = list_all_providers()
+    local_provs = [p for p in all_providers if p.is_local]
+    cloud_provs = [p for p in all_providers if not p.is_local and p.name != "custom"]
+
+    console.print("    [bold]Local[/bold] (no API key needed):")
+    idx_map: dict[int, str] = {}
+    counter = 1
+    for p in local_provs:
+        marker = "  [default]" if p.name == "ollama" else ""
+        console.print(f"      {counter:2}. {p.display_name:<14} {p.default_url}{marker}")
+        idx_map[counter] = p.name
+        counter += 1
+
+    console.print()
+    console.print("    [bold]Cloud[/bold] (API key required):")
+    for p in cloud_provs:
+        url_hint = p.default_url if p.default_url else "(enter URL manually)"
+        console.print(f"      {counter:2}. {p.display_name:<14} {url_hint}")
+        idx_map[counter] = p.name
+        counter += 1
+
+    console.print()
+    console.print(f"      {counter:2}. Custom         (enter URL manually)")
+    idx_map[counter] = "custom"
+
+    console.print()
+    raw = Prompt.ask("    Select provider (number or name)", default="1", console=console).strip()
+
+    if raw.isdigit():
+        num = int(raw)
+        chosen_name = idx_map.get(num, "ollama")
+    elif raw in PROVIDER_REGISTRY:
+        chosen_name = raw
+    else:
+        console.print(f"    [yellow]Unknown '{raw}', defaulting to Ollama.[/yellow]")
+        chosen_name = "ollama"
+
+    return PROVIDER_REGISTRY[chosen_name], chosen_name
+
+
+def _build_probe_client(name, url, prov, *, api_key=None):
+    """Build a short-timeout client for a provider and return (client, connected).
+
+    Resolves the key like the live pipeline: explicit api_key → prov.env_var env →
+    SYNTO_API_KEY. Client classes are imported locally so test patches on them apply.
+    """
+    import os
+
+    if name == "ollama":
+        from .ollama_client import OllamaClient
+
+        client = OllamaClient(base_url=url, timeout=5)
+    else:
+        from .openai_compat_client import OpenAICompatClient
+
+        resolved_key = api_key
+        if not resolved_key and prov.env_var:
+            resolved_key = os.environ.get(prov.env_var)
+        if not resolved_key:
+            resolved_key = os.environ.get("SYNTO_API_KEY")
+        client = OpenAICompatClient(
+            base_url=url,
+            provider_name=name,
+            api_key=resolved_key,
+            timeout=5,
+            supports_json_mode=prov.supports_json_mode,
+            supports_embeddings=prov.supports_embeddings,
+            azure=prov.azure,
+        )
+    return client, client.healthcheck()
+
+
 def _pick_model(
     console: Console,
     client,
@@ -785,6 +865,7 @@ def _pick_model(
     description: str,
     default_fallback: str,
     connected: bool,
+    provider_name: str | None = None,
 ) -> str:
     """Interactive model selector — shows table if models available, else free-text."""
     console.print()
@@ -814,7 +895,7 @@ def _pick_model(
             return default_fallback
         return raw
     else:
-        if connected:
+        if connected and provider_name == "ollama":
             console.print(
                 "    [yellow]No models found.[/yellow] "
                 "Pull one first: [bold]ollama pull gemma4:e4b[/bold]"
@@ -825,32 +906,39 @@ def _pick_model(
 
 
 def _collect_role_provider(console, role_label: str, default_model: str = "") -> dict:
-    """Prompt for one role's provider, URL, API-key env var, and model."""
-    from .providers import PROVIDER_REGISTRY, list_all_providers
+    """Prompt for one role's provider, URL, API-key env var, and model.
 
-    console.print(f"  [bold]{role_label} model[/bold]")
-    provs = list_all_providers()
-    idx_map: dict[int, str] = {}
-    for i, p in enumerate(provs, 1):
-        tag = "  [default]" if p.name == "ollama" else ""
-        console.print(f"    {i:2}. {p.display_name:<14} {p.default_url or '(custom URL)'}{tag}")
-        idx_map[i] = p.name
-    raw = Prompt.ask("    Provider (number or name)", default="1", console=console).strip()
-    if raw.isdigit():
-        name = idx_map.get(int(raw), "ollama")
-    elif raw in PROVIDER_REGISTRY:
-        name = raw
-    else:
-        console.print(f"    [yellow]Unknown '{raw}', using Ollama.[/yellow]")
-        name = "ollama"
-    prov = PROVIDER_REGISTRY[name]
-    url = (
-        Prompt.ask("    Base URL", default=prov.default_url or "", console=console).strip()
-        or prov.default_url
-        or ""
-    )
+    Mirrors the primary/Fast step: same rich Local/Cloud/Custom provider list
+    (`_select_provider`), a live probe (`_build_probe_client`), and the numbered model
+    table (`_pick_model`). Additional providers store an `api_key_env` reference (never a
+    raw key) because the vault synto.toml is git-committed.
+    """
+    import os
+
+    console.print(f"  [bold]{role_label}[/bold]  pick its provider, then model")
+    prov, name = _select_provider(console)
+
+    # Empty custom/azure URLs would break the probe and client factory; re-prompt rather
+    # than aborting (an exit here would discard the already-configured primary provider).
+    if name == "azure":
+        console.print(
+            "    Azure format: https://{resource}.openai.azure.com/openai/deployments/{model}"
+        )
+    while True:
+        url = (
+            Prompt.ask("    Base URL", default=prov.default_url or "", console=console).strip()
+            or prov.default_url
+            or ""
+        )
+        if url or name not in ("custom", "azure"):
+            break
+        console.print("    [red]URL is required for this provider.[/red]")
+
     api_key_env: str | None = None
-    if name != "ollama":
+    # Only cloud providers need a key. Local servers (Ollama/LM Studio/vLLM/…) are no-auth;
+    # prompting here would default to a phantom PROVIDER_API_KEY env var (env_var is None for
+    # locals), which then also blocks dedup against an identical key-less primary connection.
+    if not prov.is_local:
         default_env = prov.env_var or "PROVIDER_API_KEY"
         console.print(
             "    [dim]Enter the env var name that holds the key (not the key itself).[/dim]"
@@ -866,9 +954,25 @@ def _collect_role_provider(console, role_label: str, default_model: str = "") ->
             ).strip()
             or "2024-02-15-preview"
         )
-    model = Prompt.ask(
-        "    Model name", default=default_model if name == "ollama" else "", console=console
-    ).strip()
+
+    client, connected = _build_probe_client(
+        name, url, prov, api_key=os.environ.get(api_key_env) if api_key_env else None
+    )
+    if connected:
+        console.print("    [green]✓ connected[/green]")
+    else:
+        console.print(f"    [yellow]Warning:[/yellow] Cannot reach {url} — continuing anyway.")
+
+    model = _pick_model(
+        console=console,
+        client=client,
+        step_label="",
+        description="Heavy model  [dim](article writing · 7–14B recommended)[/dim]",
+        default_fallback=default_model if name == "ollama" else "",
+        connected=connected,
+        provider_name=name,
+    )
+    client.close()
     while not model:
         model = Prompt.ask("    Model name (required)", console=console).strip()
     return {
@@ -1002,7 +1106,7 @@ def _finalize_per_role_providers(
 def setup(non_interactive: bool, reset: bool, provider_preset: str | None):
     """Interactive wizard: configure provider, models, and default vault."""
     from .global_config import GlobalConfig, load_global_config, save_global_config
-    from .providers import PROVIDER_REGISTRY, get_provider, list_all_providers
+    from .providers import PROVIDER_REGISTRY, get_provider
 
     # ── non-interactive: show current config ──────────────────────────────────
     if non_interactive:
@@ -1083,8 +1187,6 @@ def setup(non_interactive: bool, reset: bool, provider_preset: str | None):
         )
         console.print()
 
-        all_providers = list_all_providers()
-
         # ── Step 1 — Provider selection ───────────────────────────────────────
         if provider_preset:
             chosen_prov = get_provider(provider_preset)
@@ -1096,47 +1198,7 @@ def setup(non_interactive: bool, reset: bool, provider_preset: str | None):
             chosen_name = chosen_prov.name
         else:
             console.print("  [bold]Step 1[/bold]  Provider\n")
-
-            # Build numbered list
-            local_provs = [p for p in all_providers if p.is_local]
-            cloud_provs = [p for p in all_providers if not p.is_local and p.name != "custom"]
-
-            console.print("    [bold]Local[/bold] (no API key needed):")
-            idx_map: dict[int, str] = {}
-            counter = 1
-            for p in local_provs:
-                marker = "  [default]" if p.name == "ollama" else ""
-                console.print(f"      {counter:2}. {p.display_name:<14} {p.default_url}{marker}")
-                idx_map[counter] = p.name
-                counter += 1
-
-            console.print()
-            console.print("    [bold]Cloud[/bold] (API key required):")
-            for p in cloud_provs:
-                url_hint = p.default_url if p.default_url else "(enter URL manually)"
-                console.print(f"      {counter:2}. {p.display_name:<14} {url_hint}")
-                idx_map[counter] = p.name
-                counter += 1
-
-            console.print()
-            console.print(f"      {counter:2}. Custom         (enter URL manually)")
-            idx_map[counter] = "custom"
-
-            console.print()
-            raw = Prompt.ask(
-                "    Select provider (number or name)", default="1", console=console
-            ).strip()
-
-            if raw.isdigit():
-                num = int(raw)
-                chosen_name = idx_map.get(num, "ollama")
-            elif raw in PROVIDER_REGISTRY:
-                chosen_name = raw
-            else:
-                console.print(f"    [yellow]Unknown '{raw}', defaulting to Ollama.[/yellow]")
-                chosen_name = "ollama"
-
-            chosen_prov = PROVIDER_REGISTRY[chosen_name]
+            chosen_prov, chosen_name = _select_provider(console)
 
         # ── Step 2 — URL ──────────────────────────────────────────────────────
         console.print()
@@ -1159,8 +1221,6 @@ def setup(non_interactive: bool, reset: bool, provider_preset: str | None):
         # ── Step 3 — API key (all non-Ollama providers) ──────────────────────
         # Local providers (vLLM, LM Studio, etc.) default to no-auth but can
         # require a key in enterprise deployments, so we always offer the prompt.
-        import os
-
         needs_key_prompt = chosen_name != "ollama"
         api_key: str | None = None
         if needs_key_prompt:
@@ -1182,28 +1242,9 @@ def setup(non_interactive: bool, reset: bool, provider_preset: str | None):
             api_key = raw_key if raw_key else None
 
         # ── Build a temp client to probe for model list ───────────────────────
-        if chosen_name == "ollama":
-            from .ollama_client import OllamaClient
-
-            temp_client = OllamaClient(base_url=provider_url, timeout=5)
-        else:
-            from .openai_compat_client import OpenAICompatClient
-
-            resolved_key = api_key
-            if not resolved_key and chosen_prov.env_var:
-                resolved_key = os.environ.get(chosen_prov.env_var)
-            if not resolved_key:
-                resolved_key = os.environ.get("SYNTO_API_KEY")
-            temp_client = OpenAICompatClient(
-                base_url=provider_url,
-                provider_name=chosen_name,
-                api_key=resolved_key,
-                timeout=5,
-                supports_json_mode=chosen_prov.supports_json_mode,
-                supports_embeddings=chosen_prov.supports_embeddings,
-                azure=chosen_prov.azure,
-            )
-        connected = temp_client.healthcheck()
+        temp_client, connected = _build_probe_client(
+            chosen_name, provider_url, chosen_prov, api_key=api_key
+        )
         if connected:
             console.print("    [green]✓ connected[/green]")
         else:
@@ -1232,6 +1273,7 @@ def setup(non_interactive: bool, reset: bool, provider_preset: str | None):
             description="Fast model  [dim](analysis & routing · 3–8B recommended)[/dim]",
             default_fallback=default_fast,
             connected=connected,
+            provider_name=chosen_name,
         )
 
         # ── Advanced (progressive disclosure): per-role providers (#24) ───────
@@ -1265,6 +1307,7 @@ def setup(non_interactive: bool, reset: bool, provider_preset: str | None):
                 description="Heavy model  [dim](article writing · 7–14B recommended)[/dim]",
                 default_fallback=default_heavy,
                 connected=connected,
+                provider_name=chosen_name,
             )
 
         temp_client.close()

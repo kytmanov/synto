@@ -427,11 +427,20 @@ def test_setup_wizard_per_role_branch_reuses_primary_as_fast(runner: CliRunner, 
     """Progressive disclosure (#24): no upfront question; the per-role split is offered after the
     fast model and reuses the already-configured primary provider as `fast`, collecting only the
     heavy provider. Answering "y" must persist a multi-provider config, not a flat one."""
-    with patch("synto.ollama_client.OllamaClient") as MockClient:
+    with (
+        patch("synto.ollama_client.OllamaClient") as MockClient,
+        patch("synto.openai_compat_client.OpenAICompatClient") as MockCloudClient,
+    ):
         instance = MagicMock()
         instance.healthcheck.return_value = False
         instance.list_models_detailed.return_value = []
         MockClient.return_value = instance
+        # Heavy is groq → the unified routine now builds and probes an OpenAICompatClient.
+        # Keep it offline; with no models the heavy model falls through to free-text entry.
+        cloud_instance = MagicMock()
+        cloud_instance.healthcheck.return_value = False
+        cloud_instance.list_models_detailed.return_value = []
+        MockCloudClient.return_value = cloud_instance
 
         # primary=ollama default + fast model, "y" to a different heavy provider, then the heavy
         # provider (groq, default key env, model), no vault, citations off.
@@ -458,6 +467,86 @@ def test_setup_wizard_per_role_branch_reuses_primary_as_fast(runner: CliRunner, 
     assert cfg.providers[heavy_alias].name == "groq"
     assert cfg.providers[heavy_alias].api_key_env == "GROQ_API_KEY"
     assert cfg.models["heavy"].model == "llama-3.3-70b"
+
+
+def test_setup_wizard_per_role_heavy_lists_models(runner: CliRunner, cfg_dir: Path):
+    """The unified routine routes Heavy through the same probe + model table as Fast: when the
+    heavy provider is reachable and lists models, the user picks by number from the table instead
+    of being forced to type a model name."""
+    with (
+        patch("synto.ollama_client.OllamaClient") as MockClient,
+        patch("synto.openai_compat_client.OpenAICompatClient") as MockCloudClient,
+    ):
+        instance = MagicMock()
+        instance.healthcheck.return_value = False
+        instance.list_models_detailed.return_value = []
+        MockClient.return_value = instance
+        # Heavy = LM Studio, reachable, advertises two models → the table is shown.
+        cloud_instance = MagicMock()
+        cloud_instance.healthcheck.return_value = True
+        cloud_instance.list_models_detailed.return_value = [
+            {"name": "qwen2.5:7b", "size_gb": "4.5 GB"},
+            {"name": "llama-3.1-8b", "size_gb": "8.0 GB"},
+        ]
+        MockCloudClient.return_value = cloud_instance
+
+        # primary=ollama default + fast model, "y" to different heavy, heavy=lm_studio (default URL;
+        # local → no API-key-env prompt), then select heavy model #2 from the table, no vault,
+        # citations off.
+        result = runner.invoke(
+            cli,
+            ["setup"],
+            input="\n\n\ny\nlm_studio\n\n2\n\n\n",
+            catch_exceptions=False,
+        )
+
+    assert result.exit_code == 0
+    cfg = load_global_config()
+    assert cfg is not None and cfg.is_multi_provider
+    heavy_alias = cfg.models["heavy"].provider
+    assert cfg.providers[heavy_alias].name == "lm_studio"
+    # Local heavy provider must not get a phantom API-key-env requirement.
+    assert cfg.providers[heavy_alias].api_key_env is None
+    # Picked by number from the table → the second listed model, proving the table path ran.
+    assert cfg.models["heavy"].model == "llama-3.1-8b"
+
+
+def test_setup_wizard_per_role_same_local_provider_dedupes_without_phantom_key(
+    runner: CliRunner, cfg_dir: Path
+):
+    """Regression: picking the same local provider (LM Studio) for primary and heavy must collapse
+    to a single key-less provider. The bug was that the heavy step prompted for an API-key env var
+    on a local provider, defaulting to a phantom PROVIDER_API_KEY — which both demanded a needless
+    key and broke dedup (key mismatch), leaving two identical provider blocks."""
+    with patch("synto.openai_compat_client.OpenAICompatClient") as MockClient:
+        instance = MagicMock()
+        instance.healthcheck.return_value = True
+        instance.list_models_detailed.return_value = [
+            {"name": "google/gemma-4-e4b", "size_gb": "4.5 GB"},
+        ]
+        MockClient.return_value = instance
+
+        # primary=lm_studio (default URL, blank raw key), fast model #1, "y" to a different heavy,
+        # heavy=lm_studio again (default URL, no key prompt), heavy model #1, no vault, citations.
+        result = runner.invoke(
+            cli,
+            ["setup"],
+            input="lm_studio\n\n\n1\ny\nlm_studio\n\n1\n\n\n",
+            catch_exceptions=False,
+        )
+
+    assert result.exit_code == 0
+    cfg = load_global_config()
+    assert cfg is not None and cfg.is_multi_provider
+    # Identical local connections collapse to one provider — no redundant second block.
+    assert len(cfg.providers) == 1
+    alias = cfg.models["fast"].provider
+    assert cfg.models["heavy"].provider == alias
+    block = cfg.providers[alias]
+    assert block.name == "lm_studio"
+    assert block.api_key_env is None
+    # And the summary must not tell the user to set an env var for a local no-auth server.
+    assert "Set the API-key env var" not in result.output
 
 
 def test_setup_wizard_no_upfront_same_provider_question(runner: CliRunner, cfg_dir: Path):
