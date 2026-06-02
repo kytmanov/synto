@@ -75,6 +75,18 @@ def test_compare_summary_detects_fast_only_provider_change():
     assert _compare_config_summary(base) != _compare_config_summary(moved_fast)
     # Truly identical configs compare equal.
     assert _compare_config_summary(base) == _compare_config_summary(base.model_copy(deep=True))
+    # Same model + kind + url but a different account/header is a real challenger, not "identical":
+    # connection identity (api_key/headers), not just kind/url. (No CLI flag expresses this yet, so
+    # the summary must guard it directly.)
+    with_header = base.model_copy(
+        update={
+            "providers": {
+                **base.providers,
+                "cloud": base.providers["cloud"].model_copy(update={"headers": {"X-Org": "acme"}}),
+            }
+        }
+    )
+    assert _compare_config_summary(base) != _compare_config_summary(with_header)
 
 
 def test_compare_rejects_out_inside_raw(tmp_path):

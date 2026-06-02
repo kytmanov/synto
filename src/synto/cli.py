@@ -2333,7 +2333,7 @@ def _render_mcp_backlog(db, since: str) -> None:
 def doctor(vault_str, backlog, since):
     """Check LLM provider connection, model availability, and vault health."""
     from .client_factory import LLMError, build_router
-    from .config import ROLES
+    from .config import HEALTHCHECK_ROLES, ROLES
 
     config = _load_config(vault_str)
     db = _load_db(config)
@@ -2410,15 +2410,24 @@ def doctor(vault_str, backlog, since):
             healthy, models = conn_state[key]
             conn = f"{resolved.provider_kind} @ {resolved.url}"
             think_str = "" if role == "embed" else f"  [dim]{think_label[resolved.think]}[/dim]"
+            # embed is optional (only used if embeddings/RAG are enabled), so its problems are
+            # advisory — they must not flip the health summary, matching require_healthy's contract.
+            required = role in HEALTHCHECK_ROLES
             if not healthy:
-                console.print(f"  [red]✗[/red] {role}: {resolved.model} — {conn} unreachable")
-                ok = False
+                if required:
+                    console.print(f"  [red]✗[/red] {role}: {resolved.model} — {conn} unreachable")
+                    ok = False
+                else:
+                    console.print(
+                        f"  [yellow]•[/yellow] {role}: {resolved.model} — {conn} unreachable "
+                        f"[dim](optional — only used if embeddings/RAG are enabled)[/dim]"
+                    )
                 continue
             if any(resolved.model in m for m in models):
                 console.print(
                     f"  [green]✓[/green] {role}: {resolved.model}  [dim]{conn}[/dim]{think_str}"
                 )
-            else:
+            elif required:
                 pull_hint = (
                     f"run: [bold]ollama pull {resolved.model}[/bold]"
                     if resolved.provider_kind == "ollama"
@@ -2429,6 +2438,12 @@ def doctor(vault_str, backlog, since):
                     f"[dim]({conn})[/dim] — {pull_hint}"
                 )
                 ok = False
+            else:
+                # Advisory: don't tell the user to pull a model for a feature that isn't wired up.
+                console.print(
+                    f"  [yellow]•[/yellow] {role}: {resolved.model} not available "
+                    f"[dim]({conn}) (optional — only used if embeddings/RAG are enabled)[/dim]"
+                )
     finally:
         router.close()
 
@@ -3324,20 +3339,21 @@ def _is_cloud_provider(provider_name: str | None) -> bool:
 
 
 def _compare_config_summary(config) -> tuple:
-    """Identity used to reject an identical challenger: both roles' model + provider kind + url.
+    """Identity used to reject an identical challenger: each role's model + connection identity.
 
-    Includes the fast role so a fast-only provider/url change is a real difference, not mistaken
-    for "identical".
+    Uses ResolvedModel.connection_key (provider kind/url/key/headers/timeout/azure) rather than just
+    kind+url, so a challenger differing only by account (api_key) or custom headers is still a real
+    difference — consistent with how the router de-duplicates connections. Do NOT simplify back to
+    kind/url: that silently treats different accounts/headers as identical. The tuple is only
+    `==`-compared in-memory (never printed), so folding the resolved key in is safe.
     """
     fast = config.resolve_role("fast")
     heavy = config.resolve_role("heavy")
     return (
         config.model_name("fast"),
         config.model_name("heavy"),
-        fast.provider_kind,
-        fast.url,
-        heavy.provider_kind,
-        heavy.url,
+        fast.connection_key,
+        heavy.connection_key,
     )
 
 
