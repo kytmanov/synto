@@ -596,6 +596,53 @@ def test_init_uses_global_config_models(runner: CliRunner, cfg_dir: Path, tmp_pa
     assert "192.168.1.5" in content
 
 
+def test_init_warns_when_no_global_config(runner: CliRunner, cfg_dir: Path, tmp_path: Path):
+    """A fresh vault with no global config gets Ollama defaults — init must say so and point at
+    `synto setup`, not silently wire the vault for a provider the user may not use."""
+    vault = tmp_path / "no-config-vault"
+    result = runner.invoke(cli, ["init", str(vault)])
+    assert result.exit_code == 0
+    assert "No global config found" in result.output
+    assert "synto setup" in result.output
+
+
+def test_init_no_warning_when_provider_configured(runner: CliRunner, cfg_dir: Path, tmp_path: Path):
+    """When a provider is configured, init inherits it silently — no missing-config warning."""
+    save_global_config(
+        GlobalConfig(
+            provider_name="ollama",
+            fast_model="gemma4:e4b",
+            heavy_model="gemma4:e4b",
+            ollama_url="http://localhost:11434",
+        )
+    )
+    vault = tmp_path / "configured-vault"
+    result = runner.invoke(cli, ["init", str(vault)])
+    assert result.exit_code == 0
+    assert "No global config" not in result.output
+    assert "No provider configured" not in result.output
+
+
+def test_init_leaves_existing_vault_unchanged_without_global_config(
+    runner: CliRunner, cfg_dir: Path, tmp_path: Path
+):
+    """Regression: with no global config there is nothing to sync from, so an already-configured
+    vault must be left alone — never have Ollama's URL written into its (e.g. lm_studio) block."""
+    vault = tmp_path / "lmstudio-vault"
+    vault.mkdir()
+    (vault / "synto.toml").write_text(
+        _new_format_vault_toml("lm_studio", "http://localhost:1234/v1")
+    )
+
+    result = runner.invoke(cli, ["init", str(vault)])  # no save_global_config → gcfg is None
+    assert result.exit_code == 0
+    assert "leaving existing" in result.output
+
+    parsed = tomllib.loads((vault / "synto.toml").read_text())
+    assert parsed["providers"]["default"]["name"] == "lm_studio"
+    assert parsed["providers"]["default"]["url"] == "http://localhost:1234/v1"
+
+
 def test_init_non_default_vault_shows_vault_flag_and_default_tip(
     runner: CliRunner, cfg_dir: Path, tmp_path: Path
 ):

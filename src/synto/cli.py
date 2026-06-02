@@ -468,7 +468,15 @@ def init(vault_path: str, existing: bool, non_interactive: bool, set_default: bo
     # undeterminable vaults fall through to the normal write/sync paths.
     existing_provider = _vault_provider_name(toml_path) if toml_path.exists() else None
     global_provider = _global_default_provider_name(gcfg)
-    if (
+    if toml_path.exists() and gcfg is None:
+        # No global config to sync from — never rewrite an existing vault's config from thin air.
+        # Without this, the respect-the-vault guard below is skipped (global_provider is None) and
+        # the single-provider sync would write Ollama's URL into a non-Ollama block.
+        console.print(
+            f"[dim]No global config — leaving existing {CONFIG_FILE_NAME} unchanged. "
+            f"Run [bold]{CLI_NAME} setup[/bold] to configure providers.[/dim]"
+        )
+    elif (
         existing_provider is not None
         and global_provider is not None
         and (existing_provider != global_provider)
@@ -528,6 +536,25 @@ def init(vault_path: str, existing: bool, non_interactive: bool, set_default: bo
 
         if not toml_path.exists():
             from .providers import get_provider
+
+            # Nothing configured the provider → we're about to write Ollama defaults. Say so, so a
+            # user who only runs e.g. LM Studio isn't silently handed an Ollama-wired vault.
+            no_provider_config = gcfg is None or (
+                not gcfg.provider_name and not gcfg.fast_model and not gcfg.heavy_model
+            )
+            if no_provider_config:
+                reason = (
+                    "No global config found"
+                    if gcfg is None
+                    else "No provider configured in global config"
+                )
+                console.print(
+                    f"[yellow]{reason}[/yellow] — using Ollama defaults ({fast} @ {ollama_url})."
+                )
+                console.print(
+                    f"  Run [bold]{CLI_NAME} setup[/bold] to configure your provider, "
+                    f"or edit [bold]{CONFIG_FILE_NAME}[/bold]."
+                )
 
             prov_info = get_provider(provider_name)
             timeout = prov_info.default_timeout if prov_info else 600.0

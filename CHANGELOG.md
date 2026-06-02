@@ -25,6 +25,12 @@
 
 ### Fixed
 
+- `synto init` no longer silently wires a vault for Ollama when no provider is configured,
+  and no longer rewrites an already-configured vault when there is no global config. With no
+  global config it warns (pointing at `synto setup`) on a fresh vault and leaves an existing
+  `synto.toml` untouched, instead of writing Ollama's URL into a non-Ollama provider block.
+  Also fixes a config-write regex that, when re-syncing a new-format vault, could delete the
+  `[models.*]`/`[pipeline]` sections.
 - `synto compile` no longer crashes (and `synto ingest` no longer fails notes with
   a blank reason) when an OpenAI-compatible provider returns an error as an
   HTTP-2xx body with no usable `choices` (#25). This is common on OpenRouter's free
