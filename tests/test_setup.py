@@ -249,7 +249,7 @@ def test_setup_reset_clears_config(runner: CliRunner, cfg_dir: Path):
     result = runner.invoke(
         cli,
         ["setup", "--reset"],
-        input="y\n\n\n\n\n\n\n",
+        input="\n\n\n\n\n\n\n",
         catch_exceptions=False,
     )
     assert result.exit_code == 0
@@ -274,7 +274,7 @@ def test_setup_wizard_saves_config(runner: CliRunner, cfg_dir: Path):
             cli,
             ["setup"],
             # provider default, URL default, fast, heavy, no vault, citations off
-            input="y\n\n\ngemma4:e4b\nqwen2.5:14b\n\n\n",
+            input="\n\ngemma4:e4b\n\nqwen2.5:14b\n\n\n",
             catch_exceptions=False,
         )
 
@@ -296,7 +296,7 @@ def test_setup_wizard_saves_experimental_inline_source_citations(runner: CliRunn
         result = runner.invoke(
             cli,
             ["setup"],
-            input="y\n\n\ngemma4:e4b\nqwen2.5:14b\n\ny\n",
+            input="\n\ngemma4:e4b\n\nqwen2.5:14b\n\ny\n",
             catch_exceptions=False,
         )
 
@@ -319,7 +319,7 @@ def test_setup_wizard_summary_says_uninitialized_vault_will_use_preference(
         result = runner.invoke(
             cli,
             ["setup"],
-            input=f"y\n\n\ngemma4:e4b\nqwen2.5:14b\n{vault}\ny\n",
+            input=f"\n\ngemma4:e4b\n\nqwen2.5:14b\n{vault}\ny\n",
             catch_exceptions=False,
         )
 
@@ -339,7 +339,7 @@ def test_setup_wizard_summary_mentions_support_and_metrics(runner: CliRunner, cf
         result = runner.invoke(
             cli,
             ["setup"],
-            input="y\n\n\ngemma4:e4b\nqwen2.5:14b\n\n\n",
+            input="\n\ngemma4:e4b\n\nqwen2.5:14b\n\n\n",
             catch_exceptions=False,
         )
 
@@ -364,7 +364,7 @@ def test_setup_wizard_model_number_selection(runner: CliRunner, cfg_dir: Path):
             cli,
             ["setup"],
             # provider default, URL default, pick #1 fast, pick #2 heavy, no vault, citations off
-            input="y\n\n\n1\n2\n\n\n",
+            input="\n\n1\n\n2\n\n\n",
             catch_exceptions=False,
         )
 
@@ -388,7 +388,7 @@ def test_setup_wizard_whitespace_input_uses_default(runner: CliRunner, cfg_dir: 
             cli,
             ["setup"],
             # provider default, URL default, blank models, no vault, citations off
-            input="y\n\n\n   \n   \n\n\n",
+            input="\n\n   \n\n   \n\n\n",
             catch_exceptions=False,
         )
 
@@ -413,7 +413,7 @@ def test_setup_wizard_with_vault(runner: CliRunner, cfg_dir: Path, tmp_path: Pat
         result = runner.invoke(
             cli,
             ["setup"],
-            input=f"y\n\n\ngemma4:e4b\nqwen2.5:14b\n{vault}\n\n",
+            input=f"\n\ngemma4:e4b\n\nqwen2.5:14b\n{vault}\n\n",
             catch_exceptions=False,
         )
 
@@ -421,6 +421,66 @@ def test_setup_wizard_with_vault(runner: CliRunner, cfg_dir: Path, tmp_path: Pat
     cfg = load_global_config()
     assert cfg is not None
     assert cfg.vault == str(vault.resolve())
+
+
+def test_setup_wizard_per_role_branch_reuses_primary_as_fast(runner: CliRunner, cfg_dir: Path):
+    """Progressive disclosure (#24): no upfront question; the per-role split is offered after the
+    fast model and reuses the already-configured primary provider as `fast`, collecting only the
+    heavy provider. Answering "y" must persist a multi-provider config, not a flat one."""
+    with patch("synto.ollama_client.OllamaClient") as MockClient:
+        instance = MagicMock()
+        instance.healthcheck.return_value = False
+        instance.list_models_detailed.return_value = []
+        MockClient.return_value = instance
+
+        # primary=ollama default + fast model, "y" to a different heavy provider, then the heavy
+        # provider (groq, default key env, model), no vault, citations off.
+        result = runner.invoke(
+            cli,
+            ["setup"],
+            input="\n\ngemma4:e4b\ny\ngroq\n\n\nllama-3.3-70b\n\n\n",
+            catch_exceptions=False,
+        )
+
+    assert result.exit_code == 0
+    # The removed upfront prompt is gone; the contextual one is asked instead.
+    assert "Use the same provider for all models" not in result.output
+    assert "Use a different provider for the heavy (writing) model" in result.output
+
+    cfg = load_global_config()
+    assert cfg is not None and cfg.is_multi_provider
+    # fast reuses the primary (ollama) as the "default" connection — no re-prompting.
+    assert cfg.models["fast"].provider == "default"
+    assert cfg.providers["default"].name == "ollama"
+    assert cfg.models["fast"].model == "gemma4:e4b"
+    # heavy is the separately-collected cloud provider.
+    heavy_alias = cfg.models["heavy"].provider
+    assert cfg.providers[heavy_alias].name == "groq"
+    assert cfg.providers[heavy_alias].api_key_env == "GROQ_API_KEY"
+    assert cfg.models["heavy"].model == "llama-3.3-70b"
+
+
+def test_setup_wizard_no_upfront_same_provider_question(runner: CliRunner, cfg_dir: Path):
+    """The default single-provider path must not show the old upfront question and must save a
+    flat (non-multi) config when the heavy provider is left the same."""
+    with patch("synto.ollama_client.OllamaClient") as MockClient:
+        instance = MagicMock()
+        instance.healthcheck.return_value = False
+        instance.list_models_detailed.return_value = []
+        MockClient.return_value = instance
+
+        result = runner.invoke(
+            cli,
+            ["setup"],
+            input="\n\ngemma4:e4b\n\nqwen2.5:14b\n\n\n",
+            catch_exceptions=False,
+        )
+
+    assert result.exit_code == 0
+    assert "Use the same provider for all models" not in result.output
+    cfg = load_global_config()
+    assert cfg is not None and not cfg.is_multi_provider
+    assert cfg.fast_model == "gemma4:e4b" and cfg.heavy_model == "qwen2.5:14b"
 
 
 # ── synto init uses global config models ───────────────────────────────────────

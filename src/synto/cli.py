@@ -881,29 +881,35 @@ def _collect_role_provider(console, role_label: str, default_model: str = "") ->
     }
 
 
-def _setup_multi_provider(console) -> None:
-    """Configure a different provider per role and write the new format to a vault.
+def _finalize_per_role_providers(
+    console,
+    *,
+    fast: dict,
+    heavy: dict,
+    vault_input: str,
+    citations: bool,
+    fast_api_key: str | None = None,
+) -> None:
+    """Persist a per-role provider split and optionally apply it to a vault.
 
-    Writes only env-var references (api_key_env) — never raw keys — and targets an
-    existing vault's synto.toml (preserving [pipeline] etc.), matching the documented
-    secure path. Requires the vault to exist; run `synto init` first if it doesn't.
+    `fast`/`heavy` are connection specs in the shape `_collect_role_provider` returns. Writes
+    only env-var references (api_key_env) into a vault's synto.toml — never raw keys — targeting
+    an existing vault (preserving [pipeline] etc.), matching the documented secure path. A raw key
+    for the reused primary (fast) provider, if any, is passed as `fast_api_key` and stored only in
+    the user-private global config under provider_keys[<fast alias>] (resolve_api_key step 3).
     """
-    from .config import apply_providers_to_existing_toml, multi_provider_vault_toml
-    from .vault import atomic_write
-
-    console.print(
-        "\n  [bold]Per-role providers[/bold]  "
-        "[dim](fast = analysis & routing, heavy = article writing)[/dim]\n"
+    from .config import (
+        ModelProfile,
+        apply_providers_to_existing_toml,
+        dedup_role_connections,
+        multi_provider_vault_toml,
     )
-    fast = _collect_role_provider(console, "Fast", default_model="gemma4:e4b")
-    console.print()
-    heavy = _collect_role_provider(console, "Heavy", default_model="qwen2.5:14b")
+    from .global_config import GlobalConfig, load_global_config, save_global_config
+    from .vault import atomic_write
 
     # De-duplicate connections; the first becomes "default" so embed/string roles resolve.
     # dedup returns ready-made ProviderBlock models, so they feed both the global config and the
     # vault writer unchanged — no second hand-built representation to drift out of sync.
-    from .config import ModelProfile, dedup_role_connections
-
     providers, role_alias = dedup_role_connections({"fast": fast, "heavy": heavy})
 
     models = {
@@ -915,45 +921,22 @@ def _setup_multi_provider(console) -> None:
         "heavy": ModelProfile(provider=role_alias["heavy"], model=heavy["model"], ctx=32768),
     }
 
-    # Persist to the global config so `synto init` reproduces this multi-provider setup
-    # for any new vault. Provider blocks store api_key_env references only — never raw keys.
-    from .global_config import GlobalConfig, load_global_config, save_global_config
-
+    # Persist to the global config so `synto init` reproduces this multi-provider setup for any new
+    # vault. Provider blocks store api_key_env references only; a raw key typed for the reused
+    # primary provider lives here under its alias (user-private), never in the vault.
     existing = load_global_config()
+    provider_keys = dict(existing.provider_keys) if existing and existing.provider_keys else {}
+    if fast_api_key:
+        provider_keys[role_alias["fast"]] = fast_api_key
     gcfg = GlobalConfig(
-        vault=existing.vault if existing else None,
-        experimental_inline_source_citations=(
-            existing.experimental_inline_source_citations if existing else None
-        ),
+        vault=vault_input or (existing.vault if existing else None),
+        experimental_inline_source_citations=citations,
         providers=providers,
         models=models,
         # Preserve the user-private per-alias key fallback; rebuilding from scratch would delete it.
         # The legacy flat single-provider fields are intentionally dropped (is_multi_provider wins).
-        provider_keys=existing.provider_keys if existing else None,
+        provider_keys=provider_keys or None,
     )
-    # Default vault (stored in the global config, used by `synto` without --vault) + citation
-    # preference, mirroring the single-provider wizard. The default vault doubles as the
-    # apply-now target: if it already exists, write the split into it immediately.
-    console.print()
-    vault_input = Prompt.ask(
-        "  Default vault path (Enter to skip)",
-        default=(existing.vault if existing and existing.vault else ""),
-        console=console,
-    ).strip()
-    citations = (
-        Prompt.ask(
-            "  Enable inline source citations for new vaults?",
-            choices=["y", "n"],
-            default="y" if (existing and existing.experimental_inline_source_citations) else "n",
-            show_choices=False,
-            console=console,
-        )
-        .strip()
-        .lower()
-        == "y"
-    )
-    gcfg.vault = vault_input or (existing.vault if existing else None)
-    gcfg.experimental_inline_source_citations = citations
     save_global_config(gcfg)
 
     applied_to: Path | None = None
@@ -1101,23 +1084,6 @@ def setup(non_interactive: bool, reset: bool, provider_preset: str | None):
         console.print()
 
         all_providers = list_all_providers()
-
-        # ── Multi-provider branch: a different provider per model role (#24) ──
-        if not provider_preset:
-            same_provider = (
-                Prompt.ask(
-                    "  Use the same provider for all models?",
-                    choices=["y", "n"],
-                    default="y",
-                    show_choices=False,
-                    console=console,
-                )
-                .strip()
-                .lower()
-            )
-            if same_provider == "n":
-                _setup_multi_provider(console)
-                return
 
         # ── Step 1 — Provider selection ───────────────────────────────────────
         if provider_preset:
@@ -1268,15 +1234,38 @@ def setup(non_interactive: bool, reset: bool, provider_preset: str | None):
             connected=connected,
         )
 
-        # ── Step 5 — Heavy model ──────────────────────────────────────────────
-        heavy_model = _pick_model(
-            console=console,
-            client=temp_client,
-            step_label=f"Step {4 + step_offset}",
-            description="Heavy model  [dim](article writing · 7–14B recommended)[/dim]",
-            default_fallback=default_heavy,
-            connected=connected,
-        )
+        # ── Advanced (progressive disclosure): per-role providers (#24) ───────
+        # Asked here — not up front — so "fast"/"heavy" already have meaning. The primary
+        # provider configured above is reused as the fast role; only the heavy provider is
+        # collected anew. Skipped under --provider to keep preset setup single-provider.
+        heavy_spec: dict | None = None
+        if not provider_preset:
+            different_heavy = (
+                Prompt.ask(
+                    "\n  Use a different provider for the heavy (writing) model?",
+                    choices=["y", "n"],
+                    default="n",
+                    show_choices=False,
+                    console=console,
+                )
+                .strip()
+                .lower()
+            )
+            if different_heavy == "y":
+                console.print()
+                heavy_spec = _collect_role_provider(console, "Heavy", default_model="qwen2.5:14b")
+
+        heavy_model = ""
+        if heavy_spec is None:
+            # ── Step 5 — Heavy model (same provider) ──────────────────────────
+            heavy_model = _pick_model(
+                console=console,
+                client=temp_client,
+                step_label=f"Step {4 + step_offset}",
+                description="Heavy model  [dim](article writing · 7–14B recommended)[/dim]",
+                default_fallback=default_heavy,
+                connected=connected,
+            )
 
         temp_client.close()
 
@@ -1310,6 +1299,30 @@ def setup(non_interactive: bool, reset: bool, provider_preset: str | None):
             .lower()
         )
         experimental_inline_source_citations = raw_citations == "y"
+
+        # ── Per-role split: reuse the primary provider as `fast`, finalize, done ──
+        if heavy_spec is not None:
+            fast_spec = {
+                "name": chosen_name,
+                "url": provider_url,
+                # Use the registry env var only when the user didn't type a raw key; a raw key is
+                # carried separately into provider_keys[<fast alias>] (never the vault).
+                "api_key_env": (
+                    chosen_prov.env_var if (needs_key_prompt and not api_key) else None
+                ),
+                "azure_api_version": "2024-02-15-preview" if chosen_name == "azure" else None,
+                "model": fast_model,
+                "timeout": int(chosen_prov.default_timeout),
+            }
+            _finalize_per_role_providers(
+                console,
+                fast=fast_spec,
+                heavy=heavy_spec,
+                vault_input=vault_path or "",
+                citations=experimental_inline_source_citations,
+                fast_api_key=api_key,
+            )
+            return
 
         applied_to_existing_vault = False
         current_vault_setting: bool | None = None
