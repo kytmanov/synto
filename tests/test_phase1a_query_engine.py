@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from conftest import as_endpoint, as_router
 
 from synto.config import Config
 from synto.engines import QueryEngine
@@ -68,7 +69,13 @@ def test_query_engine_returns_answer_shape_and_selected_pages(config: Config, db
         {"answer": "[[Quantum Computing]] uses qubits.", "title": "Quantum Computing"}
     )
 
-    engine = QueryEngine(VaultReader(config.vault), fast_client, heavy_client, config, db=db)
+    engine = QueryEngine(
+        VaultReader(config.vault),
+        as_endpoint(fast_client),
+        as_endpoint(heavy_client),
+        config,
+        db=db,
+    )
     answer = engine.query("What is quantum computing?")
 
     assert answer.text == "[[Quantum Computing]] uses qubits."
@@ -91,7 +98,13 @@ def test_query_engine_uses_fast_and_heavy_clients_for_distinct_stages(
         {"answer": "Answer about [[Topic]].", "title": "Topic"}
     )
 
-    engine = QueryEngine(VaultReader(config.vault), fast_client, heavy_client, config, db=db)
+    engine = QueryEngine(
+        VaultReader(config.vault),
+        as_endpoint(fast_client),
+        as_endpoint(heavy_client),
+        config,
+        db=db,
+    )
     answer = engine.query("Tell me about Topic")
 
     assert answer.text == "Answer about [[Topic]]."
@@ -107,21 +120,25 @@ def test_query_engine_matches_run_query_output(config: Config, db: StateDB) -> N
 
     engine = QueryEngine(
         VaultReader(config.vault),
-        _make_client(selection_json, answer_json),
-        _make_client(selection_json, answer_json),
+        as_endpoint(_make_client(selection_json, answer_json)),
+        as_endpoint(_make_client(selection_json, answer_json)),
         config,
         db=db,
     )
     engine_answer = engine.query("Tell me about Topic")
 
-    result = run_query(config, _make_client(selection_json, answer_json), db, "Tell me about Topic")
+    result = run_query(
+        config, as_router(_make_client(selection_json, answer_json)), db, "Tell me about Topic"
+    )
 
     assert result.answer == engine_answer.text
     assert result.selected_pages == list(engine.last_selected_pages)
 
 
 def test_query_engine_tracks_missing_index_without_saving(config: Config, db: StateDB) -> None:
-    engine = QueryEngine(VaultReader(config.vault), MagicMock(), MagicMock(), config, db=db)
+    engine = QueryEngine(
+        VaultReader(config.vault), as_endpoint(MagicMock()), as_endpoint(MagicMock()), config, db=db
+    )
 
     answer = engine.query("Any question")
 

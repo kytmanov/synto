@@ -11,7 +11,7 @@ from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ..config import Config, _toml_quote
+from ..config import Config, role_providers_head, to_toml
 from ..metrics import metrics_sink
 from ..paths import APP_DIR_NAME, CONFIG_FILE_NAME
 from ..vault import extract_wikilinks, parse_note
@@ -83,6 +83,7 @@ def run_compare(
         challenger=challenger_result,
         page_diff=page_diff,
         query_diffs=query_diffs,
+        switch_config_toml=role_providers_head(challenger_config),
     )
     report.current.diagnostics.setdefault("compare_wall_seconds", wall)
     _write_json(results_dir / "raw_report.json", asdict(report))
@@ -103,7 +104,7 @@ def _run_single_vault(
     queries,
     sample_n: int | None = None,
 ) -> ContestantRunResult:
-    from ..client_factory import build_client
+    from ..client_factory import build_router
     from ..pipeline.orchestrator import PipelineOrchestrator
     from ..pipeline.query import run_query
     from ..state import StateDB
@@ -116,7 +117,7 @@ def _run_single_vault(
         temp_root, source_config.raw_dir, effective_config, sample_n=sample_n
     )
     config = Config.from_vault(temp_root)
-    client = build_client(config)
+    router = build_router(config)
     db = StateDB(config.state_db_path)
     pipeline_report = None
     partial = False
@@ -128,7 +129,7 @@ def _run_single_vault(
         with metrics_sink() as events:
             t0 = time.monotonic()
             try:
-                pipeline_report = PipelineOrchestrator(config, client, db).run(
+                pipeline_report = PipelineOrchestrator(config, router, db).run(
                     auto_approve=True, max_rounds=2
                 )
             except Exception as e:  # noqa: BLE001
@@ -142,7 +143,7 @@ def _run_single_vault(
                     try:
                         query_result = run_query(
                             config=config,
-                            client=client,
+                            router=router,
                             db=db,
                             question=q.question,
                             save=False,
@@ -167,7 +168,7 @@ def _run_single_vault(
         except AttributeError:
             pass
         try:
-            client.close()
+            router.close()
         except AttributeError:
             pass
 
@@ -183,10 +184,10 @@ def _run_single_vault(
 
     return ContestantRunResult(
         role=role,
-        fast_model=effective_config.models.fast,
-        heavy_model=effective_config.models.heavy,
-        provider_name=effective_config.effective_provider.name,
-        provider_url=effective_config.effective_provider.url,
+        fast_model=effective_config.model_name("fast"),
+        heavy_model=effective_config.model_name("heavy"),
+        provider_name=effective_config.resolve_role("heavy").provider_kind,
+        provider_url=effective_config.resolve_role("heavy").url,
         partial=partial,
         pipeline_report=_serialize_pipeline_report(pipeline_report),
         queries=query_results,
@@ -218,53 +219,17 @@ def _materialize_compare_vault(
 
 
 def _write_effective_compare_toml(vault: Path, config: Config) -> None:
-    prov = config.effective_provider
-    lines = [
-        "[models]",
-        f"fast = {_toml_quote(config.models.fast)}",
-        f"heavy = {_toml_quote(config.models.heavy)}",
-        "",
-    ]
-    if prov.name == "ollama":
-        lines.extend(
-            [
-                "[ollama]",
-                f"url = {_toml_quote(prov.url)}",
-                f"timeout = {int(prov.timeout)}",
-                f"fast_ctx = {prov.fast_ctx}",
-                f"heavy_ctx = {prov.heavy_ctx}",
-                "",
-            ]
-        )
-    else:
-        lines.extend(
-            [
-                "[provider]",
-                f"name = {_toml_quote(prov.name)}",
-                f"url = {_toml_quote(prov.url)}",
-                f"timeout = {int(prov.timeout)}",
-                f"fast_ctx = {prov.fast_ctx}",
-                f"heavy_ctx = {prov.heavy_ctx}",
-            ]
-        )
-        if prov.name == "azure":
-            lines.append(f"azure_api_version = {_toml_quote(prov.azure_api_version)}")
-        lines.append("")
+    # Materialize the contestant vault from the *resolved* roles so it works on legacy and
+    # new-format active vaults alike, and so fast/heavy keep their distinct providers/accounts and
+    # per-role params (think/temperature/options) — see config.role_providers_head.
+    head = role_providers_head(config)
 
-    lines.extend(
-        [
-            "[pipeline]",
-            "auto_approve = true",
-            "auto_commit = false",
-            f"auto_maintain = {str(config.pipeline.auto_maintain).lower()}",
-            f"watch_debounce = {config.pipeline.watch_debounce}",
-            f"max_concepts_per_source = {config.pipeline.max_concepts_per_source}",
-            f"ingest_parallel = {str(config.pipeline.ingest_parallel).lower()}",
-        ]
-    )
-    if config.pipeline.language:
-        lines.append(f"language = {_toml_quote(config.pipeline.language)}")
-    (vault / CONFIG_FILE_NAME).write_text("\n".join(lines) + "\n")
+    # Reproduce the active [pipeline] in full (closing the old subset gap) with the compare-run
+    # policy forced on: auto_approve so contestants publish unattended, auto_commit off so the
+    # ephemeral vault makes no commits. model_copy marks those two as set so they always emit;
+    # every other pipeline field the active vault set carries through, unset ones default on reload.
+    pipeline = config.pipeline.model_copy(update={"auto_approve": True, "auto_commit": False})
+    (vault / CONFIG_FILE_NAME).write_text(head + "\n" + to_toml({"pipeline": pipeline}))
 
 
 def _capture_diagnostics(vault: Path, db, config: Config, events) -> dict:
@@ -417,12 +382,12 @@ def _serialize_pipeline_report(report) -> dict | None:
 
 
 def _config_summary(config: Config) -> dict[str, str]:
-    prov = config.effective_provider
+    heavy = config.resolve_role("heavy")
     return {
-        "fast_model": config.models.fast,
-        "heavy_model": config.models.heavy,
-        "provider": prov.name,
-        "provider_url": prov.url,
+        "fast_model": config.model_name("fast"),
+        "heavy_model": config.model_name("heavy"),
+        "provider": heavy.provider_kind,
+        "provider_url": heavy.url,
     }
 
 

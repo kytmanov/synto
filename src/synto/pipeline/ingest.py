@@ -16,14 +16,17 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from pydantic import BaseModel as _BaseModel
 
 from ..config import Config
 from ..models import AnalysisResult, Concept, RawNoteRecord, SourceSegment, TermExtractionResult
-from ..protocols import LLMClientProtocol
 from ..state import StateDB
 from ..structured_output import request_structured
+
+if TYPE_CHECKING:
+    from ..client_factory import ModelRouter, RoleEndpoint
 from ..vault import (
     chunk_text,
     generate_aliases,
@@ -109,12 +112,22 @@ def _checkpoint_hash(
     prompt_contexts: list[_PromptConceptContext],
     source_type: str = "notes",
 ) -> str:
+    fast = config.resolve_role("fast")
     payload = {
         "content_hash": content_hash,
         "prompt_version": _ingest_prompt_version(config),
         "source_type": source_type,
         "source_prompt": _source_prompt_fingerprint(source_type),
-        "fast_model": config.models.fast,
+        "fast_model": config.model_name("fast"),
+        # Fold in the fast-role connection so switching provider/account (same model id) re-ingests.
+        # api_key_env is the env-var NAME, not the secret; rotating the key under the same name is
+        # the same account and intentionally does not bust the checkpoint.
+        "fast_connection": [
+            fast.provider_kind,
+            fast.url,
+            fast.api_key_env or "",
+            sorted(fast.headers.items()),
+        ],
         "contexts": [
             {"canonical": ctx.canonical, "aliases": list(ctx.aliases)} for ctx in prompt_contexts
         ],
@@ -335,7 +348,7 @@ def _analyze_body(
     body: str,
     existing_concepts: list[str],
     path_name: str,
-    client: LLMClientProtocol,
+    router: ModelRouter,
     config: Config,
     *,
     on_chunk_result=None,
@@ -353,7 +366,10 @@ def _analyze_body(
     attribution: optional dict, populated chunk_index -> [extracted concept name], for
     callers that persist concept_occurrences. Filled on fresh analysis of each chunk.
     """
-    chunk_size = config.effective_provider.fast_ctx // 2
+    fast = router.endpoint("fast")
+    # Chunk sizing follows the fast role's resolved context window.
+    fast_ctx = config.resolve_role("fast").ctx
+    chunk_size = fast_ctx // 2
 
     if units is None and len(body) <= chunk_size:
         prompt = _build_analysis_prompt(
@@ -364,15 +380,17 @@ def _analyze_body(
             prompt_concepts=prompt_contexts,
         )
         result = request_structured(
-            client=client,
+            client=fast.client,
             prompt=prompt,
             model_class=AnalysisResult,
-            model=config.models.fast,
+            model=fast.model,
             system=load_prompt(source_type),
-            num_ctx=config.effective_provider.fast_ctx,
-            temperature=0,
+            num_ctx=fast_ctx,
+            temperature=fast.temperature if fast.temperature is not None else 0,
             stage="ingest",
             model_role="fast",
+            think=fast.think,
+            options=fast.options,
         )
         if attribution is not None:
             attribution[0] = [c.name for c in result.concepts]
@@ -413,15 +431,17 @@ def _analyze_body(
             prompt_concepts=prompt_contexts,
         )
         result = request_structured(
-            client=client,
+            client=fast.client,
             prompt=prompt,
             model_class=AnalysisResult,
-            model=config.models.fast,
+            model=fast.model,
             system=load_prompt(source_type),
-            num_ctx=config.effective_provider.fast_ctx,
-            temperature=0,
+            num_ctx=fast_ctx,
+            temperature=fast.temperature if fast.temperature is not None else 0,
             stage="ingest",
             model_role="fast",
+            think=fast.think,
+            options=fast.options,
         )
         log.info("Analyzed %s %s (%.1fs)", path_name or "note", label, time.monotonic() - t0)
         return result
@@ -470,7 +490,7 @@ def _analyze_body_with_checkpoints(
     existing_concepts: list[str],
     path: Path,
     content_hash: str,
-    client: LLMClientProtocol,
+    router: ModelRouter,
     config: Config,
     db: StateDB,
     *,
@@ -480,7 +500,7 @@ def _analyze_body_with_checkpoints(
     units: list[tuple[str, list[str]]] | None = None,
     attribution: dict[int, list[str]] | None = None,
 ) -> AnalysisResult:
-    chunk_size = config.effective_provider.fast_ctx // 2
+    chunk_size = config.resolve_role("fast").ctx // 2
     rel_path = str(path.relative_to(config.vault))
     checkpoint_hash = _checkpoint_hash(
         content_hash,
@@ -498,7 +518,7 @@ def _analyze_body_with_checkpoints(
             body,
             existing_concepts,
             path.name,
-            client,
+            router,
             config,
             prompt_contexts=prompt_contexts,
             source_type=source_type,
@@ -554,7 +574,7 @@ def _analyze_body_with_checkpoints(
             body,
             existing_concepts,
             path.name,
-            client,
+            router,
             config,
             on_chunk_result=_save_chunk,
             skip_completed=completed,
@@ -1243,7 +1263,7 @@ def write_source_content_md(
 def ingest_note(
     path: Path,
     config: Config,
-    client: LLMClientProtocol,
+    router: ModelRouter,
     db: StateDB,
     rag=None,  # Optional RAGStore, injected in Phase 2
     existing_topics: list[str] | None = None,  # existing concept names for prompt
@@ -1311,7 +1331,8 @@ def ingest_note(
         chunks = chunk_text(
             body, chunk_size=config.rag.chunk_size, overlap=config.rag.chunk_overlap
         )
-        embeddings = client.embed_batch(chunks, model=config.models.embed)
+        embed_ep = router.endpoint("embed")
+        embeddings = embed_ep.client.embed_batch(chunks, model=embed_ep.model)
         rag.add_document(
             doc_id=rel_path,
             chunks=chunks,
@@ -1320,6 +1341,7 @@ def ingest_note(
         )
 
     # LLM analysis — use existing concept names so model can reuse canonical names
+    fast = router.endpoint("fast")
     if existing_topics is None:
         existing_topics = db.list_all_concept_names()
         if not existing_topics:
@@ -1345,7 +1367,7 @@ def ingest_note(
         # context while grouping whole sections, so thin/peripheral segments (title page,
         # references) aren't analyzed in isolation — which would rate medium/low and, via the
         # min-quality aggregation + quality cap, halve the extracted concept count.
-        unit_target = max(config.effective_provider.fast_ctx * 3 // 2, 4096)
+        unit_target = max(fast.ctx * 3 // 2, 4096)
         chunk_units = _build_segment_units(source_segments, unit_target)
         chunk_attribution = {}
     try:
@@ -1354,7 +1376,7 @@ def ingest_note(
             existing_concepts=existing_topics,
             path=path,
             content_hash=h,
-            client=client,
+            router=router,
             config=config,
             db=db,
             force=force,
@@ -1482,7 +1504,7 @@ def ingest_note(
 
 def ingest_all(
     config: Config,
-    client: LLMClientProtocol,
+    router: ModelRouter,
     db: StateDB,
     rag=None,
     force: bool = False,
@@ -1511,7 +1533,7 @@ def ingest_all(
         result = ingest_note(
             path=path,
             config=config,
-            client=client,
+            router=router,
             db=db,
             rag=rag,
             existing_topics=existing_topics,
@@ -1554,7 +1576,7 @@ class _TermLLMResponse(_BaseModel):
 
 def extract_terms(
     segment: SourceSegment,
-    client: LLMClientProtocol,
+    fast: RoleEndpoint,
     config: Config,
 ) -> TermExtractionResult:
     """Second LLM pass: extract technical terms from a source segment."""
@@ -1567,15 +1589,17 @@ def extract_terms(
         f"{segment.text[:4000]}"
     )
     llm_result = request_structured(
-        client=client,
+        client=fast.client,
         prompt=prompt,
         model_class=_TermLLMResponse,
-        model=config.models.fast,
+        model=fast.model,
         system=_TERM_EXTRACTION_SYSTEM,
-        num_ctx=config.effective_provider.fast_ctx,
-        temperature=0,
+        num_ctx=fast.ctx,
+        temperature=fast.temperature if fast.temperature is not None else 0,
         stage="term_extraction",
         model_role="fast",
+        think=fast.think,
+        options=fast.options,
     )
     terms = [
         TermRecord(
@@ -1591,5 +1615,5 @@ def extract_terms(
     return TermExtractionResult(
         terms=terms,
         source_segment_id=segment.id,
-        model=config.models.fast,
+        model=fast.model,
     )

@@ -38,11 +38,15 @@ class OllamaClient:
         base_url: str = "http://localhost:11434",
         timeout: float = 300.0,
         cache: LLMCache | None = None,
+        extra_headers: dict[str, str] | None = None,
+        cache_namespace: str | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
-        self._client = httpx.Client(timeout=timeout)
+        self._client = httpx.Client(timeout=timeout, headers=extra_headers or {})
         self._last_stats: dict = {}
         self._cache = cache
+        # Account-aware cache namespace; base_url fallback for direct construction.
+        self._cache_namespace = cache_namespace or self.base_url
 
     # ── Health ────────────────────────────────────────────────────────────────
 
@@ -105,13 +109,15 @@ class OllamaClient:
         num_ctx: int = 8192,
         num_predict: int = -1,
         temperature: float | None = None,
+        think: bool | None = None,
+        options: dict | None = None,
     ) -> str:
         if self._cache is not None:
             cache_messages = []
             if system:
                 cache_messages.append({"role": "system", "content": system})
             cache_messages.append({"role": "user", "content": prompt})
-            cached = self._cache.get(model, cache_messages)
+            cached = self._cache.get(model, cache_messages, namespace=self._cache_namespace)
             if cached is not None:
                 self._last_stats = {"latency_ms": 0, "cache_hit": True}
                 return cached
@@ -125,6 +131,11 @@ class OllamaClient:
         }
         if temperature is not None:
             payload["options"]["temperature"] = temperature
+        if think is not None:
+            payload["think"] = think  # top-level: turn thinking-model reasoning on/off
+        if options:
+            # Provider-native sampling/runtime params; merged last so they can override.
+            payload["options"].update(options)
         if format:
             payload["format"] = format
         t0 = time.monotonic()
@@ -169,7 +180,7 @@ class OllamaClient:
             if system:
                 cache_messages.append({"role": "system", "content": system})
             cache_messages.append({"role": "user", "content": prompt})
-            self._cache.put(model, cache_messages, response_text)
+            self._cache.put(model, cache_messages, response_text, namespace=self._cache_namespace)
 
         return response_text
 

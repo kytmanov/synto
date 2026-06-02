@@ -263,14 +263,15 @@ def test_trace_lineage_returns_frontmatter_lineage(vault, db):
 
 
 def test_answer_question_returns_index_missing_for_empty_vault(vault, db, monkeypatch):
-    handlers = _tools(vault)
+    from unittest.mock import MagicMock
 
-    class _Stub:
-        pass
+    from conftest import as_router
+
+    handlers = _tools(vault)
 
     from synto import client_factory
 
-    monkeypatch.setattr(client_factory, "build_client", lambda *_a, **_k: _Stub())
+    monkeypatch.setattr(client_factory, "build_router", lambda *_a, **_k: as_router(MagicMock()))
 
     result = handlers["answer_question"]("anything")
     assert result["index_found"] is False

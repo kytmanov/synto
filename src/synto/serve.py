@@ -836,19 +836,22 @@ def build_tool_handlers(
         success = False
         arguments = {"question": question, "max_pages": max_pages}
         try:
-            from .client_factory import build_client
+            from .client_factory import build_router
             from .engines import QueryConfig, QueryEngine
 
-            client = build_client(config)
-            engine = QueryEngine(
-                reader=reader,
-                fast_client=client,
-                heavy_client=client,
-                config=config,
-                db=db,
-                query_config=QueryConfig(max_pages=max(1, int(max_pages))),
-            )
-            answer = engine.query(question)
+            router = build_router(config)
+            try:
+                engine = QueryEngine(
+                    reader=reader,
+                    fast_ep=router.endpoint("fast"),
+                    heavy_ep=router.endpoint("heavy"),
+                    config=config,
+                    db=db,
+                    query_config=QueryConfig(max_pages=max(1, int(max_pages))),
+                )
+                answer = engine.query(question)
+            finally:
+                router.close()
             visible_pages: list[str] = []
             for page_name in engine.last_selected_pages:
                 try:

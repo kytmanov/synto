@@ -22,6 +22,8 @@ class LLMClientProtocol(Protocol):
         num_ctx: int = ...,
         num_predict: int = ...,
         temperature: float | None = ...,
+        think: bool | None = ...,
+        options: dict | None = ...,
     ) -> str: ...
 
     def embed_batch(self, texts: list[str], model: str = ...) -> list[list[float]]: ...

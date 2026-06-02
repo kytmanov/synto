@@ -6,6 +6,7 @@ import json
 from unittest.mock import MagicMock
 
 import pytest
+from conftest import as_router
 
 from synto.config import Config
 from synto.models import RawNoteRecord
@@ -50,7 +51,7 @@ def test_ingest_detects_and_stores_language(vault, config, db):
             "language": "fr",
         }
     )
-    client = MagicMock()
+    client = as_router(MagicMock())
     client.generate.return_value = analysis
 
     ingest_note(path, config, client, db)
@@ -94,7 +95,7 @@ def test_query_answer_prompt_has_language_instruction(vault, config, db):
 
     selection_json = json.dumps({"pages": ["Topic"]})
     answer_json = json.dumps({"answer": "Réponse."})
-    client = MagicMock()
+    client = as_router(MagicMock())
     client.generate.side_effect = [selection_json, answer_json]
 
     run_query(config, client, db, "Qu'est-ce que Topic?")

@@ -108,12 +108,16 @@ def test_render_markdown_switch_includes_provider_config():
     report = _report()
     report.verdict = AdvisorVerdict.SWITCH
     report.reasons = ["challenger preview is stronger"]
-    report.challenger.provider_name = "groq"
-    report.challenger.provider_url = "https://api.groq.com/openai/v1"
+    # The markdown emits the report's precomputed switch snippet (named-provider format), so the
+    # full per-role split survives instead of collapsing to a single legacy [provider] block.
+    report.switch_config_toml = (
+        '[providers.default]\nname = "groq"\n'
+        'url = "https://api.groq.com/openai/v1"\ntimeout = 600\n'
+    )
 
     md = render_markdown(report)
 
-    assert "[provider]" in md
+    assert "[providers.default]" in md
     assert 'name = "groq"' in md
     assert 'url = "https://api.groq.com/openai/v1"' in md
 

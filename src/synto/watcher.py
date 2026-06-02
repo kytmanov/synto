@@ -97,7 +97,7 @@ class _DebounceHandler(FileSystemEventHandler):
 
 def watch(
     config,
-    client,
+    router,
     db,
     on_event: Callable[[list[str]], None],
     debounce_secs: float | None = None,
@@ -106,7 +106,7 @@ def watch(
     Block until KeyboardInterrupt. Calls on_event(paths) after each debounced batch.
 
     config       — Config (uses config.raw_dir, config.pipeline.watch_debounce)
-    client       — OllamaClient
+    router       — ModelRouter (unused here; the on_event callback drives the pipeline)
     db           — StateDB
     on_event     — callback(changed_paths: list[str]) — runs on timer thread
     debounce_secs — override config.pipeline.watch_debounce

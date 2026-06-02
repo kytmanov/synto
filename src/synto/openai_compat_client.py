@@ -135,6 +135,8 @@ class OpenAICompatClient:
         azure: bool = False,
         azure_api_version: str = "2024-02-15-preview",
         cache: LLMCache | None = None,
+        extra_headers: dict[str, str] | None = None,
+        cache_namespace: str | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.provider_name = provider_name
@@ -145,11 +147,14 @@ class OpenAICompatClient:
         self._azure = azure
         self._azure_api_version = azure_api_version
         self._client = httpx.Client(
-            headers=self._build_headers(),
+            headers={**self._build_headers(), **(extra_headers or {})},
             timeout=timeout,
         )
         self._last_stats: dict = {}
         self._cache = cache
+        # Account-aware cache namespace (folds in api_key/headers). Falls back to base_url for
+        # direct construction so two accounts on one URL never share cached responses.
+        self._cache_namespace = cache_namespace or self.base_url
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -403,6 +408,8 @@ class OpenAICompatClient:
         num_ctx: int = 8192,
         num_predict: int = -1,
         temperature: float | None = None,
+        think: bool | None = None,
+        options: dict | None = None,
     ) -> str:
         """
         Call /v1/chat/completions. Signature is identical to OllamaClient.generate().
@@ -410,6 +417,8 @@ class OpenAICompatClient:
         num_ctx is silently ignored (server-managed for cloud providers).
         num_predict > 0 maps to max_tokens; -1 omits the field (provider default).
         format="json" injects response_format when supports_json_mode=True.
+        `think` is a no-op here (Ollama-specific flag); reasoning control for OpenAI-style
+        providers is provider-specific — set it via `options` instead.
         """
         messages: list[dict] = []
         if system:
@@ -417,7 +426,7 @@ class OpenAICompatClient:
         messages.append({"role": "user", "content": prompt})
 
         if self._cache is not None:
-            cached = self._cache.get(model, messages)
+            cached = self._cache.get(model, messages, namespace=self._cache_namespace)
             if cached is not None:
                 self._last_stats = {"latency_ms": 0, "cache_hit": True}
                 return cached
@@ -432,6 +441,10 @@ class OpenAICompatClient:
 
         if num_predict > 0:
             payload["max_tokens"] = num_predict
+
+        if options:
+            # Provider-native params (top_p, reasoning_effort, ...); merged last to override.
+            payload.update(options)
 
         t0 = time.monotonic()
         try:
@@ -548,7 +561,7 @@ class OpenAICompatClient:
             )
 
         if self._cache is not None:
-            self._cache.put(model, messages, content)
+            self._cache.put(model, messages, content, namespace=self._cache_namespace)
 
         return content
 

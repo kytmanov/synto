@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from click.testing import CliRunner
+from conftest import as_router
 
 from synto.cli import cli
 from synto.config import Config
@@ -107,14 +108,14 @@ def test_reject_all_then_recompile_uses_feedback(vault, config, db, runner):
             "tags": ["concept-a"],
         }
     )
-    client = MagicMock()
+    client = as_router(MagicMock())
     client.generate.return_value = article_json
 
     # Mark sources as ingested so compile picks them up
     db.mark_raw_status("raw/note_a.md", "ingested")
     db.mark_raw_status("raw/note_b.md", "ingested")
 
-    compile_concepts(config=config, client=client, db=db)
+    compile_concepts(config=config, router=client, db=db)
 
     # At least one compile call prompt should contain the feedback
     all_prompts = [call.kwargs.get("prompt", "") for call in client.generate.call_args_list]

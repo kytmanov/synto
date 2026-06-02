@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from conftest import as_router
+
 from synto.models import PipelineVersion
 from synto.state import StateDB
 
@@ -123,7 +125,7 @@ def test_compile_run_recorded(tmp_path: Path, config, db) -> None:
         summary="A test article.",
     )
 
-    client = MagicMock()
+    client = as_router(MagicMock())
     with patch("synto.pipeline.compile.request_structured", return_value=mock_result):
         compile_concepts(config, client, db)
 
@@ -160,7 +162,7 @@ def test_frontmatter_lineage_key(tmp_path: Path, config, db) -> None:
         summary="Summary.",
     )
 
-    client = MagicMock()
+    client = as_router(MagicMock())
     with patch("synto.pipeline.compile.request_structured", return_value=mock_result):
         draft_paths, _, _ = compile_concepts(config, client, db)
 
@@ -198,7 +200,7 @@ def test_trace_article_command(tmp_path: Path, config, db) -> None:
     mock_result = SingleArticle(
         title="TraceConcept", content="Content.", tags=[], summary="Summary."
     )
-    client = MagicMock()
+    client = as_router(MagicMock())
     with patch("synto.pipeline.compile.request_structured", return_value=mock_result):
         compile_concepts(config, client, db)
 

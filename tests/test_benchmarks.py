@@ -18,6 +18,7 @@ import json
 from unittest.mock import MagicMock
 
 import pytest
+from conftest import as_router
 
 from synto.config import Config
 from synto.models import AnalysisResult
@@ -63,10 +64,10 @@ def _analysis_json(n_concepts: int = 4) -> str:
     )
 
 
-def _mock_client(n_concepts: int = 4) -> MagicMock:
+def _mock_client(n_concepts: int = 4):
     c = MagicMock()
     c.generate.return_value = _analysis_json(n_concepts)
-    return c
+    return as_router(c)
 
 
 def _make_result(n: int = 4) -> AnalysisResult:

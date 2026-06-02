@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from conftest import as_router
 
 from synto.config import Config
 from synto.models import RawNoteRecord, SingleArticle, WikiArticleRecord
@@ -80,10 +81,10 @@ def db(config: Config) -> StateDB:
     return StateDB(config.state_db_path)
 
 
-def make_mock_client(response: str = "{}") -> OllamaClient:
+def make_mock_client(response: str = "{}"):
     client = MagicMock(spec=OllamaClient)
     client.generate.return_value = response
-    return client
+    return as_router(client)
 
 
 def test_article_num_predict_respects_config_cap(config):
@@ -1199,7 +1200,7 @@ def test_compile_concepts_retry_value_error_is_counted_as_context_too_large(
         ]
     )
 
-    def fake_article_num_predict(_config, _prompt, _system):
+    def fake_article_num_predict(_config, _prompt, _system, heavy_ctx=None):
         result = next(num_predict_calls)
         if isinstance(result, Exception):
             raise result

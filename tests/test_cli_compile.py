@@ -6,6 +6,7 @@ import json
 from unittest.mock import MagicMock
 
 from click.testing import CliRunner
+from conftest import as_router
 
 from synto.cli import cli
 from synto.config import Config
@@ -30,7 +31,7 @@ def test_compile_cli_concept_alias_resolution(tmp_path, monkeypatch):
         {"title": "Product Backlog", "content": "Body.", "tags": []}
     )
 
-    monkeypatch.setattr("synto.cli._load_deps", lambda cfg: (client, db))
+    monkeypatch.setattr("synto.cli._load_deps", lambda cfg: (as_router(client), db))
 
     result = CliRunner().invoke(
         cli,
@@ -56,7 +57,7 @@ def test_compile_cli_retry_failed_retries_failed_concepts(tmp_path, monkeypatch)
     client = MagicMock()
     client.generate.return_value = json.dumps({"title": "Alpha", "content": "Body.", "tags": []})
 
-    monkeypatch.setattr("synto.cli._load_deps", lambda cfg: (client, db))
+    monkeypatch.setattr("synto.cli._load_deps", lambda cfg: (as_router(client), db))
 
     result = CliRunner().invoke(
         cli,
@@ -78,7 +79,7 @@ def test_compile_auto_approve_commits_synto_dir(tmp_path, monkeypatch):
     client = MagicMock()
     commit_calls = []
 
-    monkeypatch.setattr("synto.cli._load_deps", lambda cfg: (client, db))
+    monkeypatch.setattr("synto.cli._load_deps", lambda cfg: (as_router(client), db))
     monkeypatch.setattr(
         "synto.pipeline.compile.compile_concepts",
         lambda **kwargs: ([tmp_path / "wiki" / ".drafts" / "Alpha.md"], [], {}),
@@ -111,7 +112,7 @@ def test_compile_noop_does_not_update_index(tmp_path, monkeypatch):
     client = MagicMock()
 
     gen_idx = MagicMock()
-    monkeypatch.setattr("synto.cli._load_deps", lambda cfg: (client, db))
+    monkeypatch.setattr("synto.cli._load_deps", lambda cfg: (as_router(client), db))
     monkeypatch.setattr("synto.indexer.generate_index", gen_idx)
 
     result = CliRunner().invoke(cli, ["compile", "--vault", str(tmp_path)])

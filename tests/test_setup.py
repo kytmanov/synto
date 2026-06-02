@@ -17,7 +17,6 @@ from synto.config import Config
 from synto.global_config import (
     GlobalConfig,
     _global_config_path,
-    _toml_str,
     load_global_config,
     save_global_config,
 )
@@ -41,39 +40,16 @@ def runner() -> CliRunner:
     return CliRunner()
 
 
-# ── _toml_str ─────────────────────────────────────────────────────────────────
+# ── string quoting / escaping (now owned by the to_toml serializer) ─────────────
 
 
-def test_toml_str_simple():
-    assert _toml_str("hello") == '"hello"'
-
-
-def test_toml_str_escapes_backslashes():
-    assert _toml_str("C:\\Users\\alex") == '"C:\\\\Users\\\\alex"'
-
-
-def test_toml_str_escapes_quotes():
-    assert _toml_str('say "hi"') == '"say \\"hi\\""'
-
-
-def test_toml_str_combined():
-    result = _toml_str('C:\\path\\to\\my "wiki"')
-    assert result == '"C:\\\\path\\\\to\\\\my \\"wiki\\""'
-
-
-def test_toml_str_escapes_control_chars():
-    assert _toml_str("line1\nline2") == '"line1\\nline2"'
-    assert _toml_str("col1\tcol2") == '"col1\\tcol2"'
-    assert _toml_str("cr\rhere") == '"cr\\rhere"'
-
-
-def test_toml_str_control_chars_produce_valid_toml(cfg_dir: Path):
-    """Paths with control chars must still round-trip through save/load."""
-    cfg = GlobalConfig(fast_model="model\twith\ttabs")
+def test_control_chars_round_trip_through_save_load(cfg_dir: Path):
+    """Values with control chars (tabs, quotes, backslashes) must survive save → load."""
+    cfg = GlobalConfig(fast_model='model\twith\t"quotes"\\and\\backslashes')
     save_global_config(cfg)
     loaded = load_global_config()
     assert loaded is not None
-    assert loaded.fast_model == "model\twith\ttabs"
+    assert loaded.fast_model == 'model\twith\t"quotes"\\and\\backslashes'
 
 
 # ── save / load round-trip ────────────────────────────────────────────────────
@@ -273,7 +249,7 @@ def test_setup_reset_clears_config(runner: CliRunner, cfg_dir: Path):
     result = runner.invoke(
         cli,
         ["setup", "--reset"],
-        input="\n\n\n\n\n\n",
+        input="y\n\n\n\n\n\n\n",
         catch_exceptions=False,
     )
     assert result.exit_code == 0
@@ -298,7 +274,7 @@ def test_setup_wizard_saves_config(runner: CliRunner, cfg_dir: Path):
             cli,
             ["setup"],
             # provider default, URL default, fast, heavy, no vault, citations off
-            input="\n\ngemma4:e4b\nqwen2.5:14b\n\n\n",
+            input="y\n\n\ngemma4:e4b\nqwen2.5:14b\n\n\n",
             catch_exceptions=False,
         )
 
@@ -320,7 +296,7 @@ def test_setup_wizard_saves_experimental_inline_source_citations(runner: CliRunn
         result = runner.invoke(
             cli,
             ["setup"],
-            input="\n\ngemma4:e4b\nqwen2.5:14b\n\ny\n",
+            input="y\n\n\ngemma4:e4b\nqwen2.5:14b\n\ny\n",
             catch_exceptions=False,
         )
 
@@ -343,7 +319,7 @@ def test_setup_wizard_summary_says_uninitialized_vault_will_use_preference(
         result = runner.invoke(
             cli,
             ["setup"],
-            input=f"\n\ngemma4:e4b\nqwen2.5:14b\n{vault}\ny\n",
+            input=f"y\n\n\ngemma4:e4b\nqwen2.5:14b\n{vault}\ny\n",
             catch_exceptions=False,
         )
 
@@ -363,7 +339,7 @@ def test_setup_wizard_summary_mentions_support_and_metrics(runner: CliRunner, cf
         result = runner.invoke(
             cli,
             ["setup"],
-            input="\n\ngemma4:e4b\nqwen2.5:14b\n\n\n",
+            input="y\n\n\ngemma4:e4b\nqwen2.5:14b\n\n\n",
             catch_exceptions=False,
         )
 
@@ -388,7 +364,7 @@ def test_setup_wizard_model_number_selection(runner: CliRunner, cfg_dir: Path):
             cli,
             ["setup"],
             # provider default, URL default, pick #1 fast, pick #2 heavy, no vault, citations off
-            input="\n\n1\n2\n\n\n",
+            input="y\n\n\n1\n2\n\n\n",
             catch_exceptions=False,
         )
 
@@ -412,7 +388,7 @@ def test_setup_wizard_whitespace_input_uses_default(runner: CliRunner, cfg_dir: 
             cli,
             ["setup"],
             # provider default, URL default, blank models, no vault, citations off
-            input="\n\n   \n   \n\n\n",
+            input="y\n\n\n   \n   \n\n\n",
             catch_exceptions=False,
         )
 
@@ -437,7 +413,7 @@ def test_setup_wizard_with_vault(runner: CliRunner, cfg_dir: Path, tmp_path: Pat
         result = runner.invoke(
             cli,
             ["setup"],
-            input=f"\n\ngemma4:e4b\nqwen2.5:14b\n{vault}\n\n",
+            input=f"y\n\n\ngemma4:e4b\nqwen2.5:14b\n{vault}\n\n",
             catch_exceptions=False,
         )
 

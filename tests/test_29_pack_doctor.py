@@ -642,3 +642,37 @@ def test_doctor_tips_ingest_force_when_no_concept_links(
     assert result.exit_code == 0, result.output
     assert "0 concept→segment links" in result.output
     assert "ingest --force" in result.output
+
+
+def test_doctor_embed_missing_is_advisory_not_unhealthy(
+    vault: Path, runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing embed model is optional (RAG-only) and must NOT flip doctor's health summary
+    or tell the user to pull it — embed is excluded from required health checks by contract."""
+    # Derive the connection's "available" models from the resolved config so the test is robust to
+    # whatever fast/heavy the ambient config picks; embed's model is deliberately left out.
+    cfg = Config.from_vault(vault)
+    embed_model = cfg.model_name("embed")
+    present = {cfg.model_name("fast"), cfg.model_name("heavy")}
+    present.discard(embed_model)
+
+    class _Client:
+        def require_healthy(self) -> None:
+            return None
+
+        def list_models(self) -> list[str]:
+            return list(present)
+
+        def close(self) -> None:
+            return None
+
+    # Patch the router's actual client builder (doctor uses build_router, not build_client).
+    monkeypatch.setattr("synto.client_factory._build_client_for", lambda resolved, cache: _Client())
+
+    result = runner.invoke(cli, ["doctor", "--vault", str(vault)])
+    assert result.exit_code == 0, result.output
+    # embed's missing model must not drag the summary down...
+    assert "All checks passed" in result.output
+    assert "Some checks need attention" not in result.output
+    # ...and must not tell the user to pull a model for a feature that isn't wired up.
+    assert f"ollama pull {embed_model}" not in result.output

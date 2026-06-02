@@ -6,8 +6,9 @@ import os
 import tomllib
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
+from .config import ModelProfile, ProviderBlock, to_toml
 from .paths import APP_NAME
 
 
@@ -24,6 +25,18 @@ class GlobalConfig(BaseModel):
     api_key: str | None = None  # never stored in wiki.toml; this file is user-private
     azure_api_version: str | None = None  # Azure OpenAI API version (e.g. "2024-02-15-preview")
     experimental_inline_source_citations: bool | None = None  # new-vault default only
+    # Multi-provider (per-role) defaults: when both are set they supersede the flat
+    # single-provider fields above, and `synto init` reproduces a multi-provider vault.
+    # Provider blocks carry api_key_env references (the recommended path).
+    providers: dict[str, ProviderBlock] = Field(default_factory=dict)
+    models: dict[str, ModelProfile] | None = None
+    # Optional raw API key per provider alias (user-private — same trust as the legacy
+    # `api_key` above). Used as a fallback when no env var is set. `api_key_env` is preferred.
+    provider_keys: dict[str, str] | None = None
+
+    @property
+    def is_multi_provider(self) -> bool:
+        return bool(self.providers and self.models)
 
 
 def _global_config_path() -> Path:
@@ -48,39 +61,13 @@ def load_global_config() -> GlobalConfig | None:
 
 
 def save_global_config(cfg: GlobalConfig) -> None:
-    """Write global config to disk. Creates parent directory if needed."""
+    """Write global config to disk. Creates parent directory if needed.
+
+    Serialized through the single `to_toml` seam (model_dump → TOML), so this is the exact inverse
+    of the `GlobalConfig(**tomllib.load(...))` read path: every field — including provider
+    headers/options and model think/temperature/options — round-trips, and a new field needs no
+    change here. Only set fields are written (exclude_unset), so a partial config stays minimal.
+    """
     path = _global_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    lines: list[str] = []
-    if cfg.vault is not None:
-        lines.append(f"vault = {_toml_str(cfg.vault)}")
-    if cfg.ollama_url is not None:
-        lines.append(f"ollama_url = {_toml_str(cfg.ollama_url)}")
-    if cfg.fast_model is not None:
-        lines.append(f"fast_model = {_toml_str(cfg.fast_model)}")
-    if cfg.heavy_model is not None:
-        lines.append(f"heavy_model = {_toml_str(cfg.heavy_model)}")
-    if cfg.provider_name is not None:
-        lines.append(f"provider_name = {_toml_str(cfg.provider_name)}")
-    if cfg.provider_url is not None:
-        lines.append(f"provider_url = {_toml_str(cfg.provider_url)}")
-    if cfg.api_key is not None:
-        lines.append(f"api_key = {_toml_str(cfg.api_key)}")
-    if cfg.azure_api_version is not None:
-        lines.append(f"azure_api_version = {_toml_str(cfg.azure_api_version)}")
-    if cfg.experimental_inline_source_citations is not None:
-        value = "true" if cfg.experimental_inline_source_citations else "false"
-        lines.append(f"experimental_inline_source_citations = {value}")
-    path.write_text("\n".join(lines) + "\n" if lines else "", encoding="utf-8")
-
-
-def _toml_str(value: str) -> str:
-    """Minimal safe TOML string quoting — escapes backslashes, double quotes, and control chars."""
-    escaped = (
-        value.replace("\\", "\\\\")
-        .replace('"', '\\"')
-        .replace("\n", "\\n")
-        .replace("\r", "\\r")
-        .replace("\t", "\\t")
-    )
-    return f'"{escaped}"'
+    path.write_text(to_toml(cfg), encoding="utf-8")

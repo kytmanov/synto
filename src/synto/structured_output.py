@@ -269,6 +269,8 @@ def request_structured(
     max_retries: int = 2,
     stage: str = "",
     model_role: str | None = None,
+    think: bool | None = None,
+    options: dict | None = None,
 ) -> T:
     """
     Request structured output from an LLM client, parse into Pydantic model.
@@ -326,6 +328,8 @@ def request_structured(
             num_ctx=num_ctx,
             num_predict=num_predict,
             temperature=temperature,
+            think=think,
+            options=options,
         )
         stats = getattr(client, "_last_stats", {}) or {}
         total_latency_ms += int(stats.get("latency_ms") or 0)

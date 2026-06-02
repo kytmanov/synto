@@ -399,10 +399,95 @@ idle — that is expected, not a hang.
 | Llamafile | SiliconFlow |
 | Lemonade | Perplexity |
 | | xAI (Grok) |
+| | NVIDIA NIM |
 | | Azure OpenAI |
+| | Kimi (Anthropic-compatible) |
 | | Custom OpenAI-compatible |
 
 Any OpenAI-compatible endpoint works. Use `synto setup` to configure interactively, or edit `~/.config/synto/config.toml` directly.
+
+### Per-role providers
+
+Each model role can use a different provider and account. Define connections as named
+`[providers.<alias>]` blocks and point roles at them — for example, the fast model on local
+Ollama and the heavy model on a cloud account:
+
+```toml
+[providers.default]
+name = "ollama"
+url  = "http://localhost:11434"
+
+[providers.ngc]
+name = "nvidia"
+url  = "https://integrate.api.nvidia.com/v1"
+api_key_env = "NVIDIA_API_KEY"   # env var name only — never the key itself
+
+[models.fast]
+provider = "default"
+model    = "gemma4:e4b"
+
+[models.heavy]
+provider = "ngc"
+model    = "qwen2.5:14b"
+ctx      = 32768
+```
+
+The API key belongs to the provider block, so each model can have its own key (point two
+blocks at the same provider with different `api_key_env`) or none at all (local providers).
+Keys are read from the named env var, the provider's conventional env var, `SYNTO_API_KEY`,
+or the user-private `~/.config/synto/config.toml` — **never** from the vault's `synto.toml`.
+
+`synto setup` can configure this interactively (choose "no" at "use the same provider for all
+models?"); it saves the split to the global config so `synto init` reproduces it for new vaults.
+Re-running `synto init` on an existing vault re-syncs its provider/model sections from the global
+config — any per-model `options`/`think` you hand-edited into that vault are replaced.
+
+#### NVIDIA / NGC
+
+NVIDIA inference is OpenAI-compatible; pick the block that matches how your model is served:
+
+- **Self-hosted NIM** (a model you host with NGC — the NIM container is pulled from NGC and run
+  on your own infra). It exposes `http://<host>:8000/v1` and usually needs **no key** on inference
+  requests. Use `name = "custom"` + your `url` so no environment key is auto-sent:
+
+  ```toml
+  [providers.ngc]
+  name    = "custom"
+  url     = "http://your-host:8000/v1"
+  timeout = 600   # raise for a large self-hosted model — the cloud default is 120s
+
+  [models.heavy]
+  provider = "ngc"
+  model    = "meta/llama-3.1-70b-instruct"
+  ```
+
+- **NVIDIA Cloud Functions (NVCF)** — set the OpenAI-compatible LLM Gateway base URL for your
+  function (from NVIDIA's console, ending in `/v1`) and `api_key_env = "NGC_API_KEY"`.
+- **API Catalog** (`build.nvidia.com`) — `name = "nvidia"` (default URL) with
+  `api_key_env = "NVIDIA_API_KEY"` (an `nvapi-` key).
+
+The legacy `/v2/nvcf/pexec` invocation form is not OpenAI-compatible and is not supported — use
+the LLM Gateway URL. `synto doctor` may list an NVCF model as "not found" if the per-function
+gateway has no `/v1/models`; that doesn't mean inference is broken.
+
+### Advanced model parameters
+
+These are hand-edit-only (not prompted by `synto setup`):
+
+```toml
+[models.heavy]
+model       = "qwen3.5:9b"
+think       = true     # Ollama thinking models: on for heavy by default, off for fast
+temperature = 0.3      # override the per-stage default
+
+[models.heavy.options]   # raw passthrough — any provider-native parameter
+top_p = 0.9
+```
+
+`think` controls Ollama's reasoning flag (a no-op on OpenAI/Anthropic-compatible providers;
+use `options` for those). Keys under `[models.<role>.options]` are merged into the provider
+request as-is and override the matching first-class field, so set computed values like
+`num_predict` only if you mean to.
 
 ---
 

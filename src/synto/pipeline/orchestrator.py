@@ -17,10 +17,13 @@ import time
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from ..config import Config
-from ..protocols import LLMClientProtocol
 from ..state import StateDB
+
+if TYPE_CHECKING:
+    from ..client_factory import ModelRouter
 
 log = logging.getLogger(__name__)
 
@@ -64,9 +67,9 @@ class PipelineOrchestrator:
     pipeline lock before calling run() — this class does NOT lock internally.
     """
 
-    def __init__(self, config: Config, client: LLMClientProtocol, db: StateDB) -> None:
+    def __init__(self, config: Config, router: ModelRouter, db: StateDB) -> None:
         self.config = config
-        self.client = client
+        self.router = router
         self.db = db
 
     def run(
@@ -96,7 +99,7 @@ class PipelineOrchestrator:
         from ..pipeline.maintain import create_stubs
 
         config = self.config
-        client = self.client
+        router = self.router
         db = self.db
         report = PipelineReport()
 
@@ -122,7 +125,7 @@ class PipelineOrchestrator:
                 report.ingested += 1
                 continue
             try:
-                result = ingest_note(path=p, config=config, client=client, db=db)
+                result = ingest_note(path=p, config=config, router=router, db=db)
                 if result is not None:
                     report.ingested += 1
                     ingested_paths.append(raw_path_str)
@@ -152,7 +155,7 @@ class PipelineOrchestrator:
         log.info("── Compile round 1 (%s concept(s)) ─────────────────────────", n_concepts)
         t1 = time.monotonic()
         draft_paths, round1_failed, r1_timings = _run_compile(
-            config, client, db, concepts=priority_concepts, dry_run=dry_run
+            config, router, db, concepts=priority_concepts, dry_run=dry_run
         )
         report.timings["compile_r1"] = time.monotonic() - t1
         report.compiled += len(draft_paths)
@@ -178,7 +181,7 @@ class PipelineOrchestrator:
             transient_concepts = [f.concept for f in transient]
             t2 = time.monotonic()
             r2_drafts, r2_failed, r2_timings = _run_compile(
-                config, client, db, concepts=transient_concepts, dry_run=dry_run
+                config, router, db, concepts=transient_concepts, dry_run=dry_run
             )
             report.timings["compile_r2"] = time.monotonic() - t2
             report.compiled += len(r2_drafts)
@@ -218,7 +221,7 @@ class PipelineOrchestrator:
 
 def _run_compile(
     config: Config,
-    client: LLMClientProtocol,
+    router: ModelRouter,
     db: StateDB,
     concepts: list[str] | None,
     dry_run: bool,
@@ -230,7 +233,7 @@ def _run_compile(
     try:
         draft_paths, failed_names, concept_timings = compile_concepts(
             config=config,
-            client=client,
+            router=router,
             db=db,
             dry_run=dry_run,
             concepts=concepts,

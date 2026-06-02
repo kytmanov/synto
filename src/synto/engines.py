@@ -8,12 +8,14 @@ Phase 0 skeletons remain for compatibility tests.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from .config import Config
-from .protocols import LLMClientProtocol
 from .readers import Reader
 from .state import StateDB
+
+if TYPE_CHECKING:
+    from .client_factory import RoleEndpoint
 
 # ── Result types ──────────────────────────────────────────────────────────
 
@@ -63,15 +65,15 @@ class QueryEngine:
     def __init__(
         self,
         reader: Reader,
-        fast_client: LLMClientProtocol,
-        heavy_client: LLMClientProtocol,
+        fast_ep: RoleEndpoint,
+        heavy_ep: RoleEndpoint,
         config: Config,
         db: StateDB | None = None,
         query_config: QueryConfig | None = None,
     ) -> None:
         self.reader = reader
-        self.fast_client = fast_client
-        self.heavy_client = heavy_client
+        self.fast_ep = fast_ep
+        self.heavy_ep = heavy_ep
         self.config = config
         self.db = db
         self.query_config = query_config or QueryConfig()
@@ -83,8 +85,8 @@ class QueryEngine:
 
         result = _query_core(
             self.config,
-            self.fast_client,
-            self.heavy_client,
+            self.fast_ep,
+            self.heavy_ep,
             self.db,
             question,
             max_pages=self.query_config.max_pages,

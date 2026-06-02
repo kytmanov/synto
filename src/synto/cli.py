@@ -283,13 +283,12 @@ def _model_override_kwargs(
         models["heavy"] = heavy_model
     if models:
         kwargs["models"] = models
-    provider: dict = {}
+    # --provider/--provider-url are a per-invocation override that supersedes the configured
+    # provider for ALL roles (works regardless of vault format, incl. new [providers.*] vaults).
     if provider_name:
-        provider["name"] = provider_name
+        kwargs["provider_override"] = provider_name
     if provider_url:
-        provider["url"] = provider_url
-    if provider:
-        kwargs["provider"] = provider
+        kwargs["provider_override_url"] = provider_url
     return kwargs
 
 
@@ -309,13 +308,13 @@ def _resolve_draft_arg(config, raw_path: str | Path) -> Path:
 
 def _load_deps(config):
     from .cache import LLMCache
-    from .client_factory import LLMError, build_client
+    from .client_factory import LLMError, build_router
 
     db = _load_db(config)
     cache = LLMCache(db)
-    client = build_client(config, cache=cache)
+    router = build_router(config, cache=cache)
     try:
-        client.require_healthy()
+        router.require_healthy()
     except LLMError as e:
         err_console.print(str(e))
         db.close()
@@ -326,8 +325,8 @@ def _load_deps(config):
         metrics_cm.__enter__()
         ctx.call_on_close(lambda cm=metrics_cm: cm.__exit__(None, None, None))
         ctx.call_on_close(db.close)
-        ctx.call_on_close(client.close)
-    return client, db
+        ctx.call_on_close(router.close)
+    return router, db
 
 
 # ── CLI root ──────────────────────────────────────────────────────────────────
@@ -461,46 +460,84 @@ def init(vault_path: str, existing: bool, non_interactive: bool, set_default: bo
     from .global_config import GlobalConfig, load_global_config, save_global_config
 
     gcfg = load_global_config()
-    provider_name = gcfg.provider_name if gcfg and gcfg.provider_name else "ollama"
-    # Only fall back to Ollama-specific model names when using Ollama; cloud providers
-    # must have been configured explicitly via `synto setup`.
-    _ollama = provider_name == "ollama"
-    fast = gcfg.fast_model if gcfg and gcfg.fast_model else ("gemma4:e4b" if _ollama else "")
-    heavy = gcfg.heavy_model if gcfg and gcfg.heavy_model else ("qwen2.5:14b" if _ollama else "")
-    provider_url = gcfg.provider_url if gcfg and gcfg.provider_url else None
-    ollama_url = gcfg.ollama_url if gcfg and gcfg.ollama_url else "http://localhost:11434"
-    effective_url = provider_url or ollama_url
-    azure_api_version = gcfg.azure_api_version if gcfg and gcfg.azure_api_version else None
 
-    if not toml_path.exists():
-        from .providers import get_provider
+    if gcfg and gcfg.is_multi_provider:
+        # Reproduce the per-role multi-provider setup saved by `synto setup`. gcfg.providers and
+        # gcfg.models are already Pydantic models, so we dump them directly — no field enumeration,
+        # so headers/options/think/temperature and any role (incl. embed) carry through verbatim.
+        from .config import apply_providers_to_existing_toml, multi_provider_vault_toml
 
-        prov_info = get_provider(provider_name)
-        timeout = prov_info.default_timeout if prov_info else 600.0
-        toml_path.write_text(
-            default_wiki_toml(
-                fast,
-                heavy,
-                ollama_url=ollama_url,
-                provider_name=provider_name,
-                provider_url=effective_url if provider_name != "ollama" else None,
-                provider_timeout=timeout,
-                azure_api_version=azure_api_version,
-                inline_source_citations=(
-                    bool(gcfg.experimental_inline_source_citations) if gcfg else False
+        _role_ctx = {"fast": 16384, "heavy": 32768, "embed": 16384}
+        providers = gcfg.providers
+        models = {
+            role: prof.model_copy(
+                update={
+                    "provider": prof.provider or "default",
+                    "ctx": prof.ctx if prof.ctx is not None else _role_ctx.get(role, 8192),
+                }
+            )
+            for role, prof in (gcfg.models or {}).items()
+        }
+        if not toml_path.exists():
+            toml_path.write_text(
+                multi_provider_vault_toml(
+                    providers,
+                    models,
+                    inline_source_citations=bool(gcfg.experimental_inline_source_citations),
+                )
+            )
+        else:
+            from .vault import atomic_write
+
+            atomic_write(
+                toml_path,
+                apply_providers_to_existing_toml(
+                    toml_path.read_text(encoding="utf-8"), providers, models
                 ),
             )
-        )
     else:
-        # Existing vault: patch model/URL fields from global config so that
-        # synto setup changes are reflected without overwriting pipeline settings.
-        _sync_wiki_toml_models(
-            toml_path,
-            fast,
-            heavy,
-            effective_url,
-            provider_name=provider_name if provider_name != "ollama" else None,
+        provider_name = gcfg.provider_name if gcfg and gcfg.provider_name else "ollama"
+        # Only fall back to Ollama-specific model names when using Ollama; cloud providers
+        # must have been configured explicitly via `synto setup`.
+        _ollama = provider_name == "ollama"
+        fast = gcfg.fast_model if gcfg and gcfg.fast_model else ("gemma4:e4b" if _ollama else "")
+        heavy = (
+            gcfg.heavy_model if gcfg and gcfg.heavy_model else ("qwen2.5:14b" if _ollama else "")
         )
+        provider_url = gcfg.provider_url if gcfg and gcfg.provider_url else None
+        ollama_url = gcfg.ollama_url if gcfg and gcfg.ollama_url else "http://localhost:11434"
+        effective_url = provider_url or ollama_url
+        azure_api_version = gcfg.azure_api_version if gcfg and gcfg.azure_api_version else None
+
+        if not toml_path.exists():
+            from .providers import get_provider
+
+            prov_info = get_provider(provider_name)
+            timeout = prov_info.default_timeout if prov_info else 600.0
+            toml_path.write_text(
+                default_wiki_toml(
+                    fast,
+                    heavy,
+                    ollama_url=ollama_url,
+                    provider_name=provider_name,
+                    provider_url=effective_url if provider_name != "ollama" else None,
+                    provider_timeout=timeout,
+                    azure_api_version=azure_api_version,
+                    inline_source_citations=(
+                        bool(gcfg.experimental_inline_source_citations) if gcfg else False
+                    ),
+                )
+            )
+        else:
+            # Existing vault: patch model/URL fields from global config so that
+            # synto setup changes are reflected without overwriting pipeline settings.
+            _sync_wiki_toml_models(
+                toml_path,
+                fast,
+                heavy,
+                effective_url,
+                provider_name=provider_name if provider_name != "ollama" else None,
+            )
 
     # Init git
     git_init(vault)
@@ -581,20 +618,26 @@ def _sync_wiki_toml_models(
         replacement = rf'\1\2"{escaped_val}"'
         return re.sub(pattern, replacement, t, flags=re.MULTILINE | re.DOTALL)
 
+    # Legacy format: [models] fast/heavy scalars + url in [ollama]/[provider].
     text = _replace_value(text, "fast", fast)
     text = _replace_value(text, "heavy", heavy)
-    # Update URL only in [ollama] or [provider] sections to avoid clobbering other urls
     for section in ("ollama", "provider"):
         text = _replace_in_section(text, section, "url", ollama_url)
+    # New named-provider-block format: model under [models.<role>], url under [providers.default].
+    text = _replace_in_section(text, "models.fast", "model", fast)
+    text = _replace_in_section(text, "models.heavy", "model", heavy)
+    text = _replace_in_section(text, "providers.default", "url", ollama_url)
     if provider_name is not None:
-        if "[provider]" not in text:
+        if "[provider]" in text:
+            text = _replace_in_section(text, "provider", "name", provider_name)
+        elif "[providers.default]" in text:
+            text = _replace_in_section(text, "providers.default", "name", provider_name)
+        else:
             console.print(
-                f"  [yellow]Warning:[/yellow] {CONFIG_FILE_NAME} has no [provider] section — "
+                f"  [yellow]Warning:[/yellow] {CONFIG_FILE_NAME} has no provider section — "
                 f"provider '{provider_name}' not applied. "
                 f"Delete {CONFIG_FILE_NAME} and re-run [bold]synto init[/bold] to regenerate it."
             )
-        else:
-            text = _replace_in_section(text, "provider", "name", provider_name)
 
     if text != original:
         toml_path.write_text(text, encoding="utf-8")
@@ -780,6 +823,189 @@ def _pick_model(
         return raw if raw else default_fallback
 
 
+def _collect_role_provider(console, role_label: str, default_model: str = "") -> dict:
+    """Prompt for one role's provider, URL, API-key env var, and model."""
+    from .providers import PROVIDER_REGISTRY, list_all_providers
+
+    console.print(f"  [bold]{role_label} model[/bold]")
+    provs = list_all_providers()
+    idx_map: dict[int, str] = {}
+    for i, p in enumerate(provs, 1):
+        tag = "  [default]" if p.name == "ollama" else ""
+        console.print(f"    {i:2}. {p.display_name:<14} {p.default_url or '(custom URL)'}{tag}")
+        idx_map[i] = p.name
+    raw = Prompt.ask("    Provider (number or name)", default="1", console=console).strip()
+    if raw.isdigit():
+        name = idx_map.get(int(raw), "ollama")
+    elif raw in PROVIDER_REGISTRY:
+        name = raw
+    else:
+        console.print(f"    [yellow]Unknown '{raw}', using Ollama.[/yellow]")
+        name = "ollama"
+    prov = PROVIDER_REGISTRY[name]
+    url = (
+        Prompt.ask("    Base URL", default=prov.default_url or "", console=console).strip()
+        or prov.default_url
+        or ""
+    )
+    api_key_env: str | None = None
+    if name != "ollama":
+        default_env = prov.env_var or "PROVIDER_API_KEY"
+        console.print(
+            "    [dim]Enter the env var name that holds the key (not the key itself).[/dim]"
+        )
+        api_key_env = (
+            Prompt.ask("    API key env var", default=default_env, console=console).strip() or None
+        )
+    azure_api_version: str | None = None
+    if name == "azure":
+        azure_api_version = (
+            Prompt.ask(
+                "    Azure API version", default="2024-02-15-preview", console=console
+            ).strip()
+            or "2024-02-15-preview"
+        )
+    model = Prompt.ask(
+        "    Model name", default=default_model if name == "ollama" else "", console=console
+    ).strip()
+    while not model:
+        model = Prompt.ask("    Model name (required)", console=console).strip()
+    return {
+        "name": name,
+        "url": url,
+        "api_key_env": api_key_env,
+        "azure_api_version": azure_api_version,
+        "model": model,
+        "timeout": int(prov.default_timeout),
+    }
+
+
+def _setup_multi_provider(console) -> None:
+    """Configure a different provider per role and write the new format to a vault.
+
+    Writes only env-var references (api_key_env) — never raw keys — and targets an
+    existing vault's synto.toml (preserving [pipeline] etc.), matching the documented
+    secure path. Requires the vault to exist; run `synto init` first if it doesn't.
+    """
+    from .config import apply_providers_to_existing_toml, multi_provider_vault_toml
+    from .vault import atomic_write
+
+    console.print(
+        "\n  [bold]Per-role providers[/bold]  "
+        "[dim](fast = analysis & routing, heavy = article writing)[/dim]\n"
+    )
+    fast = _collect_role_provider(console, "Fast", default_model="gemma4:e4b")
+    console.print()
+    heavy = _collect_role_provider(console, "Heavy", default_model="qwen2.5:14b")
+
+    # De-duplicate connections; the first becomes "default" so embed/string roles resolve.
+    # dedup returns ready-made ProviderBlock models, so they feed both the global config and the
+    # vault writer unchanged — no second hand-built representation to drift out of sync.
+    from .config import ModelProfile, dedup_role_connections
+
+    providers, role_alias = dedup_role_connections({"fast": fast, "heavy": heavy})
+
+    models = {
+        "fast": ModelProfile(
+            provider=role_alias["fast"],
+            model=fast["model"],
+            ctx=16384 if fast["name"] == "ollama" else 8192,
+        ),
+        "heavy": ModelProfile(provider=role_alias["heavy"], model=heavy["model"], ctx=32768),
+    }
+
+    # Persist to the global config so `synto init` reproduces this multi-provider setup
+    # for any new vault. Provider blocks store api_key_env references only — never raw keys.
+    from .global_config import GlobalConfig, load_global_config, save_global_config
+
+    existing = load_global_config()
+    gcfg = GlobalConfig(
+        vault=existing.vault if existing else None,
+        experimental_inline_source_citations=(
+            existing.experimental_inline_source_citations if existing else None
+        ),
+        providers=providers,
+        models=models,
+        # Preserve the user-private per-alias key fallback; rebuilding from scratch would delete it.
+        # The legacy flat single-provider fields are intentionally dropped (is_multi_provider wins).
+        provider_keys=existing.provider_keys if existing else None,
+    )
+    # Default vault (stored in the global config, used by `synto` without --vault) + citation
+    # preference, mirroring the single-provider wizard. The default vault doubles as the
+    # apply-now target: if it already exists, write the split into it immediately.
+    console.print()
+    vault_input = Prompt.ask(
+        "  Default vault path (Enter to skip)",
+        default=(existing.vault if existing and existing.vault else ""),
+        console=console,
+    ).strip()
+    citations = (
+        Prompt.ask(
+            "  Enable inline source citations for new vaults?",
+            choices=["y", "n"],
+            default="y" if (existing and existing.experimental_inline_source_citations) else "n",
+            show_choices=False,
+            console=console,
+        )
+        .strip()
+        .lower()
+        == "y"
+    )
+    gcfg.vault = vault_input or (existing.vault if existing else None)
+    gcfg.experimental_inline_source_citations = citations
+    save_global_config(gcfg)
+
+    applied_to: Path | None = None
+    if vault_input:
+        vault = Path(vault_input).expanduser().resolve()
+        toml_path = vault / CONFIG_FILE_NAME
+        legacy_path = vault / LEGACY_CONFIG_FILE_NAME
+        if toml_path.exists():
+            atomic_write(
+                toml_path,
+                apply_providers_to_existing_toml(
+                    toml_path.read_text(encoding="utf-8"), providers, models
+                ),
+            )
+            applied_to = toml_path
+        elif legacy_path.exists():
+            # Write the new format into synto.toml (Config.from_vault prefers it and hard-fails
+            # on a legacy-only vault); migrate the legacy file's non-provider sections forward.
+            atomic_write(
+                toml_path,
+                apply_providers_to_existing_toml(
+                    legacy_path.read_text(encoding="utf-8"), providers, models
+                ),
+            )
+            applied_to = toml_path
+        elif vault.exists():
+            atomic_write(
+                toml_path,
+                multi_provider_vault_toml(providers, models, inline_source_citations=citations),
+            )
+            applied_to = toml_path
+        else:
+            console.print(
+                f"  [yellow]{vault} not found[/yellow] — saved to global config only; "
+                f"run [bold]synto init {vault}[/bold] to create it."
+            )
+
+    lines = ["[green]✓[/green]  Per-role providers saved to global config\n"]
+    for alias, b in providers.items():
+        key_note = f"  key: ${b.api_key_env}" if b.api_key_env else "  (no key)"
+        lines.append(f"  [bold]{alias}[/bold]: {b.name} @ {b.url}{key_note}")
+    lines.append(f"  fast  → {role_alias['fast']} / {fast['model']}")
+    lines.append(f"  heavy → {role_alias['heavy']} / {heavy['model']}")
+    lines.append("")
+    if applied_to is not None:
+        lines.append(f"  Applied to: {applied_to}")
+    lines.append("  Next: [bold]synto init <vault>[/bold] reproduces this split for new vaults.")
+    if any(b.api_key_env for b in providers.values()):
+        lines.append("  [dim]Set the API-key env var(s) above before running synto.[/dim]")
+    console.print()
+    console.print(Panel("\n".join(lines), border_style="green", expand=False, padding=(0, 2)))
+
+
 @cli.command()
 @click.option("--non-interactive", is_flag=True, help="Print current config and exit")
 @click.option("--reset", is_flag=True, help="Clear saved config and re-run wizard")
@@ -805,12 +1031,24 @@ def setup(non_interactive: bool, reset: bool, provider_preset: str | None):
         table = Table(title="Global config", show_header=False, box=None, padding=(0, 2))
         table.add_column("Key", style="bold")
         table.add_column("Value")
-        prov_display = gcfg.provider_name or (gcfg.ollama_url and "ollama") or "[dim]not set[/dim]"
-        table.add_row("Provider", prov_display)
-        table.add_row("URL", gcfg.provider_url or gcfg.ollama_url or "[dim]not set[/dim]")
-        table.add_row("API key", "***" if gcfg.api_key else "[dim]not set[/dim]")
-        table.add_row("Fast model", gcfg.fast_model or "[dim]not set[/dim]")
-        table.add_row("Heavy model", gcfg.heavy_model or "[dim]not set[/dim]")
+        if gcfg.is_multi_provider:
+            for alias, block in gcfg.providers.items():
+                key_note = f"  key: ${block.api_key_env}" if block.api_key_env else ""
+                table.add_row(
+                    f"Provider [{alias}]",
+                    f"{block.name} @ {block.url or '(default url)'}{key_note}",
+                )
+            for role, prof in (gcfg.models or {}).items():
+                table.add_row(f"Model [{role}]", f"{prof.provider} / {prof.model}")
+        else:
+            prov_display = (
+                gcfg.provider_name or (gcfg.ollama_url and "ollama") or "[dim]not set[/dim]"
+            )
+            table.add_row("Provider", prov_display)
+            table.add_row("URL", gcfg.provider_url or gcfg.ollama_url or "[dim]not set[/dim]")
+            table.add_row("API key", "***" if gcfg.api_key else "[dim]not set[/dim]")
+            table.add_row("Fast model", gcfg.fast_model or "[dim]not set[/dim]")
+            table.add_row("Heavy model", gcfg.heavy_model or "[dim]not set[/dim]")
         table.add_row("Default vault", gcfg.vault or "[dim]not set[/dim]")
         table.add_row(
             "Inline source citations for new vaults",
@@ -862,6 +1100,23 @@ def setup(non_interactive: bool, reset: bool, provider_preset: str | None):
         console.print()
 
         all_providers = list_all_providers()
+
+        # ── Multi-provider branch: a different provider per model role (#24) ──
+        if not provider_preset:
+            same_provider = (
+                Prompt.ask(
+                    "  Use the same provider for all models?",
+                    choices=["y", "n"],
+                    default="y",
+                    show_choices=False,
+                    console=console,
+                )
+                .strip()
+                .lower()
+            )
+            if same_provider == "n":
+                _setup_multi_provider(console)
+                return
 
         # ── Step 1 — Provider selection ───────────────────────────────────────
         if provider_preset:
@@ -1234,7 +1489,7 @@ def ingest(
 
     overrides = _model_override_kwargs(fast_model, heavy_model, provider_name, provider_url)
     config = _load_config(vault_str, **overrides)
-    client, db = _load_deps(config)
+    router, db = _load_deps(config)
 
     all_raw = bool(ingest_all)
     if all_raw:
@@ -1276,7 +1531,7 @@ def ingest(
 
             results = _ingest_all(
                 config=config,
-                client=client,
+                router=router,
                 db=db,
                 force=force,
                 on_progress=_update_ingest_progress,
@@ -1312,7 +1567,7 @@ def ingest(
                 result = _ingest_note(
                     path=path,
                     config=config,
-                    client=client,
+                    router=router,
                     db=db,
                     force=force,
                 )
@@ -1399,7 +1654,7 @@ def compile(
 
     overrides = _model_override_kwargs(fast_model, heavy_model, provider_name, provider_url)
     config = _load_config(vault_str, **overrides)
-    client, db = _load_deps(config)
+    router, db = _load_deps(config)
 
     explicit_concepts: list[str] | None = None
     if concepts:
@@ -1442,7 +1697,7 @@ def compile(
                     console.print(f"  [red]Not found, skipping:[/red] {rec.path}")
                     continue
                 db.mark_raw_status(rec.path, "new")
-                result = _ingest_note(path=p, config=config, client=client, db=db, force=True)
+                result = _ingest_note(path=p, config=config, router=router, db=db, force=True)
                 if result is not None:
                     retried += 1
             console.print(f"[green]Re-ingested {retried}/{len(failed_recs)} note(s).[/green]")
@@ -1474,7 +1729,7 @@ def compile(
             task = progress.add_task("Planning compilation (legacy)...", total=None)
             draft_paths, failed = compile_notes(
                 config=config,
-                client=client,
+                router=router,
                 db=db,
                 dry_run=dry_run,
             )
@@ -1491,7 +1746,7 @@ def compile(
 
             draft_paths, failed, _ = compile_concepts(
                 config=config,
-                client=client,
+                router=router,
                 db=db,
                 force=force,
                 dry_run=dry_run,
@@ -2077,12 +2332,12 @@ def _render_mcp_backlog(db, since: str) -> None:
 )
 def doctor(vault_str, backlog, since):
     """Check LLM provider connection, model availability, and vault health."""
-    from .client_factory import LLMError, build_client
+    from .client_factory import LLMError, build_router
+    from .config import HEALTHCHECK_ROLES, ROLES
 
     config = _load_config(vault_str)
     db = _load_db(config)
     ok = True
-    prov = config.effective_provider
 
     console.print("[bold]synto doctor[/bold]\n")
 
@@ -2125,34 +2380,72 @@ def doctor(vault_str, backlog, since):
         else:
             console.print(f"  [yellow]![/yellow] {name} missing (run [bold]synto init[/bold])")
 
-    # ── Provider connection ───────────────────────────────────────────────────
-    console.print(f"\n[bold]{prov.name}[/bold]")
-    client = build_client(config)
+    # ── Providers & models (per role) ─────────────────────────────────────────
+    # Each role can target a different provider/account. Healthcheck and list models
+    # once per unique connection; check each role's model against its own connection.
+    router = build_router(config)
+    think_label = {True: "think=on", False: "think=off", None: "think=default"}
+    # connection_key -> (healthy: bool, models: list[str])
+    conn_state: dict[tuple, tuple[bool, list[str]]] = {}
+    console.print("\n[bold]Providers & models[/bold]")
     try:
-        client.require_healthy()
-        console.print(f"  [green]✓[/green] Reachable at {prov.url}")
-    except LLMError as e:
-        console.print(f"  [red]✗[/red] {e}")
-        ok = False
-
-    # ── Model availability ────────────────────────────────────────────────────
-    console.print("\n[bold]Models[/bold]")
-    try:
-        available_models = client.list_models()
-    except Exception:
-        available_models = []
-
-    for label, model_name in [("fast", config.models.fast), ("heavy", config.models.heavy)]:
-        if any(model_name in a for a in available_models):
-            console.print(f"  [green]✓[/green] {label}: {model_name}")
-        else:
-            pull_hint = (
-                f"run: [bold]ollama pull {model_name}[/bold]"
-                if prov.name == "ollama"
-                else "check provider model list"
-            )
-            console.print(f"  [yellow]![/yellow] {label}: {model_name} not found — {pull_hint}")
-            ok = False
+        for role in ROLES:
+            resolved = config.resolve_role(role)
+            key = resolved.connection_key
+            if key not in conn_state:
+                ep = router.endpoint(role)
+                healthy = False
+                models: list[str] = []
+                try:
+                    ep.client.require_healthy()
+                    healthy = True
+                except LLMError:
+                    healthy = False
+                if healthy:
+                    try:
+                        models = ep.client.list_models()
+                    except Exception:
+                        models = []
+                conn_state[key] = (healthy, models)
+            healthy, models = conn_state[key]
+            conn = f"{resolved.provider_kind} @ {resolved.url}"
+            think_str = "" if role == "embed" else f"  [dim]{think_label[resolved.think]}[/dim]"
+            # embed is optional (only used if embeddings/RAG are enabled), so its problems are
+            # advisory — they must not flip the health summary, matching require_healthy's contract.
+            required = role in HEALTHCHECK_ROLES
+            if not healthy:
+                if required:
+                    console.print(f"  [red]✗[/red] {role}: {resolved.model} — {conn} unreachable")
+                    ok = False
+                else:
+                    console.print(
+                        f"  [yellow]•[/yellow] {role}: {resolved.model} — {conn} unreachable "
+                        f"[dim](optional — only used if embeddings/RAG are enabled)[/dim]"
+                    )
+                continue
+            if any(resolved.model in m for m in models):
+                console.print(
+                    f"  [green]✓[/green] {role}: {resolved.model}  [dim]{conn}[/dim]{think_str}"
+                )
+            elif required:
+                pull_hint = (
+                    f"run: [bold]ollama pull {resolved.model}[/bold]"
+                    if resolved.provider_kind == "ollama"
+                    else "check provider model list"
+                )
+                console.print(
+                    f"  [yellow]![/yellow] {role}: {resolved.model} not found "
+                    f"[dim]({conn})[/dim] — {pull_hint}"
+                )
+                ok = False
+            else:
+                # Advisory: don't tell the user to pull a model for a feature that isn't wired up.
+                console.print(
+                    f"  [yellow]•[/yellow] {role}: {resolved.model} not available "
+                    f"[dim]({conn}) (optional — only used if embeddings/RAG are enabled)[/dim]"
+                )
+    finally:
+        router.close()
 
     # ── Vault stats ───────────────────────────────────────────────────────────
     console.print("\n[bold]Vault stats[/bold]")
@@ -2284,7 +2577,7 @@ def query(vault_str, question, save, synthesize):
     from .pipeline.query import SynthesisSaveError, find_existing_synthesis, run_query
 
     config = _load_config(vault_str)
-    client, db = _load_deps(config)
+    router, db = _load_deps(config)
     duplicate_strategy = "keep_existing"
     if (
         synthesize
@@ -2312,7 +2605,7 @@ def query(vault_str, question, save, synthesize):
         try:
             result = run_query(
                 config,
-                client,
+                router,
                 db,
                 question,
                 save=save,
@@ -2353,8 +2646,8 @@ def watch(vault_str, auto_approve):
     from .watcher import watch as _watch
 
     config = _load_config(vault_str)
-    client, db = _load_deps(config)
-    orchestrator = PipelineOrchestrator(config, client, db)
+    router, db = _load_deps(config)
+    orchestrator = PipelineOrchestrator(config, router, db)
 
     debounce = config.pipeline.watch_debounce
     console.print(f"[bold]Watching[/bold] {config.raw_dir}  (debounce={debounce:.0f}s)")
@@ -2397,7 +2690,7 @@ def watch(vault_str, auto_approve):
         if report.stubs_created:
             console.print(f"  [dim]Created {report.stubs_created} stub(s) for broken links[/dim]")
 
-    _watch(config=config, client=client, db=db, on_event=_on_event)
+    _watch(config=config, router=router, db=db, on_event=_on_event)
 
 
 # ── serve ─────────────────────────────────────────────────────────────────────
@@ -2459,7 +2752,7 @@ def run(
 
     overrides = _model_override_kwargs(fast_model, heavy_model, provider_name, provider_url)
     config = _load_config(vault_str, **overrides)
-    client, db = _load_deps(config)
+    router, db = _load_deps(config)
 
     if dry_run:
         console.print("[dim]Dry run — no changes will be made.[/dim]\n")
@@ -2468,7 +2761,7 @@ def run(
         if not acquired:
             err_console.print("Pipeline already running — lock held. Check `synto status`.")
             sys.exit(1)
-        orchestrator = PipelineOrchestrator(config, client, db)
+        orchestrator = PipelineOrchestrator(config, router, db)
         report = orchestrator.run(
             auto_approve=auto_approve,
             fix=fix,
@@ -3045,6 +3338,25 @@ def _is_cloud_provider(provider_name: str | None) -> bool:
     return info is not None and not info.is_local
 
 
+def _compare_config_summary(config) -> tuple:
+    """Identity used to reject an identical challenger: each role's model + connection identity.
+
+    Uses ResolvedModel.connection_key (provider kind/url/key/headers/timeout/azure) rather than just
+    kind+url, so a challenger differing only by account (api_key) or custom headers is still a real
+    difference — consistent with how the router de-duplicates connections. Do NOT simplify back to
+    kind/url: that silently treats different accounts/headers as identical. The tuple is only
+    `==`-compared in-memory (never printed), so folding the resolved key in is safe.
+    """
+    fast = config.resolve_role("fast")
+    heavy = config.resolve_role("heavy")
+    return (
+        config.model_name("fast"),
+        config.model_name("heavy"),
+        fast.connection_key,
+        heavy.connection_key,
+    )
+
+
 def _validate_compare_out_dir(out: Path, config) -> Path:
     out = out.expanduser().resolve()
     raw_dir = config.raw_dir.resolve()
@@ -3149,25 +3461,19 @@ def compare(
         sys.exit(1)
     challenger_config = _load_config(vault_str, **challenger_kwargs)
 
-    current_summary = (
-        config.models.fast,
-        config.models.heavy,
-        config.effective_provider.name,
-        config.effective_provider.url,
-    )
-    challenger_summary = (
-        challenger_config.models.fast,
-        challenger_config.models.heavy,
-        challenger_config.effective_provider.name,
-        challenger_config.effective_provider.url,
-    )
+    current_summary = _compare_config_summary(config)
+    challenger_summary = _compare_config_summary(challenger_config)
     if challenger_summary == current_summary:
         err_console.print("Challenger config is identical to current config.")
         sys.exit(1)
 
     _validate_compare_inputs(config, queries_path)
 
-    if _is_cloud_provider(challenger_config.effective_provider.name) and not allow_cloud_upload:
+    challenger_kinds = {
+        challenger_config.resolve_role("fast").provider_kind,
+        challenger_config.resolve_role("heavy").provider_kind,
+    }
+    if any(_is_cloud_provider(k) for k in challenger_kinds) and not allow_cloud_upload:
         err_console.print(
             "Cloud challenger requires --allow-cloud-upload "
             "(your raw notes will be sent to the provider)."
@@ -3185,11 +3491,11 @@ def compare(
     console.print(
         f"[bold]synto compare[/bold] — active vault preview\n"
         f"  vault={config.vault}\n"
-        f"  current: fast={config.models.fast} heavy={config.models.heavy} "
-        f"provider={config.effective_provider.name}\n"
-        f"  challenger: fast={challenger_config.models.fast} "
-        f"heavy={challenger_config.models.heavy} "
-        f"provider={challenger_config.effective_provider.name}\n"
+        f"  current: fast={config.model_name('fast')} heavy={config.model_name('heavy')} "
+        f"provider={config.resolve_role('heavy').provider_kind}\n"
+        f"  challenger: fast={challenger_config.model_name('fast')} "
+        f"heavy={challenger_config.model_name('heavy')} "
+        f"provider={challenger_config.resolve_role('heavy').provider_kind}\n"
         f"  queries={'enabled' if queries_path else 'disabled'}\n"
         f"  scope={sample_label}\n"
         f"  Active vault will not be modified."
@@ -3208,7 +3514,6 @@ def compare(
         render_json,
         render_markdown,
         render_summary_json,
-        render_switch_config_toml,
         resolve,
     )
 
@@ -3231,15 +3536,7 @@ def compare(
         console.print(f"  · {reason}")
     if report.verdict == AdvisorVerdict.SWITCH:
         console.print(f"\n[bold]Next step:[/bold] edit {CONFIG_FILE_NAME} and set:")
-        console.print(
-            render_switch_config_toml(
-                fast_model=challenger_config.models.fast,
-                heavy_model=challenger_config.models.heavy,
-                provider_name=challenger_config.effective_provider.name,
-                provider_url=challenger_config.effective_provider.url,
-            ),
-            markup=False,
-        )
+        console.print(report.switch_config_toml, markup=False)
 
 
 # ── Trace commands ────────────────────────────────────────────────────────────
