@@ -38,6 +38,7 @@ from .paths import (
     VAULT_ENV_VAR,
     config_path,
     is_legacy_vault,
+    is_within,
     legacy_config_path,
     migration_message,
 )
@@ -2690,7 +2691,7 @@ def watch(vault_str, auto_approve):
         if report.stubs_created:
             console.print(f"  [dim]Created {report.stubs_created} stub(s) for broken links[/dim]")
 
-    _watch(config=config, router=router, db=db, on_event=_on_event)
+    _watch(config=config, on_event=_on_event)
 
 
 # ── serve ─────────────────────────────────────────────────────────────────────
@@ -2708,8 +2709,11 @@ def watch(vault_str, auto_approve):
 def serve(vault_str, transport):
     """Run the read-only MCP server.
 
-    Exposes three tools only: `list_articles`, `read_article`, `find_concept`.
-    Visibility filtering is controlled by `[mcp]` settings in `synto.toml`.
+    Exposes read-only vault tools — articles (`list_articles`, `read_article`,
+    `search_articles`), concepts (`find_concept`, `get_concept`), sources
+    (`list_sources`, `trace_lineage`), the verbatim source-segment tools, and
+    `answer_question` (the one tool that calls the configured model). Tool
+    visibility and source access are controlled by `[mcp]` settings in `synto.toml`.
     Requires the optional MCP dependency: `pip install synto[mcp]`.
     """
     from .serve import run_server
@@ -3364,16 +3368,9 @@ def _validate_compare_out_dir(out: Path, config) -> Path:
     app_dir = config.app_dir.resolve()
     compare_root = (config.app_dir / "compare").resolve()
 
-    def _is_within(path: Path, root: Path) -> bool:
-        try:
-            path.relative_to(root)
-            return True
-        except ValueError:
-            return False
-
-    if _is_within(out, raw_dir) or _is_within(out, wiki_dir):
+    if is_within(out, raw_dir) or is_within(out, wiki_dir):
         raise click.BadParameter("--out must not be inside raw/ or wiki/")
-    if _is_within(out, app_dir) and not _is_within(out, compare_root):
+    if is_within(out, app_dir) and not is_within(out, compare_root):
         raise click.BadParameter("--out under .synto/ is only allowed inside .synto/compare/")
     return out
 

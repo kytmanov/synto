@@ -125,7 +125,7 @@ def _extract_json(text: str) -> str | None:
     return None
 
 
-def _unwrap(data: dict, model_class: type[T]) -> dict:
+def _unwrap(data: dict) -> dict:
     """
     Unwrap containers that models sometimes produce instead of flat objects.
 
@@ -249,7 +249,7 @@ def _try_parse(raw: str, model_class: type[T]) -> tuple[T | None, str]:
         last_err = str(e)
     # Try unwrapping single-key container ({"ClassName": {...}})
     try:
-        return model_class.model_validate(_unwrap(data, model_class)), ""
+        return model_class.model_validate(_unwrap(data)), ""
     except ValidationError as e:
         last_err = str(e)
     except Exception:

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import logging
 import sys
@@ -957,7 +956,3 @@ def run_server(vault: Path, transport: str = "stdio") -> None:
         server.run(transport="stdio")
     finally:
         db.close()
-
-
-async def run_server_async(vault: Path, transport: str = "stdio") -> None:
-    await asyncio.to_thread(run_server, vault, transport)
