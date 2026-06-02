@@ -511,7 +511,7 @@ def test_list_models():
 
 
 def test_list_models_detailed():
-    client = _make_client(provider_name="groq")
+    client = _make_client(base_url="https://api.groq.com/openai/v1", provider_name="groq")
     mock_resp = MagicMock()
     mock_resp.status_code = 200
     mock_resp.raise_for_status.return_value = None
@@ -519,6 +519,19 @@ def test_list_models_detailed():
     with patch.object(client._client, "get", return_value=mock_resp):
         detailed = client.list_models_detailed()
     assert detailed == [{"name": "llama3", "size_gb": "(cloud)"}]
+
+
+def test_list_models_detailed_local_provider_not_labelled_cloud():
+    """A local OpenAI-compat server (LM Studio/vLLM) must show "(local)", not "(cloud)" —
+    /v1/models has no size, so the wizard table's provenance hint must at least be truthful."""
+    client = _make_client(base_url="http://localhost:1234/v1", provider_name="lm_studio")
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.raise_for_status.return_value = None
+    mock_resp.json.return_value = {"data": [{"id": "google/gemma-4-e4b"}]}
+    with patch.object(client._client, "get", return_value=mock_resp):
+        detailed = client.list_models_detailed()
+    assert detailed == [{"name": "google/gemma-4-e4b", "size_gb": "(local)"}]
 
 
 def test_embed_batch_no_embeddings_support():

@@ -393,9 +393,15 @@ class OpenAICompatClient:
             return []
 
     def list_models_detailed(self) -> list[dict]:
-        """Return list of {'name': str, 'size_gb': str} — matches OllamaClient shape."""
+        """Return list of {'name': str, 'size_gb': str} — matches OllamaClient shape.
+
+        OpenAI-compatible /v1/models reports no size, so the column is a provenance hint
+        instead of a real size. A local server (LM Studio/vLLM/…) must not be labelled
+        "(cloud)" — it's misleading in the setup wizard's model table.
+        """
         models = self.list_models()
-        return [{"name": m, "size_gb": "(cloud)"} for m in models]
+        label = "(local)" if self._is_local() else "(cloud)"
+        return [{"name": m, "size_gb": label} for m in models]
 
     # ── Generation ────────────────────────────────────────────────────────────
 
