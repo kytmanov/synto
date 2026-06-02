@@ -571,10 +571,14 @@ def init(vault_path: str, existing: bool, non_interactive: bool, set_default: bo
     console.print("Next steps:")
     console.print("  1. Drop .md notes into [bold]raw/[/bold]")
     if set_default:
+        console.print(f"     (or import PDFs/text: [bold]{CLI_NAME} add <file>[/bold])")
         console.print(f"  2. Run [bold]{CLI_NAME} run[/bold]")
         console.print(f"  3. Review drafts: [bold]{CLI_NAME} review[/bold]")
         console.print(f"  4. Publish all drafts: [bold]{CLI_NAME} approve --all[/bold]")
     else:
+        console.print(
+            f"     (or import PDFs/text: [bold]{CLI_NAME} add <file> --vault {vault}[/bold])"
+        )
         console.print(f"  2. Run [bold]{CLI_NAME} run --vault {vault}[/bold]")
         console.print(f"  3. Review drafts: [bold]{CLI_NAME} review --vault {vault}[/bold]")
         console.print(
