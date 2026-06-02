@@ -30,7 +30,13 @@
   global config it warns (pointing at `synto setup`) on a fresh vault and leaves an existing
   `synto.toml` untouched, instead of writing Ollama's URL into a non-Ollama provider block.
   Also fixes a config-write regex that, when re-syncing a new-format vault, could delete the
-  `[models.*]`/`[pipeline]` sections.
+  `[models.*]`/`[pipeline]` sections. `synto init` now leaves any existing multi-provider
+  (per-role split) vault untouched, instead of collapsing its split when the global default
+  provider name happens to match but a role's provider differs.
+- Re-running `synto setup` no longer carries a saved per-alias API key over to a different
+  provider. When an alias is repointed to another connection (e.g. the default switches from
+  Groq to OpenRouter) the stale key is dropped, so it is never sent to the new provider;
+  keys for unchanged aliases are preserved.
 - `synto compile` no longer crashes (and `synto ingest` no longer fails notes with
   a blank reason) when an OpenAI-compatible provider returns an error as an
   HTTP-2xx body with no usable `choices` (#25). This is common on OpenRouter's free

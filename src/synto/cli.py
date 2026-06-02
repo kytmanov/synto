@@ -486,6 +486,15 @@ def init(vault_path: str, existing: bool, non_interactive: bool, set_default: bo
             f"(global default: '{global_provider}') — leaving its provider and models unchanged. "
             f"Edit {CONFIG_FILE_NAME} or run [bold]{CLI_NAME} setup[/bold] to change.[/dim]"
         )
+    elif toml_path.exists() and _vault_is_multi_provider(toml_path):
+        # The vault already splits roles across multiple providers (a deliberate per-role setup).
+        # Re-syncing from global config would fully replace [providers.*]/[models.*] and could
+        # collapse that split (e.g. the global default name matches but its heavy provider differs).
+        # init only scaffolds/syncs the simple case; advanced vaults change via `synto setup`.
+        console.print(
+            f"[dim]{CONFIG_FILE_NAME} uses multiple providers (a per-role setup) — leaving its "
+            f"providers and models unchanged. Run [bold]{CLI_NAME} setup[/bold] to change.[/dim]"
+        )
     elif gcfg and gcfg.is_multi_provider:
         # Reproduce the per-role multi-provider setup saved by `synto setup`. gcfg.providers and
         # gcfg.models are already Pydantic models, so we dump them directly — no field enumeration,
@@ -668,6 +677,23 @@ def _vault_provider_name(toml_path: Path) -> str | None:
     if "ollama" in data or "models" in data:
         return "ollama"
     return None
+
+
+def _vault_is_multi_provider(toml_path: Path) -> bool:
+    """True when the vault defines more than one [providers.*] connection (a per-role split).
+
+    Best-effort: returns False on a parse failure or a single-provider/legacy vault. A
+    single-provider new-format vault emits exactly one [providers.default] block, and legacy
+    [ollama]/[provider] vaults have no [providers] table — so >1 block reliably signals that
+    the user deliberately split roles across providers.
+    """
+    try:
+        with open(toml_path, "rb") as f:
+            data = tomllib.load(f)
+    except Exception:
+        return False
+    providers = data.get("providers")
+    return isinstance(providers, dict) and len(providers) > 1
 
 
 def _global_default_provider_name(gcfg) -> str | None:
@@ -1142,6 +1168,22 @@ def _finalize_per_role_providers(
     # primary provider lives here under its alias (user-private), never in the vault.
     existing = load_global_config()
     provider_keys = dict(existing.provider_keys) if existing and existing.provider_keys else {}
+    # Drop a preserved key only when its alias is reused for a *different* connection. Aliases are
+    # regenerated each run (the first connection is always "default"), so a key saved for the old
+    # default provider would otherwise be sent to the new one (resolve_api_key prefers
+    # provider_keys[alias]). Compare the connection target (name + url), not just kind, to also
+    # catch a same-kind alias repointed at a different endpoint/account. Keys whose alias is absent
+    # from the new providers are left untouched: no role resolves them, so they can't be mis-sent,
+    # and silently deleting a user-stored secret would be the wrong call.
+    old_conn = (
+        {a: (b.name, b.url) for a, b in existing.providers.items()}
+        if existing and existing.providers
+        else {}
+    )
+    for alias in list(provider_keys):
+        new_block = providers.get(alias)
+        if new_block is not None and (new_block.name, new_block.url) != old_conn.get(alias):
+            del provider_keys[alias]
     if fast_api_key:
         provider_keys[role_alias["fast"]] = fast_api_key
     gcfg = GlobalConfig(
@@ -1149,8 +1191,9 @@ def _finalize_per_role_providers(
         experimental_inline_source_citations=citations,
         providers=providers,
         models=models,
-        # Preserve the user-private per-alias key fallback; rebuilding from scratch would delete it.
-        # The legacy flat single-provider fields are intentionally dropped (is_multi_provider wins).
+        # Carry the user-private per-alias key fallback forward (pruned above of any key whose
+        # alias was repointed). The legacy flat single-provider fields are intentionally dropped
+        # (is_multi_provider wins).
         provider_keys=provider_keys or None,
     )
     save_global_config(gcfg)
