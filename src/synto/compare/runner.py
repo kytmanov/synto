@@ -11,7 +11,7 @@ from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ..config import Config, _toml_quote, role_providers_head
+from ..config import Config, role_providers_head, to_toml
 from ..metrics import metrics_sink
 from ..paths import APP_DIR_NAME, CONFIG_FILE_NAME
 from ..vault import extract_wikilinks, parse_note
@@ -224,21 +224,12 @@ def _write_effective_compare_toml(vault: Path, config: Config) -> None:
     # per-role params (think/temperature/options) — see config.role_providers_head.
     head = role_providers_head(config)
 
-    # Known pre-existing gap (out of scope): this [pipeline] tail emits a subset of pipeline
-    # fields; article_max_tokens / concept_draft_soft_cap / graph_quality_checks / citation
-    # settings are intentionally omitted here (unchanged from before).
-    tail = [
-        "[pipeline]",
-        "auto_approve = true",
-        "auto_commit = false",
-        f"auto_maintain = {str(config.pipeline.auto_maintain).lower()}",
-        f"watch_debounce = {config.pipeline.watch_debounce}",
-        f"max_concepts_per_source = {config.pipeline.max_concepts_per_source}",
-        f"ingest_parallel = {str(config.pipeline.ingest_parallel).lower()}",
-    ]
-    if config.pipeline.language:
-        tail.append(f"language = {_toml_quote(config.pipeline.language)}")
-    (vault / CONFIG_FILE_NAME).write_text(head + "\n" + "\n".join(tail) + "\n")
+    # Reproduce the active [pipeline] in full (closing the old subset gap) with the compare-run
+    # policy forced on: auto_approve so contestants publish unattended, auto_commit off so the
+    # ephemeral vault makes no commits. model_copy marks those two as set so they always emit;
+    # every other pipeline field the active vault set carries through, unset ones default on reload.
+    pipeline = config.pipeline.model_copy(update={"auto_approve": True, "auto_commit": False})
+    (vault / CONFIG_FILE_NAME).write_text(head + "\n" + to_toml({"pipeline": pipeline}))
 
 
 def _capture_diagnostics(vault: Path, db, config: Config, events) -> dict:

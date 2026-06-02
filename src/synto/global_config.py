@@ -8,7 +8,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .config import ModelProfile, ProviderBlock
+from .config import ModelProfile, ProviderBlock, to_toml
 from .paths import APP_NAME
 
 
@@ -61,65 +61,13 @@ def load_global_config() -> GlobalConfig | None:
 
 
 def save_global_config(cfg: GlobalConfig) -> None:
-    """Write global config to disk. Creates parent directory if needed."""
+    """Write global config to disk. Creates parent directory if needed.
+
+    Serialized through the single `to_toml` seam (model_dump → TOML), so this is the exact inverse
+    of the `GlobalConfig(**tomllib.load(...))` read path: every field — including provider
+    headers/options and model think/temperature/options — round-trips, and a new field needs no
+    change here. Only set fields are written (exclude_unset), so a partial config stays minimal.
+    """
     path = _global_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    lines: list[str] = []
-    if cfg.vault is not None:
-        lines.append(f"vault = {_toml_str(cfg.vault)}")
-    if cfg.ollama_url is not None:
-        lines.append(f"ollama_url = {_toml_str(cfg.ollama_url)}")
-    if cfg.fast_model is not None:
-        lines.append(f"fast_model = {_toml_str(cfg.fast_model)}")
-    if cfg.heavy_model is not None:
-        lines.append(f"heavy_model = {_toml_str(cfg.heavy_model)}")
-    if cfg.provider_name is not None:
-        lines.append(f"provider_name = {_toml_str(cfg.provider_name)}")
-    if cfg.provider_url is not None:
-        lines.append(f"provider_url = {_toml_str(cfg.provider_url)}")
-    if cfg.api_key is not None:
-        lines.append(f"api_key = {_toml_str(cfg.api_key)}")
-    if cfg.azure_api_version is not None:
-        lines.append(f"azure_api_version = {_toml_str(cfg.azure_api_version)}")
-    if cfg.experimental_inline_source_citations is not None:
-        value = "true" if cfg.experimental_inline_source_citations else "false"
-        lines.append(f"experimental_inline_source_citations = {value}")
-    # Multi-provider tables must come AFTER all flat top-level keys (TOML requirement).
-    for alias, block in cfg.providers.items():
-        lines.append("")
-        lines.append(f"[providers.{alias}]")
-        lines.append(f"name = {_toml_str(block.name)}")
-        if block.url:
-            lines.append(f"url = {_toml_str(block.url)}")
-        if block.timeout is not None:
-            lines.append(f"timeout = {int(block.timeout)}")
-        if block.api_key_env:
-            lines.append(f"api_key_env = {_toml_str(block.api_key_env)}")
-        if block.name == "azure" and block.azure_api_version:
-            lines.append(f"azure_api_version = {_toml_str(block.azure_api_version)}")
-    for role, prof in (cfg.models or {}).items():
-        lines.append("")
-        lines.append(f"[models.{role}]")
-        if prof.provider:
-            lines.append(f"provider = {_toml_str(prof.provider)}")
-        lines.append(f"model = {_toml_str(prof.model)}")
-        if prof.ctx is not None:
-            lines.append(f"ctx = {int(prof.ctx)}")
-    if cfg.provider_keys:
-        lines.append("")
-        lines.append("[provider_keys]")
-        for key_alias, key_value in cfg.provider_keys.items():
-            lines.append(f"{_toml_str(key_alias)} = {_toml_str(key_value)}")
-    path.write_text("\n".join(lines) + "\n" if lines else "", encoding="utf-8")
-
-
-def _toml_str(value: str) -> str:
-    """Minimal safe TOML string quoting — escapes backslashes, double quotes, and control chars."""
-    escaped = (
-        value.replace("\\", "\\\\")
-        .replace('"', '\\"')
-        .replace("\n", "\\n")
-        .replace("\r", "\\r")
-        .replace("\t", "\\t")
-    )
-    return f'"{escaped}"'
+    path.write_text(to_toml(cfg), encoding="utf-8")

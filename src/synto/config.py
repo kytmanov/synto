@@ -27,32 +27,41 @@ def _toml_quote(value: str) -> str:
     return f'"{escaped}"'
 
 
-def _toml_value(value: Any) -> str:
-    """Serialize a TOML value for options/headers passthrough.
+# Single source of truth for the LLM roles. Iterate this instead of re-listing the literals so a
+# new role can't be silently dropped by a writer. HEALTHCHECK_ROLES is a *deliberate* subset (embed
+# is excluded because RAG is optional and a down embed endpoint must not block ingest/compile).
+Role = Literal["fast", "heavy", "embed"]
+ROLES: tuple[Role, ...] = ("fast", "heavy", "embed")
+HEALTHCHECK_ROLES: tuple[Role, ...] = ("fast", "heavy")
 
-    Handles scalars (bool/int/float/str) plus nested dict (inline table) and list (array) —
-    provider-native options can be nested, e.g. {"thinking": {"budget": 1}}. bool is checked
-    before int because bool is an int subclass.
+
+def _as_plain(obj: Any) -> Any:
+    """Convert Pydantic models to TOML-ready dicts, recursing into dict values.
+
+    `exclude_unset` reproduces exactly what was set in the source (so a loaded config re-emits
+    faithfully — no injected defaults, no dropped explicit-but-default values); `exclude_none`
+    drops keys explicitly set to None. Together they make `to_toml` the symmetric inverse of the
+    `Model(**tomllib.load(...))` read path.
     """
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, (int, float)):
-        return str(value)
-    if isinstance(value, str):
-        return _toml_quote(value)
-    if isinstance(value, dict):
-        return _toml_inline_table(value)
-    if isinstance(value, (list, tuple)):
-        return "[" + ", ".join(_toml_value(v) for v in value) + "]"
-    raise ValueError(f"unsupported TOML value type for passthrough: {type(value).__name__}")
+    from pydantic import BaseModel
+
+    if isinstance(obj, BaseModel):
+        return obj.model_dump(mode="json", exclude_unset=True, exclude_none=True)
+    if isinstance(obj, dict):
+        return {k: _as_plain(v) for k, v in obj.items()}
+    return obj
 
 
-def _toml_inline_table(table: dict[str, Any]) -> str:
-    """Serialize a dict to a TOML inline table: { "k" = v, ... } (values may nest). Keys quoted."""
-    if not table:
-        return "{}"
-    items = ", ".join(f"{_toml_quote(str(k))} = {_toml_value(v)}" for k, v in table.items())
-    return f"{{ {items} }}"
+def to_toml(obj: Any) -> str:
+    """Serialize a Pydantic model (or a dict whose values may be models) to TOML.
+
+    The one write-side seam: every reproduction writer routes through this, so adding a field to a
+    model needs zero writer changes — read (Pydantic) and write (model_dump) both auto-adapt. The
+    vault models carry no raw-secret field (only api_key_env), so a vault dump cannot leak a key.
+    """
+    import tomli_w
+
+    return tomli_w.dumps(_as_plain(obj))
 
 
 def default_wiki_toml(
@@ -155,63 +164,27 @@ def _vault_toml_tail(inline_source_citations: bool) -> str:
     )
 
 
-def _provider_models_head(providers: list[dict], models: dict[str, dict]) -> str:
-    """Build just the [providers.*] + [models.<role>] sections (no [pipeline] tail).
+def _vault_provider_sections(providers: dict[str, ProviderBlock], models: Any) -> str:
+    """Render the [providers.*] + [models.*] sections (no [pipeline] tail) from Pydantic models.
 
-    providers: list of {alias, name, url, timeout?, api_key_env?, azure_api_version?, headers?}.
-    Include one named "default" so string-form / embed roles resolve to it.
-    models: {role: {provider, model, ctx, think?, temperature?, options?}} for "fast"/"heavy".
-    The optional per-model (think/temperature/options) and per-provider (headers) keys are
-    emitted only when present, so callers that omit them get byte-identical output.
-    Secrets are never written — only api_key_env (an env var name).
+    The single write seam for the provider/model head — drift-proof because the field list comes
+    from the models, not from a hand-written enumeration. `models` may be a `ModelsConfig` (faithful
+    path, dumped via exclude_unset) or a `{role: ModelProfile}` dict (synthesize path). Secrets are
+    never written (ProviderBlock has no raw-key field, only api_key_env).
     """
-    blocks: list[str] = []
-    for p in providers:
-        lines = [
-            f"[providers.{p['alias']}]",
-            f"name = {_toml_quote(p['name'])}",
-            f"url = {_toml_quote(p['url'])}",
-            f"timeout = {int(p.get('timeout') or 600)}",
-        ]
-        if p.get("api_key_env"):
-            lines.append(f"api_key_env = {_toml_quote(p['api_key_env'])}")
-        if p.get("name") == "azure" and p.get("azure_api_version"):
-            lines.append(f"azure_api_version = {_toml_quote(p['azure_api_version'])}")
-        if p.get("headers"):
-            lines.append(f"headers = {_toml_inline_table(p['headers'])}")
-        blocks.append("\n".join(lines))
-    provider_section = "\n\n".join(blocks) + "\n"
-
-    model_blocks: list[str] = []
-    for role in ("fast", "heavy"):
-        m = models[role]
-        mlines = [
-            f"[models.{role}]",
-            f"provider = {_toml_quote(m['provider'])}",
-            f"model = {_toml_quote(m['model'])}",
-            f"ctx = {int(m['ctx'])}",
-        ]
-        if m.get("think") is not None:
-            mlines.append(f"think = {'true' if m['think'] else 'false'}")
-        if m.get("temperature") is not None:
-            mlines.append(f"temperature = {_toml_value(m['temperature'])}")
-        if m.get("options"):
-            mlines.append(f"options = {_toml_inline_table(m['options'])}")
-        model_blocks.append("\n".join(mlines))
-    models_section = "\n\n".join(model_blocks) + "\n"
-    return f"{provider_section}\n{models_section}"
+    return to_toml({"providers": providers, "models": models})
 
 
 def dedup_role_connections(
     roles: dict[str, dict],
-) -> tuple[list[dict], dict[str, str]]:
+) -> tuple[dict[str, ProviderBlock], dict[str, str]]:
     """Collapse per-role connection specs into de-duplicated [providers.*] blocks.
 
     roles: ordered {role: spec}; spec carries name/url/timeout/api_key_env/azure_api_version/
     headers. Roles sharing a connection share one alias; the first distinct connection becomes
     "default" so string-form/embed roles resolve to it. Connections that differ by api_key_env
-    (a different account) or headers stay distinct. Returns (providers_list, {role: alias}).
-    Shared by `synto setup` and the `synto compare` contestant materializer.
+    (a different account) or headers stay distinct. Returns ({alias: ProviderBlock}, {role: alias}).
+    Shared by `synto setup` and the `synto compare` contestant materializer (synthesize path).
     """
 
     def _key(spec: dict) -> tuple:
@@ -224,39 +197,48 @@ def dedup_role_connections(
             tuple(sorted((spec.get("headers") or {}).items())),
         )
 
-    providers: list[dict] = []
+    providers: dict[str, ProviderBlock] = {}
+    keys: dict[str, tuple] = {}
     role_alias: dict[str, str] = {}
     for role, spec in roles.items():
         key = _key(spec)
-        match = next((p for p in providers if _key(p) == key), None)
-        if match is None:
+        alias = next((a for a, k in keys.items() if k == key), None)
+        if alias is None:
             alias = "default" if not providers else spec["name"]
             base, n = alias, 2
-            while any(p["alias"] == alias for p in providers):
+            while alias in providers:
                 alias = f"{base}{n}"
                 n += 1
-            match = {
-                "alias": alias,
+            # Omit empty headers so exclude_unset doesn't emit an empty [providers.*.headers] table.
+            kwargs: dict[str, Any] = {
                 "name": spec["name"],
-                "url": spec["url"],
+                "url": spec.get("url") or None,
                 "timeout": spec.get("timeout"),
                 "api_key_env": spec.get("api_key_env"),
-                "azure_api_version": spec.get("azure_api_version"),
-                "headers": spec.get("headers") or {},
             }
-            providers.append(match)
-        role_alias[role] = match["alias"]
+            if spec.get("name") == "azure" and spec.get("azure_api_version"):
+                kwargs["azure_api_version"] = spec["azure_api_version"]
+            if spec.get("headers"):
+                kwargs["headers"] = spec["headers"]
+            providers[alias] = ProviderBlock(**kwargs)
+            keys[alias] = key
+        role_alias[role] = alias
     return providers, role_alias
 
 
 def role_providers_head(config: Config) -> str:
-    """Render [providers.*] + [models.fast/heavy] reproducing config's *resolved* roles.
+    """Render [providers.*] + [models.*] reproducing config's per-role providers.
 
     Single source of truth for both the `synto compare` contestant vault and the SWITCH
-    "apply this config" snippet: the fast and heavy roles can resolve to different
-    providers/accounts and carry distinct per-role params, all preserved here. Only api_key_env
-    (the env-var name) is emitted — never the secret.
+    "apply this config" snippet. Two paths:
+      * Faithful (new-format vault, no CLI override): dump the loaded `config.providers` /
+        `config.models` verbatim — drift-proof, byte-faithful to what the user set.
+      * Synthesize (legacy `[ollama]`/`[provider]` vault, or an active --provider/--provider-url
+        override): fold the *resolved* roles into providers/models, dedup shared connections.
+    Only api_key_env (the env-var name) is ever emitted — never the secret.
     """
+    if config.providers and not config.provider_override and not config.provider_override_url:
+        return _vault_provider_sections(config.providers, config.models)
 
     def _spec(r: ResolvedModel) -> dict:
         return {
@@ -273,32 +255,34 @@ def role_providers_head(config: Config) -> str:
             "options": r.options,
         }
 
-    role_specs = {
-        "fast": _spec(config.resolve_role("fast")),
-        "heavy": _spec(config.resolve_role("heavy")),
-    }
+    role_specs = {role: _spec(config.resolve_role(role)) for role in ("fast", "heavy")}
+    # Reproduce a hand-configured embed split (e.g. heavy=cloud, embed=local) only when a real
+    # [models.embed] table exists; the default string form stays covered by [providers.default].
+    if isinstance(config.models.embed, ModelProfile):
+        role_specs["embed"] = _spec(config.resolve_role("embed"))
     providers, role_alias = dedup_role_connections(role_specs)
-    models = {
-        role: {
+    models: dict[str, ModelProfile] = {}
+    for role, s in role_specs.items():
+        kwargs: dict[str, Any] = {
             "provider": role_alias[role],
             "model": s["model"],
             "ctx": s["ctx"],
             "think": s["think"],
             "temperature": s["temperature"],
-            "options": s["options"],
         }
-        for role, s in role_specs.items()
-    }
-    return _provider_models_head(providers, models)
+        if s["options"]:  # omit empty options so exclude_unset emits no empty table
+            kwargs["options"] = s["options"]
+        models[role] = ModelProfile(**kwargs)
+    return _vault_provider_sections(providers, models)
 
 
 def multi_provider_vault_toml(
-    providers: list[dict],
-    models: dict[str, dict],
+    providers: dict[str, ProviderBlock],
+    models: dict[str, ModelProfile],
     inline_source_citations: bool = False,
 ) -> str:
-    """Full vault synto.toml with several [providers.*] blocks + per-role refs."""
-    head = _provider_models_head(providers, models)
+    """Full vault synto.toml: several [providers.*] blocks + per-role refs + [pipeline] tail."""
+    head = _vault_provider_sections(providers, models)
     return f"{head}\n{_vault_toml_tail(inline_source_citations)}"
 
 
@@ -325,10 +309,10 @@ def strip_provider_model_sections(text: str) -> str:
 
 
 def apply_providers_to_existing_toml(
-    existing_text: str, providers: list[dict], models: dict[str, dict]
+    existing_text: str, providers: dict[str, ProviderBlock], models: dict[str, ModelProfile]
 ) -> str:
     """Replace the provider/model sections of an existing synto.toml, keeping the rest."""
-    head = _provider_models_head(providers, models)
+    head = _vault_provider_sections(providers, models)
     remainder = strip_provider_model_sections(existing_text).lstrip("\n")
     return f"{head}\n{remainder}" if remainder.strip() else f"{head}\n"
 
@@ -623,7 +607,7 @@ class Config(BaseModel):
     @model_validator(mode="after")
     def _validate_provider_refs(self) -> Config:
         """Fail loud at load: bad alias refs and unknown provider kinds without a url."""
-        for role in ("fast", "heavy", "embed"):
+        for role in ROLES:
             prof = getattr(self.models, role)
             if isinstance(prof, ModelProfile) and prof.provider is not None:
                 if prof.provider not in self.providers:

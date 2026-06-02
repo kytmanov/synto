@@ -55,6 +55,47 @@ def test_multi_provider_save_load_roundtrip():
     assert not re.search(r"(?m)^\s*api_key\s*=", _global_config_path().read_text())
 
 
+def test_save_load_preserves_every_field():
+    """Durable guard against serializer drift: save_global_config hand-rolls TOML while the
+    loader reads the full Pydantic model, so any added ProviderBlock/ModelProfile field that the
+    serializer forgets is silently dropped on the next save (e.g. the `synto init --default`
+    load→mutate→save round-trip rewrites the user's auth/generation config). Populate every
+    lossy field and assert the round-trip is identity — this fails the moment a new field drifts.
+    """
+    original = GlobalConfig(
+        vault="/tmp/vault",
+        experimental_inline_source_citations=True,
+        api_key="raw-secret",
+        providers={
+            "default": ProviderBlock(name="ollama", url="http://localhost:11434"),
+            "cloud": ProviderBlock(
+                name="groq",
+                url="https://api.groq.com/openai/v1",
+                timeout=120,
+                api_key_env="GROQ_KEY",
+                headers={"X-Org": "acme"},
+                options={"top_k": 40},
+            ),
+        },
+        models={
+            "fast": ModelProfile(provider="default", model="gemma4:e4b", ctx=16384, think=False),
+            "heavy": ModelProfile(
+                provider="cloud",
+                model="llama-3.3-70b",
+                ctx=32768,
+                think=True,
+                temperature=0.4,
+                options={"top_p": 0.9, "thinking": {"budget": 1}},
+            ),
+            "embed": ModelProfile(provider="default", model="nomic-embed-text", ctx=8192),
+        },
+        provider_keys={"cloud": "fallback-key"},
+    )
+    save_global_config(original)
+    reloaded = load_global_config()
+    assert reloaded == original
+
+
 def test_legacy_flat_config_still_loads():
     save_global_config(GlobalConfig(provider_name="ollama", fast_model="m", heavy_model="h"))
     g = load_global_config()

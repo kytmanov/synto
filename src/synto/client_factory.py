@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 from .api_keys import resolve_api_key
-from .config import Config, ResolvedModel
+from .config import HEALTHCHECK_ROLES, Config, ResolvedModel
 from .openai_compat_client import LLMError, OpenAICompatClient
 from .protocols import LLMClientProtocol
 from .providers import ProviderInfo
@@ -114,7 +114,7 @@ class ModelRouter:
         must not block ingest/compile. embed connectivity surfaces lazily on first use.
         """
         seen: set[tuple] = set()
-        for role in ("fast", "heavy"):
+        for role in HEALTHCHECK_ROLES:
             resolved = self._config.resolve_role(role, api_key_env=self._api_key_env)
             if resolved.connection_key in seen:
                 continue

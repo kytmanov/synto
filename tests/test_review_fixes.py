@@ -85,22 +85,21 @@ def test_heavy_temperature_reaches_compile(config, db):
 
 
 def test_azure_api_version_preserved_in_multi_provider(tmp_path):
-    from synto.config import multi_provider_vault_toml
+    from synto.config import ModelProfile, ProviderBlock, multi_provider_vault_toml
 
-    providers = [
-        {"alias": "default", "name": "ollama", "url": "http://localhost:11434", "timeout": 600},
-        {
-            "alias": "az",
-            "name": "azure",
-            "url": "https://r.openai.azure.com/openai/deployments/gpt4",
-            "timeout": 120,
-            "api_key_env": "AZURE_OPENAI_API_KEY",
-            "azure_api_version": "2025-01-01-preview",
-        },
-    ]
+    providers = {
+        "default": ProviderBlock(name="ollama", url="http://localhost:11434", timeout=600),
+        "az": ProviderBlock(
+            name="azure",
+            url="https://r.openai.azure.com/openai/deployments/gpt4",
+            timeout=120,
+            api_key_env="AZURE_OPENAI_API_KEY",
+            azure_api_version="2025-01-01-preview",
+        ),
+    }
     models = {
-        "fast": {"provider": "default", "model": "m", "ctx": 8192},
-        "heavy": {"provider": "az", "model": "gpt-4", "ctx": 32768},
+        "fast": ModelProfile(provider="default", model="m", ctx=8192),
+        "heavy": ModelProfile(provider="az", model="gpt-4", ctx=32768),
     }
     d = tmp_path / "v"
     for sub in ("raw", "wiki", "wiki/.drafts", ".synto"):
@@ -111,51 +110,59 @@ def test_azure_api_version_preserved_in_multi_provider(tmp_path):
     assert rh.azure_api_version == "2025-01-01-preview"
 
 
-def test_provider_models_head_omits_optional_keys_when_absent():
-    # Setup/init callers pass no think/temperature/options/headers — output must stay minimal
-    # (no spurious keys) so their existing round-trips are byte-identical.
-    from synto.config import _provider_models_head
+def test_optional_keys_omitted_when_unset():
+    # Unset per-role params must not appear in the emitted TOML (no spurious keys reviving a
+    # default the user didn't choose). Assert on the parsed structure, not the text format.
+    import tomllib
 
-    head = _provider_models_head(
-        [{"alias": "default", "name": "ollama", "url": "http://x", "timeout": 600}],
-        {
-            "fast": {"provider": "default", "model": "f", "ctx": 8192},
-            "heavy": {"provider": "default", "model": "h", "ctx": 16384},
-        },
-    )
-    for absent in ("think", "temperature", "options", "headers"):
-        assert absent not in head
+    from synto.config import ModelProfile, ProviderBlock, multi_provider_vault_toml
 
-
-def test_provider_models_head_emits_optional_keys_when_present():
-    from synto.config import _provider_models_head
-
-    head = _provider_models_head(
-        [
+    parsed = tomllib.loads(
+        multi_provider_vault_toml(
+            {"default": ProviderBlock(name="ollama", url="http://x", timeout=600)},
             {
-                "alias": "default",
-                "name": "ollama",
-                "url": "http://x",
-                "timeout": 600,
-                "headers": {"X-Org": "acme"},
-            }
-        ],
-        {
-            "fast": {"provider": "default", "model": "f", "ctx": 8192, "think": False},
-            "heavy": {
-                "provider": "default",
-                "model": "h",
-                "ctx": 16384,
-                "think": True,
-                "temperature": 0.5,
-                "options": {"top_p": 0.9},
+                "fast": ModelProfile(provider="default", model="f", ctx=8192),
+                "heavy": ModelProfile(provider="default", model="h", ctx=16384),
             },
-        },
+        )
     )
-    assert 'headers = { "X-Org" = "acme" }' in head
-    assert "think = false" in head and "think = true" in head
-    assert "temperature = 0.5" in head
-    assert 'options = { "top_p" = 0.9 }' in head
+    assert "headers" not in parsed["providers"]["default"]
+    assert "options" not in parsed["providers"]["default"]
+    for role in ("fast", "heavy"):
+        for absent in ("think", "temperature", "options"):
+            assert absent not in parsed["models"][role]
+
+
+def test_optional_keys_emitted_when_set():
+    import tomllib
+
+    from synto.config import ModelProfile, ProviderBlock, multi_provider_vault_toml
+
+    parsed = tomllib.loads(
+        multi_provider_vault_toml(
+            {
+                "default": ProviderBlock(
+                    name="ollama", url="http://x", timeout=600, headers={"X-Org": "acme"}
+                )
+            },
+            {
+                "fast": ModelProfile(provider="default", model="f", ctx=8192, think=False),
+                "heavy": ModelProfile(
+                    provider="default",
+                    model="h",
+                    ctx=16384,
+                    think=True,
+                    temperature=0.5,
+                    options={"top_p": 0.9},
+                ),
+            },
+        )
+    )
+    assert parsed["providers"]["default"]["headers"] == {"X-Org": "acme"}
+    assert parsed["models"]["fast"]["think"] is False
+    assert parsed["models"]["heavy"]["think"] is True
+    assert parsed["models"]["heavy"]["temperature"] == 0.5
+    assert parsed["models"]["heavy"]["options"] == {"top_p": 0.9}
 
 
 def test_model_string_override_keeps_role_provider_binding(tmp_path):
@@ -188,7 +195,8 @@ def test_dedup_role_connections_shares_and_splits():
             "heavy": {"name": "ollama", "url": "http://x", "timeout": 600, "api_key_env": None},
         }
     )
-    assert len(providers) == 1 and providers[0]["alias"] == "default"
+    assert list(providers) == ["default"]
+    assert providers["default"].name == "ollama"
     assert role_alias["fast"] == role_alias["heavy"] == "default"
 
     # Different api_key_env (a different account) -> two distinct providers.
@@ -199,8 +207,9 @@ def test_dedup_role_connections_shares_and_splits():
         }
     )
     assert len(providers) == 2
+    assert "default" in providers
     assert role_alias["fast"] != role_alias["heavy"]
-    assert providers[0]["alias"] == "default"
+    assert providers[role_alias["fast"]].api_key_env == "KEY_A"
 
 
 def test_nested_options_round_trip_through_toml_writers(tmp_path):
@@ -209,17 +218,17 @@ def test_nested_options_round_trip_through_toml_writers(tmp_path):
     import tomllib
 
     from synto.compare.runner import _write_effective_compare_toml
-    from synto.config import multi_provider_vault_toml
+    from synto.config import ModelProfile, ProviderBlock, multi_provider_vault_toml
 
-    providers = [{"alias": "default", "name": "ollama", "url": "http://x", "timeout": 600}]
+    providers = {"default": ProviderBlock(name="ollama", url="http://x", timeout=600)}
     models = {
-        "fast": {"provider": "default", "model": "f", "ctx": 8192},
-        "heavy": {
-            "provider": "default",
-            "model": "h",
-            "ctx": 16384,
-            "options": {"thinking": {"budget": 1}, "stop": ["a", "b"]},
-        },
+        "fast": ModelProfile(provider="default", model="f", ctx=8192),
+        "heavy": ModelProfile(
+            provider="default",
+            model="h",
+            ctx=16384,
+            options={"thinking": {"budget": 1}, "stop": ["a", "b"]},
+        ),
     }
     text = multi_provider_vault_toml(providers, models)
     parsed = tomllib.loads(text)

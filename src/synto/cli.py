@@ -462,39 +462,27 @@ def init(vault_path: str, existing: bool, non_interactive: bool, set_default: bo
     gcfg = load_global_config()
 
     if gcfg and gcfg.is_multi_provider:
-        # Reproduce the per-role multi-provider setup saved by `synto setup`.
+        # Reproduce the per-role multi-provider setup saved by `synto setup`. gcfg.providers and
+        # gcfg.models are already Pydantic models, so we dump them directly — no field enumeration,
+        # so headers/options/think/temperature and any role (incl. embed) carry through verbatim.
         from .config import apply_providers_to_existing_toml, multi_provider_vault_toml
 
         _role_ctx = {"fast": 16384, "heavy": 32768, "embed": 16384}
-        prov_list = [
-            {
-                "alias": alias,
-                "name": b.name,
-                "url": b.url or "",
-                "timeout": b.timeout,
-                "api_key_env": b.api_key_env,
-                "azure_api_version": b.azure_api_version,
-                "headers": b.headers,
-            }
-            for alias, b in gcfg.providers.items()
-        ]
-        mdl = {
-            role: {
-                "provider": m.provider or "default",
-                "model": m.model,
-                "ctx": m.ctx or _role_ctx.get(role, 8192),
-                "think": m.think,
-                "temperature": m.temperature,
-                "options": m.options,
-            }
-            for role, m in (gcfg.models or {}).items()
-            if role in ("fast", "heavy")
+        providers = gcfg.providers
+        models = {
+            role: prof.model_copy(
+                update={
+                    "provider": prof.provider or "default",
+                    "ctx": prof.ctx if prof.ctx is not None else _role_ctx.get(role, 8192),
+                }
+            )
+            for role, prof in (gcfg.models or {}).items()
         }
         if not toml_path.exists():
             toml_path.write_text(
                 multi_provider_vault_toml(
-                    prov_list,
-                    mdl,
+                    providers,
+                    models,
                     inline_source_citations=bool(gcfg.experimental_inline_source_citations),
                 )
             )
@@ -504,7 +492,7 @@ def init(vault_path: str, existing: bool, non_interactive: bool, set_default: bo
             atomic_write(
                 toml_path,
                 apply_providers_to_existing_toml(
-                    toml_path.read_text(encoding="utf-8"), prov_list, mdl
+                    toml_path.read_text(encoding="utf-8"), providers, models
                 ),
             )
     else:
@@ -911,26 +899,23 @@ def _setup_multi_provider(console) -> None:
     heavy = _collect_role_provider(console, "Heavy", default_model="qwen2.5:14b")
 
     # De-duplicate connections; the first becomes "default" so embed/string roles resolve.
-    from .config import dedup_role_connections
+    # dedup returns ready-made ProviderBlock models, so they feed both the global config and the
+    # vault writer unchanged — no second hand-built representation to drift out of sync.
+    from .config import ModelProfile, dedup_role_connections
 
     providers, role_alias = dedup_role_connections({"fast": fast, "heavy": heavy})
 
     models = {
-        "fast": {
-            "provider": role_alias["fast"],
-            "model": fast["model"],
-            "ctx": 16384 if fast["name"] == "ollama" else 8192,
-        },
-        "heavy": {
-            "provider": role_alias["heavy"],
-            "model": heavy["model"],
-            "ctx": 32768,
-        },
+        "fast": ModelProfile(
+            provider=role_alias["fast"],
+            model=fast["model"],
+            ctx=16384 if fast["name"] == "ollama" else 8192,
+        ),
+        "heavy": ModelProfile(provider=role_alias["heavy"], model=heavy["model"], ctx=32768),
     }
 
     # Persist to the global config so `synto init` reproduces this multi-provider setup
     # for any new vault. Provider blocks store api_key_env references only — never raw keys.
-    from .config import ModelProfile, ProviderBlock
     from .global_config import GlobalConfig, load_global_config, save_global_config
 
     existing = load_global_config()
@@ -939,24 +924,8 @@ def _setup_multi_provider(console) -> None:
         experimental_inline_source_citations=(
             existing.experimental_inline_source_citations if existing else None
         ),
-        providers={
-            p["alias"]: ProviderBlock(
-                name=p["name"],
-                url=p["url"] or None,
-                timeout=p.get("timeout"),
-                api_key_env=p.get("api_key_env"),
-                **(
-                    {"azure_api_version": p["azure_api_version"]}
-                    if p.get("azure_api_version")
-                    else {}
-                ),
-            )
-            for p in providers
-        },
-        models={
-            role: ModelProfile(provider=m["provider"], model=m["model"], ctx=m["ctx"])
-            for role, m in models.items()
-        },
+        providers=providers,
+        models=models,
         # Preserve the user-private per-alias key fallback; rebuilding from scratch would delete it.
         # The legacy flat single-provider fields are intentionally dropped (is_multi_provider wins).
         provider_keys=existing.provider_keys if existing else None,
@@ -1022,16 +991,16 @@ def _setup_multi_provider(console) -> None:
             )
 
     lines = ["[green]✓[/green]  Per-role providers saved to global config\n"]
-    for p in providers:
-        key_note = f"  key: ${p['api_key_env']}" if p.get("api_key_env") else "  (no key)"
-        lines.append(f"  [bold]{p['alias']}[/bold]: {p['name']} @ {p['url']}{key_note}")
+    for alias, b in providers.items():
+        key_note = f"  key: ${b.api_key_env}" if b.api_key_env else "  (no key)"
+        lines.append(f"  [bold]{alias}[/bold]: {b.name} @ {b.url}{key_note}")
     lines.append(f"  fast  → {role_alias['fast']} / {fast['model']}")
     lines.append(f"  heavy → {role_alias['heavy']} / {heavy['model']}")
     lines.append("")
     if applied_to is not None:
         lines.append(f"  Applied to: {applied_to}")
     lines.append("  Next: [bold]synto init <vault>[/bold] reproduces this split for new vaults.")
-    if any(p.get("api_key_env") for p in providers):
+    if any(b.api_key_env for b in providers.values()):
         lines.append("  [dim]Set the API-key env var(s) above before running synto.[/dim]")
     console.print()
     console.print(Panel("\n".join(lines), border_style="green", expand=False, padding=(0, 2)))
@@ -2364,6 +2333,7 @@ def _render_mcp_backlog(db, since: str) -> None:
 def doctor(vault_str, backlog, since):
     """Check LLM provider connection, model availability, and vault health."""
     from .client_factory import LLMError, build_router
+    from .config import ROLES
 
     config = _load_config(vault_str)
     db = _load_db(config)
@@ -2419,7 +2389,7 @@ def doctor(vault_str, backlog, since):
     conn_state: dict[tuple, tuple[bool, list[str]]] = {}
     console.print("\n[bold]Providers & models[/bold]")
     try:
-        for role in ("fast", "heavy", "embed"):
+        for role in ROLES:
             resolved = config.resolve_role(role)
             key = resolved.connection_key
             if key not in conn_state:
