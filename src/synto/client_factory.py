@@ -10,11 +10,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
-from .api_keys import resolve_api_key
 from .config import HEALTHCHECK_ROLES, Config, ResolvedModel
 from .openai_compat_client import LLMError, OpenAICompatClient
 from .protocols import LLMClientProtocol
-from .providers import ProviderInfo
 
 if TYPE_CHECKING:
     from .cache import LLMCache
@@ -142,21 +140,12 @@ def build_client(
 ) -> LLMClientProtocol:
     """Return a single default client (the heavy role) for callers that want just one.
 
-    For per-role routing use build_router(). Kept for setup/doctor/serve/compare paths
-    and backward compatibility; resolves through the same per-role machinery so the new
-    [providers.*] format is honored.
+    A convenience wrapper for tests and library callers; the live pipeline uses
+    build_router() for per-role routing. Resolves through the same per-role machinery,
+    so the [providers.*] format is honored.
     """
     resolved = config.resolve_role("heavy", api_key_env=api_key_env)
     return _build_client_for(resolved, cache)
-
-
-def _resolve_api_key(
-    provider_name: str,
-    prov_info: ProviderInfo | None,
-    api_key_env: str | None = None,
-) -> str | None:
-    """Backward-compatible shim. Resolution now lives in api_keys.resolve_api_key."""
-    return resolve_api_key(provider_name, api_key_env_override=api_key_env)
 
 
 __all__ = ["build_client", "build_router", "ModelRouter", "RoleEndpoint", "LLMError"]

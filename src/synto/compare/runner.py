@@ -13,7 +13,7 @@ from pathlib import Path
 
 from ..config import Config, role_providers_head, to_toml
 from ..metrics import metrics_sink
-from ..paths import APP_DIR_NAME, CONFIG_FILE_NAME
+from ..paths import APP_DIR_NAME, CONFIG_FILE_NAME, is_within
 from ..vault import extract_wikilinks, parse_note
 from .metrics import load_queries
 from .models import CompareReport, ContestantRunResult, PageDiffSummary, PageSnapshot, QueryResult
@@ -403,14 +403,6 @@ def _safe_child(root: Path, *parts: str) -> Path:
     return path
 
 
-def _is_within(path: Path, root: Path) -> bool:
-    try:
-        path.resolve().relative_to(root.resolve())
-        return True
-    except ValueError:
-        return False
-
-
 def _collect_raw_notes(raw_dir: Path) -> list[Path]:
     raw_dir = raw_dir.expanduser()
     raw_root = raw_dir.resolve()
@@ -425,7 +417,7 @@ def _collect_raw_notes(raw_dir: Path) -> list[Path]:
             if child.is_symlink():
                 raise ValueError("compare does not support symlinked raw notes")
             resolved = child.resolve()
-            if not _is_within(resolved, raw_root):
+            if not is_within(resolved, raw_root):
                 raise ValueError("compare raw notes must stay inside raw/")
             if child.is_dir():
                 pending.append(child)
@@ -455,11 +447,9 @@ def _assert_compare_root_safe(compare_root: Path, active_vault: Path) -> None:
     wiki_root = active_vault / "wiki"
     allowed_compare_root = active_vault / APP_DIR_NAME / "compare"
 
-    if _is_within(compare_root, raw_root) or _is_within(compare_root, wiki_root):
+    if is_within(compare_root, raw_root) or is_within(compare_root, wiki_root):
         raise ValueError("compare output root must not be inside active vault raw/ or wiki/")
-    if _is_within(compare_root, active_vault) and not _is_within(
-        compare_root, allowed_compare_root
-    ):
+    if is_within(compare_root, active_vault) and not is_within(compare_root, allowed_compare_root):
         raise ValueError(
             f"compare output root inside the active vault must be under {APP_DIR_NAME}/compare/"
         )

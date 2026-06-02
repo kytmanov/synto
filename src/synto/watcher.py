@@ -97,8 +97,6 @@ class _DebounceHandler(FileSystemEventHandler):
 
 def watch(
     config,
-    router,
-    db,
     on_event: Callable[[list[str]], None],
     debounce_secs: float | None = None,
 ) -> None:
@@ -106,9 +104,8 @@ def watch(
     Block until KeyboardInterrupt. Calls on_event(paths) after each debounced batch.
 
     config       — Config (uses config.raw_dir, config.pipeline.watch_debounce)
-    router       — ModelRouter (unused here; the on_event callback drives the pipeline)
-    db           — StateDB
-    on_event     — callback(changed_paths: list[str]) — runs on timer thread
+    on_event     — callback(changed_paths: list[str]) — runs on timer thread; the
+                   callback owns the router/db it needs to drive the pipeline
     debounce_secs — override config.pipeline.watch_debounce
     """
     if debounce_secs is None:

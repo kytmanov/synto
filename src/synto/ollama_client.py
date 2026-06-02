@@ -82,22 +82,6 @@ class OllamaClient:
         except (httpx.HTTPError, KeyError, ValueError):
             return []
 
-    def pull_model(self, model: str) -> None:
-        """Pull model if not present. Streams progress to stderr."""
-        import sys
-
-        with self._client.stream(
-            "POST",
-            f"{self.base_url}/api/pull",
-            json={"name": model},
-            timeout=600,
-        ) as resp:
-            resp.raise_for_status()
-            for line in resp.iter_lines():
-                if line:
-                    print(f"\r{line}", end="", file=sys.stderr)
-        print(file=sys.stderr)
-
     # ── Generation ────────────────────────────────────────────────────────────
 
     def generate(

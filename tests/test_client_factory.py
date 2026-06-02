@@ -4,15 +4,15 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from synto.client_factory import _resolve_api_key, build_client
+from synto.api_keys import resolve_api_key
+from synto.client_factory import build_client
 from synto.config import Config
-from synto.providers import get_provider
 
 
 def test_resolve_api_key_explicit_env_override(monkeypatch):
     """Explicit api_key_env parameter takes priority."""
     monkeypatch.setenv("TEST_OVERRIDE_KEY", "explicit-key")
-    key = _resolve_api_key("groq", get_provider("groq"), api_key_env="TEST_OVERRIDE_KEY")
+    key = resolve_api_key("groq", api_key_env_override="TEST_OVERRIDE_KEY")
     assert key == "explicit-key"
 
 
@@ -23,7 +23,7 @@ def test_resolve_api_key_explicit_env_empty_returns_none(monkeypatch):
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
 
     with patch("synto.global_config.load_global_config", return_value=None):
-        key = _resolve_api_key("groq", get_provider("groq"), api_key_env="TEST_EMPTY_KEY")
+        key = resolve_api_key("groq", api_key_env_override="TEST_EMPTY_KEY")
         assert key is None
 
 
@@ -31,7 +31,7 @@ def test_resolve_api_key_provider_specific_env(monkeypatch):
     """Provider-specific env var (e.g. GROQ_API_KEY) is used."""
     monkeypatch.setenv("GROQ_API_KEY", "groq-secret")
     monkeypatch.delenv("SYNTO_API_KEY", raising=False)
-    key = _resolve_api_key("groq", get_provider("groq"))
+    key = resolve_api_key("groq")
     assert key == "groq-secret"
 
 
@@ -39,7 +39,7 @@ def test_resolve_api_key_generic_env(monkeypatch):
     """Generic SYNTO_API_KEY is used when provider-specific is absent."""
     monkeypatch.setenv("SYNTO_API_KEY", "generic-secret")
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
-    key = _resolve_api_key("groq", get_provider("groq"))
+    key = resolve_api_key("groq")
     assert key == "generic-secret"
 
 
@@ -56,7 +56,7 @@ def test_resolve_api_key_global_config(monkeypatch, tmp_path):
         from synto.global_config import GlobalConfig
 
         mock_load.return_value = GlobalConfig(api_key="global-secret")
-        key = _resolve_api_key("groq", get_provider("groq"))
+        key = resolve_api_key("groq")
         assert key == "global-secret"
 
 
@@ -66,7 +66,7 @@ def test_resolve_api_key_returns_none_when_no_key_found(monkeypatch):
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
 
     with patch("synto.global_config.load_global_config", return_value=None):
-        key = _resolve_api_key("groq", get_provider("groq"))
+        key = resolve_api_key("groq")
         assert key is None
 
 
@@ -74,7 +74,7 @@ def test_resolve_api_key_unknown_provider(monkeypatch):
     """Unknown provider with no env var → falls through to generic/global."""
     monkeypatch.setenv("SYNTO_API_KEY", "fallback-key")
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
-    key = _resolve_api_key("unknown", None)
+    key = resolve_api_key("unknown")
     assert key == "fallback-key"
 
 

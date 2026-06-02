@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from unittest.mock import MagicMock
 
-from synto.models import AnalysisResult, SingleArticle
+from synto.models import SingleArticle
 from synto.ollama_client import OllamaClient
 from synto.structured_output import (
     _extract_json,
@@ -52,21 +52,21 @@ def test_unwrap_single_key_dict():
             "quality": "high",
         }
     }
-    result = _unwrap(data, AnalysisResult)
+    result = _unwrap(data)
     assert "summary" in result
 
 
 def test_unwrap_string_encoded_json():
     """Single-key with JSON string value is parsed."""
     data = {"result": '{"title": "T", "content": "body", "tags": []}'}
-    result = _unwrap(data, SingleArticle)
+    result = _unwrap(data)
     assert result["title"] == "T"
 
 
 def test_unwrap_string_encoded_json_invalid():
     """Single-key with invalid JSON string → returns original data."""
     data = {"result": "not json"}
-    result = _unwrap(data, SingleArticle)
+    result = _unwrap(data)
     assert result == data
 
 
@@ -76,7 +76,7 @@ def test_unwrap_json_schema_echo():
         "description": "A thing",
         "properties": {"title": "T", "content": "body", "tags": []},
     }
-    result = _unwrap(data, SingleArticle)
+    result = _unwrap(data)
     assert result["title"] == "T"
 
 
@@ -86,7 +86,7 @@ def test_unwrap_json_schema_echo_with_nested_schema():
         "description": "A thing",
         "properties": {"title": {"type": "string"}},
     }
-    result = _unwrap(data, SingleArticle)
+    result = _unwrap(data)
     # Not unwrapped because value is a schema dict with "type"
     assert result == data
 

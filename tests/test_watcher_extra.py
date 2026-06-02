@@ -21,8 +21,6 @@ def test_watch_uses_config_debounce(tmp_path):
     config.raw_dir = tmp_path / "raw"
     config.pipeline.watch_debounce = 0.05
 
-    client = MagicMock()
-    db = MagicMock()
     calls = []
 
     # Patch observer to not actually block
@@ -30,7 +28,7 @@ def test_watch_uses_config_debounce(tmp_path):
     mock_observer.is_alive.side_effect = [True, False]  # runs once then stops
 
     with patch("synto.watcher.Observer", return_value=mock_observer):
-        watch(config, client, db, on_event=lambda paths: calls.append(paths))
+        watch(config, on_event=lambda paths: calls.append(paths))
 
     assert mock_observer.schedule.called
     assert mock_observer.start.called
@@ -45,8 +43,6 @@ def test_watch_uses_override_debounce(tmp_path):
     config.raw_dir = tmp_path / "raw"
     config.pipeline.watch_debounce = 999.0  # should be ignored
 
-    client = MagicMock()
-    db = MagicMock()
     calls = []
 
     mock_observer = MagicMock()
@@ -55,8 +51,6 @@ def test_watch_uses_override_debounce(tmp_path):
     with patch("synto.watcher.Observer", return_value=mock_observer):
         watch(
             config,
-            client,
-            db,
             on_event=lambda paths: calls.append(paths),
             debounce_secs=0.05,
         )
@@ -74,8 +68,6 @@ def test_watch_flushes_on_exit(tmp_path):
     config.raw_dir = tmp_path / "raw"
     config.pipeline.watch_debounce = 60.0  # long debounce
 
-    client = MagicMock()
-    db = MagicMock()
     calls = []
 
     mock_observer = MagicMock()
@@ -87,7 +79,7 @@ def test_watch_flushes_on_exit(tmp_path):
         handler.on_created(_FakeEvent(str(tmp_path / "raw" / "note.md")))
 
         with patch("synto.watcher._DebounceHandler", return_value=handler):
-            watch(config, client, db, on_event=lambda paths: calls.append(paths))
+            watch(config, on_event=lambda paths: calls.append(paths))
 
     # flush() should have been called, firing the pending event
     assert len(calls) == 1
@@ -100,14 +92,11 @@ def test_watch_handles_keyboard_interrupt(tmp_path):
     config.raw_dir = tmp_path / "raw"
     config.pipeline.watch_debounce = 0.05
 
-    client = MagicMock()
-    db = MagicMock()
-
     mock_observer = MagicMock()
     mock_observer.is_alive.side_effect = KeyboardInterrupt()
 
     with patch("synto.watcher.Observer", return_value=mock_observer):
-        watch(config, client, db, on_event=lambda paths: None)
+        watch(config, on_event=lambda paths: None)
 
     # Should have stopped and joined despite the interrupt
     assert mock_observer.stop.called
@@ -125,7 +114,7 @@ def test_watch_observer_scheduled_on_raw_dir(tmp_path):
     mock_observer.is_alive.return_value = False
 
     with patch("synto.watcher.Observer", return_value=mock_observer):
-        watch(config, MagicMock(), MagicMock(), on_event=lambda paths: None)
+        watch(config, on_event=lambda paths: None)
 
     schedule_call = mock_observer.schedule.call_args
     assert schedule_call[1]["recursive"] is True

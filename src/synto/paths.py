@@ -59,3 +59,17 @@ def migration_message(vault: Path) -> str:
         f"This looks like an obsidian-llm-wiki vault: {Path(vault).resolve()}\n"
         f"Run `{CLI_NAME} migrate-olw --vault {Path(vault).resolve()}` first."
     )
+
+
+def is_within(path: Path, root: Path) -> bool:
+    """True if `path` is the same as, or nested under, `root`.
+
+    Both sides are resolved first, so `..` and symlinks can't be used to escape the
+    root — important for the output-dir containment checks that guard against writing
+    into raw/ or wiki/.
+    """
+    try:
+        Path(path).resolve().relative_to(Path(root).resolve())
+        return True
+    except ValueError:
+        return False
