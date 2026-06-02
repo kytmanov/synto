@@ -437,8 +437,10 @@ blocks at the same provider with different `api_key_env`) or none at all (local 
 Keys are read from the named env var, the provider's conventional env var, `SYNTO_API_KEY`,
 or the user-private `~/.config/synto/config.toml` — **never** from the vault's `synto.toml`.
 
-`synto setup` can configure this interactively (choose "no" at "use the same provider for all
-models?"); it saves the split to the global config so `synto init` reproduces it for new vaults.
+`synto setup` can configure this interactively: after you pick the primary provider and fast
+model, answer "yes" to "Use a different provider for the heavy (writing) model?" and the primary
+is reused as the fast role while you set up the heavy one. It saves the split to the global config
+so `synto init` reproduces it for new vaults.
 Re-running `synto init` on an existing vault re-syncs its provider/model sections from the global
 config — any per-model `options`/`think` you hand-edited into that vault are replaced.
 

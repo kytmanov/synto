@@ -462,7 +462,40 @@ def init(vault_path: str, existing: bool, non_interactive: bool, set_default: bo
 
     gcfg = load_global_config()
 
-    if gcfg and gcfg.is_multi_provider:
+    # Respect a vault explicitly configured for a different provider than the global default:
+    # re-syncing it from global config would silently switch providers — and, before the regex fix
+    # below, corrupted the file (e.g. an lm_studio block getting Ollama's URL). New or
+    # undeterminable vaults fall through to the normal write/sync paths.
+    existing_provider = _vault_provider_name(toml_path) if toml_path.exists() else None
+    global_provider = _global_default_provider_name(gcfg)
+    if toml_path.exists() and gcfg is None:
+        # No global config to sync from — never rewrite an existing vault's config from thin air.
+        # Without this, the respect-the-vault guard below is skipped (global_provider is None) and
+        # the single-provider sync would write Ollama's URL into a non-Ollama block.
+        console.print(
+            f"[dim]No global config — leaving existing {CONFIG_FILE_NAME} unchanged. "
+            f"Run [bold]{CLI_NAME} setup[/bold] to configure providers.[/dim]"
+        )
+    elif (
+        existing_provider is not None
+        and global_provider is not None
+        and (existing_provider != global_provider)
+    ):
+        console.print(
+            f"[dim]{CONFIG_FILE_NAME} is configured for '{existing_provider}' "
+            f"(global default: '{global_provider}') — leaving its provider and models unchanged. "
+            f"Edit {CONFIG_FILE_NAME} or run [bold]{CLI_NAME} setup[/bold] to change.[/dim]"
+        )
+    elif toml_path.exists() and _vault_is_multi_provider(toml_path):
+        # The vault already splits roles across multiple providers (a deliberate per-role setup).
+        # Re-syncing from global config would fully replace [providers.*]/[models.*] and could
+        # collapse that split (e.g. the global default name matches but its heavy provider differs).
+        # init only scaffolds/syncs the simple case; advanced vaults change via `synto setup`.
+        console.print(
+            f"[dim]{CONFIG_FILE_NAME} uses multiple providers (a per-role setup) — leaving its "
+            f"providers and models unchanged. Run [bold]{CLI_NAME} setup[/bold] to change.[/dim]"
+        )
+    elif gcfg and gcfg.is_multi_provider:
         # Reproduce the per-role multi-provider setup saved by `synto setup`. gcfg.providers and
         # gcfg.models are already Pydantic models, so we dump them directly — no field enumeration,
         # so headers/options/think/temperature and any role (incl. embed) carry through verbatim.
@@ -513,6 +546,25 @@ def init(vault_path: str, existing: bool, non_interactive: bool, set_default: bo
         if not toml_path.exists():
             from .providers import get_provider
 
+            # Nothing configured the provider → we're about to write Ollama defaults. Say so, so a
+            # user who only runs e.g. LM Studio isn't silently handed an Ollama-wired vault.
+            no_provider_config = gcfg is None or (
+                not gcfg.provider_name and not gcfg.fast_model and not gcfg.heavy_model
+            )
+            if no_provider_config:
+                reason = (
+                    "No global config found"
+                    if gcfg is None
+                    else "No provider configured in global config"
+                )
+                console.print(
+                    f"[yellow]{reason}[/yellow] — using Ollama defaults ({fast} @ {ollama_url})."
+                )
+                console.print(
+                    f"  Run [bold]{CLI_NAME} setup[/bold] to configure your provider, "
+                    f"or edit [bold]{CONFIG_FILE_NAME}[/bold]."
+                )
+
             prov_info = get_provider(provider_name)
             timeout = prov_info.default_timeout if prov_info else 600.0
             toml_path.write_text(
@@ -530,8 +582,9 @@ def init(vault_path: str, existing: bool, non_interactive: bool, set_default: bo
                 )
             )
         else:
-            # Existing vault: patch model/URL fields from global config so that
-            # synto setup changes are reflected without overwriting pipeline settings.
+            # Existing vault with a matching provider: patch model/URL fields from global config so
+            # synto setup changes are reflected, without overwriting pipeline settings. (A divergent
+            # provider was already handled by the respect-the-vault short-circuit above.)
             _sync_wiki_toml_models(
                 toml_path,
                 fast,
@@ -565,21 +618,102 @@ def init(vault_path: str, existing: bool, non_interactive: bool, set_default: bo
         except Exception:
             console.print("[yellow]⚠ Could not save default vault to global config.[/yellow]")
 
+    # The --vault flag is only needed when this vault isn't the resolved default. It's the default
+    # if --default was just passed, or if the global config (e.g. set by `synto setup`) already
+    # points here — in which case the next steps must drop the noisy, redundant --vault flags.
+    vault_is_default = set_default
+    if not vault_is_default and gcfg is not None and gcfg.vault:
+        try:
+            vault_is_default = Path(gcfg.vault).expanduser().resolve() == vault
+        except Exception:
+            vault_is_default = False
+
     console.print(f"[green]Vault initialised:[/green] {vault}")
     if set_default:
         console.print("[dim]Set as default vault — no --vault flag needed.[/dim]")
+    elif vault_is_default:
+        console.print("[dim]Already your default vault — no --vault flag needed.[/dim]")
     console.print("Next steps:")
     console.print("  1. Drop .md notes into [bold]raw/[/bold]")
-    if set_default:
+    if vault_is_default:
+        console.print(f"     (or import PDFs/text: [bold]{CLI_NAME} add <file>[/bold])")
         console.print(f"  2. Run [bold]{CLI_NAME} run[/bold]")
         console.print(f"  3. Review drafts: [bold]{CLI_NAME} review[/bold]")
         console.print(f"  4. Publish all drafts: [bold]{CLI_NAME} approve --all[/bold]")
     else:
+        console.print(
+            f"     (or import PDFs/text: [bold]{CLI_NAME} add <file> --vault {vault}[/bold])"
+        )
         console.print(f"  2. Run [bold]{CLI_NAME} run --vault {vault}[/bold]")
         console.print(f"  3. Review drafts: [bold]{CLI_NAME} review --vault {vault}[/bold]")
         console.print(
             f"  4. Publish all drafts: [bold]{CLI_NAME} approve --all --vault {vault}[/bold]"
         )
+        console.print(
+            f"[dim]Tip: re-run with [bold]{CLI_NAME} init {vault_path} --default[/bold] to make "
+            "this the default vault and drop the --vault flag.[/dim]"
+        )
+
+
+def _vault_provider_name(toml_path: Path) -> str | None:
+    """Best-effort read of a vault's configured provider for init's match check.
+
+    Returns the name from [providers.default] or legacy [provider]; "ollama" for a legacy
+    [ollama]/[models] vault; None if undeterminable (then init proceeds and syncs as before).
+    """
+    try:
+        with open(toml_path, "rb") as f:
+            data = tomllib.load(f)
+    except Exception:
+        return None
+    providers = data.get("providers")
+    if isinstance(providers, dict):
+        default = providers.get("default")
+        if isinstance(default, dict) and default.get("name"):
+            return str(default["name"])
+    provider = data.get("provider")
+    if isinstance(provider, dict) and provider.get("name"):
+        return str(provider["name"])
+    if "ollama" in data or "models" in data:
+        return "ollama"
+    return None
+
+
+def _vault_is_multi_provider(toml_path: Path) -> bool:
+    """True when the vault defines more than one [providers.*] connection (a per-role split).
+
+    Best-effort: returns False on a parse failure or a single-provider/legacy vault. A
+    single-provider new-format vault emits exactly one [providers.default] block, and legacy
+    [ollama]/[provider] vaults have no [providers] table — so >1 block reliably signals that
+    the user deliberately split roles across providers.
+    """
+    try:
+        with open(toml_path, "rb") as f:
+            data = tomllib.load(f)
+    except Exception:
+        return False
+    providers = data.get("providers")
+    return isinstance(providers, dict) and len(providers) > 1
+
+
+def _global_default_provider_name(gcfg) -> str | None:
+    """The provider name the global config would apply to a vault's default connection.
+
+    For a multi-provider config that's the `default` block's name (or the first block); for a
+    single-provider config it's `provider_name`, defaulting to "ollama" (init's own default).
+    Returns None only when there's no global config to compare against.
+    """
+    if gcfg is None:
+        return None
+    if gcfg.is_multi_provider and gcfg.providers:
+        default = gcfg.providers.get("default")
+        if default is not None and getattr(default, "name", None):
+            return str(default.name)
+        for block in gcfg.providers.values():
+            if getattr(block, "name", None):
+                return str(block.name)
+        return None
+    return gcfg.provider_name or "ollama"
 
 
 def _sync_wiki_toml_models(
@@ -604,8 +738,10 @@ def _sync_wiki_toml_models(
 
     def _replace_value(t: str, key: str, value: str) -> str:
         escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        # `[^"\n]*` keeps the match on the value's own line — a greedy `.+` would swallow a trailing
+        # inline comment's quotes (or, with DOTALL, the rest of the file).
         return re.sub(
-            rf'^({re.escape(key)}\s*=\s*)".+"',
+            rf'^({re.escape(key)}\s*=\s*)"[^"\n]*"',
             rf'\g<1>"{escaped}"',
             t,
             flags=re.MULTILINE,
@@ -614,10 +750,12 @@ def _sync_wiki_toml_models(
     def _replace_in_section(t: str, section: str, key: str, value: str) -> str:
         """Replace key=value only within the named TOML section."""
         escaped_val = value.replace("\\", "\\\\").replace('"', '\\"')
-        # Match the section header then capture everything until the next section or EOF
-        pattern = rf'(\[{re.escape(section)}\][^\[]*?)^({re.escape(key)}\s*=\s*)".+"'
+        # `[^\[]*?` (lazy, can't cross into the next [section]) finds the key; the value match is
+        # `"[^"\n]*"`, bounded to one line. The previous greedy `".+"` under re.DOTALL matched
+        # through to the file's LAST quote, deleting every [section] in between — see test.
+        pattern = rf'(\[{re.escape(section)}\][^\[]*?)^({re.escape(key)}\s*=\s*)"[^"\n]*"'
         replacement = rf'\1\2"{escaped_val}"'
-        return re.sub(pattern, replacement, t, flags=re.MULTILINE | re.DOTALL)
+        return re.sub(pattern, replacement, t, flags=re.MULTILINE)
 
     # Legacy format: [models] fast/heavy scalars + url in [ollama]/[provider].
     text = _replace_value(text, "fast", fast)
@@ -778,6 +916,86 @@ def migrate_olw(vault_str: Path) -> None:
 # ── setup ─────────────────────────────────────────────────────────────────────
 
 
+def _select_provider(console):
+    """Render the Local/Cloud/Custom provider list and return (provider, name).
+
+    The numbered ordering matches the historical Step-1 list so number-based selection
+    stays stable across the wizard and tests. The caller prints its own section header.
+    """
+    from .providers import PROVIDER_REGISTRY, list_all_providers
+
+    all_providers = list_all_providers()
+    local_provs = [p for p in all_providers if p.is_local]
+    cloud_provs = [p for p in all_providers if not p.is_local and p.name != "custom"]
+
+    console.print("    [bold]Local[/bold] (no API key needed):")
+    idx_map: dict[int, str] = {}
+    counter = 1
+    for p in local_provs:
+        marker = "  [default]" if p.name == "ollama" else ""
+        console.print(f"      {counter:2}. {p.display_name:<14} {p.default_url}{marker}")
+        idx_map[counter] = p.name
+        counter += 1
+
+    console.print()
+    console.print("    [bold]Cloud[/bold] (API key required):")
+    for p in cloud_provs:
+        url_hint = p.default_url if p.default_url else "(enter URL manually)"
+        console.print(f"      {counter:2}. {p.display_name:<14} {url_hint}")
+        idx_map[counter] = p.name
+        counter += 1
+
+    console.print()
+    console.print(f"      {counter:2}. Custom         (enter URL manually)")
+    idx_map[counter] = "custom"
+
+    console.print()
+    raw = Prompt.ask("    Select provider (number or name)", default="1", console=console).strip()
+
+    if raw.isdigit():
+        num = int(raw)
+        chosen_name = idx_map.get(num, "ollama")
+    elif raw in PROVIDER_REGISTRY:
+        chosen_name = raw
+    else:
+        console.print(f"    [yellow]Unknown '{raw}', defaulting to Ollama.[/yellow]")
+        chosen_name = "ollama"
+
+    return PROVIDER_REGISTRY[chosen_name], chosen_name
+
+
+def _build_probe_client(name, url, prov, *, api_key=None):
+    """Build a short-timeout client for a provider and return (client, connected).
+
+    Resolves the key like the live pipeline: explicit api_key → prov.env_var env →
+    SYNTO_API_KEY. Client classes are imported locally so test patches on them apply.
+    """
+    import os
+
+    if name == "ollama":
+        from .ollama_client import OllamaClient
+
+        client = OllamaClient(base_url=url, timeout=5)
+    else:
+        from .openai_compat_client import OpenAICompatClient
+
+        resolved_key = api_key
+        if not resolved_key and prov.env_var:
+            resolved_key = os.environ.get(prov.env_var)
+        if not resolved_key:
+            resolved_key = os.environ.get("SYNTO_API_KEY")
+        client = OpenAICompatClient(
+            base_url=url,
+            provider_name=name,
+            api_key=resolved_key,
+            timeout=5,
+            supports_json_mode=prov.supports_json_mode,
+            supports_embeddings=prov.supports_embeddings,
+            azure=prov.azure,
+        )
+    return client, client.healthcheck()
+
+
 def _pick_model(
     console: Console,
     client,
@@ -785,6 +1003,7 @@ def _pick_model(
     description: str,
     default_fallback: str,
     connected: bool,
+    provider_name: str | None = None,
 ) -> str:
     """Interactive model selector — shows table if models available, else free-text."""
     console.print()
@@ -814,7 +1033,7 @@ def _pick_model(
             return default_fallback
         return raw
     else:
-        if connected:
+        if connected and provider_name == "ollama":
             console.print(
                 "    [yellow]No models found.[/yellow] "
                 "Pull one first: [bold]ollama pull gemma4:e4b[/bold]"
@@ -825,32 +1044,39 @@ def _pick_model(
 
 
 def _collect_role_provider(console, role_label: str, default_model: str = "") -> dict:
-    """Prompt for one role's provider, URL, API-key env var, and model."""
-    from .providers import PROVIDER_REGISTRY, list_all_providers
+    """Prompt for one role's provider, URL, API-key env var, and model.
 
-    console.print(f"  [bold]{role_label} model[/bold]")
-    provs = list_all_providers()
-    idx_map: dict[int, str] = {}
-    for i, p in enumerate(provs, 1):
-        tag = "  [default]" if p.name == "ollama" else ""
-        console.print(f"    {i:2}. {p.display_name:<14} {p.default_url or '(custom URL)'}{tag}")
-        idx_map[i] = p.name
-    raw = Prompt.ask("    Provider (number or name)", default="1", console=console).strip()
-    if raw.isdigit():
-        name = idx_map.get(int(raw), "ollama")
-    elif raw in PROVIDER_REGISTRY:
-        name = raw
-    else:
-        console.print(f"    [yellow]Unknown '{raw}', using Ollama.[/yellow]")
-        name = "ollama"
-    prov = PROVIDER_REGISTRY[name]
-    url = (
-        Prompt.ask("    Base URL", default=prov.default_url or "", console=console).strip()
-        or prov.default_url
-        or ""
-    )
+    Mirrors the primary/Fast step: same rich Local/Cloud/Custom provider list
+    (`_select_provider`), a live probe (`_build_probe_client`), and the numbered model
+    table (`_pick_model`). Additional providers store an `api_key_env` reference (never a
+    raw key) because the vault synto.toml is git-committed.
+    """
+    import os
+
+    console.print(f"  [bold]{role_label}[/bold]  pick its provider, then model")
+    prov, name = _select_provider(console)
+
+    # Empty custom/azure URLs would break the probe and client factory; re-prompt rather
+    # than aborting (an exit here would discard the already-configured primary provider).
+    if name == "azure":
+        console.print(
+            "    Azure format: https://{resource}.openai.azure.com/openai/deployments/{model}"
+        )
+    while True:
+        url = (
+            Prompt.ask("    Base URL", default=prov.default_url or "", console=console).strip()
+            or prov.default_url
+            or ""
+        )
+        if url or name not in ("custom", "azure"):
+            break
+        console.print("    [red]URL is required for this provider.[/red]")
+
     api_key_env: str | None = None
-    if name != "ollama":
+    # Only cloud providers need a key. Local servers (Ollama/LM Studio/vLLM/…) are no-auth;
+    # prompting here would default to a phantom PROVIDER_API_KEY env var (env_var is None for
+    # locals), which then also blocks dedup against an identical key-less primary connection.
+    if not prov.is_local:
         default_env = prov.env_var or "PROVIDER_API_KEY"
         console.print(
             "    [dim]Enter the env var name that holds the key (not the key itself).[/dim]"
@@ -866,9 +1092,25 @@ def _collect_role_provider(console, role_label: str, default_model: str = "") ->
             ).strip()
             or "2024-02-15-preview"
         )
-    model = Prompt.ask(
-        "    Model name", default=default_model if name == "ollama" else "", console=console
-    ).strip()
+
+    client, connected = _build_probe_client(
+        name, url, prov, api_key=os.environ.get(api_key_env) if api_key_env else None
+    )
+    if connected:
+        console.print("    [green]✓ connected[/green]")
+    else:
+        console.print(f"    [yellow]Warning:[/yellow] Cannot reach {url} — continuing anyway.")
+
+    model = _pick_model(
+        console=console,
+        client=client,
+        step_label="",
+        description="Heavy model  [dim](article writing · 7–14B recommended)[/dim]",
+        default_fallback=default_model if name == "ollama" else "",
+        connected=connected,
+        provider_name=name,
+    )
+    client.close()
     while not model:
         model = Prompt.ask("    Model name (required)", console=console).strip()
     return {
@@ -881,29 +1123,35 @@ def _collect_role_provider(console, role_label: str, default_model: str = "") ->
     }
 
 
-def _setup_multi_provider(console) -> None:
-    """Configure a different provider per role and write the new format to a vault.
+def _finalize_per_role_providers(
+    console,
+    *,
+    fast: dict,
+    heavy: dict,
+    vault_input: str,
+    citations: bool,
+    fast_api_key: str | None = None,
+) -> None:
+    """Persist a per-role provider split and optionally apply it to a vault.
 
-    Writes only env-var references (api_key_env) — never raw keys — and targets an
-    existing vault's synto.toml (preserving [pipeline] etc.), matching the documented
-    secure path. Requires the vault to exist; run `synto init` first if it doesn't.
+    `fast`/`heavy` are connection specs in the shape `_collect_role_provider` returns. Writes
+    only env-var references (api_key_env) into a vault's synto.toml — never raw keys — targeting
+    an existing vault (preserving [pipeline] etc.), matching the documented secure path. A raw key
+    for the reused primary (fast) provider, if any, is passed as `fast_api_key` and stored only in
+    the user-private global config under provider_keys[<fast alias>] (resolve_api_key step 3).
     """
-    from .config import apply_providers_to_existing_toml, multi_provider_vault_toml
-    from .vault import atomic_write
-
-    console.print(
-        "\n  [bold]Per-role providers[/bold]  "
-        "[dim](fast = analysis & routing, heavy = article writing)[/dim]\n"
+    from .config import (
+        ModelProfile,
+        apply_providers_to_existing_toml,
+        dedup_role_connections,
+        multi_provider_vault_toml,
     )
-    fast = _collect_role_provider(console, "Fast", default_model="gemma4:e4b")
-    console.print()
-    heavy = _collect_role_provider(console, "Heavy", default_model="qwen2.5:14b")
+    from .global_config import GlobalConfig, load_global_config, save_global_config
+    from .vault import atomic_write
 
     # De-duplicate connections; the first becomes "default" so embed/string roles resolve.
     # dedup returns ready-made ProviderBlock models, so they feed both the global config and the
     # vault writer unchanged — no second hand-built representation to drift out of sync.
-    from .config import ModelProfile, dedup_role_connections
-
     providers, role_alias = dedup_role_connections({"fast": fast, "heavy": heavy})
 
     models = {
@@ -915,45 +1163,39 @@ def _setup_multi_provider(console) -> None:
         "heavy": ModelProfile(provider=role_alias["heavy"], model=heavy["model"], ctx=32768),
     }
 
-    # Persist to the global config so `synto init` reproduces this multi-provider setup
-    # for any new vault. Provider blocks store api_key_env references only — never raw keys.
-    from .global_config import GlobalConfig, load_global_config, save_global_config
-
+    # Persist to the global config so `synto init` reproduces this multi-provider setup for any new
+    # vault. Provider blocks store api_key_env references only; a raw key typed for the reused
+    # primary provider lives here under its alias (user-private), never in the vault.
     existing = load_global_config()
+    provider_keys = dict(existing.provider_keys) if existing and existing.provider_keys else {}
+    # Drop a preserved key only when its alias is reused for a *different* connection. Aliases are
+    # regenerated each run (the first connection is always "default"), so a key saved for the old
+    # default provider would otherwise be sent to the new one (resolve_api_key prefers
+    # provider_keys[alias]). Compare the connection target (name + url), not just kind, to also
+    # catch a same-kind alias repointed at a different endpoint/account. Keys whose alias is absent
+    # from the new providers are left untouched: no role resolves them, so they can't be mis-sent,
+    # and silently deleting a user-stored secret would be the wrong call.
+    old_conn = (
+        {a: (b.name, b.url) for a, b in existing.providers.items()}
+        if existing and existing.providers
+        else {}
+    )
+    for alias in list(provider_keys):
+        new_block = providers.get(alias)
+        if new_block is not None and (new_block.name, new_block.url) != old_conn.get(alias):
+            del provider_keys[alias]
+    if fast_api_key:
+        provider_keys[role_alias["fast"]] = fast_api_key
     gcfg = GlobalConfig(
-        vault=existing.vault if existing else None,
-        experimental_inline_source_citations=(
-            existing.experimental_inline_source_citations if existing else None
-        ),
+        vault=vault_input or (existing.vault if existing else None),
+        experimental_inline_source_citations=citations,
         providers=providers,
         models=models,
-        # Preserve the user-private per-alias key fallback; rebuilding from scratch would delete it.
-        # The legacy flat single-provider fields are intentionally dropped (is_multi_provider wins).
-        provider_keys=existing.provider_keys if existing else None,
+        # Carry the user-private per-alias key fallback forward (pruned above of any key whose
+        # alias was repointed). The legacy flat single-provider fields are intentionally dropped
+        # (is_multi_provider wins).
+        provider_keys=provider_keys or None,
     )
-    # Default vault (stored in the global config, used by `synto` without --vault) + citation
-    # preference, mirroring the single-provider wizard. The default vault doubles as the
-    # apply-now target: if it already exists, write the split into it immediately.
-    console.print()
-    vault_input = Prompt.ask(
-        "  Default vault path (Enter to skip)",
-        default=(existing.vault if existing and existing.vault else ""),
-        console=console,
-    ).strip()
-    citations = (
-        Prompt.ask(
-            "  Enable inline source citations for new vaults?",
-            choices=["y", "n"],
-            default="y" if (existing and existing.experimental_inline_source_citations) else "n",
-            show_choices=False,
-            console=console,
-        )
-        .strip()
-        .lower()
-        == "y"
-    )
-    gcfg.vault = vault_input or (existing.vault if existing else None)
-    gcfg.experimental_inline_source_citations = citations
     save_global_config(gcfg)
 
     applied_to: Path | None = None
@@ -1019,7 +1261,7 @@ def _setup_multi_provider(console) -> None:
 def setup(non_interactive: bool, reset: bool, provider_preset: str | None):
     """Interactive wizard: configure provider, models, and default vault."""
     from .global_config import GlobalConfig, load_global_config, save_global_config
-    from .providers import PROVIDER_REGISTRY, get_provider, list_all_providers
+    from .providers import PROVIDER_REGISTRY, get_provider
 
     # ── non-interactive: show current config ──────────────────────────────────
     if non_interactive:
@@ -1100,25 +1342,6 @@ def setup(non_interactive: bool, reset: bool, provider_preset: str | None):
         )
         console.print()
 
-        all_providers = list_all_providers()
-
-        # ── Multi-provider branch: a different provider per model role (#24) ──
-        if not provider_preset:
-            same_provider = (
-                Prompt.ask(
-                    "  Use the same provider for all models?",
-                    choices=["y", "n"],
-                    default="y",
-                    show_choices=False,
-                    console=console,
-                )
-                .strip()
-                .lower()
-            )
-            if same_provider == "n":
-                _setup_multi_provider(console)
-                return
-
         # ── Step 1 — Provider selection ───────────────────────────────────────
         if provider_preset:
             chosen_prov = get_provider(provider_preset)
@@ -1130,47 +1353,7 @@ def setup(non_interactive: bool, reset: bool, provider_preset: str | None):
             chosen_name = chosen_prov.name
         else:
             console.print("  [bold]Step 1[/bold]  Provider\n")
-
-            # Build numbered list
-            local_provs = [p for p in all_providers if p.is_local]
-            cloud_provs = [p for p in all_providers if not p.is_local and p.name != "custom"]
-
-            console.print("    [bold]Local[/bold] (no API key needed):")
-            idx_map: dict[int, str] = {}
-            counter = 1
-            for p in local_provs:
-                marker = "  [default]" if p.name == "ollama" else ""
-                console.print(f"      {counter:2}. {p.display_name:<14} {p.default_url}{marker}")
-                idx_map[counter] = p.name
-                counter += 1
-
-            console.print()
-            console.print("    [bold]Cloud[/bold] (API key required):")
-            for p in cloud_provs:
-                url_hint = p.default_url if p.default_url else "(enter URL manually)"
-                console.print(f"      {counter:2}. {p.display_name:<14} {url_hint}")
-                idx_map[counter] = p.name
-                counter += 1
-
-            console.print()
-            console.print(f"      {counter:2}. Custom         (enter URL manually)")
-            idx_map[counter] = "custom"
-
-            console.print()
-            raw = Prompt.ask(
-                "    Select provider (number or name)", default="1", console=console
-            ).strip()
-
-            if raw.isdigit():
-                num = int(raw)
-                chosen_name = idx_map.get(num, "ollama")
-            elif raw in PROVIDER_REGISTRY:
-                chosen_name = raw
-            else:
-                console.print(f"    [yellow]Unknown '{raw}', defaulting to Ollama.[/yellow]")
-                chosen_name = "ollama"
-
-            chosen_prov = PROVIDER_REGISTRY[chosen_name]
+            chosen_prov, chosen_name = _select_provider(console)
 
         # ── Step 2 — URL ──────────────────────────────────────────────────────
         console.print()
@@ -1193,8 +1376,6 @@ def setup(non_interactive: bool, reset: bool, provider_preset: str | None):
         # ── Step 3 — API key (all non-Ollama providers) ──────────────────────
         # Local providers (vLLM, LM Studio, etc.) default to no-auth but can
         # require a key in enterprise deployments, so we always offer the prompt.
-        import os
-
         needs_key_prompt = chosen_name != "ollama"
         api_key: str | None = None
         if needs_key_prompt:
@@ -1216,28 +1397,9 @@ def setup(non_interactive: bool, reset: bool, provider_preset: str | None):
             api_key = raw_key if raw_key else None
 
         # ── Build a temp client to probe for model list ───────────────────────
-        if chosen_name == "ollama":
-            from .ollama_client import OllamaClient
-
-            temp_client = OllamaClient(base_url=provider_url, timeout=5)
-        else:
-            from .openai_compat_client import OpenAICompatClient
-
-            resolved_key = api_key
-            if not resolved_key and chosen_prov.env_var:
-                resolved_key = os.environ.get(chosen_prov.env_var)
-            if not resolved_key:
-                resolved_key = os.environ.get("SYNTO_API_KEY")
-            temp_client = OpenAICompatClient(
-                base_url=provider_url,
-                provider_name=chosen_name,
-                api_key=resolved_key,
-                timeout=5,
-                supports_json_mode=chosen_prov.supports_json_mode,
-                supports_embeddings=chosen_prov.supports_embeddings,
-                azure=chosen_prov.azure,
-            )
-        connected = temp_client.healthcheck()
+        temp_client, connected = _build_probe_client(
+            chosen_name, provider_url, chosen_prov, api_key=api_key
+        )
         if connected:
             console.print("    [green]✓ connected[/green]")
         else:
@@ -1266,17 +1428,42 @@ def setup(non_interactive: bool, reset: bool, provider_preset: str | None):
             description="Fast model  [dim](analysis & routing · 3–8B recommended)[/dim]",
             default_fallback=default_fast,
             connected=connected,
+            provider_name=chosen_name,
         )
 
-        # ── Step 5 — Heavy model ──────────────────────────────────────────────
-        heavy_model = _pick_model(
-            console=console,
-            client=temp_client,
-            step_label=f"Step {4 + step_offset}",
-            description="Heavy model  [dim](article writing · 7–14B recommended)[/dim]",
-            default_fallback=default_heavy,
-            connected=connected,
-        )
+        # ── Advanced (progressive disclosure): per-role providers (#24) ───────
+        # Asked here — not up front — so "fast"/"heavy" already have meaning. The primary
+        # provider configured above is reused as the fast role; only the heavy provider is
+        # collected anew. Skipped under --provider to keep preset setup single-provider.
+        heavy_spec: dict | None = None
+        if not provider_preset:
+            different_heavy = (
+                Prompt.ask(
+                    "\n  Use a different provider for the heavy (writing) model?",
+                    choices=["y", "n"],
+                    default="n",
+                    show_choices=False,
+                    console=console,
+                )
+                .strip()
+                .lower()
+            )
+            if different_heavy == "y":
+                console.print()
+                heavy_spec = _collect_role_provider(console, "Heavy", default_model="qwen2.5:14b")
+
+        heavy_model = ""
+        if heavy_spec is None:
+            # ── Step 5 — Heavy model (same provider) ──────────────────────────
+            heavy_model = _pick_model(
+                console=console,
+                client=temp_client,
+                step_label=f"Step {4 + step_offset}",
+                description="Heavy model  [dim](article writing · 7–14B recommended)[/dim]",
+                default_fallback=default_heavy,
+                connected=connected,
+                provider_name=chosen_name,
+            )
 
         temp_client.close()
 
@@ -1310,6 +1497,30 @@ def setup(non_interactive: bool, reset: bool, provider_preset: str | None):
             .lower()
         )
         experimental_inline_source_citations = raw_citations == "y"
+
+        # ── Per-role split: reuse the primary provider as `fast`, finalize, done ──
+        if heavy_spec is not None:
+            fast_spec = {
+                "name": chosen_name,
+                "url": provider_url,
+                # Use the registry env var only when the user didn't type a raw key; a raw key is
+                # carried separately into provider_keys[<fast alias>] (never the vault).
+                "api_key_env": (
+                    chosen_prov.env_var if (needs_key_prompt and not api_key) else None
+                ),
+                "azure_api_version": "2024-02-15-preview" if chosen_name == "azure" else None,
+                "model": fast_model,
+                "timeout": int(chosen_prov.default_timeout),
+            }
+            _finalize_per_role_providers(
+                console,
+                fast=fast_spec,
+                heavy=heavy_spec,
+                vault_input=vault_path or "",
+                citations=experimental_inline_source_citations,
+                fast_api_key=api_key,
+            )
+            return
 
         applied_to_existing_vault = False
         current_vault_setting: bool | None = None

@@ -511,7 +511,7 @@ def test_list_models():
 
 
 def test_list_models_detailed():
-    client = _make_client(provider_name="groq")
+    client = _make_client(base_url="https://api.groq.com/openai/v1", provider_name="groq")
     mock_resp = MagicMock()
     mock_resp.status_code = 200
     mock_resp.raise_for_status.return_value = None
@@ -519,6 +519,19 @@ def test_list_models_detailed():
     with patch.object(client._client, "get", return_value=mock_resp):
         detailed = client.list_models_detailed()
     assert detailed == [{"name": "llama3", "size_gb": "(cloud)"}]
+
+
+def test_list_models_detailed_local_provider_not_labelled_cloud():
+    """A local OpenAI-compat server (LM Studio/vLLM) must show "(local)", not "(cloud)" —
+    /v1/models has no size, so the wizard table's provenance hint must at least be truthful."""
+    client = _make_client(base_url="http://localhost:1234/v1", provider_name="lm_studio")
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.raise_for_status.return_value = None
+    mock_resp.json.return_value = {"data": [{"id": "google/gemma-4-e4b"}]}
+    with patch.object(client._client, "get", return_value=mock_resp):
+        detailed = client.list_models_detailed()
+    assert detailed == [{"name": "google/gemma-4-e4b", "size_gb": "(local)"}]
 
 
 def test_embed_batch_no_embeddings_support():
@@ -722,11 +735,12 @@ def test_setup_wizard_cloud_provider_empty_api_key(tmp_path, cfg_dir):
         instance.list_models_detailed.return_value = []
         MockClient.return_value = instance
 
-        # provider=groq, URL=default, api_key=empty, fast, heavy, no vault, citations off
+        # provider=groq, URL=default, api_key=empty, fast, same heavy provider, heavy, no vault,
+        # citations off
         result = runner.invoke(
             cli,
             ["setup"],
-            input=f"y\n{groq_number}\n\n\nllama3\nllama3\n\n\n",
+            input=f"{groq_number}\n\n\nllama3\n\nllama3\n\n\n",
             catch_exceptions=False,
         )
 
@@ -758,10 +772,11 @@ def test_setup_wizard_azure_saves_provider_name(tmp_path, cfg_dir):
         result = runner.invoke(
             cli,
             ["setup"],
-            # provider=azure, URL, api key, fast model, heavy model, no vault, citations off
+            # provider=azure, URL, api key, fast model, same heavy provider, heavy model, no vault,
+            # citations off
             input=(
-                f"y\n{azure_number}\nhttps://myres.openai.azure.com/openai/deployments/gpt4\n"
-                "my-key\nmodel-a\nmodel-b\n\n\n"
+                f"{azure_number}\nhttps://myres.openai.azure.com/openai/deployments/gpt4\n"
+                "my-key\nmodel-a\n\nmodel-b\n\n\n"
             ),
             catch_exceptions=False,
         )

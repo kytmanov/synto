@@ -20,6 +20,7 @@ from synto.global_config import (
     load_global_config,
     save_global_config,
 )
+from synto.paths import CONFIG_FILE_NAME
 
 
 @pytest.fixture(autouse=True)
@@ -146,3 +147,132 @@ def test_provider_keys_roundtrip_and_resolution(monkeypatch):
     # Per-alias key is used when no env var is set; aliases without a key resolve to None.
     assert resolve_api_key("nvidia", alias="ngc") == "nvapi-secret"
     assert resolve_api_key("ollama", alias="default") is None
+
+
+def test_init_leaves_multi_provider_vault_untouched(tmp_path):
+    """A vault that already splits roles across providers must survive `init`.
+
+    Regression: the respect-the-vault guard only compared the *default* provider name, so a vault
+    with fast->default(ollama) + heavy->groq and a global config that also defaults to ollama (but
+    a different heavy) fell through to the multi-provider rewrite and lost its heavy split.
+    """
+    vault = tmp_path / "split-vault"
+    vault.mkdir()
+    (vault / CONFIG_FILE_NAME).write_text(
+        '[providers.default]\nname = "ollama"\nurl = "http://localhost:11434"\n\n'
+        '[providers.gq]\nname = "groq"\napi_key_env = "GROQ_API_KEY"\n\n'
+        '[models.fast]\nprovider = "default"\nmodel = "gemma4:e4b"\n\n'
+        '[models.heavy]\nprovider = "gq"\nmodel = "llama-3.3-70b"\n'
+    )
+    # Global default also resolves to ollama, but its heavy provider is nvidia, not groq.
+    save_global_config(_multi())
+
+    result = CliRunner().invoke(cli, ["init", str(vault)])
+    assert result.exit_code == 0, result.output
+    assert "uses multiple providers" in result.output
+
+    # The user's deliberate heavy split survives — not rewritten to the global nvidia provider.
+    heavy = Config.from_vault(vault).resolve_role("heavy")
+    assert heavy.provider_kind == "groq"
+    assert heavy.model == "llama-3.3-70b"
+
+
+def test_per_role_setup_drops_stale_key_when_default_repointed(monkeypatch):
+    """Re-running per-role setup must not send a previous provider's key to a new one.
+
+    `provider_keys` is keyed by alias, and the fast role's alias is always "default". If the
+    default provider is switched (Groq -> OpenRouter) without entering a new key, the old Groq
+    secret under "default" must be dropped, not silently reused for OpenRouter.
+    """
+    from rich.console import Console
+
+    from synto.cli import _finalize_per_role_providers
+
+    for var in ("OPENROUTER_API_KEY", "GROQ_API_KEY", "NGC_API_KEY", "SYNTO_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+
+    # Prior setup: default == Groq, with a raw key saved under "default".
+    save_global_config(
+        GlobalConfig(
+            providers={"default": ProviderBlock(name="groq", url="https://api.groq.com/openai/v1")},
+            models={"fast": ModelProfile(provider="default", model="llama-3.1-8b")},
+            provider_keys={"default": "old-groq-key"},
+        )
+    )
+
+    # Re-run: switch the fast/default provider to OpenRouter, no new raw key typed.
+    _finalize_per_role_providers(
+        Console(),
+        fast={
+            "name": "openrouter",
+            "url": "https://openrouter.ai/api/v1",
+            "api_key_env": "OPENROUTER_API_KEY",
+            "azure_api_version": None,
+            "model": "x/y",
+            "timeout": 120,
+        },
+        heavy={
+            "name": "nvidia",
+            "url": "https://integrate.api.nvidia.com/v1",
+            "api_key_env": "NGC_API_KEY",
+            "azure_api_version": None,
+            "model": "qwen2.5:14b",
+            "timeout": 120,
+        },
+        vault_input="",
+        citations=False,
+        fast_api_key=None,
+    )
+
+    from synto.api_keys import resolve_api_key
+
+    # The harm: the stale Groq key must not be returned for the new OpenRouter default.
+    assert resolve_api_key("openrouter", alias="default") is None
+    assert "default" not in (load_global_config().provider_keys or {})
+
+
+def test_per_role_setup_keeps_key_when_default_unchanged(monkeypatch):
+    """Companion to the stale-key drop: an unchanged default connection keeps its key."""
+    from rich.console import Console
+
+    from synto.api_keys import resolve_api_key
+    from synto.cli import _finalize_per_role_providers
+
+    for var in ("GROQ_API_KEY", "NGC_API_KEY", "SYNTO_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+
+    groq_url = "https://api.groq.com/openai/v1"
+    save_global_config(
+        GlobalConfig(
+            providers={"default": ProviderBlock(name="groq", url=groq_url)},
+            models={"fast": ModelProfile(provider="default", model="llama-3.1-8b")},
+            provider_keys={"default": "groq-secret"},
+        )
+    )
+
+    # Re-run keeping the same default (Groq, same URL); only the heavy provider differs.
+    _finalize_per_role_providers(
+        Console(),
+        fast={
+            "name": "groq",
+            "url": groq_url,
+            "api_key_env": "GROQ_API_KEY",
+            "azure_api_version": None,
+            "model": "llama-3.1-8b",
+            "timeout": 120,
+        },
+        heavy={
+            "name": "nvidia",
+            "url": "https://integrate.api.nvidia.com/v1",
+            "api_key_env": "NGC_API_KEY",
+            "azure_api_version": None,
+            "model": "qwen2.5:14b",
+            "timeout": 120,
+        },
+        vault_input="",
+        citations=False,
+        fast_api_key=None,
+    )
+
+    assert (load_global_config().provider_keys or {}).get("default") == "groq-secret"
+    assert resolve_api_key("groq", alias="default") == "groq-secret"

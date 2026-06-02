@@ -11,9 +11,11 @@
   per-alias key in the user-private global config) — a different key per model, or none
   for local providers. `synto init` now emits this format by default; legacy `[ollama]` /
   `[provider]` vaults keep working unchanged. Added an `nvidia` (NVIDIA NIM) provider.
-  `synto setup` gains a "different provider per model" branch that saves the split to the
-  user-private global config (api_key_env references, never raw keys), so `synto init`
-  reproduces a multi-provider vault — symmetric with single-provider setup.
+  `synto setup` offers this after you configure the primary provider and fast model — it
+  asks whether the heavy (writing) model should use a different provider, reuses the primary
+  as the fast role, and collects only the heavy one. The split is saved to the user-private
+  global config (api_key_env references, never raw keys), so `synto init` reproduces a
+  multi-provider vault.
 - Per-model parameters (#31). Each role accepts `ctx`, `temperature`, an Ollama `think`
   flag, and an `options`/`headers` passthrough for any provider-native parameter (e.g.
   `top_p`, `reasoning_effort`) with no code change. Thinking-model control resolves the
@@ -23,6 +25,18 @@
 
 ### Fixed
 
+- `synto init` no longer silently wires a vault for Ollama when no provider is configured,
+  and no longer rewrites an already-configured vault when there is no global config. With no
+  global config it warns (pointing at `synto setup`) on a fresh vault and leaves an existing
+  `synto.toml` untouched, instead of writing Ollama's URL into a non-Ollama provider block.
+  Also fixes a config-write regex that, when re-syncing a new-format vault, could delete the
+  `[models.*]`/`[pipeline]` sections. `synto init` now leaves any existing multi-provider
+  (per-role split) vault untouched, instead of collapsing its split when the global default
+  provider name happens to match but a role's provider differs.
+- Re-running `synto setup` no longer carries a saved per-alias API key over to a different
+  provider. When an alias is repointed to another connection (e.g. the default switches from
+  Groq to OpenRouter) the stale key is dropped, so it is never sent to the new provider;
+  keys for unchanged aliases are preserved.
 - `synto compile` no longer crashes (and `synto ingest` no longer fails notes with
   a blank reason) when an OpenAI-compatible provider returns an error as an
   HTTP-2xx body with no usable `choices` (#25). This is common on OpenRouter's free
