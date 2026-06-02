@@ -164,10 +164,25 @@ def test_ensure_wikilinks_empty_targets():
     assert ensure_wikilinks(content, []) == content
 
 
-def test_ensure_wikilinks_backslash_target():
-    # LaTeX titles like \int crashed re.sub via a bad group escape (\i);
-    # the replacement must be backslash-escaped so the link is inserted literally.
-    assert ensure_wikilinks(r"x\int y", [r"\int"]) == r"x[[\int]] y"
+def test_ensure_wikilinks_backslash_target_emits_filename_target():
+    # A LaTeX title \int is written to int.md (sanitize_filename strips "\"), so the
+    # body link must be [[int]] to resolve. Emitting [[\int]] would be a broken link.
+    assert ensure_wikilinks(r"x\int y", [r"\int"]) == r"x[[int]] y"
+
+
+def test_ensure_wikilinks_target_matches_filename_stem():
+    # The emitted link target must equal the file sanitize_filename() would create,
+    # for any title carrying filename-forbidden chars (here "/").
+    title = "TCP/IP"
+    result = ensure_wikilinks("see TCP/IP here", [title])
+    assert result == f"see [[{sanitize_filename(title)}]] here"
+    assert result == "see [[TCPIP]] here"
+
+
+def test_ensure_wikilinks_idempotent_for_normalized_target():
+    # Re-running over an already-normalized link must not double-wrap it.
+    once = ensure_wikilinks(r"x\int y", [r"\int"])
+    assert ensure_wikilinks(once, [r"\int"]) == once
 
 
 def test_ensure_wikilinks_backslash_target_no_match_does_not_raise():
@@ -318,9 +333,18 @@ def test_sanitize_wikilink_target_passthrough():
     assert sanitize_wikilink_target("Normal Title") == "Normal Title"
 
 
-def test_sanitize_wikilink_target_preserves_colon():
-    # Colons are fine inside wikilinks
-    assert sanitize_wikilink_target("Python: Guide") == "Python: Guide"
+def test_sanitize_wikilink_target_strips_filename_forbidden_chars():
+    # A link target must equal the filename stem to resolve. Chars that sanitize_filename
+    # strips (here ":", "/", "*") must be stripped from the target too — otherwise the
+    # link points at a name no file has.
+    for title in ["Python: Guide", "TCP/IP", "C*", r"\int", 'A*B"C/D']:
+        assert sanitize_wikilink_target(title) == sanitize_filename(title)
+
+
+def test_sanitize_wikilink_target_strips_colon():
+    # Regression for the old "preserves colon" behavior: "Python: Guide" is written to
+    # "Python Guide.md", so the link target must be "Python Guide", not "Python: Guide".
+    assert sanitize_wikilink_target("Python: Guide") == "Python Guide"
 
 
 # ── build_wiki_frontmatter ────────────────────────────────────────────────────
