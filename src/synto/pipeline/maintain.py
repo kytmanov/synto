@@ -215,6 +215,10 @@ def _move_file(old: Path, new: Path) -> None:
         old.rename(tmp)
         tmp.rename(new)
     else:
+        # Defense in depth: preflight already rejects target collisions, but never let a
+        # rename silently overwrite an unrelated file if that guarantee ever regresses.
+        if new.exists():
+            raise ConceptRenameError(f"Refusing to overwrite existing file: {new}")
         old.rename(new)
 
 
@@ -252,7 +256,7 @@ def rename_concept(
     case_only = canonical_old.casefold() == new_name.casefold()
     if canonical_old == new_name:
         raise ConceptRenameError(f"{old_name!r} is already named {new_name!r}")
-    if not case_only and db.concept_name_exists_exact(new_name):
+    if not case_only and db.concept_name_exists_exact(new_name, exclude_concept=canonical_old):
         raise ConceptRenameError(
             f"Cannot rename to {new_name!r}: a concept/alias with that name already exists"
         )
@@ -260,25 +264,47 @@ def rename_concept(
     old_stem = sanitize_filename(canonical_old)
     new_stem = sanitize_filename(new_name)
 
-    # Concept article files to move (published and/or draft). Synthesis pages are
-    # question-keyed, never a concept's own page — exclude them from the move.
+    # The concept's own article(s): the deterministic file <dir>/<old_stem>.md, plus any
+    # row whose title is exactly the canonical name. Matching on alias titles/stems (as
+    # find_article_candidates does) is unsafe here — it could pull in an unrelated
+    # article that merely shares one of this concept's aliases and clobber it.
+    old_key = canonical_old.casefold()
     candidates = [
-        art for art in db.find_article_candidates(canonical_old) if art.kind != "synthesis"
+        art
+        for art in db.list_articles()
+        if art.kind != "synthesis"
+        and (
+            Path(art.path).stem.casefold() == old_stem.casefold() or art.title.casefold() == old_key
+        )
     ]
-    moves: list[tuple[Path, Path, str]] = []  # (old_path, new_path, new_rel)
+    # Validate everything before any write so a rename can't fail partway through.
+    moves: list[tuple[Path, Path, str, str]] = []  # (old_path, new_path, new_rel, old_rel)
+    seen_targets: set[str] = set()
     for art in candidates:
-        old_path = config.vault / art.path
+        old_rel = art.path
+        old_path = config.vault / old_rel
         new_path = old_path.parent / f"{new_stem}.md"
         new_rel = str(new_path.relative_to(config.vault))
+        if not old_path.exists():
+            raise ConceptRenameError(
+                f"Tracked article {old_rel} is missing on disk; "
+                "reconcile with `synto lint` before renaming."
+            )
         if not case_only and new_path.exists():
             raise ConceptRenameError(f"Target file already exists: {new_rel}")
-        moves.append((old_path, new_path, new_rel))
+        existing = db.get_article(new_rel)
+        if existing is not None and new_rel != old_rel:
+            raise ConceptRenameError(f"A tracked article already exists at {new_rel}")
+        if new_rel in seen_targets:
+            raise ConceptRenameError(f"Multiple articles would collide at {new_rel}")
+        seen_targets.add(new_rel)
+        moves.append((old_path, new_path, new_rel, old_rel))
 
     if dry_run:
         log.info("dry-run: would rename concept %r → %r", canonical_old, new_name)
-        for old_path, _new_path, new_rel in moves:
-            log.info("dry-run: would move %s → %s", old_path.name, new_rel)
-        report.files_moved = [(str(o.relative_to(config.vault)), r) for o, _n, r in moves]
+        for _old_path, _new_path, new_rel, old_rel in moves:
+            log.info("dry-run: would move %s → %s", old_rel, new_rel)
+        report.files_moved = [(old_rel, new_rel) for _o, _n, new_rel, old_rel in moves]
         # Count pages whose inbound links would change, without writing.
         report.links_rewritten = _rewrite_inbound_links(
             config, db, old_stem, new_stem, new_name, dry_run=True
@@ -288,7 +314,7 @@ def rename_concept(
     # ── Mutations ───────────────────────────────────────────────────────────
     from .lint import _body_hash
 
-    for old_path, new_path, new_rel in moves:
+    for old_path, new_path, new_rel, old_rel in moves:
         _move_file(old_path, new_path)
         meta, body = parse_note(new_path)
         meta["title"] = new_name
@@ -298,7 +324,6 @@ def rename_concept(
             if not any(a.casefold() == canonical_old.casefold() for a in existing):
                 meta["aliases"] = [*existing, canonical_old]
         write_note(new_path, meta, body)
-        old_rel = str(old_path.relative_to(config.vault))
         db.update_article_identity(old_rel, new_rel, new_name, _body_hash(body))
         report.files_moved.append((old_rel, new_rel))
 

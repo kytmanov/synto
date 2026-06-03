@@ -1759,22 +1759,34 @@ class StateDB:
                 matches.append(article)
         return matches
 
-    def concept_name_exists_exact(self, name: str) -> bool:
+    def concept_name_exists_exact(self, name: str, *, exclude_concept: str | None = None) -> bool:
         """True if ``name`` is already an exact concept name, alias, or knowledge item.
 
         Exact (case-insensitive) only — deliberately NOT the fuzzy
         ``find_concept_by_name_or_alias`` (which falls back to substring LIKE and would
         report false collisions, e.g. renaming to "Net" matching "Network").
+
+        ``exclude_concept`` drops one concept's own identity from the check so a rename
+        can promote that concept's existing alias to canonical (e.g. "Program Counter"
+        with alias "PC" → "PC") without a false self-collision.
         """
         n = name.casefold()
-        for sql in (
-            "SELECT 1 FROM concepts WHERE lower(name) = ? LIMIT 1",
-            "SELECT 1 FROM concept_aliases WHERE lower(alias) = ? LIMIT 1",
-            "SELECT 1 FROM knowledge_items WHERE lower(name) = ? LIMIT 1",
-        ):
-            if self._conn.execute(sql, (n,)).fetchone():
-                return True
-        return False
+        ex = exclude_concept.casefold() if exclude_concept else None
+        # A concept/knowledge-item literally named `name` (other than the excluded one).
+        if n != ex:
+            for sql in (
+                "SELECT 1 FROM concepts WHERE lower(name) = ? LIMIT 1",
+                "SELECT 1 FROM knowledge_items WHERE lower(name) = ? LIMIT 1",
+            ):
+                if self._conn.execute(sql, (n,)).fetchone():
+                    return True
+        # An alias `name` claimed by a *different* concept.
+        row = self._conn.execute(
+            "SELECT 1 FROM concept_aliases "
+            "WHERE lower(alias) = ? AND (? IS NULL OR lower(concept_name) != ?) LIMIT 1",
+            (n, ex, ex),
+        ).fetchone()
+        return row is not None
 
     def rename_concept(self, old_name: str, new_name: str) -> None:
         """Migrate a concept's identity and behavioral state from ``old`` to ``new``.

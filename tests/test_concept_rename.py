@@ -223,6 +223,65 @@ def test_rename_db_only_concept_without_article(config, db):
     assert "Adopted Concept" in db.list_all_concept_names()
 
 
+def test_rename_does_not_clobber_unrelated_article_sharing_an_alias(config, db):
+    """An unrelated article that merely matches one of the concept's aliases must not be
+    moved/overwritten — only the concept's own page (by canonical name/stem) moves."""
+    _make_concept_article(config, db, "Alpha", "Alpha body.")
+    db.upsert_aliases("Alpha", ["A"])
+    other = _make_concept_article(config, db, "A", "Unrelated A body.", source="raw/a2.md")
+
+    rename_concept(config, db, "Alpha", "Renamed", keep_alias=False)
+
+    # The aliased-but-unrelated article is untouched.
+    assert other.exists()
+    assert "Unrelated A body." in other.read_text()
+    assert db.get_article("wiki/A.md") is not None
+    # The concept's own page moved.
+    assert (config.wiki_dir / "Renamed.md").exists()
+    assert not (config.wiki_dir / "Alpha.md").exists()
+
+
+def test_rename_can_promote_own_alias_to_canonical(config, db):
+    """Renaming a concept to one of its own aliases is not a collision."""
+    _make_concept_article(config, db, "Program Counter", "Body.")
+    db.upsert_aliases("Program Counter", ["PC"])
+
+    # Must not raise — "PC" is this concept's own alias, not a foreign name.
+    rename_concept(config, db, "Program Counter", "PC")
+
+    assert "PC" in db.list_all_concept_names()
+    assert "Program Counter" not in db.list_all_concept_names()
+    assert (config.wiki_dir / "PC.md").exists()
+
+
+def test_rename_errors_when_article_missing_on_disk(config, db):
+    """A tracked row whose file was deleted must fail preflight, not crash mid-rename."""
+    path = _make_concept_article(config, db, "Ghost", "Body.")
+    path.unlink()
+
+    with pytest.raises(ConceptRenameError, match="missing on disk"):
+        rename_concept(config, db, "Ghost", "Spectre")
+
+
+def test_rename_refuses_stale_db_row_at_target_path(config, db):
+    """A stale wiki_articles row at the target path must block the rename loudly rather
+    than be silently deleted."""
+    _make_concept_article(config, db, "Old", "Body.")
+    # A DB row at the target path with no file on disk (stale metadata).
+    db.upsert_article(
+        WikiArticleRecord(
+            path="wiki/New.md",
+            title="Something Else",
+            sources=[],
+            content_hash="x",
+            status="published",
+        )
+    )
+
+    with pytest.raises(ConceptRenameError, match="already exists at wiki/New.md"):
+        rename_concept(config, db, "Old", "New")
+
+
 def test_rename_draft_article(config, db):
     db.upsert_concepts("raw/a.md", ["Draft Topic"])
     draft = config.drafts_dir / "Draft Topic.md"
