@@ -1210,8 +1210,12 @@ _SERVE_HELP_RC=0
 SERVE_HELP_OUT=$($OLW serve --help 2>&1) || _SERVE_HELP_RC=$?
 echo "$SERVE_HELP_OUT"
 check "serve --help exits 0" "test $_SERVE_HELP_RC -eq 0"
-soft_check "serve help mentions stdio transport" "echo \"$SERVE_HELP_OUT\" | grep -q 'stdio'"
-soft_check "serve help describes exposed tools" "echo \"$SERVE_HELP_OUT\" | grep -q 'Exposes three tools only'"
+_SERVE_HELP_TMP=$(mktemp)
+printf '%s\n' "$SERVE_HELP_OUT" > "$_SERVE_HELP_TMP"
+soft_check "serve help mentions stdio transport" "grep -q 'stdio' \"$_SERVE_HELP_TMP\""
+soft_check "serve help describes exposed tools" \
+    "grep -q 'Exposes read-only vault tools' \"$_SERVE_HELP_TMP\""
+rm -f "$_SERVE_HELP_TMP"
 
 # ── Maintain --dry-run (Stage 3) ──────────────────────────────────────────────
 header "synto maintain --dry-run (Stage 3)"
@@ -1346,9 +1350,16 @@ check "compile produced at least one annotated draft" \
 ANNOTATED_DRAFT=$({ grep -rl 'synto-auto' "$VAULT_DIR/wiki/.drafts/" 2>/dev/null \
     | head -1; } || true)
 if [[ -n "$ANNOTATED_DRAFT" ]]; then
+    REJECTION_CONCEPT=$(grep '^title:' "$ANNOTATED_DRAFT" | head -1 | sed 's/title: *//')
     check "low-confidence annotation present"  "grep -q 'synto-auto: low-confidence' \"$ANNOTATED_DRAFT\""
     check "single-source annotation present"   "grep -q 'synto-auto: single-source' \"$ANNOTATED_DRAFT\""
     check "low-quality annotation present"     "grep -q 'synto-auto: all sources low-quality' \"$ANNOTATED_DRAFT\""
+fi
+
+if [[ -z "${REJECTION_CONCEPT:-}" ]]; then
+    REJECTION_CONCEPT=$(find "$VAULT_DIR/wiki" -maxdepth 1 -name "*.md" \
+        ! -name "index.md" ! -name "log.md" 2>/dev/null | sort | head -1 | xargs -I{} \
+        grep '^title:' "{}" | head -1 | sed 's/title: *//')
 fi
 
 # Verify annotations are stripped on approve. Match both prefixes because
@@ -1368,7 +1379,8 @@ info "Recompiling to produce a draft to reject..."
 # Use the public CLI to force a recompile of a specific concept. Mutating
 # raw_notes.status to 'ingested' would be a no-op: the recompile gate is
 # concept_compile_state, not raw_notes.status.
-$OLW compile --force --concept "Quantum computing" 2>&1 || true
+check "rejection-feedback has a concept to recompile" "test -n \"$REJECTION_CONCEPT\""
+$OLW compile --force --concept "$REJECTION_CONCEPT" 2>&1 || true
 
 REJECT_DRAFT=$(find "$VAULT_DIR/wiki/.drafts" -name "*.md" | head -1)
 # Hard-check that the prior --force --concept compile produced a draft —
@@ -1392,7 +1404,7 @@ soft_check "reject confirms feedback saved" \
 # rejection-feedback prompt path is exercised. Direct raw_notes.status
 # mutation would be a no-op (see comment above).
 _CAR_RC=0
-COMPILE_OUT2=$($OLW compile --force --concept "Quantum computing" 2>&1) || _CAR_RC=$?
+COMPILE_OUT2=$($OLW compile --force --concept "$REJECTION_CONCEPT" 2>&1) || _CAR_RC=$?
 echo "$COMPILE_OUT2"
 check "compile after rejection exits 0" "test $_CAR_RC -eq 0"
 # We can't easily inspect the prompt, but compile should succeed without crash
