@@ -501,6 +501,8 @@ request as-is and override the matching first-class field, so set computed value
 - `synto doctor --backlog` — reads the MCP audit log to show what to ingest next: zero-result queries, single-source concepts in active demand, and the verbatim-vs-`answer_question` tool mix.
 - `synto query` — index-routed Q&A with optional synthesis to `wiki/synthesis/`
 - `synto review` — interactive draft review: approve, reject, edit, or diff before publishing
+- `synto concept rename OLD NEW` — rename a concept everywhere: moves the article, repoints
+  every inbound wikilink, and migrates the name across the state DB; `--dry-run` previews
 - `synto watch` — file watcher: auto-ingest and compile on every save
 - `synto maintain` — wiki health check, stub creation, orphan cleanup
 - `synto eval` — offline structural evaluation (coverage, citation support, link resolution)
