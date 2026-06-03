@@ -28,6 +28,7 @@ from ..vault import (
     list_wiki_articles,
     normalize_wikilinks,
     parse_note,
+    rename_wikilink_targets,
     sanitize_filename,
     write_note,
 )
@@ -188,6 +189,194 @@ def normalize_published_alias_links(
         modified += 1
 
     return modified
+
+
+class ConceptRenameError(Exception):
+    """Raised when a concept rename cannot proceed (not found, name taken, etc.)."""
+
+
+@dataclass
+class RenameReport:
+    old_name: str = ""
+    new_name: str = ""
+    files_moved: list[tuple[str, str]] = field(default_factory=list)
+    links_rewritten: int = 0  # files in which inbound links were rewritten
+    alias_kept: bool = False
+    dry_run: bool = False
+
+
+def _move_file(old: Path, new: Path) -> None:
+    """Rename a file, handling case-only renames on case-insensitive filesystems."""
+    if old == new:
+        return
+    case_only = old.parent == new.parent and old.name.casefold() == new.name.casefold()
+    if case_only:
+        tmp = old.with_name(f"{old.stem}.__synto_rename__{old.suffix}")
+        old.rename(tmp)
+        tmp.rename(new)
+    else:
+        # Defense in depth: preflight already rejects target collisions, but never let a
+        # rename silently overwrite an unrelated file if that guarantee ever regresses.
+        if new.exists():
+            raise ConceptRenameError(f"Refusing to overwrite existing file: {new}")
+        old.rename(new)
+
+
+def rename_concept(
+    config: Config,
+    db: StateDB,
+    old_name: str,
+    new_name: str,
+    *,
+    keep_alias: bool = True,
+    dry_run: bool = False,
+) -> RenameReport:
+    """Rename a concept: migrate DB identity, move its article, rewrite all inbound links.
+
+    See plan/issue #29. The optional alias (old → new) is the durability mechanism:
+    ingest's _normalize_concepts canonicalizes re-extracted old names back to the new
+    one, so the rename survives future re-ingest. Dropping it can resurrect the old
+    concept if a raw note still yields the old surface form.
+    """
+    old_name = old_name.strip()
+    new_name = new_name.strip()
+    report = RenameReport(
+        old_name=old_name, new_name=new_name, alias_kept=keep_alias, dry_run=dry_run
+    )
+
+    # ── Preflight (no writes) ───────────────────────────────────────────────
+    if not new_name or sanitize_filename(new_name) == "untitled":
+        raise ConceptRenameError(f"Invalid new name: {new_name!r}")
+
+    # Exact resolution only: a fuzzy substring match (e.g. "Net" -> "Network") would
+    # silently rename the wrong concept. On a miss, reuse the fuzzy helper for a
+    # suggestion only — never to act.
+    resolved = db.find_concept_exact(old_name)
+    if resolved is None:
+        fuzzy = db.find_concept_by_name_or_alias(old_name)
+        hint = f" Did you mean {fuzzy[0]!r}?" if fuzzy else ""
+        raise ConceptRenameError(f"Concept not found: {old_name!r}.{hint}")
+    canonical_old = resolved[0]
+
+    case_only = canonical_old.casefold() == new_name.casefold()
+    if canonical_old == new_name:
+        raise ConceptRenameError(f"{old_name!r} is already named {new_name!r}")
+    if not case_only and db.concept_name_exists_exact(new_name, exclude_concept=canonical_old):
+        raise ConceptRenameError(
+            f"Cannot rename to {new_name!r}: a concept/alias with that name already exists"
+        )
+
+    old_stem = sanitize_filename(canonical_old)
+    new_stem = sanitize_filename(new_name)
+
+    # The concept's own article(s): the deterministic file <dir>/<old_stem>.md, plus any
+    # row whose title is exactly the canonical name. Matching on alias titles/stems (as
+    # find_article_candidates does) is unsafe here — it could pull in an unrelated
+    # article that merely shares one of this concept's aliases and clobber it.
+    old_key = canonical_old.casefold()
+    candidates = [
+        art
+        for art in db.list_articles()
+        if art.kind != "synthesis"
+        and (
+            Path(art.path).stem.casefold() == old_stem.casefold() or art.title.casefold() == old_key
+        )
+    ]
+    # Validate everything before any write so a rename can't fail partway through.
+    moves: list[tuple[Path, Path, str, str]] = []  # (old_path, new_path, new_rel, old_rel)
+    seen_targets: set[str] = set()
+    for art in candidates:
+        old_rel = art.path
+        old_path = config.vault / old_rel
+        new_path = old_path.parent / f"{new_stem}.md"
+        new_rel = str(new_path.relative_to(config.vault))
+        if not old_path.exists():
+            raise ConceptRenameError(
+                f"Tracked article {old_rel} is missing on disk; "
+                "reconcile with `synto lint` before renaming."
+            )
+        if not case_only and new_path.exists():
+            raise ConceptRenameError(f"Target file already exists: {new_rel}")
+        existing = db.get_article(new_rel)
+        if existing is not None and new_rel != old_rel:
+            raise ConceptRenameError(f"A tracked article already exists at {new_rel}")
+        if new_rel in seen_targets:
+            raise ConceptRenameError(f"Multiple articles would collide at {new_rel}")
+        seen_targets.add(new_rel)
+        moves.append((old_path, new_path, new_rel, old_rel))
+
+    if dry_run:
+        log.info("dry-run: would rename concept %r → %r", canonical_old, new_name)
+        for _old_path, _new_path, new_rel, old_rel in moves:
+            log.info("dry-run: would move %s → %s", old_rel, new_rel)
+        report.files_moved = [(old_rel, new_rel) for _o, _n, new_rel, old_rel in moves]
+        # Count pages whose inbound links would change, without writing.
+        report.links_rewritten = _rewrite_inbound_links(
+            config, db, old_stem, new_stem, new_name, dry_run=True
+        )
+        return report
+
+    # ── Mutations ───────────────────────────────────────────────────────────
+    for old_path, new_path, new_rel, old_rel in moves:
+        _move_file(old_path, new_path)
+        meta, body = parse_note(new_path)
+        meta["title"] = new_name
+        meta["updated"] = datetime.now().strftime("%Y-%m-%d")
+        if keep_alias:
+            existing = list(meta.get("aliases") or [])
+            if not any(a.casefold() == canonical_old.casefold() for a in existing):
+                meta["aliases"] = [*existing, canonical_old]
+        # Body is unchanged (frontmatter-only edit), so content_hash is preserved by
+        # update_article_identity — this keeps manual-edit protection on a hand-fixed page.
+        write_note(new_path, meta, body)
+        db.update_article_identity(old_rel, new_rel, new_name)
+        report.files_moved.append((old_rel, new_rel))
+
+    db.rename_concept(canonical_old, new_name)
+    if keep_alias:
+        db.upsert_aliases(new_name, [canonical_old])
+
+    report.links_rewritten = _rewrite_inbound_links(
+        config, db, old_stem, new_stem, new_name, dry_run=False
+    )
+    return report
+
+
+def _rewrite_inbound_links(
+    config: Config,
+    db: StateDB,
+    old_stem: str,
+    new_stem: str,
+    new_name: str,
+    *,
+    dry_run: bool,
+) -> int:
+    """Repoint every wikilink resolving to old_stem across the wiki tree.
+
+    Covers concept articles, drafts, sources/, queries/, synthesis/ so no broken
+    links are left anywhere. raw/ is immutable and untouched. content_hash is
+    refreshed only for tracked rows — _write_fixed_note no-ops the DB update for
+    untracked pages, so the broad rewrite scope stays cheap.
+    """
+    from .lint import _write_fixed_note
+
+    changed = 0
+    for page in sorted(config.wiki_dir.rglob("*.md")):
+        try:
+            meta, body = parse_note(page)
+        except Exception as exc:
+            log.warning("rename: skipping %s — parse error: %s", page.name, exc)
+            continue
+        new_body = rename_wikilink_targets(body, old_stem, new_stem, new_name)
+        if new_body == body:
+            continue
+        changed += 1
+        if dry_run:
+            log.info("dry-run: would rewrite links in %s", page.name)
+            continue
+        rel_path = str(page.relative_to(config.vault))
+        _write_fixed_note(page, rel_path, meta, new_body, db)
+    return changed
 
 
 def create_stubs(
