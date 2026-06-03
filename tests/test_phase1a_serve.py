@@ -87,7 +87,12 @@ def test_run_server_prints_startup_banner_to_stderr_and_keeps_stdout_clean(
             root.addHandler(handler)
 
     captured = capsys.readouterr()
+    # The full banner (not just a substring) lands on stderr: the ready line names the
+    # transport, the wait line explains the idle terminal, and the stop hint is present.
+    assert "synto MCP server ready (stdio)" in captured.err
     assert "Waiting for an MCP client" in captured.err
+    assert "Press Ctrl-C to stop" in captured.err
+    # stdout must stay pristine — a stray byte there corrupts the JSON-RPC stream.
     assert captured.out == ""
 
 

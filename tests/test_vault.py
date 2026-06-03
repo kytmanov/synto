@@ -575,3 +575,14 @@ def test_rename_emits_display_link_when_new_name_has_forbidden_chars():
     body = "See [[TCP]]."
     out = rename_wikilink_targets(body, "TCP", "TCPIP", "TCP/IP")
     assert out == "See [[TCPIP|TCP/IP]]."
+
+
+def test_rename_repoints_case_variant_links():
+    # Targets match the stem case-insensitively (old_key = old_stem.casefold()), so links
+    # an author wrote in any case still repoint — otherwise [[quantm computing]] would be
+    # left dangling after the rename while [[Quantm Computing]] was fixed.
+    body = "See [[quantm computing]] and [[QUANTM COMPUTING]]."
+    out = rename_wikilink_targets(
+        body, "Quantm Computing", "Quantum Computing", "Quantum Computing"
+    )
+    assert out == "See [[Quantum Computing]] and [[Quantum Computing]]."

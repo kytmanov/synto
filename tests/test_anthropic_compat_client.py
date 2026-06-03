@@ -183,6 +183,53 @@ def test_no_truncation_on_end_turn(client):
     assert result == "done"
 
 
+# ── _post_chat 429 backoff (the real retry loop; other tests mock _post_chat) ───
+
+
+def _plain_resp(status_code: int, headers: dict | None = None) -> MagicMock:
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.headers = headers or {}
+    return resp
+
+
+def test_post_chat_retries_429_then_returns_ok_and_releases_connection(client, monkeypatch):
+    """A 429 must be retried, and its connection released (resp.close) BEFORE sleeping —
+    otherwise a throttled run leaks a held connection per backoff."""
+    monkeypatch.setattr("synto.anthropic_compat_client.time.sleep", lambda _s: None)
+    throttled = _plain_resp(429)
+    ok = _plain_resp(200)
+    client._client.post = MagicMock(side_effect=[throttled, ok])
+
+    assert client._post_chat({"messages": []}) is ok
+    throttled.close.assert_called_once()
+
+
+def test_post_chat_429_backoff_is_exponential_and_budget_bounded(client, monkeypatch):
+    """Persistent 429s back off 1,2,4,8,16 (capped) and give up within the 60s budget,
+    returning the last 429 for the caller to classify — never an unbounded retry."""
+    waits: list[float] = []
+    monkeypatch.setattr("synto.anthropic_compat_client.time.sleep", lambda s: waits.append(s))
+    throttled = _plain_resp(429)
+    client._client.post = MagicMock(return_value=throttled)
+
+    assert client._post_chat({"messages": []}) is throttled
+    assert waits[:5] == [1.0, 2.0, 4.0, 8.0, 16.0]
+    assert sum(waits) <= 60.0
+
+
+def test_post_chat_honors_retry_after_header(client, monkeypatch):
+    """A numeric Retry-After overrides the exponential default for the first wait."""
+    waits: list[float] = []
+    monkeypatch.setattr("synto.anthropic_compat_client.time.sleep", lambda s: waits.append(s))
+    client._client.post = MagicMock(
+        side_effect=[_plain_resp(429, headers={"Retry-After": "5"}), _plain_resp(200)]
+    )
+
+    client._post_chat({"messages": []})
+    assert waits == [5.0]
+
+
 # ── Healthcheck ──────────────────────────────────────────────────────────────
 
 

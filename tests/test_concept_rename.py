@@ -13,7 +13,7 @@ import frontmatter as fm_lib
 import pytest
 
 from synto.config import Config
-from synto.models import Concept, WikiArticleRecord
+from synto.models import Concept, ItemMentionRecord, TermRecord, WikiArticleRecord
 from synto.pipeline.ingest import _normalize_concepts
 from synto.pipeline.maintain import ConceptRenameError, rename_concept
 from synto.state import StateDB
@@ -356,3 +356,104 @@ def test_rename_draft_article(config, db):
 
     assert not draft.exists()
     assert (config.drafts_dir / "Final Topic.md").exists()
+
+
+# ── State.rename_concept: DB re-key completeness (unit) ─────────────────────────
+# The high-level rename is covered above; these pin the lower-level State method's
+# obligation to re-key *every* behavioral table it documents. Each asserts a table the
+# end-to-end tests don't reach (compile state, occurrence provenance, stubs, self-alias).
+
+
+def test_state_rename_rekeys_compile_state_occurrences_and_stubs(db):
+    """If any UPDATE in State.rename_concept is dropped, the rename silently strips compile
+    progress, occurrence provenance, or a pending stub — none of which raise. Re-keying is
+    the only thing that keeps those rows reachable under the new canonical name."""
+    db.upsert_concepts("raw/n.md", ["Old Name"])
+    db.mark_concept_compile_state("Old Name", ["raw/n.md"], "compiled")
+    db.upsert_concept_occurrences(
+        [
+            TermRecord(
+                name="Old Name",
+                definition="d",
+                source_segment_id="seg-1",
+                provenance="extracted",
+                confidence=0.9,
+            )
+        ],
+        "seg-1",
+    )
+    db.add_stub("Old Name")
+
+    db.rename_concept("Old Name", "New Name")
+
+    assert db.get_compile_state("Old Name", "raw/n.md") is None
+    assert db.get_compile_state("New Name", "raw/n.md") is not None
+    assert {r["concept_name"] for r in db.list_concept_occurrences()} == {"New Name"}
+    assert db.has_stub("New Name") is True
+    assert db.has_stub("Old Name") is False
+
+
+def test_state_rename_drops_redundant_self_alias(db):
+    """Renaming onto one of the concept's own aliases must delete the now self-referential
+    row (alias == canonical). A surviving PC→PC alias would resolve a name to itself and
+    pollute the alias surface."""
+    db.upsert_concepts("raw/n.md", ["Program Counter"])
+    db.upsert_aliases("Program Counter", ["PC"])
+
+    db.rename_concept("Program Counter", "PC")
+
+    assert "PC" not in db.aliases_for_concept("PC")
+
+
+def test_state_rename_leaves_item_mentions_untouched(db):
+    """Documented invariant (State.rename_concept docstring): item_mentions are generic
+    source-evidence, not canonical concept binding, so the rename deliberately does NOT
+    re-key them. Pinning the contract makes any future change to it a conscious one."""
+    db.upsert_concepts("raw/n.md", ["Old Name"])
+    db.add_item_mention(
+        ItemMentionRecord(
+            item_name="Old Name",
+            source_path="raw/n.md",
+            mention_text="Old Name",
+            evidence_level="source_supported",
+        )
+    )
+
+    db.rename_concept("Old Name", "New Name")
+
+    assert len(db.get_item_mentions("Old Name")) == 1
+    assert db.get_item_mentions("New Name") == []
+
+
+# ── Inbound-link rewrite breadth across the wiki tree ───────────────────────────
+
+
+def test_rename_rewrites_inbound_links_in_every_subdir(config, db):
+    """_rewrite_inbound_links rglobs the whole wiki tree (sources/, queries/, synthesis/,
+    drafts), not just article root. A regression that narrowed the scan would leave broken
+    links in the other folders. Seed one inbound link per folder and assert all repoint."""
+    (config.wiki_dir / "sources").mkdir(parents=True, exist_ok=True)
+    (config.wiki_dir / "queries").mkdir(parents=True, exist_ok=True)
+    (config.wiki_dir / "synthesis").mkdir(parents=True, exist_ok=True)
+
+    _make_concept_article(config, db, "Quantm Computing", "Body.")
+    pages = {
+        "root": config.wiki_dir / "Overview.md",
+        "source": config.wiki_dir / "sources" / "Some Source.md",
+        "query": config.wiki_dir / "queries" / "2026-01-01 A question.md",
+        "synthesis": config.wiki_dir / "synthesis" / "A synthesis.md",
+        "draft": config.drafts_dir / "Draft.md",
+    }
+    for label, path in pages.items():
+        post = fm_lib.Post(
+            f"Mentions [[Quantm Computing]] in {label}.", title=label, status="published"
+        )
+        atomic_write(path, fm_lib.dumps(post))
+
+    report = rename_concept(config, db, "Quantm Computing", "Quantum Computing")
+
+    assert report.links_rewritten == len(pages)
+    for path in pages.values():
+        text = path.read_text()
+        assert "[[Quantum Computing]]" in text
+        assert "Quantm Computing" not in text

@@ -199,6 +199,35 @@ def test_provider_override_replaces_kind_and_url():
     assert r.url == "https://api.groq.com/openai/v1"
 
 
+def test_provider_override_resets_timeout_to_registry_default():
+    """--provider switches accounts entirely, so a custom timeout from the old block must
+    NOT leak onto the new provider; it falls back to the new provider's registry default."""
+    from synto.providers import get_provider
+
+    c = _cfg(
+        providers={"default": ProviderBlock(name="ollama", timeout=999.0)},
+        models={"heavy": {"provider": "default", "model": "m"}},
+        provider_override="groq",
+    )
+    r = c.resolve_role("heavy")
+    assert r.timeout != 999.0
+    assert r.timeout == get_provider("groq").default_timeout
+
+
+def test_provider_url_override_alone_keeps_block_timeout():
+    """--provider-url only relocates the same account, so its configured timeout survives."""
+    c = _cfg(
+        providers={
+            "default": ProviderBlock(
+                name="groq", url="https://api.groq.com/openai/v1", timeout=42.0
+            )
+        },
+        models={"heavy": {"provider": "default", "model": "m"}},
+        provider_override_url="http://relocated/v1",
+    )
+    assert c.resolve_role("heavy").timeout == 42.0
+
+
 def test_override_preserves_per_role_model_and_params():
     # An override changes only the connection; per-role model/ctx/think/temperature survive.
     c = _cfg(
