@@ -2,6 +2,8 @@
 
 <p align="center">
      <a href="https://pepy.tech/projects/synto"><img alt="PyPI downloads" src="https://static.pepy.tech/badge/synto"></a>
+     <a href="https://github.com/kytmanov/synto/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/kytmanov/synto?style=flat"></a>
+     <a href="https://github.com/kytmanov/synto/forks"><img alt="GitHub forks" src="https://img.shields.io/github/forks/kytmanov/synto?style=flat"></a>
      <a href="https://github.com/kytmanov/synto/commits/master"><img alt="GitHub last commit" src="https://img.shields.io/github/last-commit/kytmanov/synto?style=flat"></a> 
      <a href="https://github.com/kytmanov/synto/actions/workflows/ci.yml"><img alt="CI status" src="https://img.shields.io/github/actions/workflow/status/kytmanov/synto/ci.yml?style=flat&amp;label=CI"></a> 
      <a href="https://pypi.org/project/synto/"><img alt="PyPI version" src="https://img.shields.io/pypi/v/synto?style=flat"></a>
