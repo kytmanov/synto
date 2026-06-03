@@ -2,6 +2,8 @@
 
 <p align="center">
      <a href="https://pepy.tech/projects/synto"><img alt="PyPI downloads" src="https://static.pepy.tech/badge/synto"></a>
+     <a href="https://github.com/kytmanov/synto/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/kytmanov/synto?style=flat"></a>
+     <a href="https://github.com/kytmanov/synto/forks"><img alt="GitHub forks" src="https://img.shields.io/github/forks/kytmanov/synto?style=flat"></a>
      <a href="https://github.com/kytmanov/synto/commits/master"><img alt="GitHub last commit" src="https://img.shields.io/github/last-commit/kytmanov/synto?style=flat"></a> 
      <a href="https://github.com/kytmanov/synto/actions/workflows/ci.yml"><img alt="CI status" src="https://img.shields.io/github/actions/workflow/status/kytmanov/synto/ci.yml?style=flat&amp;label=CI"></a> 
      <a href="https://pypi.org/project/synto/"><img alt="PyPI version" src="https://img.shields.io/pypi/v/synto?style=flat"></a>
@@ -36,7 +38,7 @@ The key insight: **treat your notes as source material, not as the final artifac
 
 ```
 You write raw notes  →  LLM extracts concepts  →  Wiki articles grow  →  Agent-ready pack
-      raw/                    (automatic)              wiki/                   pack/
+      raw/                    (automatic)              wiki/             .synto/exports/
   quantum.md           "Qubit", "Superposition"     Qubit.md
   ml-basics.md         "Neural Net", "SGD"          Superposition.md ←── [[wikilinks]]
   physics.md           "Qubit"  ← same concept      Neural_Network.md
@@ -58,7 +60,7 @@ Four stages. Two LLM tiers.
 │  Stage 1: Import  Stage 2: Ingest  Stage 3: Compile  Stage 4: Export  │
 │                                                                        │
 │  synto add ─────┐                                                      │
-│  (PDF/md/txt)   ├─ raw/*.md ──────► wiki/.drafts/ ──────► pack/       │
+│  (PDF/md/txt)   ├─ raw/*.md ──────► wiki/.drafts/ ──────► exports/    │
 │  .synto/sources/┘  fast model       heavy model      agent-ready      │
 │                    (4B params)      (14B+ params)     directory        │
 │                                                                        │
@@ -87,15 +89,15 @@ Four stages. Two LLM tiers.
   .synto/
     state.db        ← SQLite: note lifecycle, concept registry, metrics
     sources/        ← originals archived via synto add (PDF, md, txt)
+    exports/agents/ ← agent-ready export (synto pack export; --out to relocate)
   synto.toml        ← vault config (provider, models, pipeline settings)
-  pack/             ← agent-ready export (created by synto pack export)
 ```
 
 ### Key mechanisms
 
 **Incremental compilation.** Change one note — only the articles derived from that note recompile. A vault with 200 notes doesn't restart from scratch on every run.
 
-**Rejection feedback loop.** Reject a draft and explain why. The reason is stored and injected into the LLM prompt the next time that concept compiles, so the model can address it. Five rejections without an approval auto-blocks the concept until you re-enable it.
+**Rejection feedback loop.** Reject a draft and explain why. The reason is stored and injected into the LLM prompt the next time that concept compiles, so the model can address it. Five rejections auto-block the concept until you re-enable it.
 
 ```bash
 synto reject wiki/.drafts/Qubit.md --feedback "Too abstract, needs a hardware analogy"
@@ -119,8 +121,8 @@ synto approve --min-confidence 0.8              # publish reviewed or fresh draf
 `spec`, `api_docs`, `web_article`, `corp_docs`, `transcript`, or `unknown_text`. During ingest
 analysis the fast model receives a matching system prompt: a `paper` prompt extracts
 abstract/methods/results structure; an `api_docs` prompt preserves parameter names; a
-`textbook` prompt follows chapter/definition flow. If `--type` is omitted, Synto infers it
-from the file extension.
+`textbook` prompt follows chapter/definition flow. If `--type` is omitted, PDFs default to
+`paper` and everything else to `notes` — pass `--type` for anything more specific.
 
 ---
 
@@ -144,7 +146,7 @@ Works today with Markdown. Drop notes in `raw/`, run `synto run`, and get a cros
 
 **Incremental compiles.** Each concept gets its own article. When you change a source note, only the articles tied to that note recompile — not the whole vault.
 
-**Rejection feedback.** Reject a draft and attach a reason. The next compile of that concept includes your feedback in the prompt. Five rejections without an approval auto-blocks the concept until you run `synto unblock`.
+**Rejection feedback.** Reject a draft and attach a reason. The next compile of that concept includes your feedback in the prompt. Five rejections auto-block the concept until you run `synto unblock`.
 
 **Hand-edit protection.** Edit any published article directly. Synto tracks a content hash — if the file changed since last compile, it won't overwrite your work.
 
@@ -242,7 +244,7 @@ table instead of hitting the model. `synto maintain --clear-cache` flushes it;
 `--older-than N` prunes entries older than N days.
 
 **Pack extension flag.** `synto add --extend-pack NAME` is reserved for future pack-scoped
-imports. In `v0.2.0` it is intentionally a safe no-op and does not mutate `synto.toml`.
+imports and is currently a safe no-op that does not mutate `synto.toml`.
 
 ---
 
@@ -338,10 +340,11 @@ synto add api-reference.md --type api_docs --vault ~/my-wiki
 ```
 
 Use `--type` to select the matching ingest-analysis prompt (see the table in Features).
-If omitted, the type is inferred from the file extension.
+If omitted, PDFs are treated as `paper` and everything else as `notes` — pass `--type` for
+anything more specific (`spec`, `transcript`, `api_docs`, …).
 
 `synto add --force` re-imports an existing source in place. `--extend-pack` is reserved for
-future pack integration and currently reports a safe no-op.
+future pack integration and is currently a safe no-op.
 
 ### 5. Run the pipeline
 
@@ -441,8 +444,11 @@ or the user-private `~/.config/synto/config.toml` — **never** from the vault's
 model, answer "yes" to "Use a different provider for the heavy (writing) model?" and the primary
 is reused as the fast role while you set up the heavy one. It saves the split to the global config
 so `synto init` reproduces it for new vaults.
-Re-running `synto init` on an existing vault re-syncs its provider/model sections from the global
-config — any per-model `options`/`think` you hand-edited into that vault are replaced.
+Re-running `synto init` only re-syncs a simple single-provider vault whose provider matches your
+global default; in that case any per-model `options`/`think` you hand-edited there are replaced.
+It leaves a vault untouched when there is no global config, when the vault is set to a different
+provider than the global default, or when the vault already splits roles across providers (a
+per-role setup). Change those via `synto setup` or by editing `synto.toml` directly.
 
 #### NVIDIA / NGC
 
@@ -501,6 +507,8 @@ request as-is and override the matching first-class field, so set computed value
 - `synto doctor --backlog` — reads the MCP audit log to show what to ingest next: zero-result queries, single-source concepts in active demand, and the verbatim-vs-`answer_question` tool mix.
 - `synto query` — index-routed Q&A with optional synthesis to `wiki/synthesis/`
 - `synto review` — interactive draft review: approve, reject, edit, or diff before publishing
+- `synto concept rename OLD NEW` — rename a concept everywhere: moves the article, repoints
+  every inbound wikilink, and migrates the name across the state DB; `--dry-run` previews
 - `synto watch` — file watcher: auto-ingest and compile on every save
 - `synto maintain` — wiki health check, stub creation, orphan cleanup
 - `synto eval` — offline structural evaluation (coverage, citation support, link resolution)
@@ -523,14 +531,16 @@ request as-is and override the matching first-class field, so set computed value
 ## What's in a pack
 
 ```
-pack/
+.synto/exports/agents/   ← default output dir (synto pack export; --out DIR to relocate)
   articles/           one Markdown file per concept
+  synthesis/          published synthesis articles (when present)
   index/
     INDEX.json        machine-readable index with stable article IDs
   agent/
     manifest.json     capabilities and pack metadata
     concepts.json     concept registry with aliases
     sources.json      source provenance
+    routes.json       concept/source routing hints
   AGENTS.md           agent-readable entrypoint and usage guide
   CLAUDE.md           Claude Code context file
 ```

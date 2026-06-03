@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.5.0] - 2026-06-03
 
 ### Added
 
@@ -31,6 +31,10 @@
   ingest timeout: the `fast` role defaults to `think=false` (structured extraction wastes
   reasoning and could exhaust the budget), while `heavy`/answer roles keep thinking on.
   All knobs are overridable per role in `synto.toml`.
+- Anthropic-compatible API support (#22). A new client speaks Anthropic's
+  `/v1/messages` schema, so providers exposing that API (e.g. Kimi) can back any
+  model role. Selected via the provider block like any other connection; keys are
+  read from the block's `api_key_env`.
 
 ### Fixed
 
@@ -64,6 +68,13 @@
   stdout JSON-RPC stream. The README now shows the MCP client-config form instead
   of a bare command. The `\n` validation error users saw is expected stdio
   behavior (a terminal is not a valid MCP client); the fix makes the wait legible.
+- Wikilink resolution and rewriting hardened across several edge cases (#27, #35,
+  #38, #45). Targets now resolve by filename stem so a `[[Note]]` link reaches
+  `raw/note.md` regardless of path depth; `sources/` links resolve against
+  forward-slash index keys (#26); leading/trailing backslashes are stripped from
+  link targets before lookup; and backslashes in the replacement string are
+  escaped so links containing them rewrite correctly instead of corrupting the
+  output.
 
 ## [0.4.0] - 2026-05-29
 
