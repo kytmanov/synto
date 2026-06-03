@@ -1788,6 +1788,29 @@ class StateDB:
         ).fetchone()
         return row is not None
 
+    def find_concept_exact(self, query: str) -> tuple[str, list[str]] | None:
+        """Resolve a concept by EXACT (case-insensitive) name or alias only.
+
+        No substring fallback — use this for destructive operations (rename) where a
+        fuzzy neighbour (e.g. "Net" -> "Network") would silently target the wrong
+        concept. Fuzzy callers (ingest, query, MCP) want find_concept_by_name_or_alias.
+        Scope matches that helper: concepts + concept_aliases (not knowledge_items).
+        """
+        q_lower = query.strip().casefold()
+        row = self._conn.execute(
+            "SELECT DISTINCT name FROM concepts WHERE lower(name) = ? LIMIT 1",
+            (q_lower,),
+        ).fetchone()
+        if row:
+            return row["name"], self.aliases_for_concept(row["name"])
+        row = self._conn.execute(
+            "SELECT concept_name FROM concept_aliases WHERE lower(alias) = ? LIMIT 1",
+            (q_lower,),
+        ).fetchone()
+        if row:
+            return row["concept_name"], self.aliases_for_concept(row["concept_name"])
+        return None
+
     def rename_concept(self, old_name: str, new_name: str) -> None:
         """Migrate a concept's identity and behavioral state from ``old`` to ``new``.
 

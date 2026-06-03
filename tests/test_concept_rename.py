@@ -214,9 +214,44 @@ def test_collision_check_is_exact_not_fuzzy(config, db):
     assert db.concept_name_exists_exact("network") is True
 
 
+def test_find_concept_exact_rejects_substring(config, db):
+    """find_concept_exact resolves exact name/alias (any case) but never a substring."""
+    _make_concept_article(config, db, "Network", "Body.")
+
+    assert db.find_concept_exact("Net") is None
+    assert db.find_concept_exact("Network")[0] == "Network"
+    assert db.find_concept_exact("network")[0] == "Network"
+
+
 def test_rename_unknown_concept_errors(config, db):
     with pytest.raises(ConceptRenameError, match="not found"):
         rename_concept(config, db, "Nonexistent", "Whatever")
+
+
+def test_rename_source_lookup_is_exact_not_fuzzy(config, db):
+    """A substring of an existing concept must NOT resolve as the rename source —
+    fuzzy matching here would silently rename the wrong concept (the destructive bug).
+    The error suggests the near-match without acting on it."""
+    article = _make_concept_article(config, db, "Network", "Body.")
+
+    with pytest.raises(ConceptRenameError, match="not found.*Network"):
+        rename_concept(config, db, "Net", "Foo")
+
+    # "Network" untouched: still tracked, file unmoved, no "Foo" article created.
+    assert "Network" in db.list_all_concept_names()
+    assert article.exists()
+    assert not (config.wiki_dir / "Foo.md").exists()
+
+
+def test_rename_by_exact_alias_still_works(config, db):
+    """Exact-alias resolution (tier 2) must survive the exact-only source lookup."""
+    _make_concept_article(config, db, "Program Counter", "Body.")
+    db.upsert_aliases("Program Counter", ["PC"])
+
+    rename_concept(config, db, "PC", "Instruction Pointer")
+
+    assert "Instruction Pointer" in db.list_all_concept_names()
+    assert "Program Counter" not in db.list_all_concept_names()
 
 
 def test_dry_run_writes_nothing(config, db):

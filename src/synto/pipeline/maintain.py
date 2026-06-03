@@ -248,9 +248,14 @@ def rename_concept(
     if not new_name or sanitize_filename(new_name) == "untitled":
         raise ConceptRenameError(f"Invalid new name: {new_name!r}")
 
-    resolved = db.find_concept_by_name_or_alias(old_name)
+    # Exact resolution only: a fuzzy substring match (e.g. "Net" -> "Network") would
+    # silently rename the wrong concept. On a miss, reuse the fuzzy helper for a
+    # suggestion only — never to act.
+    resolved = db.find_concept_exact(old_name)
     if resolved is None:
-        raise ConceptRenameError(f"Concept not found: {old_name!r}")
+        fuzzy = db.find_concept_by_name_or_alias(old_name)
+        hint = f" Did you mean {fuzzy[0]!r}?" if fuzzy else ""
+        raise ConceptRenameError(f"Concept not found: {old_name!r}.{hint}")
     canonical_old = resolved[0]
 
     case_only = canonical_old.casefold() == new_name.casefold()
