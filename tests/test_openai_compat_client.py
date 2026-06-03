@@ -395,6 +395,23 @@ def test_generate_transient_2xx_error_exhausts_budget_then_raises(monkeypatch):
     assert client._post_chat.call_count > 1
 
 
+def test_transient_2xx_backoff_is_exponential_and_budget_bounded(monkeypatch):
+    """Pins the budget arithmetic that call-count alone can't: back off exponentially
+    (doubling, capped at 16s) and never sleep past the 60s cumulative budget. The final
+    wait is clamped by min(delay, budget - waited) so the sum lands exactly on 60s."""
+    waits: list[float] = []
+    monkeypatch.setattr("synto.openai_compat_client.time.sleep", lambda s: waits.append(s))
+    client = _make_client()
+    client._post_chat = MagicMock(return_value=_error_body_2xx("Rate limit exceeded", code=429))
+
+    with pytest.raises(LLMBadRequestError):
+        client.generate(prompt="hi", model="m", num_predict=2048)
+
+    assert waits[:5] == [1.0, 2.0, 4.0, 8.0, 16.0]
+    assert all(w <= 16.0 for w in waits)
+    assert sum(waits) <= 60.0
+
+
 def test_generate_non_dict_body_raises_bad_request():
     """A non-dict JSON body must not crash with an uncaught TypeError."""
     client = _make_client()

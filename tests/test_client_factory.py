@@ -78,6 +78,54 @@ def test_resolve_api_key_unknown_provider(monkeypatch):
     assert key == "fallback-key"
 
 
+# ── resolve_api_key precedence INTERACTIONS ───────────────────────────────────
+# The single-source tests above don't constrain ordering. These set several sources at
+# once and assert which one wins — the contract documented in api_keys.py's module docstring.
+
+
+def _gcfg(**kw):
+    from synto.global_config import GlobalConfig
+
+    return patch("synto.global_config.load_global_config", return_value=GlobalConfig(**kw))
+
+
+def test_block_env_beats_provider_registry_env(monkeypatch):
+    monkeypatch.setenv("MY_BLOCK_KEY", "block-key")
+    monkeypatch.setenv("GROQ_API_KEY", "registry-key")
+    with patch("synto.global_config.load_global_config", return_value=None):
+        assert resolve_api_key("groq", block_api_key_env="MY_BLOCK_KEY") == "block-key"
+
+
+def test_provider_registry_env_beats_per_alias_global_key(monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "registry-key")
+    monkeypatch.delenv("SYNTO_API_KEY", raising=False)
+    with _gcfg(provider_keys={"acct1": "alias-key"}):
+        assert resolve_api_key("groq", alias="acct1") == "registry-key"
+
+
+def test_per_alias_global_key_beats_generic_env(monkeypatch):
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.setenv("SYNTO_API_KEY", "generic-key")
+    with _gcfg(provider_keys={"acct1": "alias-key"}):
+        assert resolve_api_key("groq", alias="acct1") == "alias-key"
+
+
+def test_generic_env_beats_legacy_single_key(monkeypatch):
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.setenv("SYNTO_API_KEY", "generic-key")
+    with _gcfg(api_key="legacy-key"):
+        assert resolve_api_key("groq") == "generic-key"
+
+
+def test_alias_none_does_not_pick_up_a_per_alias_key(monkeypatch):
+    """A None alias must skip the per-alias step entirely — otherwise a role with no account
+    binding could silently borrow some other account's key."""
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.setenv("SYNTO_API_KEY", "generic-key")
+    with _gcfg(provider_keys={"acct1": "alias-key"}):
+        assert resolve_api_key("groq", alias=None) == "generic-key"
+
+
 def test_build_client_ollama(tmp_path):
     """build_client returns OllamaClient for ollama provider."""
     vault = tmp_path / "vault"

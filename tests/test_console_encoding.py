@@ -7,7 +7,19 @@ from __future__ import annotations
 
 import io
 
+import pytest
+
 from synto.cli import _ensure_utf8_streams
+
+
+def test_cp1252_stream_cannot_encode_status_glyph_without_fix():
+    """Guards the premise of the fix: a cp1252 stream genuinely cannot encode ✓, so the
+    reconfigure in _ensure_utf8_streams is load-bearing, not cosmetic. If this ever stops
+    raising, the reconfigure logic is testing nothing."""
+    stream = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+    with pytest.raises(UnicodeEncodeError):
+        stream.write("✓")
+        stream.flush()
 
 
 def test_cp1252_stream_is_switched_to_utf8_and_glyph_survives(monkeypatch):
