@@ -312,8 +312,6 @@ def rename_concept(
         return report
 
     # ── Mutations ───────────────────────────────────────────────────────────
-    from .lint import _body_hash
-
     for old_path, new_path, new_rel, old_rel in moves:
         _move_file(old_path, new_path)
         meta, body = parse_note(new_path)
@@ -323,8 +321,10 @@ def rename_concept(
             existing = list(meta.get("aliases") or [])
             if not any(a.casefold() == canonical_old.casefold() for a in existing):
                 meta["aliases"] = [*existing, canonical_old]
+        # Body is unchanged (frontmatter-only edit), so content_hash is preserved by
+        # update_article_identity — this keeps manual-edit protection on a hand-fixed page.
         write_note(new_path, meta, body)
-        db.update_article_identity(old_rel, new_rel, new_name, _body_hash(body))
+        db.update_article_identity(old_rel, new_rel, new_name)
         report.files_moved.append((old_rel, new_rel))
 
     db.rename_concept(canonical_old, new_name)

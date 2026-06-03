@@ -113,6 +113,26 @@ def test_rename_refreshes_content_hash_of_rewritten_pages(config, db):
     assert db.get_article(rel).content_hash == _body_hash(on_disk_body)
 
 
+def test_rename_preserves_manual_edit_protection(config, db):
+    """The issue's workflow is a hand-fixed article (review process). The rename must not
+    sync the DB content_hash to the on-disk body — that would erase manual-edit
+    protection and let the next compile clobber the user's fix."""
+    path = _make_concept_article(config, db, "Quantm Computing", "Hand-fixed body.")
+    # Simulate a manual on-disk edit after the last compile: DB hash is now stale, so
+    # compile.py treats the page as manually edited (on-disk hash != DB hash).
+    rel = str(path.relative_to(config.vault))
+    art = db.get_article(rel)
+    db.upsert_article(art.model_copy(update={"content_hash": "STALE_PRE_EDIT_HASH"}))
+
+    rename_concept(config, db, "Quantm Computing", "Quantum Computing")
+
+    new_rel = "wiki/Quantum Computing.md"
+    moved = db.get_article(new_rel)
+    # Stale (protective) hash preserved → still differs from the on-disk body → protected.
+    assert moved.content_hash == "STALE_PRE_EDIT_HASH"
+    assert moved.content_hash != _body_hash(parse_note(config.wiki_dir / "Quantum Computing.md")[1])
+
+
 def test_rename_migrates_concept_identity_tables(config, db):
     _make_concept_article(config, db, "Old Concept", "Body.")
     db.upsert_aliases("Old Concept", ["OC"])

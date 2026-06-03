@@ -1842,13 +1842,17 @@ class StateDB:
                 (new_name, old_name),
             )
 
-    def update_article_identity(
-        self, old_path: str, new_path: str, new_title: str, content_hash: str
-    ) -> None:
-        """Repoint a tracked article row to a new path/title and refresh its body hash.
+    def update_article_identity(self, old_path: str, new_path: str, new_title: str) -> None:
+        """Repoint a tracked article row to a new path/title.
 
         An UPDATE (not delete+insert) so article_id and lineage survive. No-op if the
         old row is absent (DB-only rename of a never-compiled concept).
+
+        content_hash is deliberately preserved, not recomputed: a concept rename changes
+        only the frontmatter title, and content_hash is body-only. Recomputing it would
+        sync the DB hash to the on-disk body and so erase manual-edit protection
+        (compile skips a published article only while its body hash differs from the DB);
+        that would expose a hand-fixed article to being clobbered on the next compile.
         """
         with self._tx():
             if not self._conn.execute(
@@ -1858,9 +1862,8 @@ class StateDB:
             if old_path != new_path:
                 self._conn.execute("DELETE FROM wiki_articles WHERE path = ?", (new_path,))
             self._conn.execute(
-                "UPDATE wiki_articles SET path=?, title=?, content_hash=?, updated_at=? "
-                "WHERE path=?",
-                (new_path, new_title, content_hash, datetime.now().isoformat(), old_path),
+                "UPDATE wiki_articles SET path=?, title=?, updated_at=? WHERE path=?",
+                (new_path, new_title, datetime.now().isoformat(), old_path),
             )
 
     def _upsert_article_row(self, record: WikiArticleRecord) -> None:
