@@ -4,6 +4,15 @@
 
 ### Added
 
+- `synto concept rename OLD NEW` (#29). Renames a concept everywhere its name is its
+  identity: moves the article file and fixes its title, repoints every inbound wikilink
+  across the wiki tree, and migrates the name across the state DB (concepts, aliases,
+  compile state, occurrences, knowledge items, plus rejection/block/stub state so a
+  rename can't silently unblock a concept or lose review guidance). The old name is kept
+  as an alias by default so a later re-ingest that still yields the old surface form is
+  canonicalized back to the new concept rather than recreating the old one; pass
+  `--drop-old-alias` to opt out. `content_hash` is refreshed for every rewritten tracked
+  page so manual-edit protection isn't tripped. `--dry-run` previews without writing.
 - Per-role LLM providers (#24). Each model role (`fast` / `heavy` / `embed`) can now
   target a different provider and account via named `[providers.<alias>]` blocks that
   roles reference, e.g. the heavy model on a cloud endpoint and the fast model on local

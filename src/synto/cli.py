@@ -4009,3 +4009,91 @@ def add(
     if segment_count:
         console.print(f"  Segments extracted: {segment_count}")
     console.print(f"  Raw note: {raw_path.relative_to(config.vault)}")
+
+
+@cli.group()
+def concept():
+    """Concept maintenance."""
+
+
+@concept.command("rename")
+@click.argument("old_name")
+@click.argument("new_name")
+@click.option("--vault", "vault_str", envvar=VAULT_ENV_VAR, default=None)
+@click.option("--dry-run", is_flag=True, help="Preview changes without writing.")
+@click.option(
+    "--keep-old-alias/--drop-old-alias",
+    "keep_alias",
+    default=None,
+    help=(
+        "Keep the old name as an alias so re-ingested notes don't recreate the old "
+        "concept (durable, default). --drop-old-alias removes it."
+    ),
+)
+def concept_rename(
+    old_name: str,
+    new_name: str,
+    vault_str: str | None,
+    dry_run: bool,
+    keep_alias: bool | None,
+) -> None:
+    """Rename concept OLD_NAME to NEW_NAME across the vault and state DB."""
+    from .git_ops import git_commit
+    from .indexer import append_log, generate_index
+    from .pipeline.maintain import ConceptRenameError, rename_concept
+
+    config = _load_config(vault_str)
+    db = _load_db(config)
+
+    # Resolve the alias decision: prompt on a TTY when unspecified; default keep.
+    if keep_alias is None:
+        if sys.stdin.isatty():
+            keep_alias = click.confirm(
+                f"Keep '{old_name}' as an alias so re-ingested notes don't recreate it?",
+                default=True,
+            )
+        else:
+            keep_alias = True
+    if not keep_alias:
+        click.secho(
+            "⚠ Dropping the old name as alias: re-ingesting a raw note that still "
+            "yields the old term can recreate the old concept on the next compile.",
+            fg="yellow",
+        )
+
+    try:
+        report = rename_concept(
+            config, db, old_name, new_name, keep_alias=keep_alias, dry_run=dry_run
+        )
+    except ConceptRenameError as exc:
+        click.echo(str(exc), err=True)
+        sys.exit(1)
+
+    verb = "Would rename" if dry_run else "Renamed"
+    console.print(f"[green]{verb} concept:[/green] {report.old_name} → {report.new_name}")
+    for old_rel, new_rel in report.files_moved:
+        console.print(f"  [dim]{old_rel} → {new_rel}[/dim]")
+    console.print(f"  Pages with rewritten links: {report.links_rewritten}")
+    console.print(f"  Old name kept as alias: {'yes' if report.alias_kept else 'no'}")
+
+    if dry_run:
+        return
+
+    generate_index(config, db)
+    append_log(config, f"concept rename | '{report.old_name}' → '{report.new_name}'")
+
+    if config.pipeline.auto_commit:
+        outcome = git_commit(
+            config.vault,
+            f"concept rename: {report.old_name} → {report.new_name}",
+            paths=["wiki/", ".synto/"],
+        )
+        if outcome == "committed":
+            console.print("[dim]Git commit created.[/dim]")
+        elif outcome == "failed":
+            console.print("[yellow]⚠ Git commit failed — run 'git status' in your vault.[/yellow]")
+        elif outcome == "blocked":
+            console.print(
+                "[yellow]⚠ Auto-commit skipped — you have staged changes. "
+                "Commit or stash them first.[/yellow]"
+            )

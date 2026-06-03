@@ -14,6 +14,7 @@ from synto.vault import (
     next_available_path,
     normalize_wikilinks,
     parse_note,
+    rename_wikilink_targets,
     sanitize_filename,
     sanitize_wikilink_target,
     write_note,
@@ -509,3 +510,68 @@ def test_normalize_wikilinks_skips_inline_code():
     known = {"Machine Learning"}
     body = "Use `[[ml]]` in code."
     assert normalize_wikilinks(body, alias_map, known) == body
+
+
+# ── rename_wikilink_targets ───────────────────────────────────────────────────
+
+
+# Filename stems keep spaces (only Obsidian-forbidden chars are stripped), so a
+# concept "Quantm Computing" lives at "Quantm Computing.md" and links read
+# [[Quantm Computing]]. Stem and name diverge only when the name has forbidden chars.
+
+
+def test_rename_repoints_bare_link():
+    body = "See [[Quantm Computing]] for more."
+    out = rename_wikilink_targets(
+        body, "Quantm Computing", "Quantum Computing", "Quantum Computing"
+    )
+    assert out == "See [[Quantum Computing]] for more."
+
+
+def test_rename_repoints_target_when_display_echoes_old_name():
+    body = "See [[Quantm Computing|Quantm Computing]]."
+    out = rename_wikilink_targets(
+        body, "Quantm Computing", "Quantum Computing", "Quantum Computing"
+    )
+    assert out == "See [[Quantum Computing]]."
+
+
+def test_rename_preserves_deliberate_display_text():
+    # An author's intentional, different display must survive — only the target moves.
+    body = "Read [[Quantm Computing|the quantum chapter]]."
+    out = rename_wikilink_targets(
+        body, "Quantm Computing", "Quantum Computing", "Quantum Computing"
+    )
+    assert out == "Read [[Quantum Computing|the quantum chapter]]."
+
+
+def test_rename_preserves_fragment():
+    body = "Jump to [[Quantm Computing#History]]."
+    out = rename_wikilink_targets(
+        body, "Quantm Computing", "Quantum Computing", "Quantum Computing"
+    )
+    assert out == "Jump to [[Quantum Computing#History]]."
+
+
+def test_rename_leaves_other_links_untouched():
+    body = "Links: [[Other]] and [[Quantm Computing]]."
+    out = rename_wikilink_targets(
+        body, "Quantm Computing", "Quantum Computing", "Quantum Computing"
+    )
+    assert "[[Other]]" in out
+    assert "[[Quantum Computing]]" in out
+
+
+def test_rename_skips_code_blocks():
+    body = "`[[Quantm Computing]]` stays literal."
+    out = rename_wikilink_targets(
+        body, "Quantm Computing", "Quantum Computing", "Quantum Computing"
+    )
+    assert out == body
+
+
+def test_rename_emits_display_link_when_new_name_has_forbidden_chars():
+    # Renaming "TCP" → "TCP/IP": stem "TCPIP" ≠ name, so emit [[TCPIP|TCP/IP]].
+    body = "See [[TCP]]."
+    out = rename_wikilink_targets(body, "TCP", "TCPIP", "TCP/IP")
+    assert out == "See [[TCPIP|TCP/IP]]."

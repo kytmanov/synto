@@ -375,3 +375,37 @@ def normalize_wikilinks(body: str, alias_map: dict[str, str], known_titles: set[
 
     rewritten = _WIKILINK_FULL_RE.sub(_rewrite, masked)
     return _restore_code_blocks(rewritten, spans)
+
+
+def rename_wikilink_targets(body: str, old_stem: str, new_stem: str, new_name: str) -> str:
+    """Repoint links that resolve to ``old_stem`` at ``new_stem`` (concept rename).
+
+    A link's target is the filename stem, so matching is done on the sanitized stem,
+    not the raw text — this catches both ``[[OldStem]]`` and ``[[Old/Name]]`` forms.
+    The author's explicit display is preserved, except when it merely echoes the old
+    name/stem, in which case it is updated to the corrected ``new_name``. Code blocks
+    are protected from rewrites.
+    """
+    masked, spans = _mask_code_blocks(body)
+    old_key = old_stem.casefold()
+
+    def _rewrite(m: re.Match) -> str:
+        target = m.group(1).strip()
+        if sanitize_filename(target).casefold() != old_key:
+            return m.group(0)
+        fragment = m.group(2)  # may be None
+        display = m.group(3)  # may be None
+        frag_part = f"#{fragment}" if fragment else ""
+
+        # Drop a display that only echoed the old name/stem so the rename actually
+        # corrects the visible text; keep a deliberate, different display as-is. The
+        # display "Quantm Computing" echoes stem "QuantmComputing", so compare on stems.
+        echoes_old = display is not None and sanitize_filename(display).casefold() == old_key
+        if display is None or echoes_old:
+            if new_stem == new_name:
+                return f"[[{new_stem}{frag_part}]]"
+            return f"[[{new_stem}{frag_part}|{new_name}]]"
+        return f"[[{new_stem}{frag_part}|{display}]]"
+
+    rewritten = _WIKILINK_FULL_RE.sub(_rewrite, masked)
+    return _restore_code_blocks(rewritten, spans)

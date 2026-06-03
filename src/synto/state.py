@@ -1759,6 +1759,98 @@ class StateDB:
                 matches.append(article)
         return matches
 
+    def concept_name_exists_exact(self, name: str) -> bool:
+        """True if ``name`` is already an exact concept name, alias, or knowledge item.
+
+        Exact (case-insensitive) only — deliberately NOT the fuzzy
+        ``find_concept_by_name_or_alias`` (which falls back to substring LIKE and would
+        report false collisions, e.g. renaming to "Net" matching "Network").
+        """
+        n = name.casefold()
+        for sql in (
+            "SELECT 1 FROM concepts WHERE lower(name) = ? LIMIT 1",
+            "SELECT 1 FROM concept_aliases WHERE lower(alias) = ? LIMIT 1",
+            "SELECT 1 FROM knowledge_items WHERE lower(name) = ? LIMIT 1",
+        ):
+            if self._conn.execute(sql, (n,)).fetchone():
+                return True
+        return False
+
+    def rename_concept(self, old_name: str, new_name: str) -> None:
+        """Migrate a concept's identity and behavioral state from ``old`` to ``new``.
+
+        Atomically re-keys every table that binds a concept by name: identity
+        (concepts, concept_aliases, concept_compile_state, concept_occurrences,
+        knowledge_items) and behavioral state whose consumers look up by current title
+        (rejections — exact-match guidance; blocked_concepts — skipping silently
+        unblocks; stubs). Caller must guarantee ``new`` is collision-free first.
+
+        item_mentions is intentionally left untouched: those rows are generic
+        source-evidence mentions, not concept canonical binding.
+        """
+        with self._tx():
+            self._conn.execute(
+                "UPDATE concepts SET name = ? WHERE lower(name) = lower(?)",
+                (new_name, old_name),
+            )
+            self._conn.execute(
+                "UPDATE concept_aliases SET concept_name = ? WHERE lower(concept_name) = lower(?)",
+                (new_name, old_name),
+            )
+            # An alias equal to the new canonical is a no-op self-match — drop it.
+            self._conn.execute(
+                "DELETE FROM concept_aliases "
+                "WHERE lower(concept_name) = lower(?) AND lower(alias) = lower(?)",
+                (new_name, new_name),
+            )
+            self._conn.execute(
+                "UPDATE concept_compile_state SET concept_name = ? "
+                "WHERE lower(concept_name) = lower(?)",
+                (new_name, old_name),
+            )
+            self._conn.execute(
+                "UPDATE concept_occurrences SET concept_name = ? "
+                "WHERE lower(concept_name) = lower(?)",
+                (new_name, old_name),
+            )
+            self._conn.execute(
+                "UPDATE knowledge_items SET name = ? WHERE lower(name) = lower(?)",
+                (new_name, old_name),
+            )
+            self._conn.execute(
+                "UPDATE rejections SET concept = ? WHERE lower(concept) = lower(?)",
+                (new_name, old_name),
+            )
+            self._conn.execute(
+                "UPDATE blocked_concepts SET concept = ? WHERE lower(concept) = lower(?)",
+                (new_name, old_name),
+            )
+            self._conn.execute(
+                "UPDATE stubs SET concept = ? WHERE lower(concept) = lower(?)",
+                (new_name, old_name),
+            )
+
+    def update_article_identity(
+        self, old_path: str, new_path: str, new_title: str, content_hash: str
+    ) -> None:
+        """Repoint a tracked article row to a new path/title and refresh its body hash.
+
+        An UPDATE (not delete+insert) so article_id and lineage survive. No-op if the
+        old row is absent (DB-only rename of a never-compiled concept).
+        """
+        with self._tx():
+            if not self._conn.execute(
+                "SELECT 1 FROM wiki_articles WHERE path = ?", (old_path,)
+            ).fetchone():
+                return
+            if old_path != new_path:
+                self._conn.execute("DELETE FROM wiki_articles WHERE path = ?", (new_path,))
+            self._conn.execute(
+                "UPDATE wiki_articles SET path=?, title=?, content_hash=?, updated_at=? "
+                "WHERE path=?",
+                (new_path, new_title, content_hash, datetime.now().isoformat(), old_path),
+            )
+
     def _upsert_article_row(self, record: WikiArticleRecord) -> None:
         article_id = self._resolve_article_id(record.path, record.article_id)
         self._conn.execute(
