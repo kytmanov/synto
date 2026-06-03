@@ -3836,7 +3836,7 @@ def _make_source_id(path: Path) -> str:
     "source_type",
     default=None,
     type=click.Choice(_SOURCE_TYPES),
-    help="Override source type (default: inferred from extension).",
+    help="Override source type (default: paper for PDFs, notes otherwise).",
 )
 @click.option("--vault", "vault_str", envvar=VAULT_ENV_VAR, default=None)
 @click.option(
