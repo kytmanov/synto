@@ -1026,11 +1026,15 @@ class StateDB:
         REPLACE'd: a Windows path is JSON-escaped on disk as ``raw\\note.md``, so a naive
         ``REPLACE('\', '/')`` would corrupt it to ``raw//note.md``.
 
-        Collision-safe: a vault moved across OSes and then re-run on the new OS could hold
-        both ``wiki\Qubit.md`` and ``wiki/Qubit.md`` (pre-fix exact-path lookups treated them
-        as distinct). ``UPDATE OR IGNORE`` keeps the already-POSIX row and skips the rewrite
-        of the colliding backslash row, which is then dropped as a stale duplicate — so the
-        migration can't abort on a uniqueness violation.
+        Collision-safe without silent loss: a vault compiled on two OSes can hold both
+        ``wiki\Qubit.md`` and ``wiki/Qubit.md``. ``wiki_articles`` is the only table that both
+        collides and carries user-meaningful mutable state (status, approval, content_hash),
+        so its collisions are resolved by recency (newer ``updated_at`` wins, last-write-wins
+        like upserts) with approval audit preserved from either row — see
+        ``_resolve_article_separator_collisions_v17``. The other path columns hold
+        regenerable links/caches; for them ``UPDATE OR IGNORE`` keeps the existing POSIX row
+        and the colliding backslash duplicate is dropped (and logged), so the migration can't
+        abort on a uniqueness violation.
         """
         plain_columns = [
             ("raw_notes", "path"),
@@ -1043,12 +1047,28 @@ class StateDB:
             ("generated_assets", "master_path"),
         ]
         with self._tx():
+            # Resolve article collisions by recency first so the REPLACE below can't collide
+            # and can't silently drop the newer of a ``wiki\X`` / ``wiki/X`` pair.
+            self._resolve_article_separator_collisions_v17()
             for table, col in plain_columns:
                 self._conn.execute(
                     f"UPDATE OR IGNORE {table} SET {col} = REPLACE({col}, '\\', '/')"
                 )
                 # Drop rows whose normalized path collided with an existing POSIX row
-                # (UPDATE OR IGNORE left them with their original backslash value).
+                # (UPDATE OR IGNORE left them with their original backslash value). Log first
+                # so a non-article collision is never fully silent. (wiki_articles has no
+                # leftovers here — they were resolved by recency above.)
+                leftover = self._conn.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE INSTR({col}, '\\') > 0"
+                ).fetchone()[0]
+                if leftover:
+                    log.warning(
+                        "v17 migration: dropping %d duplicate %s.%s row(s) whose normalized "
+                        "path collided with an existing POSIX row",
+                        leftover,
+                        table,
+                        col,
+                    )
                 self._conn.execute(f"DELETE FROM {table} WHERE INSTR({col}, '\\') > 0")
             for col in ("sources", "synthesis_sources"):
                 rows = self._conn.execute(
@@ -1063,6 +1083,50 @@ class StateDB:
                         f"UPDATE wiki_articles SET {col} = ? WHERE rowid = ?",
                         (json.dumps(fixed), row["rid"]),
                     )
+
+    def _resolve_article_separator_collisions_v17(self) -> None:
+        r"""Resolve wiki_articles rows that exist under both ``wiki\X`` and ``wiki/X``.
+
+        A vault compiled on two OSes (compile has no dedup guard) can hold both forms. Keep
+        the row with the newer ``updated_at`` (last-write-wins, matching upsert semantics)
+        rather than always preferring POSIX — the backslash row may carry newer status /
+        approval / content_hash. Approval audit is preserved from either row via COALESCE
+        (the invariant `verify_article`/`approve_article` already uphold), and a real
+        divergence is logged so the dropped state is never silent. Caller runs inside _tx().
+        """
+        pairs = self._conn.execute(
+            r"""
+            SELECT b.path AS bpath, b.updated_at AS bupd, b.status AS bstatus,
+                   b.content_hash AS bhash, b.approved_at AS bappr, b.approval_notes AS bnotes,
+                   p.path AS ppath, p.updated_at AS pupd, p.status AS pstatus,
+                   p.content_hash AS phash, p.approved_at AS pappr, p.approval_notes AS pnotes
+            FROM wiki_articles b
+            JOIN wiki_articles p ON p.path = REPLACE(b.path, '\', '/')
+            WHERE INSTR(b.path, '\') > 0
+            """
+        ).fetchall()
+        for r in pairs:
+            # (path, updated_at, status, content_hash, approved_at, approval_notes)
+            backslash = (r["bpath"], r["bupd"], r["bstatus"], r["bhash"], r["bappr"], r["bnotes"])
+            posix = (r["ppath"], r["pupd"], r["pstatus"], r["phash"], r["pappr"], r["pnotes"])
+            # ISO `updated_at` strings sort chronologically; tie keeps POSIX.
+            winner, loser = (backslash, posix) if backslash[1] > posix[1] else (posix, backslash)
+            if backslash[2] != posix[2] or backslash[3] != posix[3]:
+                log.warning(
+                    "v17 migration: separator-duplicate article diverged; keeping newer %r "
+                    "(status=%s) and dropping %r (status=%s)",
+                    winner[0],
+                    winner[2],
+                    loser[0],
+                    loser[2],
+                )
+            # Preserve approval audit from the loser if the winner lacks it.
+            self._conn.execute(
+                "UPDATE wiki_articles SET approved_at = COALESCE(approved_at, ?), "
+                "approval_notes = COALESCE(approval_notes, ?) WHERE path = ?",
+                (loser[4], loser[5], winner[0]),
+            )
+            self._conn.execute("DELETE FROM wiki_articles WHERE path = ?", (loser[0],))
 
     def _validate_v6_tables(self) -> None:
         expected_ingest = {

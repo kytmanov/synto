@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -177,53 +178,92 @@ def test_state_transitions_match_windows_style_caller_paths(tmp_path: Path) -> N
     assert db.get_article("wiki/Foo.md") is None
 
 
-def test_v17_migration_resolves_duplicate_backslash_and_posix_rows(tmp_path: Path) -> None:
-    """A cross-OS-moved vault re-compiled on the new OS can hold both `wiki\\Q.md` and
-    `wiki/Q.md` (pre-fix exact-path lookups kept them as distinct rows). Normalizing the
-    primary key in place would collide; the migration must keep the POSIX row and drop the
-    stale backslash duplicate instead of aborting.
-    """
+def _seed_article(db, path, aid, status, content_hash, updated_at, approved_at=None) -> None:
+    db._conn.execute(
+        """INSERT INTO wiki_articles
+               (path, title, sources, content_hash, created_at, updated_at, status,
+                kind, synthesis_sources, synthesis_source_hashes, article_id, approved_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            path,
+            "Q",
+            json.dumps([]),
+            content_hash,
+            "2026-01-01",
+            updated_at,
+            status,
+            "concept",
+            json.dumps([]),
+            json.dumps([]),
+            aid,
+            approved_at,
+        ),
+    )
+
+
+def _seed_collision_and_migrate(tmp_path: Path, backslash: dict, posix: dict) -> StateDB:
+    """Seed a v16 DB holding both `wiki\\Q.md` and `wiki/Q.md`, then reopen to run v17."""
     db_path = tmp_path / "state.db"
     db = StateDB(db_path)
-    for path, status, aid in [("wiki\\Q.md", "draft", "a1"), ("wiki/Q.md", "published", "a2")]:
-        db._conn.execute(
-            """INSERT INTO wiki_articles
-                   (path, title, sources, content_hash, created_at, updated_at, status,
-                    kind, synthesis_sources, synthesis_source_hashes, article_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                path,
-                "Q",
-                json.dumps([]),
-                "h",
-                "2026-01-01",
-                "2026-01-01",
-                status,
-                "concept",
-                json.dumps([]),
-                json.dumps([]),
-                aid,
-            ),
-        )
-    # Same collision on a raw_notes primary key.
-    db._conn.execute(
-        "INSERT INTO raw_notes (path, content_hash, status) VALUES (?, ?, ?)",
-        ("raw\\n.md", "h1", "ingested"),
-    )
-    db._conn.execute(
-        "INSERT INTO raw_notes (path, content_hash, status) VALUES (?, ?, ?)",
-        ("raw/n.md", "h2", "ingested"),
-    )
+    _seed_article(db, "wiki\\Q.md", "aidB", **backslash)
+    _seed_article(db, "wiki/Q.md", "aidP", **posix)
     db._conn.execute("UPDATE schema_version SET version = 16 WHERE id = 1")
     db._conn.commit()
     db._conn.close()
+    return StateDB(db_path)  # reopen → runs the v17 migration
 
-    db = StateDB(db_path)  # must not raise on the PK collision
 
-    arts = db._conn.execute("SELECT path, status FROM wiki_articles").fetchall()
-    assert [(r[0], r[1]) for r in arts] == [("wiki/Q.md", "published")]
-    raws = [r[0] for r in db._conn.execute("SELECT path FROM raw_notes").fetchall()]
-    assert raws == ["raw/n.md"]
+def test_v17_article_collision_keeps_the_newer_row_not_posix(tmp_path: Path, caplog) -> None:
+    """A vault compiled on two OSes can hold both `wiki\\Q.md` and `wiki/Q.md`. When the
+    backslash (Windows) row is the newer one, the migration must keep ITS state — not blindly
+    keep POSIX, which would silently discard the newer status/content_hash.
+    """
+    with caplog.at_level(logging.WARNING):
+        db = _seed_collision_and_migrate(
+            tmp_path,
+            backslash={"status": "published", "content_hash": "HASH_B", "updated_at": "2026-03-01"},
+            posix={"status": "draft", "content_hash": "HASH_P", "updated_at": "2026-01-01"},
+        )
+
+    rows = db._conn.execute("SELECT path, status, content_hash FROM wiki_articles").fetchall()
+    assert [(r[0], r[1], r[2]) for r in rows] == [("wiki/Q.md", "published", "HASH_B")]
+    # Dropping divergent state must not be silent.
+    assert any("separator-duplicate article diverged" in m for m in caplog.messages)
+
+
+def test_v17_article_collision_keeps_posix_when_it_is_newer(tmp_path: Path) -> None:
+    """The reverse: when the POSIX row is newer, its state survives."""
+    db = _seed_collision_and_migrate(
+        tmp_path,
+        backslash={"status": "draft", "content_hash": "HASH_B", "updated_at": "2026-01-01"},
+        posix={"status": "published", "content_hash": "HASH_P", "updated_at": "2026-03-01"},
+    )
+    rows = db._conn.execute("SELECT path, status, content_hash FROM wiki_articles").fetchall()
+    assert [(r[0], r[1], r[2]) for r in rows] == [("wiki/Q.md", "published", "HASH_P")]
+
+
+def test_v17_article_collision_preserves_approval_audit(tmp_path: Path) -> None:
+    """Approval audit must survive from whichever row had it, even if that row loses on
+    recency — matching the verify/approve COALESCE invariant."""
+    db = _seed_collision_and_migrate(
+        tmp_path,
+        # Newer winner has no approval; older loser carries the approval timestamp.
+        backslash={
+            "status": "published",
+            "content_hash": "HASH_B",
+            "updated_at": "2026-03-01",
+            "approved_at": None,
+        },
+        posix={
+            "status": "verified",
+            "content_hash": "HASH_P",
+            "updated_at": "2026-01-01",
+            "approved_at": "2026-02-15T00:00:00",
+        },
+    )
+    row = db._conn.execute("SELECT path, approved_at FROM wiki_articles").fetchone()
+    assert row[0] == "wiki/Q.md"
+    assert row[1] == "2026-02-15T00:00:00"  # preserved from the dropped row
 
 
 def test_line_endings_do_not_change_content_hash(tmp_path: Path) -> None:
