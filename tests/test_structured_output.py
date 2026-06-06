@@ -360,6 +360,21 @@ def test_template_expands_nested_object_array():
     assert isinstance(concepts[0]["aliases"], list)
 
 
+def test_template_does_not_cap_concept_count():
+    """The rendered template must not surface a per-call concept ceiling.
+
+    Why it matters: concepts are capped downstream by effective_max_concepts (textbook 25,
+    paper 15). A number like "max 8" leaking from the schema into the template would tell the
+    model to stop early and silently cap long-form sources below their configured ceiling —
+    exactly the failure mode #52 fixed for multi-chunk sources, here for single-chunk ones.
+    """
+    template = _make_template(AnalysisResult)
+    concepts = json.loads(template)["concepts"]
+    # Object shape rendered (one example), with no numeric ceiling leaking from the schema.
+    assert len(concepts) == 1 and set(concepts[0]) == {"name", "aliases"}
+    assert "max 8" not in template.lower()
+
+
 def test_template_expands_compile_plan_articles():
     template = json.loads(_make_template(CompilePlan))
     articles = template["articles"]

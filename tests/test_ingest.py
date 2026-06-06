@@ -233,6 +233,20 @@ def test_build_prompt_includes_chunk_label():
     assert "[part 2/4]" in prompt
 
 
+def test_build_prompt_does_not_cap_concept_count():
+    """The analysis prompt must not impose a concept ceiling.
+
+    Why it matters: the only "Max 8" in the prompt belongs to named_references guidance.
+    Concepts are capped downstream by effective_max_concepts (textbook 25, paper 15); a
+    concept limit in the prompt would silently cap long-form single-chunk sources below
+    their configured ceiling — the path the #52 fix left untested.
+    """
+    prompt = _build_analysis_prompt("body text", [], "note.md")
+    assert "concept" in prompt.lower()  # concepts are still requested
+    concepts_section = prompt.split("named_references")[0]
+    assert "max 8" not in concepts_section.lower()
+
+
 def test_build_prompt_no_chunk_label_by_default():
     prompt = _build_analysis_prompt("content", [])
     assert "[part" not in prompt

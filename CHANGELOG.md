@@ -2,8 +2,27 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Long-form source types now get a book-appropriate concept-extraction ceiling out of the
+  box: `source_type: textbook` defaults to 25 concepts and `source_type: paper` to 15,
+  without any `synto.toml` override. An explicit per-type override still wins, and raising
+  the global `max_concepts_per_source` above a built-in default still takes effect (a
+  built-in never lowers a configured value). Other source types are unchanged.
+
 ### Fixed
 
+- `max_concepts_per_source` (and per-source-type overrides) are no longer silently ignored
+  for large sources (#52). `_merge_chunk_results` capped concepts at a hardcoded 8 — the
+  per-LLM-call limit — when combining the chunks of a multi-chunk source, before the
+  configured, quality-scaled cap was ever consulted. Because 8 equalled the default, the
+  limit was invisible until raised, and only long (multi-chunk) sources were affected:
+  short single-chunk sources skip the merge and always honored the config. The merge now
+  returns the full deduplicated union and leaves capping to the one place that owns it.
+  The same hardcoded limit silently bounded a multi-chunk source's named references to 8
+  total (they have no other cap), dropping the rest by chunk order before evidence
+  filtering; named references are now the full evidenced union as well. Existing vaults are
+  unaffected until re-ingested (`synto ingest --force`).
 - `synto status`, `synto run`, and `synto maintain` no longer crash with
   `OSError: [Errno 9] Bad file descriptor` on NFS vaults (#56). The pipeline-lock
   liveness probe requested an exclusive lock to test whether the lock was held;
