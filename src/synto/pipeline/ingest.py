@@ -240,7 +240,10 @@ def _merge_chunk_results(results: list[AnalysisResult]) -> AnalysisResult:
                         seen[key].append(a)
                         existing_lower.add(a.lower())
 
-    all_concepts = [Concept(name=canonical_by_lower[k], aliases=seen[k]) for k in order][:8]
+    # Full deduplicated union. Capping is the caller's policy: ingest_note applies the
+    # quality-scaled, configured max_concepts. A per-call "max 8" must not become a
+    # whole-document cap here, or multi-chunk sources silently ignore the config.
+    all_concepts = [Concept(name=canonical_by_lower[k], aliases=seen[k]) for k in order]
 
     seen_topics: set[str] = set()
     all_topics: list[str] = []
@@ -277,8 +280,12 @@ def _merge_chunk_results(results: list[AnalysisResult]) -> AnalysisResult:
     return AnalysisResult(
         summary=results[0].summary,
         concepts=all_concepts,
+        # suggested_topics keeps a small bound: it is only a concept-fallback, sliced to
+        # [:3] downstream, so this is not a silent whole-document ceiling.
         suggested_topics=all_topics[:5],
-        named_references=all_named_references[:8],
+        # Full evidenced union; named references have no downstream cap, so a per-call
+        # limit here would silently bound the whole document (chunk-order biased).
+        named_references=all_named_references,
         quality=merged_quality,
         language=merged_language,
     )

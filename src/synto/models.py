@@ -57,7 +57,7 @@ class AnalysisResult(BaseModel):
     """Returned by fast model when analyzing a raw note."""
 
     summary: str = Field(description="2-3 sentence summary in the note's language")
-    concepts: list[Concept] = Field(description="Main topics/concepts found (max 8)")
+    concepts: list[Concept] = Field(description="Main concepts found in the note")
     suggested_topics: list[str] = Field(
         description="Titles of wiki articles this note should feed into (max 5)"
     )

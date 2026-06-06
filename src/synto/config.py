@@ -150,17 +150,19 @@ def _vault_toml_tail(inline_source_citations: bool) -> str:
         f"graph_quality_checks = true\n"
         f'# language = "en"  # ISO 639-1 output language; autodetects from notes if unset\n'
         f"#\n"
-        f"# Per-source-type ingest overrides. Raises the concept-extraction ceiling for\n"
-        f"# long-form sources. Quality-based reduction (medium -> 4, low -> 2) still\n"
-        f"# applies within this ceiling, so the override only lifts the high-quality cap.\n"
-        f"# Editing this only affects newly-ingested sources; run `synto ingest --force`\n"
-        f"# to re-apply it to sources already ingested.\n"
+        f"# Per-source-type ingest overrides. Long-form types already default to a higher\n"
+        f"# concept-extraction ceiling (textbook 25, paper 15); everything else uses the\n"
+        f"# global max_concepts_per_source above. Set a block below only to change those.\n"
+        f"# Quality-based reduction (medium -> 4, low -> 2) still applies within the\n"
+        f"# ceiling, so the value only lifts the high-quality cap. Editing this only\n"
+        f"# affects newly-ingested sources; run `synto ingest --force` to re-apply it to\n"
+        f"# sources already ingested.\n"
         f"#\n"
         f"# [pipeline.source_overrides.textbook]\n"
-        f"# max_concepts_per_source = 25  # default: 8\n"
+        f"# max_concepts_per_source = 25  # built-in default: 25\n"
         f"#\n"
         f"# [pipeline.source_overrides.paper]\n"
-        f"# max_concepts_per_source = 15  # default: 8\n"
+        f"# max_concepts_per_source = 15  # built-in default: 15\n"
     )
 
 
@@ -433,6 +435,13 @@ class ResolvedModel:
         return hashlib.sha256(ident.encode()).hexdigest()
 
 
+# Long-form source types get a higher concept ceiling out of the box, so `source_type:
+# textbook` is useful without hand-writing an override. All other types use the global
+# default. Consulted by effective_max_concepts; an explicit per-type override still wins,
+# and a user who raises the global above these still wins (these never lower a setting).
+_BUILTIN_MAX_CONCEPTS: dict[str, int] = {"textbook": 25, "paper": 15}
+
+
 class SourceTypeOverride(BaseModel):
     max_concepts_per_source: int | None = Field(default=None, ge=1)
 
@@ -518,7 +527,13 @@ class PipelineConfig(BaseModel):
         return value
 
     def effective_max_concepts(self, source_type: str) -> int:
-        """Return max_concepts_per_source for source_type, or the global default.
+        """Return the concept-extraction ceiling for source_type.
+
+        Resolution: an explicit per-type override wins (and may set any value, including
+        below the built-in default); otherwise the larger of the built-in default for the
+        type (textbook 25, paper 15) and the global max_concepts_per_source, so book-ish
+        types are lifted above the global floor without a built-in ever lowering a user's
+        raised global; types with no built-in fall through to the global default.
 
         Quality-based reduction still applies *after* this returns: high keeps the
         ceiling, medium clamps to min(ceiling, 4), low to 2. The override only lifts
@@ -528,6 +543,9 @@ class PipelineConfig(BaseModel):
         override = self.source_overrides.get(source_type)
         if override is not None and override.max_concepts_per_source is not None:
             return override.max_concepts_per_source
+        builtin = _BUILTIN_MAX_CONCEPTS.get(source_type)
+        if builtin is not None:
+            return max(builtin, self.max_concepts_per_source)
         return self.max_concepts_per_source
 
 
