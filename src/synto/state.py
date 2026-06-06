@@ -972,6 +972,12 @@ class StateDB:
         JSON list columns (``sources``/``synthesis_sources``) are decoded and re-encoded, not
         REPLACE'd: a Windows path is JSON-escaped on disk as ``raw\\note.md``, so a naive
         ``REPLACE('\', '/')`` would corrupt it to ``raw//note.md``.
+
+        Collision-safe: a vault moved across OSes and then re-run on the new OS could hold
+        both ``wiki\Qubit.md`` and ``wiki/Qubit.md`` (pre-fix exact-path lookups treated them
+        as distinct). ``UPDATE OR IGNORE`` keeps the already-POSIX row and skips the rewrite
+        of the colliding backslash row, which is then dropped as a stale duplicate — so the
+        migration can't abort on a uniqueness violation.
         """
         plain_columns = [
             ("raw_notes", "path"),
@@ -985,7 +991,12 @@ class StateDB:
         ]
         with self._tx():
             for table, col in plain_columns:
-                self._conn.execute(f"UPDATE {table} SET {col} = REPLACE({col}, '\\', '/')")
+                self._conn.execute(
+                    f"UPDATE OR IGNORE {table} SET {col} = REPLACE({col}, '\\', '/')"
+                )
+                # Drop rows whose normalized path collided with an existing POSIX row
+                # (UPDATE OR IGNORE left them with their original backslash value).
+                self._conn.execute(f"DELETE FROM {table} WHERE INSTR({col}, '\\') > 0")
             for col in ("sources", "synthesis_sources"):
                 rows = self._conn.execute(
                     f"SELECT rowid AS rid, {col} AS val FROM wiki_articles"
@@ -1074,6 +1085,9 @@ class StateDB:
         articles: list[WikiArticleRecord],
         alias_map: dict[str, set[str]],
     ) -> WikiArticleRecord | None:
+        # a.sources are POSIX (model validator); normalize so the overlap test matches
+        # cross-OS (#55).
+        source_path = to_posix(source_path)
         concept_lower = concept_name.casefold()
         alias_lowers = {alias.casefold() for alias in alias_map.get(concept_name, set())}
         candidates: list[WikiArticleRecord] = []
@@ -1105,6 +1119,7 @@ class StateDB:
         query = "SELECT name, source_path FROM concepts"
         params: tuple[str, ...] = ()
         if source_path is not None:
+            source_path = to_posix(source_path)  # match POSIX-stored paths cross-OS (#55)
             query += " WHERE source_path = ?"
             params = (source_path,)
         rows = self._conn.execute(query, params).fetchall()
@@ -1274,6 +1289,7 @@ class StateDB:
         through `synto add`). Callers should fall back to path uniqueness
         in that case.
         """
+        paths = [to_posix(p) for p in paths]  # match POSIX-stored paths cross-OS (#55)
         result: dict[str, str | None] = {p: None for p in paths}
         if not paths:
             return result
@@ -1292,6 +1308,7 @@ class StateDB:
         return result
 
     def get_note_language(self, path: str) -> str | None:
+        path = to_posix(path)  # match POSIX-stored paths cross-OS (#55)
         row = self._conn.execute(
             "SELECT language FROM raw_notes WHERE path = ?", (path,)
         ).fetchone()
@@ -1304,6 +1321,7 @@ class StateDB:
         return [str(row[0]) for row in rows if row[0]]
 
     def mark_raw_status(self, path: str, status: str, error: str | None = None) -> None:
+        path = to_posix(path)  # match POSIX-stored paths cross-OS (#55)
         now = datetime.now().isoformat()
         with self._tx():
             if status == "ingested":
@@ -1326,6 +1344,7 @@ class StateDB:
 
     def upsert_concepts(self, source_path: str, concept_names: list[str]) -> None:
         """Link concept names to a source note (idempotent)."""
+        source_path = to_posix(source_path)  # match POSIX-stored paths cross-OS (#55)
         with self._tx():
             for name in concept_names:
                 name = name.strip()
@@ -1346,6 +1365,7 @@ class StateDB:
 
     def replace_concepts_for_source(self, source_path: str, concept_names: list[str]) -> None:
         """Replace concept links for a source and reset compile state for current concepts."""
+        source_path = to_posix(source_path)  # match POSIX-stored paths cross-OS (#55)
         normalized = []
         seen: set[str] = set()
         for name in concept_names:
@@ -1526,6 +1546,7 @@ class StateDB:
         """Concept names linked to any of the given source paths."""
         if not source_paths:
             return []
+        source_paths = [to_posix(p) for p in source_paths]  # match POSIX-stored paths (#55)
         placeholders = ",".join("?" * len(source_paths))
         rows = self._conn.execute(
             f"SELECT DISTINCT name FROM concepts WHERE source_path IN ({placeholders})",
@@ -1606,6 +1627,7 @@ class StateDB:
         return None
 
     def get_compile_state(self, concept_name: str, source_path: str) -> sqlite3.Row | None:
+        source_path = to_posix(source_path)  # match POSIX-stored paths cross-OS (#55)
         return self._conn.execute(
             """
             SELECT * FROM concept_compile_state
@@ -1622,6 +1644,9 @@ class StateDB:
         *,
         error: str | None = None,
     ) -> None:
+        # compile.py builds these via str(path.relative_to(...)) — POSIX-normalize so the
+        # compile_state key matches concepts.source_path on any OS (#55).
+        source_paths = [to_posix(p) for p in source_paths]
         now = datetime.now().isoformat()
         with self._tx():
             for source_path in source_paths:
@@ -1649,6 +1674,8 @@ class StateDB:
     def clear_deferred_state(
         self, concept_name: str, source_paths: list[str] | None = None
     ) -> None:
+        if source_paths:
+            source_paths = [to_posix(p) for p in source_paths]  # match POSIX paths (#55)
         params: list[str] = [concept_name]
         query = (
             "UPDATE concept_compile_state SET status='pending', error=NULL, compiled_at=NULL, "
@@ -1668,6 +1695,7 @@ class StateDB:
                 self.refresh_raw_compile_status(source_path)
 
     def refresh_raw_compile_status(self, source_path: str) -> None:
+        source_path = to_posix(source_path)  # match POSIX-stored paths cross-OS (#55)
         row = self._conn.execute(
             "SELECT COUNT(*) AS cnt FROM concepts WHERE source_path = ?", (source_path,)
         ).fetchone()
@@ -2080,6 +2108,10 @@ class StateDB:
         return _row_to_article(row) if row else None
 
     def publish_article(self, old_path: str, new_path: str) -> None:
+        # Normalize separators so the mutating UPDATE matches POSIX-stored paths on any OS
+        # (#55) — without this, a Windows-style key silently no-ops the publish.
+        old_path = to_posix(old_path)
+        new_path = to_posix(new_path)
         with self._tx():
             # Guard: draft row must exist before we touch anything.
             # Without this, the DELETE below would silently destroy the previously
@@ -2106,6 +2138,7 @@ class StateDB:
         `synto compile` run does not regenerate (and clobber) a draft a
         human has already signed off on.
         """
+        path = to_posix(path)  # match POSIX-stored paths cross-OS (#55)
         with self._tx():
             # Parity with publish_article: silent no-op if the row is missing.
             if not self._conn.execute(
@@ -2138,6 +2171,7 @@ class StateDB:
         was previously verified — the verify→publish path must not lose
         audit history.
         """
+        path = to_posix(path)  # match POSIX-stored paths cross-OS (#55)
         with self._tx():
             self._conn.execute(
                 "UPDATE wiki_articles SET "
@@ -2151,6 +2185,7 @@ class StateDB:
             self.mark_concept_compile_state(art.title, art.sources, "compiled")
 
     def delete_article(self, path: str) -> None:
+        path = to_posix(path)  # match POSIX-stored paths cross-OS (#55)
         with self._tx():
             self._conn.execute("DELETE FROM wiki_articles WHERE path = ?", (path,))
 
@@ -2232,6 +2267,7 @@ class StateDB:
         chunk_size: int,
         checkpoint_schema: int = _CHECKPOINT_SCHEMA_VERSION,
     ) -> list[sqlite3.Row]:
+        source_path = to_posix(source_path)  # match POSIX-stored paths cross-OS (#55)
         return self._conn.execute(
             """
             SELECT * FROM ingest_chunks
@@ -2255,6 +2291,7 @@ class StateDB:
         result_json: str,
         checkpoint_schema: int = _CHECKPOINT_SCHEMA_VERSION,
     ) -> None:
+        source_path = to_posix(source_path)  # match POSIX-stored paths cross-OS (#55)
         now = datetime.now().isoformat()
         with self._tx():
             self._conn.execute(
@@ -2287,6 +2324,7 @@ class StateDB:
             )
 
     def purge_ingest_chunks(self, source_path: str, *, keep_hash: str | None = None) -> None:
+        source_path = to_posix(source_path)  # match POSIX-stored paths cross-OS (#55)
         with self._tx():
             if keep_hash is None:
                 self._conn.execute(
@@ -2306,6 +2344,7 @@ class StateDB:
         chunk_size: int,
         checkpoint_schema: int = _CHECKPOINT_SCHEMA_VERSION,
     ) -> None:
+        source_path = to_posix(source_path)  # match POSIX-stored paths cross-OS (#55)
         with self._tx():
             self._conn.execute(
                 """
@@ -2475,6 +2514,7 @@ class StateDB:
         self._conn.commit()
 
     def update_article_compile_run(self, article_path: str, run_ulid: str) -> None:
+        article_path = to_posix(article_path)  # match POSIX-stored paths cross-OS (#55)
         self._conn.execute(
             "UPDATE wiki_articles SET last_compile_pipeline = ? WHERE path = ?",
             (run_ulid, article_path),

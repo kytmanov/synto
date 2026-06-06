@@ -144,6 +144,84 @@ def test_record_models_normalize_separators_on_construction() -> None:
     assert article.synthesis_sources == ["raw/s.md"]
 
 
+def test_state_transitions_match_windows_style_caller_paths(tmp_path: Path) -> None:
+    """verify/publish/approve/delete must hit the POSIX-stored row even when the caller
+    passes a Windows-style path.
+
+    compile.py builds keys with ``str(path.relative_to(...))`` — backslash-separated on
+    Windows. Articles are stored as POSIX (model validator), so without boundary
+    normalization the mutating ``WHERE path = ?`` silently no-ops and publish/approve do
+    nothing.
+    """
+    db = StateDB(tmp_path / "state.db")
+    db.upsert_article(
+        WikiArticleRecord(
+            path="wiki/.drafts/Foo.md", title="Foo", sources=[], content_hash="h", status="draft"
+        )
+    )
+
+    db.verify_article("wiki\\.drafts\\Foo.md")
+    assert db.get_article("wiki/.drafts/Foo.md").status == "verified"
+
+    db.publish_article("wiki\\.drafts\\Foo.md", "wiki\\Foo.md")
+    assert db.get_article("wiki/Foo.md").status == "published"
+
+    db.approve_article("wiki\\Foo.md", notes="ok")
+    assert db.get_article("wiki/Foo.md").approved_at is not None
+
+    db.delete_article("wiki\\Foo.md")
+    assert db.get_article("wiki/Foo.md") is None
+
+
+def test_v17_migration_resolves_duplicate_backslash_and_posix_rows(tmp_path: Path) -> None:
+    """A cross-OS-moved vault re-compiled on the new OS can hold both `wiki\\Q.md` and
+    `wiki/Q.md` (pre-fix exact-path lookups kept them as distinct rows). Normalizing the
+    primary key in place would collide; the migration must keep the POSIX row and drop the
+    stale backslash duplicate instead of aborting.
+    """
+    db_path = tmp_path / "state.db"
+    db = StateDB(db_path)
+    for path, status, aid in [("wiki\\Q.md", "draft", "a1"), ("wiki/Q.md", "published", "a2")]:
+        db._conn.execute(
+            """INSERT INTO wiki_articles
+                   (path, title, sources, content_hash, created_at, updated_at, status,
+                    kind, synthesis_sources, synthesis_source_hashes, article_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                path,
+                "Q",
+                json.dumps([]),
+                "h",
+                "2026-01-01",
+                "2026-01-01",
+                status,
+                "concept",
+                json.dumps([]),
+                json.dumps([]),
+                aid,
+            ),
+        )
+    # Same collision on a raw_notes primary key.
+    db._conn.execute(
+        "INSERT INTO raw_notes (path, content_hash, status) VALUES (?, ?, ?)",
+        ("raw\\n.md", "h1", "ingested"),
+    )
+    db._conn.execute(
+        "INSERT INTO raw_notes (path, content_hash, status) VALUES (?, ?, ?)",
+        ("raw/n.md", "h2", "ingested"),
+    )
+    db._conn.execute("UPDATE schema_version SET version = 16 WHERE id = 1")
+    db._conn.commit()
+    db._conn.close()
+
+    db = StateDB(db_path)  # must not raise on the PK collision
+
+    arts = db._conn.execute("SELECT path, status FROM wiki_articles").fetchall()
+    assert [(r[0], r[1]) for r in arts] == [("wiki/Q.md", "published")]
+    raws = [r[0] for r in db._conn.execute("SELECT path FROM raw_notes").fetchall()]
+    assert raws == ["raw/n.md"]
+
+
 def test_line_endings_do_not_change_content_hash(tmp_path: Path) -> None:
     """Lock in that CRLF↔LF is a non-issue: a git line-ending rewrite must not change a
     note's dedup identity. This is why the user's line-ending hypothesis was wrong."""

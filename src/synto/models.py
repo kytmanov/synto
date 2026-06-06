@@ -288,6 +288,9 @@ class ItemMentionRecord(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0, default=0.5)
     id: int | None = None
 
+    # Normalize separators so mentions key on POSIX paths cross-OS (#55).
+    _norm_path = field_validator("source_path", mode="before")(_normalize_path_field)
+
 
 # ────────────────────────────────────────────────────────────────────────
 # V6 abstractions (added in Phase 0; not yet used by any code path).
