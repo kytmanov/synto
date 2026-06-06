@@ -16,7 +16,21 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from .paths import to_posix
 from .sanitize import sanitize_tags
+
+
+def _normalize_path_field(v: Any) -> Any:
+    """Normalize a single path string to POSIX separators (cross-OS DB portability, #55)."""
+    return to_posix(v) if isinstance(v, str) else v
+
+
+def _normalize_path_list_field(v: Any) -> Any:
+    """Normalize a list of path strings to POSIX separators."""
+    if isinstance(v, list):
+        return [to_posix(s) if isinstance(s, str) else s for s in v]
+    return v
+
 
 log = logging.getLogger(__name__)
 
@@ -208,6 +222,9 @@ class RawNoteRecord(BaseModel):
     compiled_at: datetime | None = None
     error: str | None = None
 
+    # Normalize separators so the same note hashes/looks up identically across OSes (#55).
+    _norm_path = field_validator("path", mode="before")(_normalize_path_field)
+
 
 class WikiArticleRecord(BaseModel):
     path: str
@@ -225,6 +242,12 @@ class WikiArticleRecord(BaseModel):
     synthesis_source_hashes: list[list[str]] = Field(default_factory=list)
     article_id: str | None = None
     last_compile_pipeline: str | None = None
+
+    # Normalize separators on path + source lists for cross-OS portability (#55).
+    _norm_path = field_validator("path", mode="before")(_normalize_path_field)
+    _norm_sources = field_validator("sources", "synthesis_sources", mode="before")(
+        _normalize_path_list_field
+    )
 
     @property
     def is_draft(self) -> bool:

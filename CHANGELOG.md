@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- Vaults are now portable across operating systems (#55). The state DB stored
+  vault-relative paths with OS-native separators, so a vault built on Windows
+  (`raw\note.md`) and moved to Linux/macOS (`raw/note.md`) had every note treated as a
+  duplicate and skipped, ignoring its sources. Paths are now stored as POSIX everywhere,
+  and a one-time migration repairs existing DBs on first open — no rebuild needed. The
+  suspected cause (CRLF/LF line endings) was a red herring: content hashes are computed on
+  a newline-normalized body, so line endings never affected note identity.
+
 ## [0.5.0] - 2026-06-03
 
 ### Added

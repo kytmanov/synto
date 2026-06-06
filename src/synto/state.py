@@ -36,6 +36,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 from .models import ItemMentionRecord, KnowledgeItemRecord, RawNoteRecord, WikiArticleRecord
+from .paths import to_posix
 
 log = logging.getLogger(__name__)
 
@@ -68,7 +69,7 @@ def _fts5_available(conn: sqlite3.Connection) -> bool:
         return False
 
 
-_CURRENT_SCHEMA_VERSION = 16
+_CURRENT_SCHEMA_VERSION = 17
 _CHECKPOINT_SCHEMA_VERSION = 2
 _SESSION_IDLE_GAP_SECONDS = 1800  # 30-min idle gap that splits MCP sessions in the backlog report
 
@@ -629,6 +630,7 @@ _VERSIONED_MIGRATIONS: dict[int, list[str]] = {
     14: [],  # all v14 work happens in the post-hook below for atomicity
     15: [],  # all v15 work happens in the post-hook below for atomicity
     16: [],  # all v16 work happens in the post-hook below for atomicity
+    17: [],  # all v17 work happens in the post-hook below for atomicity
 }
 
 
@@ -805,6 +807,8 @@ class StateDB:
                 self._apply_status_column_v15()
             if version == 16:
                 self._create_source_segments_fts_v16()
+            if version == 17:
+                self._normalize_path_separators_v17()
             with self._tx():
                 self._conn.execute(
                     "INSERT OR REPLACE INTO schema_version (id, version) VALUES (1, ?)",
@@ -952,6 +956,49 @@ class StateDB:
                 INSERT INTO source_segments_fts(rowid, text)
                 SELECT rowid, text FROM source_segments
             """)
+
+    def _normalize_path_separators_v17(self) -> None:
+        r"""Rewrite Windows-style path separators in stored paths to POSIX (issue #55).
+
+        A vault built on Windows stored vault-relative paths like ``raw\note.md``; moved to
+        Linux, the same note resolves to ``raw/note.md``, so dedup/lookup treated every note
+        as a duplicate and skipped it. This repairs already-built DBs on first open.
+
+        Atomic via _tx(); idempotent — ``REPLACE`` and re-encoding are no-ops once paths are
+        already POSIX, so re-runs and Linux/macOS-built DBs (no backslashes) are unaffected.
+        Tradeoff: a backslash is a legal POSIX filename char and would also be rewritten, but
+        synto vault paths (Obsidian/markdown filenames) never contain one.
+
+        JSON list columns (``sources``/``synthesis_sources``) are decoded and re-encoded, not
+        REPLACE'd: a Windows path is JSON-escaped on disk as ``raw\\note.md``, so a naive
+        ``REPLACE('\', '/')`` would corrupt it to ``raw//note.md``.
+        """
+        plain_columns = [
+            ("raw_notes", "path"),
+            ("concepts", "source_path"),
+            ("concept_compile_state", "source_path"),
+            ("wiki_articles", "path"),
+            ("ingest_chunks", "source_path"),
+            ("item_mentions", "source_path"),
+            ("generated_assets", "path"),
+            ("generated_assets", "master_path"),
+        ]
+        with self._tx():
+            for table, col in plain_columns:
+                self._conn.execute(f"UPDATE {table} SET {col} = REPLACE({col}, '\\', '/')")
+            for col in ("sources", "synthesis_sources"):
+                rows = self._conn.execute(
+                    f"SELECT rowid AS rid, {col} AS val FROM wiki_articles"
+                ).fetchall()
+                for row in rows:
+                    raw = row["val"]
+                    if not raw or "\\" not in raw:
+                        continue
+                    fixed = [to_posix(s) if isinstance(s, str) else s for s in json.loads(raw)]
+                    self._conn.execute(
+                        f"UPDATE wiki_articles SET {col} = ? WHERE rowid = ?",
+                        (json.dumps(fixed), row["rid"]),
+                    )
 
     def _validate_v6_tables(self) -> None:
         expected_ingest = {
@@ -1193,6 +1240,8 @@ class StateDB:
             )
 
     def get_raw(self, path: str) -> RawNoteRecord | None:
+        # Normalize separators so a Windows-style key matches POSIX-stored paths (#55).
+        path = to_posix(path)
         row = self._conn.execute("SELECT * FROM raw_notes WHERE path = ?", (path,)).fetchone()
         return _row_to_raw(row) if row else None
 
@@ -1877,6 +1926,9 @@ class StateDB:
         (compile skips a published article only while its body hash differs from the DB);
         that would expose a hand-fixed article to being clobbered on the next compile.
         """
+        # Normalize separators so lookups/stores match POSIX-stored paths cross-OS (#55).
+        old_path = to_posix(old_path)
+        new_path = to_posix(new_path)
         with self._tx():
             if not self._conn.execute(
                 "SELECT 1 FROM wiki_articles WHERE path = ?", (old_path,)
@@ -1999,6 +2051,8 @@ class StateDB:
             raise SynthesisInsertConflictError(message) from exc
 
     def get_article(self, path: str) -> WikiArticleRecord | None:
+        # Normalize separators so a Windows-style key matches POSIX-stored paths (#55).
+        path = to_posix(path)
         row = self._conn.execute("SELECT * FROM wiki_articles WHERE path = ?", (path,)).fetchone()
         return _row_to_article(row) if row else None
 
