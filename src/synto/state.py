@@ -1036,6 +1036,12 @@ class StateDB:
         and the colliding backslash duplicate is dropped (and logged), so the migration can't
         abort on a uniqueness violation.
         """
+        # Vault-relative path KEYS only — these are looked up across OSes, so their separators
+        # must be normalized. Absolute/external columns are deliberately excluded because
+        # rewriting their separators would corrupt the stored value, not portability-fix it:
+        #   - generated_assets.master_path: absolute imported-source path, e.g.
+        #     C:\Users\alice\paper.pdf (extractors/pdf.py writes str(path)).
+        #   - source_documents.origin_uri: external URI / origin of an imported document.
         plain_columns = [
             ("raw_notes", "path"),
             ("concepts", "source_path"),
@@ -1044,7 +1050,6 @@ class StateDB:
             ("ingest_chunks", "source_path"),
             ("item_mentions", "source_path"),
             ("generated_assets", "path"),
-            ("generated_assets", "master_path"),
         ]
         with self._tx():
             # Resolve article collisions by recency first so the REPLACE below can't collide

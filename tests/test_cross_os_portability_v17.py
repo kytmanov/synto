@@ -110,6 +110,33 @@ def test_v17_migration_does_not_corrupt_json_source_lists(tmp_path: Path) -> Non
     assert all("//" not in s and "\\" not in s for s in sources)
 
 
+def test_v17_migration_leaves_absolute_master_path_untouched(tmp_path: Path) -> None:
+    """generated_assets.master_path is the ABSOLUTE source-file path of an imported document
+    (extractors/pdf.py writes str(path)), not a vault-relative key. The migration must not
+    rewrite its separators — doing so corrupts imported-source metadata. Only the
+    vault-relative generated_assets.path is normalized.
+    """
+    db_path = tmp_path / "state.db"
+    db = StateDB(db_path)
+    abs_master = r"C:\Users\alice\paper.pdf"
+    db._conn.execute(
+        """INSERT INTO generated_assets
+               (path, source_id, asset_type, master_path, created_at, referenced_by_json)
+           VALUES (?, ?, 'image', ?, ?, '[]')""",
+        ("assets/doc/img.png", "doc", abs_master, "2026-01-01"),
+    )
+    db._conn.execute("UPDATE schema_version SET version = 16 WHERE id = 1")
+    db._conn.commit()
+    db._conn.close()
+
+    db = StateDB(db_path)  # runs v17
+
+    assert db._conn.execute("SELECT version FROM schema_version").fetchone()[0] == 17
+    path, master = db._conn.execute("SELECT path, master_path FROM generated_assets").fetchone()
+    assert master == abs_master  # absolute external path preserved byte-for-byte
+    assert path == "assets/doc/img.png"  # vault-relative key untouched (already POSIX)
+
+
 def test_moved_vault_recognizes_existing_note_instead_of_skipping_it(tmp_path: Path) -> None:
     """The reported symptom: after the move, the note is found, not flagged a duplicate.
 
