@@ -921,6 +921,20 @@ def test_no_stale_lock_when_absent(config, db):
     assert not any(i.issue_type == "stale_lock" for i in result.issues)
 
 
+def test_own_lock_not_flagged_as_stale(config, db):
+    """Lint runs inside the held pipeline lock during run/maintain; our own lock
+    must not be reported as stale. On NFS the liveness probe can't self-detect, so
+    this is guarded by a current-PID short-circuit (also avoids the probe's fd
+    close dropping the held lock under NFS POSIX-lock emulation)."""
+    import os
+
+    lock_path = config.vault / ".synto" / "pipeline.lock"
+    lock_path.parent.mkdir(exist_ok=True)
+    lock_path.write_text(str(os.getpid()))
+    result = run_lint(config, db)
+    assert not any(i.issue_type == "stale_lock" for i in result.issues)
+
+
 def test_invalid_lock_file_detected(config, db):
     lock_path = config.vault / ".synto" / "pipeline.lock"
     lock_path.parent.mkdir(exist_ok=True)

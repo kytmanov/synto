@@ -6,11 +6,13 @@
 
 - `synto status`, `synto run`, and `synto maintain` no longer crash with
   `OSError: [Errno 9] Bad file descriptor` on NFS vaults (#56). The pipeline-lock
-  liveness probe opened the lock file read-only and then requested an exclusive
-  lock; NFS emulates `flock()` as `fcntl()` write-locks, which require a writable
-  fd, so the read-only fd returned `EBADF`. The probe now opens the file writable,
-  and a filesystem that rejects locking entirely (e.g. a `nolock` mount) degrades
-  gracefully instead of crashing.
+  liveness probe requested an exclusive lock to test whether the lock was held;
+  NFS emulates `flock()` as `fcntl()` write-locks, which require a writable fd, so
+  the read-only probe returned `EBADF`. The probe now uses a shared lock (which
+  needs only a readable fd), so it also works on read-only mounts and mode-0444
+  stale lock files; a filesystem that rejects locking entirely (e.g. a `nolock`
+  mount) degrades gracefully instead of crashing. Lint no longer reports the
+  pipeline's own lock as "stale" while a run is in progress on NFS.
 - Vaults are now portable across operating systems (#55). The state DB stored
   vault-relative paths with OS-native separators, so a vault built on Windows
   (`raw\note.md`) and moved to Linux/macOS (`raw/note.md`) had every note treated as a
