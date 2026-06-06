@@ -22,6 +22,7 @@ from pydantic import BaseModel as _BaseModel
 
 from ..config import Config
 from ..models import AnalysisResult, Concept, RawNoteRecord, SourceSegment, TermExtractionResult
+from ..paths import rel_posix
 from ..state import StateDB
 from ..structured_output import request_structured
 
@@ -501,7 +502,7 @@ def _analyze_body_with_checkpoints(
     attribution: dict[int, list[str]] | None = None,
 ) -> AnalysisResult:
     chunk_size = config.resolve_role("fast").ctx // 2
-    rel_path = str(path.relative_to(config.vault))
+    rel_path = rel_posix(path, config.vault)
     checkpoint_hash = _checkpoint_hash(
         content_hash,
         config,
@@ -1174,7 +1175,7 @@ def _create_source_summary_page(
     config.sources_dir.mkdir(parents=True, exist_ok=True)
 
     now = datetime.now().strftime("%Y-%m-%d")
-    rel_raw = str(path.relative_to(config.vault))
+    rel_raw = rel_posix(path, config.vault)
     source_url = src_meta.get("source") or src_meta.get("url") or ""
     aliases = generate_aliases(title, "")  # source pages rarely have abbreviations
 
@@ -1293,11 +1294,11 @@ def ingest_note(
 
     # Dedup check
     existing = db.get_raw_by_hash(h)
-    if existing and existing.path != str(path.relative_to(config.vault)):
+    if existing and existing.path != rel_posix(path, config.vault):
         log.info("Duplicate of %s, skipping %s", existing.path, path.name)
         return None
 
-    rel_path = str(path.relative_to(config.vault))
+    rel_path = rel_posix(path, config.vault)
     record = db.get_raw(rel_path)
     current_prompt_version = _ingest_prompt_version(config)
 
@@ -1549,7 +1550,7 @@ def ingest_all(
         )
         results.append((path, result))
         if result is not None:
-            rel_path = str(path.relative_to(config.vault))
+            rel_path = rel_posix(path, config.vault)
             for name in db.get_concepts_for_sources([rel_path]):
                 name_key = name.casefold()
                 if name_key not in existing_topic_keys:

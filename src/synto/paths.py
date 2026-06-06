@@ -17,6 +17,24 @@ VAULT_ENV_VAR = "SYNTO_VAULT"
 
 API_KEY_ENV_VAR = "SYNTO_API_KEY"
 
+
+def to_posix(path: str) -> str:
+    """Normalize OS-native separators to POSIX.
+
+    State-DB paths are vault-relative; storing them with forward slashes keeps a vault
+    portable across OSes. A Windows-built DB stores ``raw\\note.md`` while the same note
+    resolves to ``raw/note.md`` on Linux, which made dedup/lookup treat every note as a
+    duplicate after a cross-OS move (issue #55). Backslash is a legal POSIX filename char,
+    but synto vault paths never contain one, so this is safe.
+    """
+    return path.replace("\\", "/")
+
+
+def rel_posix(path: Path, base: Path) -> str:
+    """Base-relative path as a POSIX string — stable across OSes for DB storage/lookup."""
+    return Path(path).relative_to(Path(base)).as_posix()
+
+
 AUTO_COMMIT_PREFIX = "[synto]"
 LEGACY_AUTO_COMMIT_PREFIX = "[olw]"
 

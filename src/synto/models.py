@@ -12,11 +12,28 @@ import hashlib
 import json
 import logging
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, BeforeValidator, Field, field_validator, model_validator
 
+from .paths import to_posix
 from .sanitize import sanitize_tags
+
+
+def _normalize_path_field(v: Any) -> Any:
+    """Normalize a path string to POSIX separators (cross-OS DB portability, #55).
+
+    Non-str input is passed through unchanged so Pydantic raises a clean validation error
+    rather than crashing inside ``to_posix`` (``int`` has no ``.replace``).
+    """
+    return to_posix(v) if isinstance(v, str) else v
+
+
+# A vault-relative path that is always stored with POSIX separators. Annotating a field with
+# this (or ``list[VaultRelPath]``) is the whole normalization contract — models carry no
+# per-field validator boilerplate, and `list[VaultRelPath]` normalizes each element.
+VaultRelPath = Annotated[str, BeforeValidator(_normalize_path_field)]
+
 
 log = logging.getLogger(__name__)
 
@@ -197,7 +214,7 @@ class LintResult(BaseModel):
 
 
 class RawNoteRecord(BaseModel):
-    path: str
+    path: VaultRelPath
     content_hash: str
     status: Literal["new", "ingested", "compiled", "failed"] = "new"
     summary: str | None = None
@@ -210,9 +227,9 @@ class RawNoteRecord(BaseModel):
 
 
 class WikiArticleRecord(BaseModel):
-    path: str
+    path: VaultRelPath
     title: str
-    sources: list[str]  # raw note paths
+    sources: list[VaultRelPath]  # raw note paths
     content_hash: str
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
@@ -221,7 +238,7 @@ class WikiArticleRecord(BaseModel):
     approval_notes: str | None = None
     kind: Literal["concept", "synthesis"] = "concept"
     question_hash: str | None = None
-    synthesis_sources: list[str] = Field(default_factory=list)
+    synthesis_sources: list[VaultRelPath] = Field(default_factory=list)
     synthesis_source_hashes: list[list[str]] = Field(default_factory=list)
     article_id: str | None = None
     last_compile_pipeline: str | None = None
@@ -258,7 +275,7 @@ class KnowledgeItemRecord(BaseModel):
 
 class ItemMentionRecord(BaseModel):
     item_name: str
-    source_path: str
+    source_path: VaultRelPath
     mention_text: str
     context: str | None = None
     evidence_level: Literal["title_supported", "filename_supported", "source_supported"]
