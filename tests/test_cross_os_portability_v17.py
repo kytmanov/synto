@@ -15,13 +15,17 @@ by ``test_line_endings_do_not_change_content_hash``.
 
 from __future__ import annotations
 
+import inspect
 import json
 from pathlib import Path
 
-from synto.models import RawNoteRecord, WikiArticleRecord
+import pytest
+from pydantic import ValidationError
+
+from synto.models import ItemMentionRecord, RawNoteRecord, WikiArticleRecord
 from synto.paths import rel_posix
 from synto.pipeline.ingest import _content_hash
-from synto.state import StateDB
+from synto.state import _DB_PATH_LIST_PARAMS, _DB_PATH_PARAMS, StateDB
 from synto.vault import parse_note, write_note
 
 
@@ -234,3 +238,52 @@ def test_line_endings_do_not_change_content_hash(tmp_path: Path) -> None:
     _, lf_body = parse_note(lf_path)
     _, crlf_body = parse_note(crlf_path)
     assert _content_hash(lf_body) == _content_hash(crlf_body)
+
+
+# ── Abstraction guarantees (the normalization machinery itself) ────────────────
+
+
+def test_vault_rel_path_type_rejects_non_str() -> None:
+    """The `VaultRelPath` type wraps a *guarded* validator: a non-str field must raise a
+    clean Pydantic `ValidationError`, not crash in `to_posix` (`int` has no `.replace`)."""
+    with pytest.raises(ValidationError):
+        RawNoteRecord(path=123, content_hash="h")  # type: ignore[arg-type]
+    with pytest.raises(ValidationError):
+        ItemMentionRecord(
+            item_name="x",
+            source_path=object(),  # type: ignore[arg-type]
+            mention_text="m",
+            evidence_level="source_supported",
+        )
+
+
+def test_db_path_decorator_does_not_mangle_path_typed_argument(tmp_path: Path) -> None:
+    """The decorator's `isinstance(str)` guard is load-bearing: `_infer_orphan_draft_status`
+    has a parameter named `path` but receives a `Path`. Normalizing it would call
+    `Path.replace` (a file rename) — the guard must pass the `Path` through untouched."""
+    db = StateDB(tmp_path / "state.db")
+    note = tmp_path / "a b.md"  # space — exercises a real filesystem read
+    write_note(note, {"status": "verified"}, "body\n")
+
+    assert db._infer_orphan_draft_status(note) == "verified"
+    assert note.exists()  # not accidentally renamed by a mis-applied str.replace
+
+
+def test_db_path_param_naming_convention_is_complete() -> None:
+    """Enforce the decorator's naming convention as an invariant: every `StateDB` parameter
+    whose name contains `path` and is typed `str`/`list[str]` must be covered by the
+    decorator's constants. A future method with an uncovered path param fails here instead of
+    silently bypassing normalization (the convention is the contract)."""
+    covered = _DB_PATH_PARAMS | _DB_PATH_LIST_PARAMS
+    str_like = {"str", "str | None", "list[str]", "list[str] | None"}
+    offenders: list[str] = []
+    for name, fn in vars(StateDB).items():
+        if not inspect.isfunction(fn):
+            continue
+        for p in inspect.signature(fn).parameters.values():
+            if p.name == "self":
+                continue
+            ann = p.annotation if isinstance(p.annotation, str) else None
+            if "path" in p.name.lower() and ann in str_like and p.name not in covered:
+                offenders.append(f"{name}({p.name}: {ann})")
+    assert not offenders, f"path-named str params not covered by the decorator: {offenders}"

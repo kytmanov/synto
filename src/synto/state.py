@@ -25,20 +25,72 @@ Schema versioning: schema_version table tracks migration level.
 
 from __future__ import annotations
 
+import functools
 import hashlib
+import inspect
 import json
 import logging
 import sqlite3
 import time
+import types
 import uuid
 from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
 
 from .models import ItemMentionRecord, KnowledgeItemRecord, RawNoteRecord, WikiArticleRecord
-from .paths import to_posix
+from .paths import rel_posix, to_posix
 
 log = logging.getLogger(__name__)
+
+# Vault-relative paths are stored with POSIX separators so a vault is portable across OSes
+# (#55). `_normalizes_db_paths` is applied to StateDB so its methods never carry inline
+# normalization: any argument named below — typed str / list[str] — is POSIX-normalized at the
+# call boundary. Filesystem-path args (e.g. `db_path`, the `Path`-typed `path` of
+# `_infer_orphan_draft_status`) are skipped by the runtime isinstance(str) guard, and a
+# completeness test pins the convention so a future path-named param can't slip through.
+_DB_PATH_PARAMS = frozenset({"path", "source_path", "old_path", "new_path", "article_path"})
+_DB_PATH_LIST_PARAMS = frozenset({"paths", "source_paths"})
+
+
+def _normalizes_db_paths(cls: type) -> type:
+    """Wrap StateDB methods so str path arguments are POSIX-normalized at the boundary."""
+    for name, func in list(vars(cls).items()):
+        if not isinstance(func, types.FunctionType):
+            continue  # skip classmethod/staticmethod descriptors, etc.
+        params = list(inspect.signature(func).parameters.values())
+        # Precompute (positional_index, name, is_list) once per method, so call-time work is a
+        # tiny fixed loop rather than a Signature.bind. Index counts `self` at 0.
+        targets = [
+            (i, p.name, p.name in _DB_PATH_LIST_PARAMS)
+            for i, p in enumerate(params)
+            if p.name in _DB_PATH_PARAMS or p.name in _DB_PATH_LIST_PARAMS
+        ]
+        if not targets:
+            continue
+        setattr(cls, name, _wrap_path_normalizer(func, targets))
+    return cls
+
+
+def _wrap_path_normalizer(func, targets):
+    def _norm(value, is_list):
+        if is_list and isinstance(value, list):
+            return [to_posix(v) if isinstance(v, str) else v for v in value]
+        return to_posix(value) if isinstance(value, str) else value
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        args_list = None
+        for idx, pname, is_list in targets:
+            if pname in kwargs:
+                kwargs[pname] = _norm(kwargs[pname], is_list)
+            elif idx < len(args):
+                if args_list is None:
+                    args_list = list(args)
+                args_list[idx] = _norm(args_list[idx], is_list)
+        return func(*(args_list if args_list is not None else args), **kwargs)
+
+    return wrapper
 
 
 def _hash8(value: str) -> str:
@@ -682,6 +734,7 @@ class DuplicateArticlePathError(SynthesisInsertConflictError):
     """Raised when a synthesis article path already exists."""
 
 
+@_normalizes_db_paths
 class StateDB:
     def __init__(self, db_path: Path) -> None:
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1085,9 +1138,6 @@ class StateDB:
         articles: list[WikiArticleRecord],
         alias_map: dict[str, set[str]],
     ) -> WikiArticleRecord | None:
-        # a.sources are POSIX (model validator); normalize so the overlap test matches
-        # cross-OS (#55).
-        source_path = to_posix(source_path)
         concept_lower = concept_name.casefold()
         alias_lowers = {alias.casefold() for alias in alias_map.get(concept_name, set())}
         candidates: list[WikiArticleRecord] = []
@@ -1119,7 +1169,6 @@ class StateDB:
         query = "SELECT name, source_path FROM concepts"
         params: tuple[str, ...] = ()
         if source_path is not None:
-            source_path = to_posix(source_path)  # match POSIX-stored paths cross-OS (#55)
             query += " WHERE source_path = ?"
             params = (source_path,)
         rows = self._conn.execute(query, params).fetchall()
@@ -1255,8 +1304,6 @@ class StateDB:
             )
 
     def get_raw(self, path: str) -> RawNoteRecord | None:
-        # Normalize separators so a Windows-style key matches POSIX-stored paths (#55).
-        path = to_posix(path)
         row = self._conn.execute("SELECT * FROM raw_notes WHERE path = ?", (path,)).fetchone()
         return _row_to_raw(row) if row else None
 
@@ -1289,7 +1336,6 @@ class StateDB:
         through `synto add`). Callers should fall back to path uniqueness
         in that case.
         """
-        paths = [to_posix(p) for p in paths]  # match POSIX-stored paths cross-OS (#55)
         result: dict[str, str | None] = {p: None for p in paths}
         if not paths:
             return result
@@ -1308,7 +1354,6 @@ class StateDB:
         return result
 
     def get_note_language(self, path: str) -> str | None:
-        path = to_posix(path)  # match POSIX-stored paths cross-OS (#55)
         row = self._conn.execute(
             "SELECT language FROM raw_notes WHERE path = ?", (path,)
         ).fetchone()
@@ -1321,7 +1366,6 @@ class StateDB:
         return [str(row[0]) for row in rows if row[0]]
 
     def mark_raw_status(self, path: str, status: str, error: str | None = None) -> None:
-        path = to_posix(path)  # match POSIX-stored paths cross-OS (#55)
         now = datetime.now().isoformat()
         with self._tx():
             if status == "ingested":
@@ -1344,7 +1388,6 @@ class StateDB:
 
     def upsert_concepts(self, source_path: str, concept_names: list[str]) -> None:
         """Link concept names to a source note (idempotent)."""
-        source_path = to_posix(source_path)  # match POSIX-stored paths cross-OS (#55)
         with self._tx():
             for name in concept_names:
                 name = name.strip()
@@ -1365,7 +1408,6 @@ class StateDB:
 
     def replace_concepts_for_source(self, source_path: str, concept_names: list[str]) -> None:
         """Replace concept links for a source and reset compile state for current concepts."""
-        source_path = to_posix(source_path)  # match POSIX-stored paths cross-OS (#55)
         normalized = []
         seen: set[str] = set()
         for name in concept_names:
@@ -1546,7 +1588,6 @@ class StateDB:
         """Concept names linked to any of the given source paths."""
         if not source_paths:
             return []
-        source_paths = [to_posix(p) for p in source_paths]  # match POSIX-stored paths (#55)
         placeholders = ",".join("?" * len(source_paths))
         rows = self._conn.execute(
             f"SELECT DISTINCT name FROM concepts WHERE source_path IN ({placeholders})",
@@ -1627,7 +1668,6 @@ class StateDB:
         return None
 
     def get_compile_state(self, concept_name: str, source_path: str) -> sqlite3.Row | None:
-        source_path = to_posix(source_path)  # match POSIX-stored paths cross-OS (#55)
         return self._conn.execute(
             """
             SELECT * FROM concept_compile_state
@@ -1644,9 +1684,6 @@ class StateDB:
         *,
         error: str | None = None,
     ) -> None:
-        # compile.py builds these via str(path.relative_to(...)) — POSIX-normalize so the
-        # compile_state key matches concepts.source_path on any OS (#55).
-        source_paths = [to_posix(p) for p in source_paths]
         now = datetime.now().isoformat()
         with self._tx():
             for source_path in source_paths:
@@ -1674,8 +1711,6 @@ class StateDB:
     def clear_deferred_state(
         self, concept_name: str, source_paths: list[str] | None = None
     ) -> None:
-        if source_paths:
-            source_paths = [to_posix(p) for p in source_paths]  # match POSIX paths (#55)
         params: list[str] = [concept_name]
         query = (
             "UPDATE concept_compile_state SET status='pending', error=NULL, compiled_at=NULL, "
@@ -1695,7 +1730,6 @@ class StateDB:
                 self.refresh_raw_compile_status(source_path)
 
     def refresh_raw_compile_status(self, source_path: str) -> None:
-        source_path = to_posix(source_path)  # match POSIX-stored paths cross-OS (#55)
         row = self._conn.execute(
             "SELECT COUNT(*) AS cnt FROM concepts WHERE source_path = ?", (source_path,)
         ).fetchone()
@@ -1954,9 +1988,6 @@ class StateDB:
         (compile skips a published article only while its body hash differs from the DB);
         that would expose a hand-fixed article to being clobbered on the next compile.
         """
-        # Normalize separators so lookups/stores match POSIX-stored paths cross-OS (#55).
-        old_path = to_posix(old_path)
-        new_path = to_posix(new_path)
         with self._tx():
             if not self._conn.execute(
                 "SELECT 1 FROM wiki_articles WHERE path = ?", (old_path,)
@@ -2079,8 +2110,6 @@ class StateDB:
             raise SynthesisInsertConflictError(message) from exc
 
     def get_article(self, path: str) -> WikiArticleRecord | None:
-        # Normalize separators so a Windows-style key matches POSIX-stored paths (#55).
-        path = to_posix(path)
         row = self._conn.execute("SELECT * FROM wiki_articles WHERE path = ?", (path,)).fetchone()
         return _row_to_article(row) if row else None
 
@@ -2108,10 +2137,6 @@ class StateDB:
         return _row_to_article(row) if row else None
 
     def publish_article(self, old_path: str, new_path: str) -> None:
-        # Normalize separators so the mutating UPDATE matches POSIX-stored paths on any OS
-        # (#55) — without this, a Windows-style key silently no-ops the publish.
-        old_path = to_posix(old_path)
-        new_path = to_posix(new_path)
         with self._tx():
             # Guard: draft row must exist before we touch anything.
             # Without this, the DELETE below would silently destroy the previously
@@ -2138,7 +2163,6 @@ class StateDB:
         `synto compile` run does not regenerate (and clobber) a draft a
         human has already signed off on.
         """
-        path = to_posix(path)  # match POSIX-stored paths cross-OS (#55)
         with self._tx():
             # Parity with publish_article: silent no-op if the row is missing.
             if not self._conn.execute(
@@ -2171,7 +2195,6 @@ class StateDB:
         was previously verified — the verify→publish path must not lose
         audit history.
         """
-        path = to_posix(path)  # match POSIX-stored paths cross-OS (#55)
         with self._tx():
             self._conn.execute(
                 "UPDATE wiki_articles SET "
@@ -2185,7 +2208,6 @@ class StateDB:
             self.mark_concept_compile_state(art.title, art.sources, "compiled")
 
     def delete_article(self, path: str) -> None:
-        path = to_posix(path)  # match POSIX-stored paths cross-OS (#55)
         with self._tx():
             self._conn.execute("DELETE FROM wiki_articles WHERE path = ?", (path,))
 
@@ -2267,7 +2289,6 @@ class StateDB:
         chunk_size: int,
         checkpoint_schema: int = _CHECKPOINT_SCHEMA_VERSION,
     ) -> list[sqlite3.Row]:
-        source_path = to_posix(source_path)  # match POSIX-stored paths cross-OS (#55)
         return self._conn.execute(
             """
             SELECT * FROM ingest_chunks
@@ -2291,7 +2312,6 @@ class StateDB:
         result_json: str,
         checkpoint_schema: int = _CHECKPOINT_SCHEMA_VERSION,
     ) -> None:
-        source_path = to_posix(source_path)  # match POSIX-stored paths cross-OS (#55)
         now = datetime.now().isoformat()
         with self._tx():
             self._conn.execute(
@@ -2324,7 +2344,6 @@ class StateDB:
             )
 
     def purge_ingest_chunks(self, source_path: str, *, keep_hash: str | None = None) -> None:
-        source_path = to_posix(source_path)  # match POSIX-stored paths cross-OS (#55)
         with self._tx():
             if keep_hash is None:
                 self._conn.execute(
@@ -2344,7 +2363,6 @@ class StateDB:
         chunk_size: int,
         checkpoint_schema: int = _CHECKPOINT_SCHEMA_VERSION,
     ) -> None:
-        source_path = to_posix(source_path)  # match POSIX-stored paths cross-OS (#55)
         with self._tx():
             self._conn.execute(
                 """
@@ -2389,7 +2407,7 @@ class StateDB:
                     for path in raw_dir.rglob("*.md")
                     if "processed" not in path.parts
                     and not path.name.startswith(".")
-                    and str(path.relative_to(vault)) not in tracked_paths
+                    and rel_posix(path, vault) not in tracked_paths
                 )
                 if untracked_raw:
                     raw_counts["new"] = raw_counts.get("new", 0) + untracked_raw
@@ -2405,7 +2423,7 @@ class StateDB:
                 ).fetchall()
                 tracked_paths = {row["path"] for row in tracked_rows}
                 for path in drafts_dir.rglob("*.md"):
-                    rel_path = str(path.relative_to(vault))
+                    rel_path = rel_posix(path, vault)
                     if rel_path in tracked_paths:
                         continue
                     try:
@@ -2514,7 +2532,6 @@ class StateDB:
         self._conn.commit()
 
     def update_article_compile_run(self, article_path: str, run_ulid: str) -> None:
-        article_path = to_posix(article_path)  # match POSIX-stored paths cross-OS (#55)
         self._conn.execute(
             "UPDATE wiki_articles SET last_compile_pipeline = ? WHERE path = ?",
             (run_ulid, article_path),
