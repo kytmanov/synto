@@ -31,6 +31,7 @@ from ..config import Config
 from ..markdown_math import mask_markdown_regions, restore_markdown_regions, sanitize_obsidian_math
 from ..models import ArticlePlan, CompilePlan, PipelineVersion, SingleArticle, WikiArticleRecord
 from ..openai_compat_client import LLMBadRequestError, LLMTruncatedError
+from ..paths import rel_posix, to_posix
 from ..sanitize import sanitize_tags
 from ..state import StateDB
 from ..structured_output import StructuredOutputError, request_structured
@@ -293,9 +294,12 @@ def _resolve_source_path(source_path: str, vault: Path) -> tuple[Path, str] | No
     if path is None:
         return None
     try:
-        rel = str(path.relative_to(vault))
+        # POSIX rel path: `rel` is a key matched against POSIX, DB-derived values (dedup sets,
+        # summary_lookup, SourceRef.raw_path). str(relative_to) is backslash-separated on
+        # Windows, which would miss those lookups; rel_posix keeps it portable.
+        rel = rel_posix(path, vault)
     except ValueError:
-        rel = source_path
+        rel = to_posix(source_path)
     return path, rel
 
 
