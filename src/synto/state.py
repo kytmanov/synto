@@ -378,6 +378,48 @@ CREATE TABLE IF NOT EXISTS concept_occurrences (
 CREATE INDEX IF NOT EXISTS idx_concept_occurrences_concept ON concept_occurrences(concept_name);
 """
 
+# v17 separator-collision tables resolved by recency, not "POSIX wins" (issue #55 follow-up).
+# Each entry: (table, path_col, other_key_cols, recency_expr, state_cols). These tables key on
+# a vault-relative path and carry mutable state, so a vault used on two OSes can hold both
+# ``X\Y`` and ``X/Y`` forms of one logical row; dropping the backslash row blindly would
+# discard newer state. recency_expr is a per-row SQL expression with an ``{a}`` alias
+# placeholder; state_cols are the columns whose divergence is worth logging.
+# wiki_articles is resolved separately (_resolve_article_separator_collisions_v17) because it
+# also merges approval audit. concepts/generated_assets are NOT here: concepts carries only its
+# PK (a duplicate is lossless) and generated_assets.path is always POSIX (never collides).
+_RECENCY_PATH_COLLISIONS: list[tuple[str, str, tuple[str, ...], str, tuple[str, ...]]] = [
+    (
+        "concept_compile_state",
+        "source_path",
+        ("concept_name",),
+        "{a}.updated_at",
+        ("status", "error", "compiled_at"),
+    ),
+    (
+        "ingest_chunks",
+        "source_path",
+        ("content_hash", "chunk_index", "chunk_count", "chunk_size", "checkpoint_schema"),
+        "{a}.updated_at",
+        ("result_json",),
+    ),
+    (
+        "raw_notes",
+        "path",
+        (),
+        "MAX(COALESCE({a}.compiled_at, ''), COALESCE({a}.ingested_at, ''))",
+        ("content_hash", "status", "prompt_version"),
+    ),
+    (
+        "item_mentions",
+        "source_path",
+        ("item_name", "mention_text", "evidence_level"),
+        # No timestamp on mentions; only exact-duplicate mentions collide, so the higher
+        # confidence is a principled, non-POSIX-biased tiebreak.
+        "{a}.confidence",
+        ("confidence", "context"),
+    ),
+]
+
 # Migrations keyed by version they bring the DB to.
 _VERSIONED_MIGRATIONS: dict[int, list[str]] = {
     1: [
@@ -1026,15 +1068,16 @@ class StateDB:
         REPLACE'd: a Windows path is JSON-escaped on disk as ``raw\\note.md``, so a naive
         ``REPLACE('\', '/')`` would corrupt it to ``raw//note.md``.
 
-        Collision-safe without silent loss: a vault compiled on two OSes can hold both
-        ``wiki\Qubit.md`` and ``wiki/Qubit.md``. ``wiki_articles`` is the only table that both
-        collides and carries user-meaningful mutable state (status, approval, content_hash),
-        so its collisions are resolved by recency (newer ``updated_at`` wins, last-write-wins
-        like upserts) with approval audit preserved from either row — see
-        ``_resolve_article_separator_collisions_v17``. The other path columns hold
-        regenerable links/caches; for them ``UPDATE OR IGNORE`` keeps the existing POSIX row
-        and the colliding backslash duplicate is dropped (and logged), so the migration can't
-        abort on a uniqueness violation.
+        Collision-safe without silent loss: a vault used on two OSes can hold both
+        ``wiki\Qubit.md`` and ``wiki/Qubit.md`` for one logical row. Any path column that
+        carries mutable state is resolved by recency (newer wins, last-write-wins like upserts)
+        BEFORE the REPLACE below, so the newer of a ``X\Y`` / ``X/Y`` pair is never silently
+        dropped: ``wiki_articles`` via ``_resolve_article_separator_collisions_v17`` (which
+        also preserves approval audit) and the ``_RECENCY_PATH_COLLISIONS`` tables via
+        ``_resolve_separator_collisions_by_recency_v17``. ``concepts`` carries only its PK so a
+        separator-duplicate is lossless, and ``generated_assets.path`` is always POSIX; for
+        those the REPLACE pass's ``UPDATE OR IGNORE`` keeps the POSIX row and drops the
+        backslash duplicate, so the migration can't abort on a uniqueness violation.
         """
         # Vault-relative path KEYS only — these are looked up across OSes, so their separators
         # must be normalized. Absolute/external columns are deliberately excluded because
@@ -1042,32 +1085,46 @@ class StateDB:
         #   - generated_assets.master_path: absolute imported-source path, e.g.
         #     C:\Users\alice\paper.pdf (extractors/pdf.py writes str(path)).
         #   - source_documents.origin_uri: external URI / origin of an imported document.
-        plain_columns = [
-            ("raw_notes", "path"),
-            ("concepts", "source_path"),
-            ("concept_compile_state", "source_path"),
-            ("wiki_articles", "path"),
-            ("ingest_chunks", "source_path"),
-            ("item_mentions", "source_path"),
-            ("generated_assets", "path"),
-        ]
+        #
+        # Every path column lives in exactly one bucket so none silently falls back to
+        # "POSIX wins". Resolved tables (recency + wiki_articles) have their twins removed
+        # before the REPLACE pass, so a leftover backslash row there is unexpected (an exotic
+        # mixed-separator path with no clean-POSIX twin — synto writes homogeneous separators
+        # via str(path.relative_to(vault)), so this should never happen) and is logged at
+        # ERROR. Lossless tables (concepts/generated_assets) can't lose meaningful state, so a
+        # leftover there is only WARNed.
+        recency_columns = [(table, col) for (table, col, *_rest) in _RECENCY_PATH_COLLISIONS]
+        resolved_columns = recency_columns + [("wiki_articles", "path")]
+        lossless_columns = [("concepts", "source_path"), ("generated_assets", "path")]
+        all_columns = resolved_columns + lossless_columns
         with self._tx():
-            # Resolve article collisions by recency first so the REPLACE below can't collide
-            # and can't silently drop the newer of a ``wiki\X`` / ``wiki/X`` pair.
+            # Resolve collisions by recency first so the REPLACE below can't collide and can't
+            # silently drop the newer of a ``X\Y`` / ``X/Y`` pair.
             self._resolve_article_separator_collisions_v17()
-            for table, col in plain_columns:
+            for (
+                table,
+                path_col,
+                other_key_cols,
+                recency_expr,
+                state_cols,
+            ) in _RECENCY_PATH_COLLISIONS:
+                self._resolve_separator_collisions_by_recency_v17(
+                    table, path_col, other_key_cols, recency_expr, state_cols
+                )
+            for table, col in all_columns:
                 self._conn.execute(
                     f"UPDATE OR IGNORE {table} SET {col} = REPLACE({col}, '\\', '/')"
                 )
-                # Drop rows whose normalized path collided with an existing POSIX row
-                # (UPDATE OR IGNORE left them with their original backslash value). Log first
-                # so a non-article collision is never fully silent. (wiki_articles has no
-                # leftovers here — they were resolved by recency above.)
+                # Rows whose normalized path collided with an existing POSIX row keep their
+                # backslash value after UPDATE OR IGNORE; drop them, but log first so the drop
+                # is never silent. ERROR for resolved tables (unexpected — see comment above),
+                # WARNING for lossless ones.
                 leftover = self._conn.execute(
                     f"SELECT COUNT(*) FROM {table} WHERE INSTR({col}, '\\') > 0"
                 ).fetchone()[0]
                 if leftover:
-                    log.warning(
+                    emit = log.error if (table, col) in resolved_columns else log.warning
+                    emit(
                         "v17 migration: dropping %d duplicate %s.%s row(s) whose normalized "
                         "path collided with an existing POSIX row",
                         leftover,
@@ -1132,6 +1189,58 @@ class StateDB:
                 (loser[4], loser[5], winner[0]),
             )
             self._conn.execute("DELETE FROM wiki_articles WHERE path = ?", (loser[0],))
+
+    def _resolve_separator_collisions_by_recency_v17(
+        self,
+        table: str,
+        key_col: str,
+        other_key_cols: tuple[str, ...],
+        recency_expr: str,
+        state_cols: tuple[str, ...],
+    ) -> None:
+        r"""Resolve ``table`` rows that exist under both ``X\Y`` and ``X/Y`` separator forms.
+
+        Generalizes ``_resolve_article_separator_collisions_v17`` for the path-keyed tables
+        that carry mutable state (``_RECENCY_PATH_COLLISIONS``). A vault used on two OSes can
+        hold both forms of the same logical key; keep the row whose ``recency_expr`` is newer
+        (last-write-wins) instead of always preferring POSIX, which would silently discard
+        newer status / checkpoint / extraction state. Tie keeps POSIX, matching the article
+        resolver. A divergence in ``state_cols`` is logged so dropped state is never silent;
+        a byte-identical re-ingest dedup resolves quietly. Caller runs inside _tx().
+
+        Identifiers come from the hardcoded ``_RECENCY_PATH_COLLISIONS`` table (no user input),
+        so f-string interpolation is safe.
+        """
+        # Null-safe key matching (``IS``, not ``=``): a NULL secondary key must still pair a
+        # twin, else the row would bypass this resolver and be dropped by the generic cleanup.
+        # Consistent with the ``IS NOT`` divergence clause below. Current key columns are all
+        # NOT NULL, so this only hardens the helper for future _RECENCY_PATH_COLLISIONS entries.
+        key_eq = "".join(f" AND b.{c} IS p.{c}" for c in other_key_cols)
+        # ``p`` is the clean-POSIX twin of backslash row ``b`` (and is distinct from ``b``,
+        # since REPLACE strips the backslash that ``b`` is required to have).
+        join = (
+            f"FROM {table} b JOIN {table} p "
+            f"ON p.{key_col} = REPLACE(b.{key_col}, '\\', '/'){key_eq} "
+            f"WHERE INSTR(b.{key_col}, '\\') > 0"
+        )
+        rb, rp = recency_expr.format(a="b"), recency_expr.format(a="p")
+        divergence = " OR ".join(f"b.{c} IS NOT p.{c}" for c in state_cols)
+        diverged = self._conn.execute(f"SELECT COUNT(*) {join} AND ({divergence})").fetchone()[0]
+        if diverged:
+            log.warning(
+                "v17 migration: resolving %d separator-duplicate %s row(s) with divergent "
+                "state by recency (newer wins, older dropped)",
+                diverged,
+                table,
+            )
+        # Step 1: drop the POSIX twin of each backslash row that is strictly newer. Its
+        # backslash winner now has no twin, so it survives step 2 and the REPLACE pass.
+        self._conn.execute(
+            f"DELETE FROM {table} WHERE rowid IN (SELECT p.rowid {join} AND {rb} > {rp})"
+        )
+        # Step 2: drop the remaining backslash rows that still have a POSIX twin (POSIX won, or
+        # a recency tie). The REPLACE pass then normalizes the surviving rows.
+        self._conn.execute(f"DELETE FROM {table} WHERE rowid IN (SELECT b.rowid {join})")
 
     def _validate_v6_tables(self) -> None:
         expected_ingest = {

@@ -26,7 +26,12 @@ from pydantic import ValidationError
 from synto.models import ItemMentionRecord, RawNoteRecord, WikiArticleRecord
 from synto.paths import rel_posix
 from synto.pipeline.ingest import _content_hash
-from synto.state import _DB_PATH_LIST_PARAMS, _DB_PATH_PARAMS, StateDB
+from synto.state import (
+    _DB_PATH_LIST_PARAMS,
+    _DB_PATH_PARAMS,
+    _RECENCY_PATH_COLLISIONS,
+    StateDB,
+)
 from synto.vault import parse_note, write_note
 
 
@@ -293,6 +298,210 @@ def test_v17_article_collision_preserves_approval_audit(tmp_path: Path) -> None:
     assert row[1] == "2026-02-15T00:00:00"  # preserved from the dropped row
 
 
+# ── Recency-aware collision resolution for the other mutable-state tables ──────
+#
+# Same silent-loss class the article resolver fixed, for the path-keyed tables that carry
+# mutable state. A vault used on two OSes can hold both `X\Y` and `X/Y` of one logical row;
+# the migration must keep the NEWER row's state, not blindly prefer POSIX. Each test fails if
+# "POSIX wins" were restored.
+
+
+def _seed_v16_and_migrate(db_path: Path, inserts: list[tuple[str, tuple]]) -> StateDB:
+    """Insert raw rows into a fresh DB, pin it back to v16, reopen to run only the v17 step."""
+    db = StateDB(db_path)
+    for sql, params in inserts:
+        db._conn.execute(sql, params)
+    db._conn.execute("UPDATE schema_version SET version = 16 WHERE id = 1")
+    db._conn.commit()
+    db._conn.close()
+    return StateDB(db_path)
+
+
+_COMPILE_INSERT = (
+    "INSERT INTO concept_compile_state (concept_name, source_path, status, updated_at) "
+    "VALUES (?, ?, ?, ?)"
+)
+
+
+def test_v17_compile_state_collision_keeps_newer_status_not_posix(tmp_path: Path) -> None:
+    """concept_compile_state is the correctness-critical case: compile writes a row per
+    (concept, source_path) with no separator dedup, so two OSes leave both forms. Keeping the
+    older `pending` over a newer `compiled` (or vice versa) skips a needed recompile or forces
+    a redundant one. The newer `updated_at` must win, regardless of separator."""
+    db = _seed_v16_and_migrate(
+        tmp_path / "state.db",
+        [
+            (_COMPILE_INSERT, ("Qubit", "raw\\q.md", "compiled", "2026-03-01")),
+            (_COMPILE_INSERT, ("Qubit", "raw/q.md", "pending", "2026-01-01")),
+        ],
+    )
+    rows = db._conn.execute("SELECT source_path, status FROM concept_compile_state").fetchall()
+    assert [(r[0], r[1]) for r in rows] == [("raw/q.md", "compiled")]
+
+
+def test_v17_compile_state_collision_keeps_posix_when_newer(tmp_path: Path) -> None:
+    """The reverse: when the POSIX row is the newer one, its state survives."""
+    db = _seed_v16_and_migrate(
+        tmp_path / "state.db",
+        [
+            (_COMPILE_INSERT, ("Qubit", "raw\\q.md", "pending", "2026-01-01")),
+            (_COMPILE_INSERT, ("Qubit", "raw/q.md", "compiled", "2026-03-01")),
+        ],
+    )
+    rows = db._conn.execute("SELECT source_path, status FROM concept_compile_state").fetchall()
+    assert [(r[0], r[1]) for r in rows] == [("raw/q.md", "compiled")]
+
+
+def test_v17_ingest_chunks_collision_keeps_newer_checkpoint(tmp_path: Path) -> None:
+    """ingest_chunks is an ingest checkpoint keyed on (source_path, content_hash, chunk dims).
+    The same content re-chunked on both OSes collides on everything but the separator; the
+    newer `result_json` must survive so a resumed ingest doesn't replay stale work."""
+    insert = (
+        "INSERT INTO ingest_chunks (source_path, content_hash, chunk_index, chunk_count, "
+        "chunk_size, checkpoint_schema, result_json, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+    dims = ("h", 0, 1, 1000, 2)  # content_hash + chunk dims, identical across the pair
+    db = _seed_v16_and_migrate(
+        tmp_path / "state.db",
+        [
+            (insert, ("raw\\q.md", *dims, '{"v": "new"}', "2026-01-01", "2026-03-01")),
+            (insert, ("raw/q.md", *dims, '{"v": "old"}', "2026-01-01", "2026-01-01")),
+        ],
+    )
+    rows = db._conn.execute("SELECT source_path, result_json FROM ingest_chunks").fetchall()
+    assert [(r[0], r[1]) for r in rows] == [("raw/q.md", '{"v": "new"}')]
+
+
+def test_v17_raw_notes_collision_keeps_more_processed_row(tmp_path: Path) -> None:
+    """raw_notes collides only when the note's content changed across OSes (else dedup-by-hash
+    matches). Recency = the latest of compiled_at/ingested_at, so the processed (`ingested`)
+    row beats an untouched (`new`) one and its content_hash/status survive at the POSIX path."""
+    db = _seed_v16_and_migrate(
+        tmp_path / "state.db",
+        [
+            (
+                "INSERT INTO raw_notes (path, content_hash, status, ingested_at) "
+                "VALUES (?, ?, ?, ?)",
+                ("raw\\q.md", "HASH_B", "ingested", "2026-03-01"),
+            ),
+            (
+                "INSERT INTO raw_notes (path, content_hash, status) VALUES (?, ?, ?)",
+                ("raw/q.md", "HASH_P", "new"),
+            ),
+        ],
+    )
+    rows = db._conn.execute("SELECT path, status, content_hash FROM raw_notes").fetchall()
+    assert [(r[0], r[1], r[2]) for r in rows] == [("raw/q.md", "ingested", "HASH_B")]
+
+
+def test_v17_raw_notes_collision_keeps_posix_when_more_recent(tmp_path: Path) -> None:
+    """The reverse direction: a newer POSIX row (later ingested_at) survives over an older
+    backslash one."""
+    db = _seed_v16_and_migrate(
+        tmp_path / "state.db",
+        [
+            (
+                "INSERT INTO raw_notes (path, content_hash, status) VALUES (?, ?, ?)",
+                ("raw\\q.md", "HASH_B", "new"),
+            ),
+            (
+                "INSERT INTO raw_notes (path, content_hash, status, ingested_at) "
+                "VALUES (?, ?, ?, ?)",
+                ("raw/q.md", "HASH_P", "ingested", "2026-03-01"),
+            ),
+        ],
+    )
+    rows = db._conn.execute("SELECT path, status, content_hash FROM raw_notes").fetchall()
+    assert [(r[0], r[1], r[2]) for r in rows] == [("raw/q.md", "ingested", "HASH_P")]
+
+
+def test_v17_item_mentions_collision_keeps_higher_confidence_and_distinct_survive(
+    tmp_path: Path,
+) -> None:
+    """item_mentions has no timestamp, so only EXACT duplicate mentions collide (same
+    item/text/evidence); the higher confidence is the tiebreak. A genuinely distinct mention
+    (different text) under the backslash path must survive, just separator-normalized."""
+    insert = (
+        "INSERT INTO item_mentions (item_name, source_path, mention_text, evidence_level, "
+        "confidence) VALUES (?, ?, ?, ?, ?)"
+    )
+    db = _seed_v16_and_migrate(
+        tmp_path / "state.db",
+        [
+            (insert, ("Qubit", "raw\\q.md", "a qubit", "source_supported", 0.9)),
+            (insert, ("Qubit", "raw/q.md", "a qubit", "source_supported", 0.4)),
+            (insert, ("Qubit", "raw\\q.md", "another mention", "source_supported", 0.7)),
+        ],
+    )
+    rows = db._conn.execute(
+        "SELECT source_path, mention_text, confidence FROM item_mentions ORDER BY mention_text"
+    ).fetchall()
+    assert [(r[0], r[1], r[2]) for r in rows] == [
+        ("raw/q.md", "a qubit", 0.9),
+        ("raw/q.md", "another mention", 0.7),
+    ]
+
+
+def test_v17_recency_resolution_is_loud_only_when_state_diverges(tmp_path: Path, caplog) -> None:
+    """Dropping a superseded row must be logged when the rows actually diverge, but a
+    byte-identical re-ingest dedup must stay quiet — otherwise the warning is noise."""
+    with caplog.at_level(logging.WARNING):
+        _seed_v16_and_migrate(
+            tmp_path / "diverged.db",
+            [
+                (_COMPILE_INSERT, ("Q", "raw\\q.md", "compiled", "2026-03-01")),
+                (_COMPILE_INSERT, ("Q", "raw/q.md", "pending", "2026-01-01")),
+            ],
+        )
+    assert any("divergent state by recency" in m for m in caplog.messages)
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        _seed_v16_and_migrate(
+            tmp_path / "identical.db",
+            [
+                (_COMPILE_INSERT, ("Q", "raw\\q.md", "compiled", "2026-03-01")),
+                (_COMPILE_INSERT, ("Q", "raw/q.md", "compiled", "2026-01-01")),
+            ],
+        )
+    assert not any("divergent state by recency" in m for m in caplog.messages)
+
+
+def test_v17_concepts_separator_duplicate_is_lossless_posix_wins(tmp_path: Path) -> None:
+    """concepts carries only its PK (name, source_path), so a separator-duplicate is identical
+    information — collapsing to the single POSIX row is correct, not the silent-loss bug."""
+    insert = "INSERT INTO concepts (name, source_path) VALUES (?, ?)"
+    db = _seed_v16_and_migrate(
+        tmp_path / "state.db",
+        [(insert, ("Qubit", "raw\\q.md")), (insert, ("Qubit", "raw/q.md"))],
+    )
+    rows = db._conn.execute("SELECT name, source_path FROM concepts").fetchall()
+    assert [(r[0], r[1]) for r in rows] == [("Qubit", "raw/q.md")]
+
+
+def test_v17_every_normalized_path_column_is_consciously_bucketed(tmp_path: Path) -> None:
+    """Guard against this finding recurring: every path column the v17 migration normalizes
+    must be classified into exactly one bucket (recency / wiki_articles / lossless), and the
+    columns each bucket names must really exist in the live schema. A future schema that adds
+    or renames a path column fails here instead of silently bypassing recency resolution."""
+    db = StateDB(tmp_path / "state.db")
+    recency_tables = {t for t, _c, *_ in _RECENCY_PATH_COLLISIONS}
+    # No table may be both recency-resolved and treated as lossless/bespoke.
+    assert not (recency_tables & {"wiki_articles", "concepts", "generated_assets"})
+
+    referenced: list[tuple[str, str]] = [
+        ("wiki_articles", "path"),
+        ("concepts", "source_path"),
+        ("generated_assets", "path"),
+    ]
+    for table, path_col, other_key_cols, _recency, state_cols in _RECENCY_PATH_COLLISIONS:
+        referenced += [(table, c) for c in (path_col, *other_key_cols, *state_cols)]
+    for table, col in referenced:
+        cols = {r[1] for r in db._conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        assert col in cols, f"v17 bucket references missing column {table}.{col}"
+
+
 def test_line_endings_do_not_change_content_hash(tmp_path: Path) -> None:
     """Lock in that CRLF↔LF is a non-issue: a git line-ending rewrite must not change a
     note's dedup identity. This is why the user's line-ending hypothesis was wrong."""
@@ -308,6 +517,38 @@ def test_line_endings_do_not_change_content_hash(tmp_path: Path) -> None:
 
 
 # ── Abstraction guarantees (the normalization machinery itself) ────────────────
+
+
+def test_recency_resolver_pairs_twins_across_a_null_secondary_key(tmp_path: Path) -> None:
+    """Contract of the generic resolver: it must pair separator twins even when a secondary
+    key column is NULL on both. The join uses null-safe `IS`, not `=` (NULL = NULL is false in
+    SQL, which would leave the twins unpaired and let the newer row be dropped downstream).
+
+    No current `_RECENCY_PATH_COLLISIONS` entry has a nullable key, so this drives the helper
+    directly with `compiled_at` (nullable, NULL here) added to the key columns — exercising the
+    abstraction's guarantee rather than a live config. Red with `=`, green with `IS`.
+    """
+    db = StateDB(tmp_path / "state.db")
+    insert = (
+        "INSERT INTO concept_compile_state (concept_name, source_path, status, compiled_at, "
+        "updated_at) VALUES (?, ?, ?, NULL, ?)"
+    )
+    db._conn.execute(insert, ("Qubit", "raw\\q.md", "compiled", "2026-03-01"))  # newer
+    db._conn.execute(insert, ("Qubit", "raw/q.md", "pending", "2026-01-01"))  # older
+    db._conn.commit()
+
+    with db._tx():
+        db._resolve_separator_collisions_by_recency_v17(
+            "concept_compile_state",
+            "source_path",
+            ("concept_name", "compiled_at"),  # compiled_at is NULL on both twins
+            "{a}.updated_at",
+            ("status",),
+        )
+
+    rows = db._conn.execute("SELECT status FROM concept_compile_state").fetchall()
+    # Twins paired despite the NULL key → older POSIX row dropped, newer survives.
+    assert [r[0] for r in rows] == ["compiled"]
 
 
 def test_vault_rel_path_type_rejects_non_str() -> None:
