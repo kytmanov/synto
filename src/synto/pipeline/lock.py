@@ -142,8 +142,8 @@ def lock_holder_pid(vault: Path) -> int | None:
     """Return PID if the pipeline lock is actively held, None otherwise.
 
     Verifies the lock is actually held (not just a stale lock file) by
-    attempting a non-blocking exclusive acquire. If that succeeds the lock
-    is free; if it raises BlockingIOError the lock is live.
+    attempting a non-blocking shared acquire. If that succeeds the lock is
+    free; if it raises BlockingIOError the lock is live.
     """
     lock_path = effective_app_dir(vault) / "pipeline.lock"
     if not lock_path.exists():
@@ -154,15 +154,29 @@ def lock_holder_pid(vault: Path) -> int | None:
         return None
     if not _IS_POSIX:
         return pid if _windows_pid_alive(pid) else None
+    import errno
     import fcntl
 
     try:
+        # Detect the holder with a SHARED lock: pipeline_lock() always takes an
+        # exclusive lock, so a non-blocking shared acquire fails iff it is live.
+        # A read lock needs only a readable fd (the file is already proven
+        # readable above), so this works on NFS — where flock() is emulated as
+        # fcntl() locks and an exclusive lock on a read-only fd returns EBADF —
+        # and on read-only mounts / mode-0444 stale lock files.
         with open(lock_path) as f:
-            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
             fcntl.flock(f, fcntl.LOCK_UN)
         return None  # acquired → nobody holding it
     except BlockingIOError:
         return pid  # lock is live
+    except OSError as e:
+        # Locking subsystem unavailable (e.g. nolock NFS mount → ENOLCK). Can't
+        # probe liveness; assume held so we never advise deleting a possibly-live
+        # lock. Re-raise anything unexpected rather than masking real bugs.
+        if e.errno in (errno.ENOLCK, errno.EOPNOTSUPP, errno.ENOTSUP):
+            return pid
+        raise
 
 
 def has_invalid_lock_file(vault: Path) -> bool:

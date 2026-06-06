@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import platform
 import threading
 from pathlib import Path
@@ -96,6 +97,100 @@ def test_has_invalid_lock_file_detects_garbage(vault):
     lock_path.write_text("not-a-pid")
 
     assert has_invalid_lock_file(vault) is True
+
+
+# ── NFS flock emulation (issue #56) ───────────────────────────────────────────
+
+
+def _install_nfs_flock(monkeypatch):
+    """Make fcntl.flock behave like NFS: exclusive lock on a read-only fd → EBADF.
+
+    On NFS the kernel emulates flock() as fcntl() POSIX byte-range locks, and a
+    POSIX write lock requires a writable fd; a read-only fd returns EBADF.
+    """
+    import errno
+    import fcntl
+
+    real_flock = fcntl.flock
+
+    def fake_flock(fd, operation):
+        writable = getattr(fd, "writable", lambda: True)()
+        if operation & fcntl.LOCK_EX and not writable:
+            raise OSError(errno.EBADF, "Bad file descriptor")
+        return real_flock(fd, operation)
+
+    monkeypatch.setattr(fcntl, "flock", fake_flock)
+
+
+@pytest.mark.skipif(platform.system() == "Windows", reason="flock POSIX only")
+def test_lock_holder_pid_on_nfs_does_not_crash(vault, monkeypatch):
+    """Regression for #56: probing the lock on NFS must not raise Bad file descriptor.
+
+    The probe must take a SHARED lock (which needs only a readable fd), so the
+    NFS-emulated flock never sees an exclusive lock on a read-only fd. If anyone
+    reverts to an exclusive probe, the fake raises EBADF, the narrowed errno guard
+    re-raises it, and this test goes red.
+    """
+    lock_path = vault / ".synto" / "pipeline.lock"
+    lock_path.write_text("4242")  # valid PID, but no live flock holder
+    _install_nfs_flock(monkeypatch)
+
+    assert lock_holder_pid(vault) is None
+
+
+@pytest.mark.skipif(platform.system() == "Windows", reason="flock POSIX only")
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root ignores file permission bits",
+)
+def test_lock_holder_pid_stale_lock_on_readonly_file(vault):
+    """Review regression: a readable-but-not-writable stale lock must read as free.
+
+    A mode-0444 lock file (read-only mount / snapshot) used to make the old
+    writable open() raise PermissionError, which the broad OSError guard reported
+    as a phantom holder — suppressing stale-lock cleanup. The shared-lock probe
+    opens read-only, so it correctly reports the dead lock as free.
+    """
+    lock_path = vault / ".synto" / "pipeline.lock"
+    lock_path.write_text("4242")  # valid PID, no live holder
+    os.chmod(lock_path, 0o444)
+
+    assert lock_holder_pid(vault) is None
+
+
+@pytest.mark.skipif(platform.system() == "Windows", reason="flock POSIX only")
+def test_lock_holder_pid_locking_unavailable_assumes_held(vault, monkeypatch):
+    """nolock filesystem (ENOLCK): can't probe, so conservatively assume held."""
+    import errno
+    import fcntl
+
+    lock_path = vault / ".synto" / "pipeline.lock"
+    lock_path.write_text("4242")
+
+    def enolck(fd, operation):
+        raise OSError(errno.ENOLCK, "No locks available")
+
+    monkeypatch.setattr(fcntl, "flock", enolck)
+
+    assert lock_holder_pid(vault) == 4242
+
+
+@pytest.mark.skipif(platform.system() == "Windows", reason="flock POSIX only")
+def test_lock_holder_pid_unexpected_oserror_propagates(vault, monkeypatch):
+    """An unexpected probe failure must not be swallowed (fail loud)."""
+    import errno
+    import fcntl
+
+    lock_path = vault / ".synto" / "pipeline.lock"
+    lock_path.write_text("4242")
+
+    def eio(fd, operation):
+        raise OSError(errno.EIO, "I/O error")
+
+    monkeypatch.setattr(fcntl, "flock", eio)
+
+    with pytest.raises(OSError):
+        lock_holder_pid(vault)
 
 
 # ── Thread safety ─────────────────────────────────────────────────────────────

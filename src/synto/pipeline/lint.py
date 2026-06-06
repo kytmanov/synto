@@ -238,6 +238,8 @@ def _check_malformed_latex(rel_path: str, body: str, issues: list[LintIssue]) ->
 
 
 def _check_stale_lock(config: Config, issues: list[LintIssue]) -> None:
+    import os
+
     from .lock import effective_app_dir, has_invalid_lock_file, lock_holder_pid
 
     lock_path = effective_app_dir(config.vault) / "pipeline.lock"
@@ -254,6 +256,14 @@ def _check_stale_lock(config: Config, issues: list[LintIssue]) -> None:
             )
         )
         return
+    # Lint often runs inside the held pipeline lock (synto run/maintain). Our own
+    # lock is not stale, and probing it would open a second fd whose close drops
+    # the lock under NFS POSIX-lock emulation — so short-circuit on our own PID.
+    try:
+        if int(lock_path.read_text().strip()) == os.getpid():
+            return
+    except (ValueError, OSError):
+        pass
     if lock_holder_pid(config.vault) is None:
         try:
             pid: int | str = int(lock_path.read_text().strip())
