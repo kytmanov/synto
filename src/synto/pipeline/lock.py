@@ -157,12 +157,19 @@ def lock_holder_pid(vault: Path) -> int | None:
     import fcntl
 
     try:
-        with open(lock_path) as f:
+        # Open writable: on NFS the kernel emulates flock() as fcntl() POSIX
+        # locks, and an exclusive (write) lock on a read-only fd returns EBADF.
+        with open(lock_path, "r+") as f:
             fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
             fcntl.flock(f, fcntl.LOCK_UN)
         return None  # acquired → nobody holding it
     except BlockingIOError:
         return pid  # lock is live
+    except OSError:
+        # Locking unsupported on this filesystem (e.g. nolock NFS mount, lockd
+        # down). Can't probe liveness; assume held so we never advise deleting
+        # an active lock — and never crash a read-only command.
+        return pid
 
 
 def has_invalid_lock_file(vault: Path) -> bool:

@@ -98,6 +98,65 @@ def test_has_invalid_lock_file_detects_garbage(vault):
     assert has_invalid_lock_file(vault) is True
 
 
+# ── NFS flock emulation (issue #56) ───────────────────────────────────────────
+
+
+def _install_nfs_flock(monkeypatch):
+    """Make fcntl.flock behave like NFS: exclusive lock on a read-only fd → EBADF.
+
+    On NFS the kernel emulates flock() as fcntl() POSIX byte-range locks, and a
+    POSIX write lock requires a writable fd; a read-only fd returns EBADF.
+    """
+    import errno
+    import fcntl
+
+    real_flock = fcntl.flock
+
+    def fake_flock(fd, operation):
+        writable = getattr(fd, "writable", lambda: True)()
+        if operation & fcntl.LOCK_EX and not writable:
+            raise OSError(errno.EBADF, "Bad file descriptor")
+        return real_flock(fd, operation)
+
+    monkeypatch.setattr(fcntl, "flock", fake_flock)
+
+
+@pytest.mark.skipif(platform.system() == "Windows", reason="flock POSIX only")
+def test_lock_holder_pid_on_nfs_does_not_crash(vault, monkeypatch):
+    """Regression for #56: probing the lock on NFS must not raise Bad file descriptor.
+
+    The probe must open the lock file writable so the emulated exclusive lock
+    succeeds. If it reverts to a read-only open, the NFS-emulated flock raises
+    EBADF and (caught by the OSError guard) the function would wrongly report the
+    lock as held — so asserting None here goes red on that regression.
+    """
+    lock_path = vault / ".synto" / "pipeline.lock"
+    lock_path.write_text("4242")  # valid PID, but no live flock holder
+    _install_nfs_flock(monkeypatch)
+
+    assert lock_holder_pid(vault) is None
+
+
+@pytest.mark.skipif(platform.system() == "Windows", reason="flock POSIX only")
+def test_lock_holder_pid_locking_unsupported_assumes_held(vault, monkeypatch):
+    """When the filesystem rejects locking entirely (e.g. nolock NFS), assume held.
+
+    The probe must not crash; it conservatively returns the stored PID so we never
+    advise deleting a lock that may be live on another node.
+    """
+    import fcntl
+
+    lock_path = vault / ".synto" / "pipeline.lock"
+    lock_path.write_text("4242")
+
+    def always_fail(fd, operation):
+        raise OSError("locking not supported")
+
+    monkeypatch.setattr(fcntl, "flock", always_fail)
+
+    assert lock_holder_pid(vault) == 4242
+
+
 # ── Thread safety ─────────────────────────────────────────────────────────────
 
 
