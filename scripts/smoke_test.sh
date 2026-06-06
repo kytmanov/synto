@@ -1310,31 +1310,38 @@ header "Draft annotations"
 info "Compiling with low-quality source to trigger annotation..."
 $OLW approve --all 2>&1 || true   # clear drafts first
 
-# Target a concept with EXACTLY ONE source so the single-source annotation
-# fires deterministically. "Quantum Fourier Transform" is only mentioned in
-# quantum-computing.md, while "Reinforcement learning" picks up a second
-# source (reinforcement-learning.md) during the source-type-policy section,
-# which would defeat single-source on recompile.
-#
-# Setting quality='low' on the source drops the quality bonus to 0, so
+# Discover a concept with EXACTLY ONE source so the single-source annotation fires
+# deterministically. Concept names are LLM-non-deterministic (CLAUDE.md), so we must NOT
+# hardcode one — instead pick a genuinely single-source concept from the DB at this point
+# in the run. Setting that source to quality='low' drops the quality bonus to 0, so
 # _compute_confidence returns 1 * 0.25 + 0 = 0.25, below the 0.4 threshold
-# (compile.py:_ANNOTATION_CONFIDENCE_THRESHOLD). All three annotation kinds
-# fire: low-confidence, single-source, all-low-quality.
-python3 - <<PYEOF
+# (compile.py:_ANNOTATION_CONFIDENCE_THRESHOLD). All three annotation kinds then fire:
+# low-confidence, single-source, all-low-quality.
+ANNOTATION_CONCEPT=$(python3 - <<PYEOF
 import sqlite3
 db_path = "$VAULT_DIR/.synto/state.db"
 conn = sqlite3.connect(db_path)
-conn.execute("UPDATE raw_notes SET quality='low' WHERE path='raw/quantum-computing.md'")
-conn.commit()
+row = conn.execute(
+    "SELECT name, MIN(source_path) FROM concepts "
+    "GROUP BY name HAVING COUNT(DISTINCT source_path) = 1 "
+    "ORDER BY name LIMIT 1"
+).fetchone()
+if row:
+    name, source = row
+    conn.execute("UPDATE raw_notes SET quality='low' WHERE path=?", (source,))
+    conn.commit()
+    print(name)
 conn.close()
 PYEOF
+)
+check "found a single-source concept to annotate" "test -n \"$ANNOTATION_CONCEPT\""
+info "Annotation target: $ANNOTATION_CONCEPT"
 
-# Force a recompile of a specific concept via the public CLI. `--force`
-# overwrites the already-published article; `--concept` bypasses the
-# needing-compile gate (concept_compile_state). This is the smoke's
-# load-bearing call: if compile doesn't produce a draft here, the assertion
-# below fires.
-$OLW compile --force --concept "Quantum Fourier Transform" 2>&1 || true
+# Force a recompile of the discovered concept via the public CLI. `--force` overwrites any
+# already-published article; `--concept` bypasses the needing-compile gate
+# (concept_compile_state). This is the smoke's load-bearing call: if compile doesn't
+# produce a draft here, the assertion below fires.
+$OLW compile --force --concept "$ANNOTATION_CONCEPT" 2>&1 || true
 # Annotation triggering is deterministic under the forced setup above: with
 # one source at quality='low', _compute_confidence returns 0.25, which is
 # below _ANNOTATION_CONFIDENCE_THRESHOLD=0.4 — the low-confidence,
