@@ -1592,10 +1592,13 @@ def verify_drafts(
             continue
 
         try:
-            draft_path.relative_to(config.drafts_dir.resolve())
+            rel_to_drafts = draft_path.relative_to(config.drafts_dir.resolve())
         except ValueError:
             log.warning("Draft is outside wiki/.drafts/: %s", draft_path)
             continue
+
+        published_path = config.wiki_dir / rel_to_drafts
+        published_rel = str(published_path.relative_to(vault_root))
 
         meta, body = parse_note(draft_path)
         if min_confidence > 0.0 and float(meta.get("confidence", 1.0)) < min_confidence:
@@ -1612,6 +1615,12 @@ def verify_drafts(
         existing = db.get_article(draft_rel)
         if existing is not None and existing.status == "verified":
             log.debug("Already verified, skipping: %s", draft_path.name)
+            continue
+        published_existing = db.get_article(published_rel)
+        if published_existing is not None and published_existing.status == "published":
+            # Publish won the race; never resurrect the draft row or file.
+            if draft_path.exists():
+                draft_path.unlink()
             continue
         if existing is None:
             db.upsert_article(
@@ -1630,6 +1639,13 @@ def verify_drafts(
         meta["updated"] = datetime.now().strftime("%Y-%m-%d")
         if isinstance(meta.get("tags"), list):
             meta["tags"] = sanitize_tags([str(t) for t in meta["tags"] if t is not None])
+        if (published_existing is None and published_path.exists()) or (
+            published_existing is not None and published_existing.status == "published"
+        ):
+            db.delete_article(draft_rel)
+            if draft_path.exists():
+                draft_path.unlink()
+            continue
         write_note(draft_path, meta, body)
         db.verify_article(draft_rel, notes=notes)
         affected.append(draft_path)

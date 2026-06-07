@@ -2024,6 +2024,7 @@ def approve(vault_str, approve_all, min_confidence, files):
     """Publish draft(s) from wiki/.drafts/ to wiki/."""
     from .git_ops import git_commit
     from .pipeline.compile import approve_drafts
+    from .pipeline.lock import pipeline_lock
 
     config = _load_config(vault_str)
     db = _load_db(config)
@@ -2036,8 +2037,12 @@ def approve(vault_str, approve_all, min_confidence, files):
         click.echo("Specify --all or file paths.", err=True)
         sys.exit(1)
 
-    all_paths = list((config.drafts_dir).glob("*.md")) if paths is None else paths
-    affected = approve_drafts(config, db, paths, min_confidence=min_confidence)
+    with pipeline_lock(config.vault) as acquired:
+        if not acquired:
+            err_console.print("Pipeline already running — lock held.")
+            sys.exit(1)
+        all_paths = list((config.drafts_dir).glob("*.md")) if paths is None else paths
+        affected = approve_drafts(config, db, paths, min_confidence=min_confidence)
     if not affected:
         console.print("[yellow]No drafts to publish.[/yellow]")
         return
@@ -2088,6 +2093,7 @@ def verify(vault_str, verify_all, min_confidence, files):
     """Mark draft(s) verified in place without publishing."""
     from .git_ops import git_commit
     from .pipeline.compile import verify_drafts
+    from .pipeline.lock import pipeline_lock
 
     config = _load_config(vault_str)
     db = _load_db(config)
@@ -2100,8 +2106,12 @@ def verify(vault_str, verify_all, min_confidence, files):
         click.echo("Specify --all or file paths.", err=True)
         sys.exit(1)
 
-    all_paths = list(config.drafts_dir.glob("*.md")) if paths is None else paths
-    affected = verify_drafts(config, db, paths, min_confidence=min_confidence)
+    with pipeline_lock(config.vault) as acquired:
+        if not acquired:
+            err_console.print("Pipeline already running — lock held.")
+            sys.exit(1)
+        all_paths = list(config.drafts_dir.glob("*.md")) if paths is None else paths
+        affected = verify_drafts(config, db, paths, min_confidence=min_confidence)
     if not affected:
         console.print("[yellow]No drafts to verify.[/yellow]")
         return
