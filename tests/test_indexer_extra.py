@@ -80,6 +80,24 @@ def test_generate_index_with_source_pages_from_filesystem(tmp_path):
     assert "Quantum Computing Notes" in text
 
 
+def test_generate_index_normalizes_legacy_windows_source_file_hint(tmp_path):
+    """Legacy source_file hints are rendered with forward slashes."""
+    _, config, db = _setup_vault(tmp_path)
+    src_path = config.sources_dir / "legacy-source.md"
+    post = fm_lib.Post(
+        "Legacy summary.",
+        title="Legacy Source",
+        tags=["source"],
+        source_file=r"raw\quantum.md",
+    )
+    atomic_write(src_path, fm_lib.dumps(post))
+
+    text = generate_index(config, db).read_text()
+
+    assert "raw/quantum.md" in text
+    assert "raw\\quantum.md" not in text
+
+
 def test_generate_index_source_page_with_parse_error(tmp_path):
     """Source page that can't be parsed — uses stem as title."""
     _, config, db = _setup_vault(tmp_path)

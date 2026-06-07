@@ -16,6 +16,7 @@ from pathlib import Path
 import frontmatter as fm_lib
 
 from .config import Config
+from .paths import to_posix
 from .state import StateDB
 from .vault import atomic_write, is_concept_article_path, parse_note, sanitize_filename, write_note
 
@@ -58,6 +59,8 @@ def generate_index(config: Config, db: StateDB) -> Path:
                 title = meta.get("title", md.stem)
                 quality = meta.get("quality", "")
                 src_file = meta.get("source_file", "")
+                if isinstance(src_file, str):
+                    src_file = to_posix(src_file)
                 hint = quality if quality else src_file
                 source_pages.append((title, hint))
             except Exception:

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Literal
 
 from .config import Config
+from .paths import to_posix
 from .readers import ArticleFilter, ArticleRef, VaultReader
 from .state import StateDB
 from .vault import atomic_write, is_concept_article_path, parse_note
@@ -462,7 +463,10 @@ def _export_source_refs(
         elif not isinstance(sources, list):
             sources = []
         for raw_path in sources:
-            referenced_by_raw.setdefault(str(raw_path), []).append(_pack_article_path(ref.path))
+            if not isinstance(raw_path, str) or not raw_path.strip():
+                continue
+            normalized_raw = to_posix(raw_path.strip())
+            referenced_by_raw.setdefault(normalized_raw, []).append(_pack_article_path(ref.path))
 
     concepts_by_raw = {
         source_path: concepts for source_path, _hash, concepts in db.list_source_concept_seeds()
@@ -480,6 +484,7 @@ def _export_source_refs(
         raw_path = meta.get("source_file")
         if not isinstance(raw_path, str) or not raw_path.strip():
             continue
+        raw_path = to_posix(raw_path.strip())
         concepts = concepts_by_raw.get(raw_path, _concepts_from_source_body(body))
         refs.append(
             {
@@ -524,7 +529,7 @@ def _build_source_lookup(source_refs: list[dict[str, object]]) -> dict[str, dict
     for source in source_refs:
         path = Path(str(source["path"]))
         title = str(source["title"])
-        raw_path = str(source["raw_path"])
+        raw_path = to_posix(str(source["raw_path"]))
         for key in {
             path.stem.casefold(),
             title.casefold(),

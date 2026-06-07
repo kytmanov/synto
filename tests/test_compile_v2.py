@@ -253,6 +253,27 @@ def test_build_source_refs_stable_order_and_metadata(vault):
     assert refs[1].title == "B"
 
 
+def test_build_source_refs_matches_legacy_windows_source_file_frontmatter(vault):
+    (vault / "raw" / "a.md").write_text("---\ntitle: Raw Title\n---\nBody A.")
+    (vault / "wiki" / "sources").mkdir(parents=True, exist_ok=True)
+    (vault / "wiki" / "sources" / "Canonical Source.md").write_text(
+        """---
+title: Canonical Source
+source_file: raw\\a.md
+---
+Summary.""",
+        encoding="utf-8",
+    )
+
+    refs = _build_source_refs(["raw/a.md"], vault)
+
+    assert len(refs) == 1
+    assert refs[0].raw_path == "raw/a.md"
+    assert refs[0].title == "Canonical Source"
+    assert refs[0].safe_title == "Canonical Source"
+    assert refs[0].wiki_target == "sources/Canonical Source"
+
+
 def test_gather_sources_with_refs_labels_source_ids(vault):
     (vault / "raw" / "a.md").write_text("---\ntitle: Alpha Source\n---\nBody A.")
     refs = _build_source_refs(["raw/a.md"], vault)

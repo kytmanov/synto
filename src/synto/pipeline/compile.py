@@ -108,6 +108,7 @@ def _source_summary_lookup(vault: Path) -> dict[str, tuple[str, str]]:
         source_file = meta.get("source_file")
         if not isinstance(source_file, str) or not source_file.strip():
             continue
+        source_file = to_posix(source_file.strip())
         title = meta.get("title", page.stem)
         display_title = title.strip() if isinstance(title, str) and title.strip() else page.stem
         lookup[source_file] = (display_title, page.stem)
