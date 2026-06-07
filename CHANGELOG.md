@@ -12,6 +12,12 @@
 
 ### Fixed
 
+- `synto verify` / `synto approve` no longer race each other over the same draft.
+  Both commands now take the pipeline lock before mutating draft state, so a
+  concurrent lifecycle operation is refused instead of interleaving. `verify`
+  also now treats an already-published twin as the winner: if publish moved the
+  article to `wiki/`, verify removes the stale draft row/file instead of
+  resurrecting it as `verified`.
 - Stray, unbalanced edge punctuation on a name no longer mints a divergent file or wikilink
   (#53). An LLM-emitted concept, synthesis title, or link target like `Phase II)` (a trailing
   `)` with no opener) passed straight through `sanitize_filename`, which keeps parens, so it

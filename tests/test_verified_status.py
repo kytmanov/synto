@@ -6,6 +6,7 @@ surface as failures rather than green-but-wrong tests.
 
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 from pathlib import Path
 
@@ -346,6 +347,36 @@ def test_reverify_is_noop_so_verify_is_safe_to_rerun_in_scripts(
     assert second.updated_at == first_updated
 
 
+def test_verify_skips_draft_when_published_twin_already_exists(
+    vault: Path, config, db: StateDB
+) -> None:
+    """If publish already won, verify must not recreate a verified draft row/file."""
+    from synto.vault import write_note
+
+    draft_path = config.drafts_dir / "Article.md"
+    published_path = config.wiki_dir / "Article.md"
+    write_note(draft_path, {"title": "Article", "status": "draft", "tags": []}, "Body.")
+    write_note(published_path, {"title": "Article", "status": "published", "tags": []}, "Body.")
+    db.upsert_article(
+        WikiArticleRecord(
+            path="wiki/Article.md",
+            title="Article",
+            sources=[],
+            content_hash="h",
+            status="published",
+        )
+    )
+
+    affected = verify_drafts(config, db, [draft_path])
+
+    assert affected == []
+    assert not draft_path.exists()
+    assert db.get_article("wiki/.drafts/Article.md") is None
+    published = db.get_article("wiki/Article.md")
+    assert published is not None
+    assert published.status == "published"
+
+
 def test_reject_works_on_verified_article_so_curators_can_change_their_mind(
     vault: Path, config, db: StateDB
 ) -> None:
@@ -463,6 +494,34 @@ def test_cli_verify_command_marks_reviewed(vault: Path, config, db: StateDB) -> 
     assert "Verified" in result.output
     meta, _ = parse_note(draft_path)
     assert meta["status"] == "verified"
+
+
+def test_cli_verify_refuses_when_lock_held(vault: Path, monkeypatch) -> None:
+    @contextlib.contextmanager
+    def _held(_vault):
+        yield False
+
+    monkeypatch.setattr("synto.pipeline.lock.pipeline_lock", _held)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["verify", "--vault", str(vault), "--all"])
+
+    assert result.exit_code == 1
+    assert "lock held" in result.output.lower()
+
+
+def test_cli_approve_refuses_when_lock_held(vault: Path, monkeypatch) -> None:
+    @contextlib.contextmanager
+    def _held(_vault):
+        yield False
+
+    monkeypatch.setattr("synto.pipeline.lock.pipeline_lock", _held)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["approve", "--vault", str(vault), "--all"])
+
+    assert result.exit_code == 1
+    assert "lock held" in result.output.lower()
 
 
 def test_cli_verify_help_is_available(vault: Path) -> None:
