@@ -697,7 +697,7 @@ def _write_draft(
     db: StateDB,
     confidence: float = 0.5,
     existing_meta: dict | None = None,
-    existing_titles: list[str] | None = None,
+    resolvable_titles: list[str] | None = None,
     concept_aliases: list[str] | None = None,
     alias_map: dict[str, str] | None = None,
     canonical_title: str | None = None,
@@ -712,17 +712,18 @@ def _write_draft(
     safe_name = sanitize_filename(article_title)
     draft_path = config.drafts_dir / f"{safe_name}.md"
 
-    # Inject wikilinks for known article titles mentioned in body
+    # Prompt context may mention same-run concepts that do not exist yet. Preserve links only
+    # for titles that already resolve on disk so published output never ships speculative links.
     source_refs = _build_source_refs(source_paths, config.vault)
-    known_titles = (existing_titles or []) + [ref.title for ref in source_refs]
+    known_titles = (resolvable_titles or []) + [ref.title for ref in source_refs]
     body = _repair_literal_newlines(content_result.content)
     body = sanitize_obsidian_math(body)
     body = _repair_malformed_embeds(body)
     body = _repair_bare_bracket_links(body, known_titles)
-    body = ensure_wikilinks(body, existing_titles or [])
+    body = ensure_wikilinks(body, resolvable_titles or [])
     # Normalize alias-based links to canonical targets
     if alias_map:
-        known = {t.lower() for t in (existing_titles or [])}
+        known = {t.lower() for t in (resolvable_titles or [])}
         body = normalize_wikilinks(body, alias_map, known)
     if config.pipeline.inline_source_citations:
         body = _rewrite_citation_markers(
@@ -731,14 +732,14 @@ def _write_draft(
             link_inline=config.pipeline.source_citation_style == "inline-wikilink",
         )
     source_targets = [ref.wiki_target for ref in source_refs]
-    body = _repair_malformed_wikilinks(body, (existing_titles or []) + source_targets)
+    body = _repair_malformed_wikilinks(body, (resolvable_titles or []) + source_targets)
     body = _repair_wikilink_placeholders(body)
     # Resolve concept links by filename stem so titles with forbidden chars (e.g. "TCP/IP"
     # -> TCPIP.md) survive as readable [[stem|title]] links instead of being stripped.
     stem_to_title: dict[str, str] = {}
-    for t in existing_titles or []:
+    for t in resolvable_titles or []:
         stem_to_title.setdefault(sanitize_filename(t).lower(), t)
-    body = _strip_unknown_wikilinks(body, (existing_titles or []) + source_targets, stem_to_title)
+    body = _strip_unknown_wikilinks(body, (resolvable_titles or []) + source_targets, stem_to_title)
     body = _strip_self_wikilinks(body, article_title)
     body = _strip_empty_wikilinks(body)
     body = _repair_malformed_embeds(body)
@@ -983,10 +984,11 @@ def compile_concepts(
     log.info("Compiling %d concept(s)", len(concept_names))
     existing_titles = [t for t, _ in list_wiki_articles(config.wiki_dir)]
     draft_titles = [t for t, _, _ in list_draft_articles(config.drafts_dir)]
-    link_titles = existing_titles + [t for t in draft_titles if t not in existing_titles]
+    resolvable_titles = existing_titles + [t for t in draft_titles if t not in existing_titles]
+    prompt_titles = list(resolvable_titles)
     for concept_name in concept_names:
-        if concept_name not in link_titles:
-            link_titles.append(concept_name)
+        if concept_name not in prompt_titles:
+            prompt_titles.append(concept_name)
     vault_schema = _load_vault_schema(config)
     total = len(concept_names)
     # Build alias resolution map once per compile run
@@ -1096,7 +1098,7 @@ def compile_concepts(
                 db=db,
                 confidence=0.0,
                 existing_meta=existing_meta,
-                existing_titles=link_titles,
+                resolvable_titles=resolvable_titles,
                 canonical_title=name,
                 concept_aliases=db.get_aliases(name),
                 alias_map=alias_map,
@@ -1129,7 +1131,7 @@ def compile_concepts(
             name,
             source_paths,
             config,
-            link_titles,
+            prompt_titles,
             existing_content,
             vault_schema,
             rejection_history,
@@ -1230,7 +1232,7 @@ def compile_concepts(
                     fallback_prompt = _write_concept_prompt(
                         name,
                         fallback_sources_text,
-                        link_titles,
+                        prompt_titles,
                         existing_content[:existing_budget] if existing_budget else "",
                         vault_schema,
                         rejection_history,
@@ -1312,7 +1314,7 @@ def compile_concepts(
             db=db,
             confidence=confidence,
             existing_meta=existing_meta,
-            existing_titles=link_titles,
+            resolvable_titles=resolvable_titles,
             canonical_title=name,
             concept_aliases=db.get_aliases(name),
             alias_map=alias_map,
@@ -1530,7 +1532,7 @@ def compile_notes(
             db=db,
             confidence=confidence,
             existing_meta=existing_meta,
-            existing_titles=existing_titles,
+            resolvable_titles=existing_titles,
         )
         draft_paths.append(draft_path)
         log.info("Draft written: %s", draft_path.name)
