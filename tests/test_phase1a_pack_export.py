@@ -11,7 +11,7 @@ from jsonschema import validate
 from synto.cli import cli
 from synto.indexer import index_schema_path
 from synto.models import RawNoteRecord, WikiArticleRecord
-from synto.pack_export import _export_source_refs, export_pack
+from synto.pack_export import _build_source_lookup, _export_source_refs, export_pack
 from synto.readers import ArticleRef, PackReader
 from synto.vault import write_note
 
@@ -620,6 +620,51 @@ def test_export_source_refs_sources_as_string(vault, config, db):
     match = next((r for r in refs if r["title"] == "Note Source"), None)
     assert match is not None
     assert match["referenced_by_articles"]  # cross-reference was built
+
+
+def test_export_source_refs_normalizes_legacy_windows_source_file(vault, config, db):
+    """Legacy source_file backslashes still match DB and article metadata."""
+    config.sources_dir.mkdir(parents=True, exist_ok=True)
+    config.raw_dir.mkdir(parents=True, exist_ok=True)
+    write_note(
+        config.sources_dir / "Legacy Source.md",
+        {"title": "Legacy Source", "source_file": r"raw\note.md"},
+        "## Concepts\n- [[Fallback Concept]]",
+    )
+    write_note(
+        config.wiki_dir / "Article.md",
+        {"title": "Article", "sources": ["raw/note.md"]},
+        "body",
+    )
+    db.upsert_concepts("raw/note.md", ["Portable Concept"])
+    db.upsert_raw(RawNoteRecord(path="raw/note.md", content_hash="hash-note", status="ingested"))
+
+    refs = _export_source_refs(
+        config,
+        db,
+        [ArticleRef(id="1", name="Article", path="wiki/Article.md")],
+    )
+
+    assert len(refs) == 1
+    assert refs[0]["id"] == "raw/note.md"
+    assert refs[0]["raw_path"] == "raw/note.md"
+    assert refs[0]["concepts"] == ["Portable Concept"]
+    assert refs[0]["referenced_by_articles"] == ["articles/Article.md"]
+    assert refs[0]["raw_content_hash"] == "hash-note"
+
+
+def test_build_source_lookup_normalizes_legacy_windows_raw_path():
+    source = {
+        "title": "Legacy Source",
+        "path": "sources/Legacy Source.md",
+        "raw_path": r"raw\note.md",
+    }
+
+    lookup = _build_source_lookup([source])
+
+    assert lookup["note"] is source
+    assert lookup["legacy source"] is source
+    assert lookup["sources/legacy source.md"] is source
 
 
 def test_export_source_refs_malformed_yaml(vault, config, db):
