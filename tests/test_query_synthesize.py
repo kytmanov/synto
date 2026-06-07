@@ -56,6 +56,10 @@ def test_derive_synthesis_title_uses_model_title():
     assert _derive_synthesis_title("what is topic?", "Topic Overview") == "Topic Overview"
 
 
+def test_derive_synthesis_title_preserves_punctuation_before_dangling_bracket():
+    assert _derive_synthesis_title("what is yahoo?", "What Is Yahoo!?)") == "What Is Yahoo!?"
+
+
 def test_derive_synthesis_title_falls_back_for_blank_title():
     assert _derive_synthesis_title("what is topic?", "   ") == "What Is Topic"
 

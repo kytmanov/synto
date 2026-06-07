@@ -29,6 +29,7 @@ from ..markdown_math import sanitize_obsidian_math
 from ..metrics import AppEvent, emit_app_event
 from ..models import PageSelection, QueryAnswer, WikiArticleRecord
 from ..readers import VaultReader
+from ..sanitize import clean_display_name
 from ..state import (
     DuplicateArticlePathError,
     DuplicateSynthesisQuestionHashError,
@@ -258,7 +259,8 @@ def _load_pages(
 
 
 def _derive_synthesis_title(question: str, model_title: str | None) -> str:
-    candidate = (model_title or "").strip()
+    # Drop dangling punctuation so a model title like "Foo)" doesn't become Foo).md.
+    candidate = clean_display_name(model_title or "")
     if candidate and len(candidate.split()) <= 12 and sanitize_filename(candidate) != "untitled":
         return candidate
 

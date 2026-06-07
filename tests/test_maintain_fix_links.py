@@ -310,6 +310,243 @@ def test_fix_broken_links_repair_report_records_path(config, db):
     assert report.repaired_links[0][0] == "wiki/Report.md"
 
 
+def test_fix_broken_links_heals_dangling_link_to_existing_page(config, db):
+    """[[Phase II)]] beside an existing 'Phase II' page is rewritten to [[Phase II]] (issue #53).
+
+    The malformed link is genuinely broken in Obsidian (it targets 'Phase II)'); healing it both
+    fixes the link and removes it from still_broken so no duplicate stub is created.
+    """
+    _write_article(config, "Phase II", "## Body\n\nContent.")
+
+    article = config.wiki_dir / "Ref.md"
+    post = fm_lib.Post(
+        "See [[Phase II)]] for details.", title="Ref", status="published", tags=[], sources=[]
+    )
+    atomic_write(article, fm_lib.dumps(post))
+
+    issues = [
+        LintIssue(
+            path="wiki/Ref.md",
+            issue_type="broken_link",
+            description="[[Phase II)]] has no matching wiki page",
+            suggestion="Fix link",
+        )
+    ]
+    report = fix_broken_links(config, db, issues)
+    assert report.repaired == 1
+    assert report.still_broken == []
+
+    _, body = parse_note(article)
+    assert "[[Phase II]]" in body
+    assert "[[Phase II)]]" not in body
+
+
+def test_fix_broken_links_preserves_punctuation_before_dangling_bracket(config, db):
+    """[[Yahoo!)]] beside an existing 'Yahoo!' page must heal to [[Yahoo!]], not [[Yahoo]]."""
+    _write_article(config, "Yahoo!", "## Body\n\nContent.")
+
+    article = config.wiki_dir / "Ref.md"
+    post = fm_lib.Post(
+        "See [[Yahoo!)]] for details.", title="Ref", status="published", tags=[], sources=[]
+    )
+    atomic_write(article, fm_lib.dumps(post))
+
+    issues = [
+        LintIssue(
+            path="wiki/Ref.md",
+            issue_type="broken_link",
+            description="[[Yahoo!)]] has no matching wiki page",
+            suggestion="Fix link",
+        )
+    ]
+    report = fix_broken_links(config, db, issues)
+    assert report.repaired == 1
+    assert report.still_broken == []
+
+    _, body = parse_note(article)
+    assert "[[Yahoo!]]" in body
+    assert "[[Yahoo)]]" not in body
+    assert "[[Yahoo]]" not in body
+
+
+def test_fix_broken_links_targets_sanitized_stem_not_title(config, db):
+    """A title with filename-forbidden chars must be linked by its stem, not the raw title.
+
+    'TCP/IP' is stored as TCPIP.md; a wikilink only resolves to the sanitized stem. The repair must
+    emit [[TCPIP|TCP/IP]], not [[TCP/IP]] (which stays broken) — and not falsely report success.
+    """
+    from synto.vault import sanitize_filename
+
+    tcp = _write_article(config, "TCP/IP", "## Body\n\nNetworking.")
+    assert tcp.name == "TCPIP.md"  # title sanitized to stem on disk
+
+    article = config.wiki_dir / "Ref.md"
+    post = fm_lib.Post(
+        "See [[TCP/IP)]] for details.", title="Ref", status="published", tags=[], sources=[]
+    )
+    atomic_write(article, fm_lib.dumps(post))
+
+    issues = [
+        LintIssue(
+            path="wiki/Ref.md",
+            issue_type="broken_link",
+            description="[[TCP/IP)]] has no matching wiki page",
+            suggestion="Fix link",
+        )
+    ]
+    report = fix_broken_links(config, db, issues)
+    assert report.repaired == 1
+    assert report.still_broken == []
+
+    _, body = parse_note(article)
+    assert "[[TCPIP|TCP/IP]]" in body
+    assert sanitize_filename("TCP/IP") == "TCPIP"
+
+
+def test_fix_broken_links_alias_to_forbidden_char_canonical(config, db):
+    """An alias whose canonical title has forbidden chars resolves to the canonical's stem."""
+    _write_article(config, "TCP/IP", "## Body")
+    db.upsert_aliases("TCP/IP", ["IP stack"])
+
+    article = config.wiki_dir / "Ref.md"
+    post = fm_lib.Post(
+        "See [[IP stack]] for details.", title="Ref", status="published", tags=[], sources=[]
+    )
+    atomic_write(article, fm_lib.dumps(post))
+
+    issues = [
+        LintIssue(
+            path="wiki/Ref.md",
+            issue_type="broken_link",
+            description="[[IP stack]] has no matching wiki page",
+            suggestion="Fix link",
+        )
+    ]
+    report = fix_broken_links(config, db, issues)
+    assert report.repaired == 1
+    assert report.still_broken == []
+
+    _, body = parse_note(article)
+    assert "[[TCPIP|IP stack]]" in body
+
+
+def test_fix_broken_links_preserves_path_style_link(config, db):
+    """A dangling path link to a real source page heals to the path, not a sanitized stem.
+
+    [[sources/Paper)]] must become [[sources/Paper]] (the '/' is meaningful and resolves by path) —
+    never [[sourcesPaper|sources/Paper]], which stays broken.
+    """
+    sources = config.wiki_dir / "sources"
+    sources.mkdir(parents=True, exist_ok=True)
+    paper = sources / "Paper.md"
+    post = fm_lib.Post("Source summary.", title="Paper", status="published", tags=[], sources=[])
+    atomic_write(paper, fm_lib.dumps(post))
+
+    article = config.wiki_dir / "Ref.md"
+    ref = fm_lib.Post(
+        "See [[sources/Paper)]] for details.", title="Ref", status="published", tags=[], sources=[]
+    )
+    atomic_write(article, fm_lib.dumps(ref))
+
+    issues = [
+        LintIssue(
+            path="wiki/Ref.md",
+            issue_type="broken_link",
+            description="[[sources/Paper)]] has no matching wiki page",
+            suggestion="Run `synto run` ...",
+        )
+    ]
+    report = fix_broken_links(config, db, issues)
+    assert report.repaired == 1
+    assert report.still_broken == []
+
+    _, body = parse_note(article)
+    assert "[[sources/Paper]]" in body
+    assert "sourcesPaper" not in body
+
+
+def test_fix_broken_links_unknown_path_style_not_corrupted(config, db):
+    """A path link with no matching page is left untouched — not sanitized, not stubbed."""
+    from synto.pipeline.maintain import create_stubs
+
+    article = config.wiki_dir / "Ref.md"
+    ref = fm_lib.Post(
+        "See [[sources/Ghost)]] for details.", title="Ref", status="published", tags=[], sources=[]
+    )
+    atomic_write(article, fm_lib.dumps(ref))
+
+    issues = [
+        LintIssue(
+            path="wiki/Ref.md",
+            issue_type="broken_link",
+            description="[[sources/Ghost)]] has no matching wiki page",
+            suggestion="Run `synto run` ...",
+        )
+    ]
+    report = fix_broken_links(config, db, issues)
+    assert report.repaired == 0
+    assert len(report.still_broken) == 1
+
+    _, body = parse_note(article)
+    assert "[[sources/Ghost)]]" in body  # untouched
+    assert "sourcesGhost" not in body  # not corrupted into a stem
+
+    # And no bogus stub is created for a path-style target.
+    created = create_stubs(config, db, broken_link_issues=report.still_broken)
+    assert created == []
+
+
+def test_fix_broken_links_dangling_unresolved_rewrites_and_stays_broken(config, db):
+    """A malformed link to an unknown page is rewritten to the clean target AND stays broken.
+
+    The body is normalized to [[Foo]] so the stub create_stubs makes for it ('Foo.md') matches —
+    but it remains in still_broken because no page resolves it yet.
+    """
+    article = config.wiki_dir / "Ref.md"
+    post = fm_lib.Post(
+        "See [[Foo)]] for details.", title="Ref", status="published", tags=[], sources=[]
+    )
+    atomic_write(article, fm_lib.dumps(post))
+
+    issues = [
+        LintIssue(
+            path="wiki/Ref.md",
+            issue_type="broken_link",
+            description="[[Foo)]] has no matching wiki page",
+            suggestion="Fix link",
+        )
+    ]
+    report = fix_broken_links(config, db, issues)
+    assert report.repaired == 1
+    assert len(report.still_broken) == 1
+
+    _, body = parse_note(article)
+    assert "[[Foo]]" in body
+    assert "[[Foo)]]" not in body
+
+
+def test_fix_broken_links_dangling_dry_run_does_not_write(config, db):
+    _write_article(config, "Phase II", "## Body")
+
+    article = config.wiki_dir / "Ref.md"
+    post = fm_lib.Post("See [[Phase II)]].", title="Ref", status="published", tags=[], sources=[])
+    atomic_write(article, fm_lib.dumps(post))
+
+    issues = [
+        LintIssue(
+            path="wiki/Ref.md",
+            issue_type="broken_link",
+            description="[[Phase II)]] has no matching wiki page",
+            suggestion="Fix link",
+        )
+    ]
+    report = fix_broken_links(config, db, issues, dry_run=True)
+    assert report.repaired == 1
+
+    _, body = parse_note(article)
+    assert "[[Phase II)]]" in body  # untouched in dry run
+
+
 def test_fix_broken_links_with_fragment(config, db):
     """Alias link with heading fragment — target extraction strips fragment."""
     canonical = "Machine Learning"

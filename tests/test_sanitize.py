@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from synto.sanitize import sanitize_tag, sanitize_tags
+import pytest
+
+from synto.sanitize import clean_display_name, sanitize_tag, sanitize_tags
 
 # ── sanitize_tag ──────────────────────────────────────────────────────────────
 
@@ -115,3 +117,52 @@ def test_no_duplicate_after_sanitize():
     # Both sanitize to "machine-learning"
     result = sanitize_tags(["machine learning", "machine-learning"])
     assert result == ["machine-learning"]
+
+
+# ── clean_display_name ────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        # The #53 case: dangling closer with no opener → drop it so it stops diverging.
+        ("Phase II)", "Phase II"),
+        ("Phase II))", "Phase II"),
+        ("(draft", "draft"),
+        ("[draft", "draft"),
+        ("Phase II.)", "Phase II."),
+        # Balanced punctuation is part of the title → kept verbatim.
+        ("Extreme Programming (XP)", "Extreme Programming (XP)"),
+        ("f(x)", "f(x)"),
+        ("(see note)", "(see note)"),
+        # A matched leading "(" must survive even when an interior bracket is unbalanced — the edge
+        # check matches the specific bracket, not whole-string counts.
+        ("(a) (b", "(a) (b"),
+        ("(RFC 1234) (draft", "(RFC 1234) (draft"),
+        # Only the genuinely dangling edge bracket is trimmed; the matched pair is kept.
+        ("(a))", "(a)"),
+        ("(see note) extra)", "(see note) extra"),
+        # Ordinary trailing punctuation is part of the name and kept — sanitize_filename keeps
+        # these chars, so there is no filename divergence to fix (cf. the bracket cases above).
+        ("etc.", "etc."),
+        ("Done!", "Done!"),
+        ("Yahoo!", "Yahoo!"),
+        ("Jeopardy!", "Jeopardy!"),
+        ("What Is Yahoo!?", "What Is Yahoo!?"),
+        ("Yahoo!)", "Yahoo!"),
+        ("What Is Yahoo!?)", "What Is Yahoo!?"),
+        ("etc.)", "etc."),
+        (".NET", ".NET"),
+        ("Node.js", "Node.js"),
+        ("C++", "C++"),
+        # Surrounding quotes stripped, then the dangling closer.
+        ('"Phase II)"', "Phase II"),
+        # Internal unbalanced paren is left alone — we only trim edges.
+        ("Foo (bar", "Foo (bar"),
+        # Never returns empty: a name made only of strippable chars falls back to its stripped form.
+        (")", ")"),
+        ("  Quantum  ", "Quantum"),
+    ],
+)
+def test_clean_display_name(raw, expected):
+    assert clean_display_name(raw) == expected

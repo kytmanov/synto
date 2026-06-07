@@ -12,6 +12,18 @@
 
 ### Fixed
 
+- Stray, unbalanced edge punctuation on a name no longer mints a divergent file or wikilink
+  (#53). An LLM-emitted concept, synthesis title, or link target like `Phase II)` (a trailing
+  `)` with no opener) passed straight through `sanitize_filename`, which keeps parens, so it
+  became its own `Phase II).md` instead of resolving to `Phase II`. A new `clean_display_name`
+  trims only *unmatched* edge brackets — balanced titles (`Extreme Programming (XP)`, `f(x)`,
+  `(see note)`) and ordinary trailing punctuation (`Yahoo!`, `etc.`, `C++`) are untouched — and
+  is applied at the three points such a name enters the vault: concept extraction, synthesis
+  titles, and broken-link repair / stub creation. `synto maintain --fix` now also heals existing
+  dangling links: `fix_broken_links` resolves against lint's authoritative title index instead of
+  a second, narrower resolver, which also fixes the prior corruption of path-style links (e.g.
+  `[[TCP/IP]]`). Existing vaults are repaired by `synto maintain --fix`; new dirty names are
+  cleaned on the next ingest.
 - `max_concepts_per_source` (and per-source-type overrides) are no longer silently ignored
   for large sources (#52). `_merge_chunk_results` capped concepts at a hardcoded 8 — the
   per-LLM-call limit — when combining the chunks of a multi-chunk source, before the
