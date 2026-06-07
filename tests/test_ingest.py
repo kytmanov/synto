@@ -22,6 +22,7 @@ from synto.pipeline.ingest import (
     _build_trusted_alias_rewrite_index,
     _canonical_prompt_contexts,
     _checkpoint_hash,
+    _clean_concept_text,
     _concept_key,
     _content_hash,
     _dedup_by_shared_alias,
@@ -263,6 +264,15 @@ def test_concept_key_normalizes_case_punctuation_and_unicode():
 def test_base_concept_name_strips_only_safe_abbreviations():
     assert _base_concept_name("Extreme Programming (XP)") == "Extreme Programming"
     assert _base_concept_name("Scrum (framework)") == "Scrum (framework)"
+
+
+def test_clean_concept_text_strips_dangling_punctuation():
+    """A model concept name like 'Phase II)' must canonicalize to 'Phase II' (issue #53),
+    while balanced parenthetical abbreviations are preserved for _base_concept_name to handle."""
+    assert _clean_concept_text("Phase II)") == "Phase II"
+    assert _clean_concept_text("Yahoo!)") == "Yahoo!"
+    assert _clean_concept_text("  Quantum Computing  ") == "Quantum Computing"
+    assert _clean_concept_text("Extreme Programming (XP)") == "Extreme Programming (XP)"
 
 
 def test_safe_aliases_for_name_extracts_parenthetical_abbreviation():

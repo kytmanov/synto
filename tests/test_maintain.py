@@ -193,6 +193,60 @@ def test_create_stubs_strips_md_extension(config, db):
     assert created[0].name == "deep-learning.md"
 
 
+def test_create_stubs_strips_dangling_punctuation(config, db):
+    """A malformed target 'Phase II)' must not create a divergent 'Phase II).md' (issue #53)."""
+    from synto.models import LintIssue
+
+    issues = [
+        LintIssue(
+            path="wiki/Article.md",
+            issue_type="broken_link",
+            description="[[Phase II)]] has no matching wiki page",
+            suggestion="",
+        )
+    ]
+    created = create_stubs(config, db, broken_link_issues=issues)
+    assert len(created) == 1
+    assert created[0].name == "Phase II.md"
+    assert db.has_stub("Phase II")
+
+
+def test_create_stubs_dangling_target_matches_existing_article(config, db):
+    """'Phase II)' resolves to the existing 'Phase II' page after cleaning — no duplicate stub."""
+    from synto.models import LintIssue
+
+    _write_article(config, "Phase II")
+    issues = [
+        LintIssue(
+            path="wiki/Article.md",
+            issue_type="broken_link",
+            description="[[Phase II)]] has no matching wiki page",
+            suggestion="",
+        )
+    ]
+    created = create_stubs(config, db, broken_link_issues=issues)
+    assert created == []
+    assert not (config.drafts_dir / "Phase II).md").exists()
+
+
+def test_create_stubs_preserves_punctuation_before_dangling_bracket(config, db):
+    """A malformed target like 'Yahoo!)' must keep the real title punctuation when stubbed."""
+    from synto.models import LintIssue
+
+    issues = [
+        LintIssue(
+            path="wiki/Article.md",
+            issue_type="broken_link",
+            description="[[Yahoo!)]] has no matching wiki page",
+            suggestion="",
+        )
+    ]
+    created = create_stubs(config, db, broken_link_issues=issues)
+    assert len(created) == 1
+    assert created[0].name == "Yahoo!.md"
+    assert db.has_stub("Yahoo!")
+
+
 def test_create_stubs_empty_issues(config, db):
     created = create_stubs(config, db, broken_link_issues=[])
     assert created == []
@@ -317,6 +371,24 @@ def test_suggest_concept_merges_high_similarity(config, db):
     assert {"Machine Learning", "Machine-Learning"} == {a, b}
 
 
+def test_suggest_concept_merges_surfaces_dangling_punctuation_duplicate(config, db):
+    """'Phase II' and 'Phase II)' must score as near-duplicates (issue #53) so users can merge them.
+
+    Without per-token punctuation stripping, 'ii)' != 'ii' drops the score below threshold and the
+    duplicate stays hidden — the same defect that minted it.
+    """
+    db.upsert_raw(RawNoteRecord(path="raw/a.md", content_hash="h1", status="ingested"))
+    db.upsert_raw(RawNoteRecord(path="raw/b.md", content_hash="h2", status="ingested"))
+    db.upsert_concepts("raw/a.md", ["Phase II"])
+    db.upsert_concepts("raw/b.md", ["Phase II)"])
+
+    result = suggest_concept_merges(config, db)
+    assert len(result) > 0
+    a, b, score = result[0]
+    assert score >= 0.7
+    assert {"Phase II", "Phase II)"} == {a, b}
+
+
 def test_suggest_concept_merges_low_similarity_excluded(config, db):
     db.upsert_raw(RawNoteRecord(path="raw/a.md", content_hash="h1", status="ingested"))
     db.upsert_raw(RawNoteRecord(path="raw/b.md", content_hash="h2", status="ingested"))
@@ -338,3 +410,35 @@ def test_suggest_concept_merges_sorted_by_score_desc(config, db):
     result = suggest_concept_merges(config, db)
     scores = [r[2] for r in result]
     assert scores == sorted(scores, reverse=True)
+
+
+# ── issue #53: malformed-link end-to-end ──────────────────────────────────────
+
+
+def test_maintain_fix_flow_heals_malformed_link_no_duplicate_file(config, db):
+    """End-to-end: a [[Phase II)]] link beside an existing 'Phase II' page is healed, not duped.
+
+    Reproduces issue #53 through the real maintain --fix path: lint flags the malformed link,
+    fix_broken_links rewrites it to [[Phase II]], and create_stubs makes no 'Phase II).md'.
+    """
+    from synto.models import LintIssue
+    from synto.pipeline.lint import run_lint
+    from synto.pipeline.maintain import fix_broken_links
+
+    _write_article(config, "Phase II", "## Body\n\nContent about phase two.")
+    ref = _write_article(config, "Project Plan", "The plan covers [[Phase II)]] in detail.")
+
+    result = run_lint(config, db)
+    broken = [i for i in result.issues if i.issue_type == "broken_link"]
+    assert any("Phase II)" in i.description for i in broken), "lint should flag the malformed link"
+
+    repair = fix_broken_links(config, db, broken)
+    remaining: list[LintIssue] = repair.still_broken
+    created = create_stubs(config, db, broken_link_issues=remaining)
+
+    assert not (config.drafts_dir / "Phase II).md").exists()
+    assert all(p.name != "Phase II).md" for p in created)
+
+    _, body = parse_note(ref)
+    assert "[[Phase II]]" in body
+    assert "[[Phase II)]]" not in body

@@ -20,6 +20,7 @@ import frontmatter as fm_lib
 
 from ..config import Config
 from ..models import LintIssue
+from ..sanitize import clean_display_name
 from ..state import StateDB
 from ..vault import (
     _mask_code_blocks,
@@ -30,6 +31,7 @@ from ..vault import (
     parse_note,
     rename_wikilink_targets,
     sanitize_filename,
+    sanitize_wikilink_target,
     write_note,
 )
 
@@ -60,23 +62,25 @@ def fix_broken_links(
     broken_link_issues: list[LintIssue],
     dry_run: bool = False,
 ) -> FixReport:
-    """Rewrite broken [[Alias]] links to [[Canonical|Alias]] using the alias map.
+    """Repair broken wikilinks in place: dangling-punctuation links (``[[Phase II)]]`` →
+    ``[[Phase II]]``) and alias links (``[[Alias]]`` → ``[[Canonical|Alias]]``).
 
-    Only unambiguous matches are rewritten. Ambiguous or unknown links fall through
-    to still_broken for stub creation.
+    A link whose cleaned form resolves to a known page is healed and removed from still_broken.
+    A dangling link whose cleaned form is still unknown is rewritten to the clean target (so the
+    stub created for it matches) but stays in still_broken. Other unknown links fall through
+    unchanged for stub creation.
     """
     report = FixReport()
 
     if not broken_link_issues:
         return report
 
-    alias_map = db.list_alias_map()
-    if not alias_map:
-        report.still_broken = list(broken_link_issues)
-        return report
+    # Resolve links against lint's authoritative index (concept stems/titles, wiki-relative paths,
+    # drafts, and unambiguous aliases) so this repair never diverges from what lint accepts as
+    # valid — a second, narrower resolver here is what previously corrupted path-style links.
+    from .lint import _build_title_index
 
-    # Build set of known published article titles (lowercase) so we don't rewrite good links
-    known_lower = {t.lower() for t, _ in list_wiki_articles(config.wiki_dir)}
+    title_index = _build_title_index(config, db)
 
     # Group issues by source file for one write per file
     issues_by_file: dict[str, list[LintIssue]] = {}
@@ -105,33 +109,56 @@ def fix_broken_links(
                 still_broken_in_file.append(issue)
                 continue
 
-            # Skip if target is already a known title (shouldn't be in broken list, but guard)
-            if target.lower() in known_lower:
+            clean = clean_display_name(target)
+            dangling = clean != target
+            key = clean.lower()
+
+            matched = title_index.get(key)
+            if matched is not None:
+                # Cleaned link resolves to a real page. Emit the form matching its namespace: a
+                # genuine path link keeps its wiki-relative path; anything matched by stem/title/
+                # alias is emitted as the sanitized filename stem (e.g. "TCP/IP" lives in TCPIP.md).
+                relpath = matched.relative_to(config.wiki_dir).with_suffix("").as_posix()
+                dest = relpath if ("/" in relpath and key == relpath.lower()) else matched.stem
+                resolved = True
+            elif dangling and "/" not in clean:
+                # Unknown concept: rewrite toward the stem of the stub create_stubs will write
+                # (sanitize_filename(clean).md), so the body link and that stub stay consistent.
+                dest, resolved = sanitize_wikilink_target(clean), False
+            else:
+                # Non-dangling unknown, or a path-style link with no matching page — never sanitize
+                # a path to a stem and never stub it (create_stubs also skips "/" targets).
                 still_broken_in_file.append(issue)
                 continue
 
-            canonical = alias_map.get(target.lower())
-            if canonical is None or canonical.lower() not in known_lower:
-                still_broken_in_file.append(issue)
-                continue
-
-            # Rewrite all occurrences of [[target ...]] → [[canonical|target]]
-            def _make_rewriter(t: str, canon: str):
+            # Rewrite [[target ...]] occurrences (target is the dirty form actually in the body).
+            # Emit the display-preserving form like ensure_wikilinks: [[dest|display]] when the
+            # readable text differs from the link target, else [[dest]].
+            def _make_rewriter(t: str, dest: str, default_display: str):
                 def _rewrite(m: re.Match) -> str:
                     if m.group(1).strip().lower() != t.lower():
                         return m.group(0)
                     fragment = m.group(2)
-                    display = m.group(3) if m.group(3) is not None else m.group(1).strip()
+                    explicit_display = m.group(3)
                     frag_part = f"#{fragment}" if fragment else ""
-                    return f"[[{canon}{frag_part}|{display}]]"
+                    display = explicit_display if explicit_display is not None else default_display
+                    if display == dest:
+                        return f"[[{dest}{frag_part}]]"
+                    return f"[[{dest}{frag_part}|{display}]]"
 
                 return _rewrite
 
-            new_masked = _WIKILINK_REPAIR_RE.sub(_make_rewriter(target, canonical), masked_body)
-            if new_masked != masked_body:
-                repaired_in_file.append((f"[[{target}]]", f"[[{canonical}|{target}]]"))
+            new_masked = _WIKILINK_REPAIR_RE.sub(_make_rewriter(target, dest, clean), masked_body)
+            changed = new_masked != masked_body
+            if changed:
+                new_form = f"[[{dest}]]" if clean == dest else f"[[{dest}|{clean}]]"
+                repaired_in_file.append((f"[[{target}]]", new_form))
                 masked_body = new_masked
-            else:
+            if not resolved:
+                # Body link now points at the clean target; the stub will be created for it.
+                still_broken_in_file.append(issue)
+            elif not changed:
+                # Resolved, but the only occurrence is unrewritable (e.g. inside a code fence).
                 still_broken_in_file.append(issue)
 
         body = _restore_code_blocks(masked_body, spans)
@@ -427,6 +454,12 @@ def create_stubs(
             log.debug("Skipping path-fragment broken link target: %s", target)
             continue
 
+        # Drop dangling/unbalanced punctuation (e.g. "Phase II)") before any dedup check or write,
+        # so a malformed link can't spawn a stub that diverges from the real "Phase II.md".
+        target = clean_display_name(target)
+        if not target:
+            continue
+
         if target in seen:
             continue
         seen.add(target)
@@ -532,8 +565,10 @@ def suggest_concept_merges(config: Config, db: StateDB) -> list[tuple[str, str, 
         return []
 
     def tokenize(name: str) -> frozenset[str]:
-        # Lowercase, split on spaces/hyphens/underscores, filter short tokens
-        tokens = re.split(r"[\s\-_]+", name.lower())
+        # Lowercase, split on spaces/hyphens/underscores, strip per-token punctuation, filter short.
+        # Without the strip, "Phase II)" → {"phase", "ii)"} never matches "Phase II" {"phase",
+        # "ii"}, hiding exactly the stray-char duplicates this is meant to surface.
+        tokens = (re.sub(r"\W+", "", t) for t in re.split(r"[\s\-_]+", name.lower()))
         return frozenset(t for t in tokens if len(t) > 1)
 
     tokenized = [(c, tokenize(c)) for c in concepts]

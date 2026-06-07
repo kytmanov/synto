@@ -23,6 +23,7 @@ from pydantic import BaseModel as _BaseModel
 from ..config import Config
 from ..models import AnalysisResult, Concept, RawNoteRecord, SourceSegment, TermExtractionResult
 from ..paths import rel_posix
+from ..sanitize import clean_display_name
 from ..state import StateDB
 from ..structured_output import request_structured
 
@@ -648,6 +649,10 @@ _LEGACY_REWRITE_ALIAS_PREFIX = "__olw_rewrite_alias__:"
 def _clean_concept_text(text: str) -> str:
     text = unicodedata.normalize("NFKC", text).strip()
     text = _SURROUNDING_QUOTES_RE.sub("", text).strip()
+    # Drop dangling/unbalanced punctuation (e.g. "Phase II)") so a stray char can't mint a concept
+    # name that diverges into its own file. Runs before _base_concept_name, which expects balanced
+    # "(ABBR)" and is unaffected — clean_display_name only trims unbalanced edge brackets.
+    text = clean_display_name(text)
     return re.sub(r"\s+", " ", text)
 
 
