@@ -13,23 +13,28 @@ from synto.stats import compute_stats_from_db, render_json, render_text
 from synto.vault import write_note
 
 
-def _init_stats_vault(tmp_path, provider_name: str = "ollama"):
+def _init_stats_vault(
+    tmp_path,
+    provider_name: str = "ollama",
+    *,
+    provider_blocks: str = "",
+    model_block: str = "",
+    include_default_heavy: bool = True,
+):
     (tmp_path / "raw").mkdir()
     (tmp_path / "wiki").mkdir()
     (tmp_path / "wiki" / ".drafts").mkdir()
     (tmp_path / "wiki" / "sources").mkdir()
     (tmp_path / ".synto").mkdir()
-    (tmp_path / "synto.toml").write_text(
-        (
-            "[models]\n"
-            'fast = "gemma4:e4b"\n'
-            'heavy = "qwen2.5:14b"\n\n'
-            "[provider]\n"
-            f'name = "{provider_name}"\n'
-            'url = "http://localhost:11434"\n'
-        ),
-        encoding="utf-8",
-    )
+    config_text = "[models]\n" + 'fast = "gemma4:e4b"\n'
+    if include_default_heavy:
+        config_text += 'heavy = "qwen2.5:14b"\n'
+    config_text += model_block
+    config_text += "\n[provider]\n"
+    config_text += f'name = "{provider_name}"\n'
+    config_text += 'url = "http://localhost:11434"\n'
+    config_text += provider_blocks
+    (tmp_path / "synto.toml").write_text(config_text, encoding="utf-8")
 
 
 def test_stats_empty_vault_returns_zeroes(tmp_path):
@@ -191,6 +196,32 @@ def test_stats_json_output_is_parseable_and_key_safe(tmp_path):
     assert payload["metrics"]["estimated_cost_usd"] == 0.0
     assert "sk-" not in result.output
     assert "api_key" not in result.output.lower()
+
+
+def test_stats_report_uses_resolved_heavy_provider(tmp_path):
+    from synto.cli import _load_config
+
+    _init_stats_vault(
+        tmp_path,
+        provider_name="ollama",
+        provider_blocks=(
+            "\n[providers.local]\n"
+            'name = "lm_studio"\n'
+            'url = "http://localhost:1234/v1"\n'
+        ),
+        model_block=(
+            "\n[models.heavy]\n"
+            'provider = "local"\n'
+            'model = "qwen/qwen3.5-9b"\n'
+        ),
+        include_default_heavy=False,
+    )
+
+    db = StateDB(tmp_path / ".synto" / "state.db")
+    report = compute_stats_from_db(_load_config(str(tmp_path)), db)
+
+    assert report.vault.provider == "lm_studio"
+    assert report.vault.provider_is_cloud is False
 
 
 def test_stats_reports_low_confidence_and_single_source_articles(tmp_path):

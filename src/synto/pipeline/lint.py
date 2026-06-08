@@ -240,7 +240,7 @@ def _check_malformed_latex(rel_path: str, body: str, issues: list[LintIssue]) ->
 def _check_stale_lock(config: Config, issues: list[LintIssue]) -> None:
     import os
 
-    from .lock import effective_app_dir, has_invalid_lock_file, lock_holder_pid
+    from .lock import _IS_POSIX, effective_app_dir, has_invalid_lock_file, lock_holder_pid
 
     lock_path = effective_app_dir(config.vault) / "pipeline.lock"
     if not lock_path.exists():
@@ -265,6 +265,11 @@ def _check_stale_lock(config: Config, issues: list[LintIssue]) -> None:
     except (ValueError, OSError):
         pass
     if lock_holder_pid(config.vault) is None:
+        # On POSIX the flock lives on the open fd, not the filename. A leftover
+        # pipeline.lock file after release is normal and does not block a future
+        # acquire, so only invalid lock-file contents are worth flagging here.
+        if _IS_POSIX:
+            return
         try:
             pid: int | str = int(lock_path.read_text().strip())
         except Exception:
