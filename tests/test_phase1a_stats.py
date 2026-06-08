@@ -205,15 +205,9 @@ def test_stats_report_uses_resolved_heavy_provider(tmp_path):
         tmp_path,
         provider_name="ollama",
         provider_blocks=(
-            "\n[providers.local]\n"
-            'name = "lm_studio"\n'
-            'url = "http://localhost:1234/v1"\n'
+            '\n[providers.local]\nname = "lm_studio"\nurl = "http://localhost:1234/v1"\n'
         ),
-        model_block=(
-            "\n[models.heavy]\n"
-            'provider = "local"\n'
-            'model = "qwen/qwen3.5-9b"\n'
-        ),
+        model_block=('\n[models.heavy]\nprovider = "local"\nmodel = "qwen/qwen3.5-9b"\n'),
         include_default_heavy=False,
     )
 

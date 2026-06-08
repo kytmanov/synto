@@ -31,10 +31,10 @@ from synto.pipeline.compile import (
     _strip_self_wikilinks,
     _strip_unknown_wikilinks,
     _write_concept_prompt,
+    _write_draft,
     approve_drafts,
     compile_concepts,
     reject_draft,
-    _write_draft,
 )
 from synto.state import StateDB
 from synto.vault import ensure_wikilinks, sanitize_filename
