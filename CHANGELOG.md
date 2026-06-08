@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-06-08
+
 ### Changed
 
 - Long-form source types now get a book-appropriate concept-extraction ceiling out of the
@@ -59,6 +61,15 @@
   duplicate path entries by recency, keeping the most recently updated state rather than
   dropping it. The suspected cause (CRLF/LF line endings) was a red herring: content hashes
   are computed on a newline-normalized body, so line endings never affected note identity.
+- Compile no longer ships speculative same-run concept links as live `[[wikilinks]]` (#65).
+  When an article mentioned another concept from the same compile batch, the draft writer
+  treated every in-batch title as resolvable before that target page existed on disk, so a
+  not-yet-materialized concept could be emitted as a real wikilink. Draft generation now
+  keeps `[[wikilinks]]` only for titles that already resolve in the vault and unwraps the
+  rest to plain text, while preserving links to real pages such as existing concepts and
+  `wiki/sources/*` pages. The same fix train also tightens a few related edge cases around
+  Windows-path lint reporting, released POSIX lock files, compare soft caps for local
+  providers, and resolved-provider reporting in stats/compare output.
 
 ## [0.5.0] - 2026-06-03
 

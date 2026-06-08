@@ -122,7 +122,9 @@ synto approve --min-confidence 0.8              # publish reviewed or fresh draf
 analysis the fast model receives a matching system prompt: a `paper` prompt extracts
 abstract/methods/results structure; an `api_docs` prompt preserves parameter names; a
 `textbook` prompt follows chapter/definition flow. If `--type` is omitted, PDFs default to
-`paper` and everything else to `notes` — pass `--type` for anything more specific.
+`paper` and everything else to `notes` — pass `--type` for anything more specific. Long-form
+source types also get higher built-in concept ceilings during ingest: `textbook` defaults to
+25 concepts and `paper` to 15 unless you set an explicit override in `synto.toml`.
 
 ---
 
