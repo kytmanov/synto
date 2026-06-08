@@ -155,7 +155,11 @@ def lock_holder_pid(vault: Path) -> int | None:
     if not _IS_POSIX:
         return pid if _windows_pid_alive(pid) else None
     import errno
-    import fcntl
+
+    try:
+        import fcntl
+    except ModuleNotFoundError:
+        return None
 
     try:
         # Detect the holder with a SHARED lock: pipeline_lock() always takes an
