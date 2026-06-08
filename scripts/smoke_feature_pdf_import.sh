@@ -288,7 +288,7 @@ $OLW approve --all 2>&1
 check "compile_runs has a finished row" \
   "python3 -c \"import sqlite3; c=sqlite3.connect('$DB'); assert c.execute('SELECT COUNT(*) FROM compile_runs WHERE finished_at IS NOT NULL').fetchone()[0]>=1\""
 check "at least one wiki article published" \
-  "find '$VAULT_DIR/wiki' -maxdepth 1 -name '*.md' | grep -q ."
+  "find '$VAULT_DIR/wiki' -maxdepth 1 -name '*.md' ! -name 'index.md' ! -name 'log.md' | grep -q ."
 check "published article has lineage: frontmatter" \
   "find '$VAULT_DIR/wiki' -maxdepth 1 -name '*.md' -exec grep -l '^lineage:' {} \; | grep -q ."
 

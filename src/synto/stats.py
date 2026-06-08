@@ -72,7 +72,7 @@ def compute_stats(config: Config, *, since: str | None = None) -> StatsReport:
 
 def _empty_stats_report(config: Config, *, since: str | None = None) -> StatsReport:
     _, _, since_label = parse_since(since)
-    provider_name = config.effective_provider.name
+    provider_name = config.resolve_role("heavy").provider_kind
     low_confidence_articles = 0
     try:
         low_confidence_articles = sum(
@@ -126,7 +126,7 @@ def compute_stats_from_db(config: Config, db: StateDB, *, since: str | None = No
     since_day, since_ts, since_label = parse_since(since)
     base_stats = db.stats(config.vault)
     raw = base_stats.get("raw", {})
-    provider_name = config.effective_provider.name
+    provider_name = config.resolve_role("heavy").provider_kind
     synthesis_articles = len(db.list_synthesis_articles_brief())
     low_confidence_articles = 0
     try:

@@ -31,6 +31,7 @@ from synto.pipeline.compile import (
     _strip_self_wikilinks,
     _strip_unknown_wikilinks,
     _write_concept_prompt,
+    _write_draft,
     approve_drafts,
     compile_concepts,
     reject_draft,
@@ -488,6 +489,72 @@ def test_repair_malformed_wikilinks_strips_quote_and_citation_debris():
     assert body == "See [[Independent publishing culture]] and [[Documentary notes]]."
 
 
+def test_write_draft_unwraps_nonmaterialized_same_run_concept_link(config, db):
+    result = SingleArticle(
+        title="Knowledge Compounding",
+        content=(
+            "See [[Karpathy LLM Wiki paradigm]] and [[Qing Claw]] and [[sources/2604.11243v2]]."
+        ),
+        tags=["knowledge-compounding"],
+    )
+
+    draft = _write_draft(
+        content_result=result,
+        config=config,
+        source_paths=[],
+        db=db,
+        resolvable_titles=["Qing Claw"],
+        canonical_title="Knowledge Compounding",
+    )
+
+    body = draft.read_text(encoding="utf-8")
+    assert "Karpathy LLM Wiki paradigm" in body
+    assert "[[Karpathy LLM Wiki paradigm]]" not in body
+    assert "[[Qing Claw]]" in body
+
+
+def test_write_draft_keeps_link_when_target_is_resolvable(config, db):
+    result = SingleArticle(
+        title="Knowledge Compounding",
+        content="See [[Karpathy LLM Wiki paradigm]] and [[Qing Claw]].",
+        tags=["knowledge-compounding"],
+    )
+
+    draft = _write_draft(
+        content_result=result,
+        config=config,
+        source_paths=[],
+        db=db,
+        resolvable_titles=["Qing Claw", "Karpathy LLM Wiki paradigm"],
+        canonical_title="Knowledge Compounding",
+    )
+
+    body = draft.read_text(encoding="utf-8")
+    assert "[[Karpathy LLM Wiki paradigm]]" in body
+    assert "[[Qing Claw]]" in body
+
+
+def test_write_draft_unwraps_unknown_padded_wikilink_target(config, db):
+    result = SingleArticle(
+        title="Long-Context Regime",
+        content="Compounding uses [[LLM Wiki ]] for persistence.",
+        tags=["long-context"],
+    )
+
+    draft = _write_draft(
+        content_result=result,
+        config=config,
+        source_paths=[],
+        db=db,
+        resolvable_titles=["Chunk-RAG"],
+        canonical_title="Long-Context Regime",
+    )
+
+    body = draft.read_text(encoding="utf-8")
+    assert "LLM Wiki" in body
+    assert "[[LLM Wiki ]]" not in body
+
+
 def test_repair_wikilink_placeholders_collapses_nested_and_stray_tokens():
     body = _repair_wikilink_placeholders(
         "Bad [[wikilinks][[Agentic ROI]]] and stray [[wikilinks]LLM agents]."
@@ -858,7 +925,7 @@ def test_compile_concepts_draft_media_reference_mode(config, db):
     assert "Media reference: ./_resources/file.pdf" in body
 
 
-def test_compile_concepts_links_to_same_batch_concepts(config, db):
+def test_compile_concepts_unwraps_same_batch_concepts_until_materialized(config, db):
     import json
 
     db.upsert_raw(RawNoteRecord(path="raw/a.md", content_hash="h1", status="ingested"))
@@ -878,7 +945,9 @@ def test_compile_concepts_links_to_same_batch_concepts(config, db):
 
     assert failed == []
     alpha = next(path for path in drafts if path.name == "Alpha.md")
-    assert "[[Beta]]" in alpha.read_text()
+    alpha_body = alpha.read_text()
+    assert "Beta" in alpha_body
+    assert "[[Beta]]" not in alpha_body
 
 
 def test_compile_concepts_skips_pending_draft(config, db):

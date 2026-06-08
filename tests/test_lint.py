@@ -906,7 +906,10 @@ def test_lint_silent_when_article_max_tokens_at_new_default(vault, config, db):
 # ── Stale lock ────────────────────────────────────────────────────────────────
 
 
-def test_stale_lock_detected(config, db):
+def test_dead_windows_lock_detected(config, db, monkeypatch):
+    monkeypatch.setattr("synto.pipeline.lock._IS_POSIX", False)
+    monkeypatch.setattr("synto.pipeline.lock._windows_pid_alive", lambda pid: False)
+
     lock_path = config.vault / ".synto" / "pipeline.lock"
     lock_path.parent.mkdir(exist_ok=True)
     lock_path.write_text("99999999")  # PID far above OS max → guaranteed dead
@@ -932,6 +935,18 @@ def test_own_lock_not_flagged_as_stale(config, db):
     lock_path.parent.mkdir(exist_ok=True)
     lock_path.write_text(str(os.getpid()))
     result = run_lint(config, db)
+    assert not any(i.issue_type == "stale_lock" for i in result.issues)
+
+
+def test_released_posix_lock_file_not_flagged_as_stale(config, db, monkeypatch):
+    monkeypatch.setattr("synto.pipeline.lock._IS_POSIX", True)
+
+    lock_path = config.vault / ".synto" / "pipeline.lock"
+    lock_path.parent.mkdir(exist_ok=True)
+    lock_path.write_text("99999999")
+
+    result = run_lint(config, db)
+
     assert not any(i.issue_type == "stale_lock" for i in result.issues)
 
 

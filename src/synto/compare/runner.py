@@ -14,6 +14,7 @@ from pathlib import Path
 from ..config import Config, role_providers_head, to_toml
 from ..metrics import metrics_sink
 from ..paths import APP_DIR_NAME, CONFIG_FILE_NAME, is_within
+from ..providers import get_provider
 from ..vault import extract_wikilinks, parse_note
 from .metrics import load_queries
 from .models import CompareReport, ContestantRunResult, PageDiffSummary, PageSnapshot, QueryResult
@@ -229,7 +230,23 @@ def _write_effective_compare_toml(vault: Path, config: Config) -> None:
     # ephemeral vault makes no commits. model_copy marks those two as set so they always emit;
     # every other pipeline field the active vault set carries through, unset ones default on reload.
     pipeline = config.pipeline.model_copy(update={"auto_approve": True, "auto_commit": False})
+    if _should_relax_compare_soft_cap(config):
+        # Local OpenAI-compatible servers (LM Studio, vLLM, etc.) can ignore the client's num_ctx
+        # hint, so compare preview runs were repeatedly truncating concept drafts at the default
+        # 2400-token soft cap. Prefer a usable preview over strict fidelity for these isolated
+        # compare vaults by letting concept drafts use the normal article budget instead.
+        pipeline = pipeline.model_copy(update={"concept_draft_soft_cap": "article_max_tokens"})
     (vault / CONFIG_FILE_NAME).write_text(head + "\n" + to_toml({"pipeline": pipeline}))
+
+
+def _should_relax_compare_soft_cap(config: Config) -> bool:
+    heavy = config.resolve_role("heavy")
+    if heavy.provider_kind == "ollama":
+        return False
+    info = get_provider(heavy.provider_kind)
+    if info is not None:
+        return info.is_local
+    return heavy.url.startswith(("http://localhost", "http://127.0.0.1"))
 
 
 def _capture_diagnostics(vault: Path, db, config: Config, events) -> dict:

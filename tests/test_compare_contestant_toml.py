@@ -155,3 +155,35 @@ def test_legacy_active_config_still_materializes(tmp_path):
     reloaded = _write_and_reload(tmp_path, config)
     assert reloaded.resolve_role("heavy").provider_kind == "groq"
     assert reloaded.resolve_role("fast").model == "f"
+
+
+def test_local_openai_compare_materialization_uses_full_article_budget(tmp_path):
+    config = Config(
+        vault=str(tmp_path / "active"),
+        providers={"local": ProviderBlock(name="lm_studio", url="http://localhost:1234/v1")},
+        models={
+            "fast": {"provider": "local", "model": "gemma4:e4b"},
+            "heavy": {"provider": "local", "model": "qwen/qwen3.5-9b"},
+        },
+    )
+
+    reloaded = _write_and_reload(tmp_path, config)
+
+    assert reloaded.pipeline.auto_approve is True
+    assert reloaded.pipeline.auto_commit is False
+    assert reloaded.pipeline.concept_draft_soft_cap == "article_max_tokens"
+
+
+def test_ollama_compare_materialization_keeps_existing_soft_cap(tmp_path):
+    config = Config(
+        vault=str(tmp_path / "active"),
+        providers={"default": ProviderBlock(name="ollama", url="http://localhost:11434")},
+        models={
+            "fast": {"provider": "default", "model": "gemma4:e4b"},
+            "heavy": {"provider": "default", "model": "qwen2.5:14b"},
+        },
+    )
+
+    reloaded = _write_and_reload(tmp_path, config)
+
+    assert reloaded.pipeline.concept_draft_soft_cap == 2400

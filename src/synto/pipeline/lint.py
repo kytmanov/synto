@@ -240,7 +240,7 @@ def _check_malformed_latex(rel_path: str, body: str, issues: list[LintIssue]) ->
 def _check_stale_lock(config: Config, issues: list[LintIssue]) -> None:
     import os
 
-    from .lock import effective_app_dir, has_invalid_lock_file, lock_holder_pid
+    from .lock import _IS_POSIX, effective_app_dir, has_invalid_lock_file, lock_holder_pid
 
     lock_path = effective_app_dir(config.vault) / "pipeline.lock"
     if not lock_path.exists():
@@ -265,6 +265,11 @@ def _check_stale_lock(config: Config, issues: list[LintIssue]) -> None:
     except (ValueError, OSError):
         pass
     if lock_holder_pid(config.vault) is None:
+        # On POSIX the flock lives on the open fd, not the filename. A leftover
+        # pipeline.lock file after release is normal and does not block a future
+        # acquire, so only invalid lock-file contents are worth flagging here.
+        if _IS_POSIX:
+            return
         try:
             pid: int | str = int(lock_path.read_text().strip())
         except Exception:
@@ -367,6 +372,10 @@ def _title_from_file(path: Path) -> str:
         return path.stem
 
 
+def _vault_rel_path(path: Path, vault: Path) -> str:
+    return path.relative_to(vault).as_posix()
+
+
 def _normalized_graph_title(title: str) -> str:
     return re.sub(r"\s+", " ", title.replace("-", " ").strip()).casefold()
 
@@ -412,7 +421,7 @@ def _add_graph_quality_issues(
             if _OBSIDIAN_EMBED_RE.search(body):
                 issues.append(
                     LintIssue(
-                        path=str(draft.relative_to(config.vault)),
+                        path=_vault_rel_path(draft, config.vault),
                         issue_type="graph_noise",
                         description=(
                             "Draft contains media embeds that create attachment nodes in graph view"
@@ -443,11 +452,11 @@ def _add_graph_quality_issues(
         suffix = "" if len(duplicate_examples) == 1 else f" and {len(duplicate_examples) - 1} more"
         issues.append(
             LintIssue(
-                path=str(example_source.relative_to(config.vault)),
+                path=_vault_rel_path(example_source, config.vault),
                 issue_type="graph_noise",
                 description=(
                     "Source summary titles closely duplicate raw note titles, e.g. "
-                    f"{example_raw.relative_to(config.vault)}{suffix}"
+                    f"{_vault_rel_path(example_raw, config.vault)}{suffix}"
                 ),
                 suggestion="Filter raw/ or wiki/sources/ from Obsidian graph view.",
                 auto_fixable=False,
@@ -480,7 +489,7 @@ def _add_graph_quality_issues(
         suffix = "" if len(disconnected) == 1 else f" and {len(disconnected) - 1} more"
         issues.append(
             LintIssue(
-                path=str(example.relative_to(config.vault)),
+                path=_vault_rel_path(example, config.vault),
                 issue_type="graph_connectivity",
                 description=(
                     "Generated drafts have no links to other concept drafts, e.g. "
@@ -628,7 +637,7 @@ def run_lint(config: Config, db: StateDB, fix: bool = False) -> LintResult:
     all_pages = _all_wiki_pages(config)
 
     for page in pages:
-        rel_path = str(page.relative_to(config.vault))
+        rel_path = _vault_rel_path(page, config.vault)
 
         try:
             meta, body = parse_note(page)
@@ -762,7 +771,7 @@ def run_lint(config: Config, db: StateDB, fix: bool = False) -> LintResult:
     for page in all_pages:
         if page in concept_page_paths:
             continue  # already checked above
-        rel_path = str(page.relative_to(config.vault))
+        rel_path = _vault_rel_path(page, config.vault)
         try:
             meta, body = parse_note(page)
         except Exception as exc:
@@ -835,7 +844,7 @@ def run_lint(config: Config, db: StateDB, fix: bool = False) -> LintResult:
     # Scan raw/ for missing media (outside wiki denominator → advisory)
     if config.raw_dir.exists():
         for raw_note in sorted(config.raw_dir.glob("*.md")):
-            rel_path = str(raw_note.relative_to(config.vault))
+            rel_path = _vault_rel_path(raw_note, config.vault)
             try:
                 _, body = parse_note(raw_note)
             except Exception:
@@ -843,7 +852,7 @@ def run_lint(config: Config, db: StateDB, fix: bool = False) -> LintResult:
             _check_missing_media(rel_path, body, config.vault, issues)
 
     for page in sorted(config.synthesis_dir.glob("*.md")) if config.synthesis_dir.exists() else []:
-        rel_path = str(page.relative_to(config.vault))
+        rel_path = _vault_rel_path(page, config.vault)
         db_rec = db_articles.get(rel_path)
         if db_rec is None:
             issues.append(
@@ -905,7 +914,7 @@ def run_lint(config: Config, db: StateDB, fix: bool = False) -> LintResult:
                 )
                 continue
 
-            resolved_rel = str(resolved.relative_to(config.vault))
+            resolved_rel = _vault_rel_path(resolved, config.vault)
             if resolved_rel in synthesis_db_paths or "synthesis" in resolved.parts:
                 issues.append(
                     LintIssue(

@@ -209,7 +209,7 @@ $OLW compile 2>&1
 $OLW approve --all 2>&1
 
 check "at least one wiki article published" \
-  "find '$VAULT_DIR/wiki' -maxdepth 1 -name '*.md' | grep -q ."
+  "find '$VAULT_DIR/wiki' -maxdepth 1 -name '*.md' ! -name 'index.md' ! -name 'log.md' | grep -q ."
 
 # ── Section B: discover the concept + plant an inbound link ────────────────────
 header "concept rename"
