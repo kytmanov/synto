@@ -390,11 +390,32 @@ idle — that is expected, not a hang.
 
 For remote MCP clients that support Streamable HTTP, run:
 ```bash
-synto serve --vault ~/my-wiki --transport streamable-http --name synto --host 0.0.0.0 --port 8000
+synto serve --vault ~/my-wiki --transport streamable-http --host 127.0.0.1 --port 8000
 ```
-Then connect the client to `http://<server-host>:8000/mcp`. This mode has no built-in
-authentication; bind to `127.0.0.1` for local-only access, or expose `0.0.0.0` only on
-a trusted network or behind a firewall/reverse proxy.
+Then connect the client to `http://127.0.0.1:8000/mcp`. To reach it from another machine,
+bind a routable address — `--host 0.0.0.0` — and treat it as a trusted-network-only or
+behind-a-proxy deployment.
+
+This mode has **no authentication**; control access with a trusted network, firewall, or
+reverse proxy. DNS-rebinding protection is enforced: only `Host` headers for loopback and
+the bind address are accepted. When fronting it with a reverse proxy (which forwards its
+own public hostname), add that hostname so requests are not rejected:
+```bash
+synto serve --vault ~/my-wiki --transport streamable-http --host 127.0.0.1 \
+  --allowed-host synto.example.com
+```
+
+If you bind wildcard IPv6 with `--host ::`, Synto still auto-allows only loopback.
+Add any remote IPv6 literal or public hostname explicitly, for example:
+```bash
+synto serve --vault ~/my-wiki --transport streamable-http --host :: \
+  --allowed-host "[2001:db8::5]"
+```
+
+Note: source-access privacy applies over HTTP exactly as locally. If no source declares a
+license, the privacy gate opens to `all` and raw source text becomes readable by any
+connected client — far riskier over a network. Declare licenses or set `[mcp.source_access]`
+in `synto.toml` before exposing the server.
 
 ---
 
