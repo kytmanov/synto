@@ -10,7 +10,6 @@ import hashlib
 import json
 import logging
 import re
-import unicodedata
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -20,10 +19,13 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel as _BaseModel
 
+from ..concept_text import _PAREN_ABBR_RE
+from ..concept_text import base_concept_name as _base_concept_name
+from ..concept_text import clean_concept_text as _clean_concept_text
+from ..concept_text import concept_key as _concept_key
 from ..config import Config
 from ..models import AnalysisResult, Concept, RawNoteRecord, SourceSegment, TermExtractionResult
 from ..paths import rel_posix
-from ..sanitize import clean_display_name
 from ..state import StateDB
 from ..structured_output import request_structured
 
@@ -640,40 +642,8 @@ _NOISE_CONCEPT_KEYS = frozenset(
     }
 )
 
-_PAREN_ABBR_RE = re.compile(r"^(?P<base>.+?)\s*\((?P<abbr>[A-ZА-Я0-9][A-ZА-Я0-9.+-]{1,8})\)$")
-_SURROUNDING_QUOTES_RE = re.compile(r"^[`'\"“”‘’«»]+|[`'\"“”‘’«»]+$")
 _REWRITE_ALIAS_PREFIX = "__synto_rewrite_alias__:"
 _LEGACY_REWRITE_ALIAS_PREFIX = "__olw_rewrite_alias__:"
-
-
-def _clean_concept_text(text: str) -> str:
-    text = unicodedata.normalize("NFKC", text).strip()
-    text = _SURROUNDING_QUOTES_RE.sub("", text).strip()
-    # Drop dangling/unbalanced punctuation (e.g. "Phase II)") so a stray char can't mint a concept
-    # name that diverges into its own file. Runs before _base_concept_name, which expects balanced
-    # "(ABBR)" and is unaffected — clean_display_name only trims unbalanced edge brackets.
-    text = clean_display_name(text)
-    return re.sub(r"\s+", " ", text)
-
-
-def _concept_key(text: str) -> str:
-    """Deterministic key for safe concept matching; not used as display text."""
-    text = _clean_concept_text(text).casefold()
-    text = re.sub(r"[_\-/:]+", " ", text)
-    text = re.sub(r"[^\w\s]+", " ", text, flags=re.UNICODE)
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def _base_concept_name(text: str) -> str:
-    """Strip only safe parenthetical abbreviations, e.g. Extreme Programming (XP)."""
-    cleaned = _clean_concept_text(text)
-    match = _PAREN_ABBR_RE.match(cleaned)
-    if not match:
-        return cleaned
-    abbr = match.group("abbr")
-    if not abbr.isupper():
-        return cleaned
-    return match.group("base").strip()
 
 
 def _safe_aliases_for_name(text: str) -> list[str]:
@@ -933,6 +903,12 @@ def _load_source_concept_seeds_from_index(config: Config) -> dict[str, tuple[str
         concepts: list[str] = []
         seen: set[str] = set()
         for concept in raw_concepts:
+            # Accept both legacy string format and new {name, entity_id} dict format.
+            if isinstance(concept, dict):
+                raw_name = concept.get("name")
+                if not isinstance(raw_name, str):
+                    continue
+                concept = raw_name
             if not isinstance(concept, str):
                 continue
             cleaned = _clean_concept_text(concept)

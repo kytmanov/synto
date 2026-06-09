@@ -44,6 +44,7 @@
         "required": ["id", "name", "path", "summary", "tags", "aliases", "confidence"],
         "properties": {
           "id": {"type": "string"},
+          "entity_id": {"type": "string"},
           "name": {"type": "string", "minLength": 1},
           "path": {"type": "string", "minLength": 1},
           "summary": {"type": ["string", "null"]},
@@ -53,6 +54,9 @@
         },
         "additionalProperties": false
       }
+    },
+    "identity_log": {
+      "type": "array"
     },
     "terms": {
       "type": "array"
@@ -83,7 +87,20 @@
           "content_hash": {"type": "string", "minLength": 1},
           "concepts": {
             "type": "array",
-            "items": {"type": "string", "minLength": 1}
+            "items": {
+              "oneOf": [
+                {"type": "string", "minLength": 1},
+                {
+                  "type": "object",
+                  "required": ["name", "entity_id"],
+                  "properties": {
+                    "name": {"type": "string", "minLength": 1},
+                    "entity_id": {"type": "string"}
+                  },
+                  "additionalProperties": false
+                }
+              ]
+            }
           }
         },
         "additionalProperties": false

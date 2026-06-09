@@ -21,6 +21,8 @@ Schema versioning: schema_version table tracks migration level.
   v14 — drop dead v8 metadata columns from raw_notes (superseded by
          source_documents in v9): source_type, origin_uri, imported_at,
          normalized_hash, extractor_version
+  v18 — concept_entities + concept_labels (entity identity layer; backfill from
+         concepts + concept_aliases; resolve_label seam; INDEX.json seed extended)
 """
 
 from __future__ import annotations
@@ -35,9 +37,12 @@ import time
 import types
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 
+from .concept_text import concept_key as _ck
+from .concept_text import match_key as _mk
 from .models import ItemMentionRecord, KnowledgeItemRecord, RawNoteRecord, WikiArticleRecord
 from .paths import rel_posix, to_posix
 
@@ -121,7 +126,17 @@ def _fts5_available(conn: sqlite3.Connection) -> bool:
         return False
 
 
-_CURRENT_SCHEMA_VERSION = 17
+_CURRENT_SCHEMA_VERSION = 18
+
+
+@dataclass
+class ResolveResult:
+    """Result from resolve_label: a list of entity IDs + ambiguity flag."""
+
+    ids: list[str] = field(default_factory=list)
+    ambiguous: bool = False
+
+
 _CHECKPOINT_SCHEMA_VERSION = 2
 _SESSION_IDLE_GAP_SECONDS = 1800  # 30-min idle gap that splits MCP sessions in the backlog report
 
@@ -376,6 +391,35 @@ CREATE TABLE IF NOT EXISTS concept_occurrences (
 );
 
 CREATE INDEX IF NOT EXISTS idx_concept_occurrences_concept ON concept_occurrences(concept_name);
+
+CREATE TABLE IF NOT EXISTS concept_entities (
+    id          TEXT PRIMARY KEY,
+    kind        TEXT NOT NULL DEFAULT 'concept',
+    status      TEXT NOT NULL DEFAULT 'active'
+                    CHECK (status IN ('active', 'merged')),
+    merged_into TEXT,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS concept_labels (
+    entity_id  TEXT NOT NULL REFERENCES concept_entities(id),
+    label      TEXT NOT NULL,
+    label_key  TEXT NOT NULL,
+    match_key  TEXT NOT NULL,
+    role       TEXT NOT NULL CHECK (role IN ('preferred', 'alias')),
+    source     TEXT NOT NULL
+                   CHECK (source IN ('extracted', 'user', 'rename', 'legacy_backfill')),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (entity_id, label_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_concept_labels_label_key ON concept_labels(label_key);
+CREATE INDEX IF NOT EXISTS idx_concept_labels_match_key ON concept_labels(match_key);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_concept_labels_preferred_global
+    ON concept_labels(label_key) WHERE role = 'preferred';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_concept_labels_preferred_per_entity
+    ON concept_labels(entity_id) WHERE role = 'preferred';
 """
 
 # v17 separator-collision tables resolved by recency, not "POSIX wins" (issue #55 follow-up).
@@ -725,6 +769,40 @@ _VERSIONED_MIGRATIONS: dict[int, list[str]] = {
     15: [],  # all v15 work happens in the post-hook below for atomicity
     16: [],  # all v16 work happens in the post-hook below for atomicity
     17: [],  # all v17 work happens in the post-hook below for atomicity
+    18: [
+        # Entity identity layer: stable opaque IDs + label sets (feature 45, Phase 1).
+        # Backfill from concepts + concept_aliases happens in the post-hook.
+        """CREATE TABLE IF NOT EXISTS concept_entities (
+               id          TEXT PRIMARY KEY,
+               kind        TEXT NOT NULL DEFAULT 'concept',
+               status      TEXT NOT NULL DEFAULT 'active'
+                               CHECK (status IN ('active', 'merged')),
+               merged_into TEXT,
+               created_at  TEXT NOT NULL,
+               updated_at  TEXT NOT NULL
+           )""",
+        """CREATE TABLE IF NOT EXISTS concept_labels (
+               entity_id  TEXT NOT NULL REFERENCES concept_entities(id),
+               label      TEXT NOT NULL,
+               label_key  TEXT NOT NULL,
+               match_key  TEXT NOT NULL,
+               role       TEXT NOT NULL CHECK (role IN ('preferred', 'alias')),
+               source     TEXT NOT NULL
+                              CHECK (source IN ('extracted', 'user', 'rename', 'legacy_backfill')),
+               created_at TEXT NOT NULL,
+               PRIMARY KEY (entity_id, label_key)
+           )""",
+        "CREATE INDEX IF NOT EXISTS idx_concept_labels_label_key ON concept_labels(label_key)",
+        "CREATE INDEX IF NOT EXISTS idx_concept_labels_match_key ON concept_labels(match_key)",
+        (
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_concept_labels_preferred_global"
+            " ON concept_labels(label_key) WHERE role = 'preferred'"
+        ),
+        (
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_concept_labels_preferred_per_entity"
+            " ON concept_labels(entity_id) WHERE role = 'preferred'"
+        ),
+    ],
 }
 
 
@@ -904,6 +982,8 @@ class StateDB:
                 self._create_source_segments_fts_v16()
             if version == 17:
                 self._normalize_path_separators_v17()
+            if version == 18:
+                self._backfill_entities_v18()
             with self._tx():
                 self._conn.execute(
                     "INSERT OR REPLACE INTO schema_version (id, version) VALUES (1, ?)",
@@ -1287,6 +1367,121 @@ class StateDB:
                 self._conn.execute(_VERSIONED_MIGRATIONS[6][3])
                 self._conn.execute(_VERSIONED_MIGRATIONS[6][4])
 
+    def _backfill_entities_v18(self) -> None:
+        """Populate concept_entities + concept_labels from existing concepts + concept_aliases.
+
+        Idempotent: skips the whole backfill if concept_entities already has rows.
+        One entity per distinct canonical concept name; aliases from concept_aliases
+        land as role='alias', source='legacy_backfill' (untrusted, not blessed).
+        match_key collisions among preferred labels are expected (User/Users, issue #54)
+        and are logged as the dedup worklist — they do not abort the migration.
+        """
+        existing = self._conn.execute("SELECT COUNT(*) FROM concept_entities").fetchone()[0]
+        if existing > 0:
+            return
+
+        now = datetime.now().isoformat()
+        names = self._conn.execute("SELECT DISTINCT name FROM concepts ORDER BY name").fetchall()
+
+        # Pass 1: create entities + preferred labels, build name→entity_id mapping.
+        name_to_id: dict[str, str] = {}
+        seen_preferred_keys: set[str] = set()
+        with self._tx():
+            for row in names:
+                name = row[0]
+                lk = _ck(name)
+                mk = _mk(name)
+                if not lk:
+                    continue
+                if lk in seen_preferred_keys:
+                    # Collision: two concept names share a label_key — log and skip.
+                    log.warning(
+                        "v18 backfill: label_key collision for %r, skipping entity creation",
+                        name,
+                    )
+                    continue
+                seen_preferred_keys.add(lk)
+                entity_id = _generate_article_id()
+                name_to_id[name] = entity_id
+                self._conn.execute(
+                    "INSERT INTO concept_entities (id, kind, status, created_at, updated_at)"
+                    " VALUES (?, 'concept', 'active', ?, ?)",
+                    (entity_id, now, now),
+                )
+                self._conn.execute(
+                    "INSERT INTO concept_labels"
+                    " (entity_id, label, label_key, match_key, role, source, created_at)"
+                    " VALUES (?, ?, ?, ?, 'preferred', 'extracted', ?)",
+                    (entity_id, name, lk, mk, now),
+                )
+
+        # Pass 2: import aliases from concept_aliases (legacy_backfill = untrusted).
+        if not self._has_table("concept_aliases"):
+            return
+        alias_rows = self._conn.execute(
+            "SELECT concept_name, alias FROM concept_aliases ORDER BY concept_name, alias"
+        ).fetchall()
+
+        # Also add knowledge_items names not yet in concepts (orphan KI rows).
+        ki_names = self._conn.execute(
+            "SELECT name FROM knowledge_items WHERE kind = 'concept'"
+            " AND name NOT IN (SELECT DISTINCT name FROM concepts)"
+        ).fetchall()
+        with self._tx():
+            for ki_row in ki_names:
+                name = ki_row[0]
+                lk = _ck(name)
+                mk = _mk(name)
+                if not lk or lk in seen_preferred_keys:
+                    continue
+                seen_preferred_keys.add(lk)
+                entity_id = _generate_article_id()
+                name_to_id[name] = entity_id
+                self._conn.execute(
+                    "INSERT INTO concept_entities (id, kind, status, created_at, updated_at)"
+                    " VALUES (?, 'concept', 'active', ?, ?)",
+                    (entity_id, now, now),
+                )
+                self._conn.execute(
+                    "INSERT INTO concept_labels"
+                    " (entity_id, label, label_key, match_key, role, source, created_at)"
+                    " VALUES (?, ?, ?, ?, 'preferred', 'extracted', ?)",
+                    (entity_id, name, lk, mk, now),
+                )
+
+        with self._tx():
+            for alias_row in alias_rows:
+                concept_name, alias = alias_row[0], alias_row[1]
+                entity_id = name_to_id.get(concept_name)
+                if entity_id is None:
+                    continue
+                alias_lk = _ck(alias)
+                if not alias_lk or alias_lk == _ck(concept_name):
+                    continue  # self-alias or empty
+                try:
+                    self._conn.execute(
+                        "INSERT INTO concept_labels"
+                        " (entity_id, label, label_key, match_key, role, source, created_at)"
+                        " VALUES (?, ?, ?, ?, 'alias', 'legacy_backfill', ?)",
+                        (entity_id, alias, alias_lk, _mk(alias), now),
+                    )
+                except sqlite3.IntegrityError:
+                    pass  # (entity_id, label_key) duplicate — already have this alias
+
+        match_key_counts: dict[str, int] = {}
+        mk_rows = self._conn.execute(
+            "SELECT match_key FROM concept_labels WHERE role = 'preferred'"
+        ).fetchall()
+        for r in mk_rows:
+            match_key_counts[r[0]] = match_key_counts.get(r[0], 0) + 1
+        collisions = [(mk_v, n) for mk_v, n in match_key_counts.items() if n > 1]
+        if collisions:
+            log.info(
+                "v18 backfill: %d match_key collision(s) among preferred labels"
+                " (merge candidates — run `synto doctor` for details)",
+                len(collisions),
+            )
+
     def _backfill_compile_state_v6(self) -> None:
         self._ensure_compile_state_rows()
         alias_rows = self._conn.execute(
@@ -1566,6 +1761,7 @@ class StateDB:
 
     def upsert_concepts(self, source_path: str, concept_names: list[str]) -> None:
         """Link concept names to a source note (idempotent)."""
+        now = datetime.now().isoformat()
         with self._tx():
             for name in concept_names:
                 name = name.strip()
@@ -1575,6 +1771,7 @@ class StateDB:
                     "INSERT OR IGNORE INTO concepts (name, source_path) VALUES (?, ?)",
                     (name, source_path),
                 )
+                self._ensure_entity_for_name(name, now)
                 now = datetime.now().isoformat()
                 self._conn.execute(
                     """INSERT OR IGNORE INTO knowledge_items
@@ -1640,6 +1837,7 @@ class StateDB:
                            updated_at=excluded.updated_at""",
                     (name, source_path, now),
                 )
+                self._ensure_entity_for_name(name, now)
         self.refresh_raw_compile_status(source_path)
 
     def list_all_concept_names(self) -> list[str]:
@@ -1655,26 +1853,129 @@ class StateDB:
         ).fetchall()
         return [r[0] for r in rows]
 
+    def _ensure_entity_for_name(self, name: str, now: str) -> str | None:
+        """Get or create an entity for a concept name (must be called inside a _tx).
+
+        Returns entity_id, or None if name produces an empty label_key.
+        Idempotent: a second call for the same name returns the existing entity_id.
+        """
+        if not self._has_table("concept_labels"):
+            return None
+        lk = _ck(name)
+        if not lk:
+            return None
+        row = self._conn.execute(
+            "SELECT entity_id FROM concept_labels WHERE label_key = ? AND role = 'preferred'",
+            (lk,),
+        ).fetchone()
+        if row:
+            return row[0]
+        entity_id = _generate_article_id()
+        self._conn.execute(
+            "INSERT INTO concept_entities (id, kind, status, created_at, updated_at)"
+            " VALUES (?, 'concept', 'active', ?, ?)",
+            (entity_id, now, now),
+        )
+        self._conn.execute(
+            "INSERT INTO concept_labels"
+            " (entity_id, label, label_key, match_key, role, source, created_at)"
+            " VALUES (?, ?, ?, ?, 'preferred', 'extracted', ?)",
+            (entity_id, name, lk, _mk(name), now),
+        )
+        return entity_id
+
+    # ── Entity identity (feature 45, Phase 1) ─────────────────────────────────
+
+    def resolve_label(self, text: str) -> ResolveResult:
+        """Resolve a label string to entity IDs. The single identity seam.
+
+        Returns ids=[] (unknown), ids=[id] (unambiguous), ids=[...] (ambiguous).
+        Phase 1 matches on exact label_key only. Phase 2 extends to match_key.
+        """
+        key = _ck(text)
+        if not key:
+            return ResolveResult()
+        if not self._has_table("concept_labels"):
+            return ResolveResult()
+        rows = self._conn.execute(
+            """
+            SELECT DISTINCT cl.entity_id
+            FROM concept_labels cl
+            JOIN concept_entities ce ON ce.id = cl.entity_id
+            WHERE cl.label_key = ? AND ce.status = 'active'
+            """,
+            (key,),
+        ).fetchall()
+        ids = [r[0] for r in rows]
+        return ResolveResult(ids=ids, ambiguous=len(ids) > 1)
+
+    def entity_id_for_name(self, name: str) -> str | None:
+        """Return entity_id for concept name, or None if not found / ambiguous."""
+        result = self.resolve_label(name)
+        if result.ambiguous or not result.ids:
+            return None
+        return result.ids[0]
+
+    def preferred_label_for_entity(self, entity_id: str) -> str | None:
+        """Return the preferred label string for a given entity_id."""
+        if not self._has_table("concept_labels"):
+            return None
+        row = self._conn.execute(
+            "SELECT label FROM concept_labels WHERE entity_id = ? AND role = 'preferred'",
+            (entity_id,),
+        ).fetchone()
+        return row[0] if row else None
+
+    # ── Alias facade (reimplemented on concept_labels; concept_aliases kept for Phase 3) ──
+
     def upsert_aliases(self, concept_name: str, aliases: list[str]) -> None:
         """Merge aliases for a concept. Skips self-matches (alias == canonical)."""
         canonical_lower = concept_name.lower()
+        canonical_key = _ck(concept_name)
+        now = datetime.now().isoformat()
         with self._tx():
+            # Ensure the entity exists (creates if missing — upsert_aliases asserts ownership).
+            entity_id = self._ensure_entity_for_name(concept_name, now)
             for alias in aliases:
                 alias = alias.strip()
                 if not alias or alias.lower() == canonical_lower:
                     continue
+                # Legacy dual-write — concept_aliases stays in sync until Phase 3 drops it.
                 self._conn.execute(
                     "INSERT OR IGNORE INTO concept_aliases (concept_name, alias) VALUES (?, ?)",
                     (concept_name, alias),
                 )
+                # Primary write: concept_labels.
+                if entity_id is not None:
+                    alias_lk = _ck(alias)
+                    if alias_lk and alias_lk != canonical_key:
+                        self._conn.execute(
+                            "INSERT INTO concept_labels"
+                            " (entity_id, label, label_key, match_key, role, source, created_at)"
+                            " VALUES (?, ?, ?, ?, 'alias', 'extracted', ?)"
+                            " ON CONFLICT(entity_id, label_key) DO NOTHING",
+                            (entity_id, alias, alias_lk, _mk(alias), now),
+                        )
 
     def get_aliases(self, concept_name: str) -> list[str]:
         """All aliases stored for a concept (case-insensitive match on concept_name)."""
-        if not self._has_table("concept_aliases"):
+        if not self._has_table("concept_labels"):
+            # Pre-v18 DB: fall back to concept_aliases.
+            if not self._has_table("concept_aliases"):
+                return []
+            rows = self._conn.execute(
+                "SELECT alias FROM concept_aliases"
+                " WHERE lower(concept_name) = lower(?) ORDER BY alias",
+                (concept_name,),
+            ).fetchall()
+            return [r[0] for r in rows]
+        entity_id = self.entity_id_for_name(concept_name)
+        if entity_id is None:
             return []
         rows = self._conn.execute(
-            "SELECT alias FROM concept_aliases WHERE lower(concept_name) = lower(?) ORDER BY alias",
-            (concept_name,),
+            "SELECT label FROM concept_labels"
+            " WHERE entity_id = ? AND role = 'alias' ORDER BY label",
+            (entity_id,),
         ).fetchall()
         return [r[0] for r in rows]
 
@@ -1683,84 +1984,135 @@ class StateDB:
 
     def resolve_alias(self, surface: str) -> str | None:
         """Return canonical concept name if surface unambiguously matches exactly one concept."""
-        rows = self._conn.execute(
-            "SELECT DISTINCT concept_name FROM concept_aliases WHERE lower(alias) = lower(?)",
-            (surface,),
-        ).fetchall()
-        if len(rows) == 1:
-            return rows[0][0]
-        return None
+        result = self.resolve_label(surface)
+        if result.ambiguous or not result.ids:
+            return None
+        return self.preferred_label_for_entity(result.ids[0])
 
     def list_alias_map(self) -> dict[str, str]:
-        """Return {lower(alias): canonical_name} for all unambiguous aliases.
+        """Return {label_key: canonical_name} for all unambiguous alias labels.
 
-        Aliases claimed by more than one concept are excluded — they are unsafe to rewrite.
+        Labels claimed by more than one active entity are excluded — they are unsafe to rewrite.
         """
+        if not self._has_table("concept_labels"):
+            # Pre-v18 fallback.
+            rows = self._conn.execute(
+                "SELECT lower(alias) as al, concept_name FROM concept_aliases"
+            ).fetchall()
+            counts: dict[str, int] = {}
+            mapping: dict[str, str] = {}
+            for al, canonical in rows:
+                counts[al] = counts.get(al, 0) + 1
+                mapping[al] = canonical
+            return {al: v for al, v in mapping.items() if counts[al] == 1}
         rows = self._conn.execute(
-            "SELECT lower(alias) as al, concept_name FROM concept_aliases"
+            """
+            SELECT cl.label_key, cl_p.label AS preferred
+            FROM concept_labels cl
+            JOIN concept_entities ce ON ce.id = cl.entity_id AND ce.status = 'active'
+            JOIN concept_labels cl_p ON cl_p.entity_id = ce.id AND cl_p.role = 'preferred'
+            WHERE cl.role = 'alias'
+            """
         ).fetchall()
-        counts: dict[str, int] = {}
-        mapping: dict[str, str] = {}
-        for al, canonical in rows:
-            counts[al] = counts.get(al, 0) + 1
-            mapping[al] = canonical
-        return {al: canonical for al, canonical in mapping.items() if counts[al] == 1}
+        counts2: dict[str, int] = {}
+        mapping2: dict[str, str] = {}
+        for alias_key, preferred in rows:
+            counts2[alias_key] = counts2.get(alias_key, 0) + 1
+            mapping2[alias_key] = preferred
+        return {k: v for k, v in mapping2.items() if counts2[k] == 1}
 
     def load_concept_alias_map(self) -> dict[str, list[str]]:
         """Return {concept_name: [aliases]} for all concepts with aliases.
 
         Used by query routing to bridge task-vocabulary questions to source-vocabulary
-        page titles. Empty dict on missing table (older DBs predate v4).
-
-        Excludes ambiguous aliases (claimed by >= 2 distinct concepts) — hinting
-        multiple concepts from one surface dilutes the routing signal.
+        page titles. Excludes ambiguous aliases (claimed by >= 2 distinct concepts).
         """
-        if not self._has_table("concept_aliases"):
-            return {}
+        if not self._has_table("concept_labels"):
+            # Pre-v18 fallback.
+            if not self._has_table("concept_aliases"):
+                return {}
+            rows = self._conn.execute(
+                """
+                SELECT concept_name, alias
+                FROM concept_aliases
+                WHERE lower(alias) NOT IN (
+                    SELECT lower(alias)
+                    FROM concept_aliases
+                    GROUP BY lower(alias)
+                    HAVING count(DISTINCT lower(concept_name)) >= 2
+                )
+                ORDER BY concept_name, alias
+                """
+            ).fetchall()
+            result: dict[str, list[str]] = {}
+            for concept_name, alias in rows:
+                result.setdefault(concept_name, []).append(alias)
+            return result
         rows = self._conn.execute(
             """
-            SELECT concept_name, alias
-            FROM concept_aliases
-            WHERE lower(alias) NOT IN (
+            SELECT cl_p.label AS concept_name, cl.label AS alias
+            FROM concept_labels cl
+            JOIN concept_entities ce ON ce.id = cl.entity_id AND ce.status = 'active'
+            JOIN concept_labels cl_p ON cl_p.entity_id = ce.id AND cl_p.role = 'preferred'
+            WHERE cl.role = 'alias'
+              AND cl.label_key NOT IN (
+                  SELECT label_key FROM concept_labels WHERE role = 'alias'
+                  GROUP BY label_key
+                  HAVING count(DISTINCT entity_id) >= 2
+              )
+            ORDER BY cl_p.label, cl.label
+            """
+        ).fetchall()
+        result2: dict[str, list[str]] = {}
+        for concept_name, alias in rows:
+            result2.setdefault(concept_name, []).append(alias)
+        return result2
+
+    def list_frequent_aliases(self, threshold: int = 2) -> list[str]:
+        """label_keys claimed by >= threshold distinct active entities.
+
+        Used at export time to filter ambiguous aliases. Language-agnostic.
+        """
+        if not self._has_table("concept_labels"):
+            if not self._has_table("concept_aliases"):
+                return []
+            rows = self._conn.execute(
+                """
                 SELECT lower(alias)
                 FROM concept_aliases
                 GROUP BY lower(alias)
-                HAVING count(DISTINCT lower(concept_name)) >= 2
-            )
-            ORDER BY concept_name, alias
-            """
-        ).fetchall()
-        result: dict[str, list[str]] = {}
-        for concept_name, alias in rows:
-            result.setdefault(concept_name, []).append(alias)
-        return result
-
-    def list_frequent_aliases(self, threshold: int = 2) -> list[str]:
-        """Aliases (lower-cased) claimed by >= threshold distinct concepts.
-
-        Used at export time to filter ambiguous aliases that can't be used for
-        concept lookup. Language-agnostic — works for any language.
-        """
-        if not self._has_table("concept_aliases"):
-            return []
+                HAVING count(DISTINCT lower(concept_name)) >= ?
+                """,
+                (threshold,),
+            ).fetchall()
+            return [r[0] for r in rows]
         rows = self._conn.execute(
             """
-            SELECT lower(alias)
-            FROM concept_aliases
-            GROUP BY lower(alias)
-            HAVING count(DISTINCT lower(concept_name)) >= ?
+            SELECT cl.label_key
+            FROM concept_labels cl
+            JOIN concept_entities ce ON ce.id = cl.entity_id AND ce.status = 'active'
+            WHERE cl.role = 'alias'
+            GROUP BY cl.label_key
+            HAVING count(DISTINCT cl.entity_id) >= ?
             """,
             (threshold,),
         ).fetchall()
         return [r[0] for r in rows]
 
     def delete_aliases_for_concept(self, concept_name: str) -> None:
-        """Remove all aliases for a concept (call when concept is removed)."""
+        """Remove all aliases for a concept."""
+        entity_id = self.entity_id_for_name(concept_name)
         with self._tx():
+            # Legacy dual-delete.
             self._conn.execute(
                 "DELETE FROM concept_aliases WHERE lower(concept_name) = lower(?)",
                 (concept_name,),
             )
+            if entity_id is not None:
+                self._conn.execute(
+                    "DELETE FROM concept_labels WHERE entity_id = ? AND role = 'alias'",
+                    (entity_id,),
+                )
 
     def get_concepts_for_sources(self, source_paths: list[str]) -> list[str]:
         """Concept names linked to any of the given source paths."""
@@ -1819,22 +2171,14 @@ class StateDB:
         q_lower = q.casefold()
         q_escaped = q_lower.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
-        row = self._conn.execute(
-            "SELECT DISTINCT name FROM concepts WHERE lower(name) = ? LIMIT 1",
-            (q_lower,),
-        ).fetchone()
-        if row:
-            name = row["name"]
-            return name, self.aliases_for_concept(name)
+        # Exact match via entity layer first.
+        result = self.resolve_label(q)
+        if result.ids and not result.ambiguous:
+            preferred = self.preferred_label_for_entity(result.ids[0])
+            if preferred:
+                return preferred, self.aliases_for_concept(preferred)
 
-        row = self._conn.execute(
-            "SELECT concept_name FROM concept_aliases WHERE lower(alias) = ? LIMIT 1",
-            (q_lower,),
-        ).fetchone()
-        if row:
-            name = row["concept_name"]
-            return name, self.aliases_for_concept(name)
-
+        # Substring fallback on canonical concept names (covers prefix/infix queries).
         row = self._conn.execute(
             "SELECT DISTINCT name FROM concepts WHERE lower(name) LIKE ? ESCAPE '\\' LIMIT 1",
             (f"%{q_escaped}%",),
@@ -2031,11 +2375,7 @@ class StateDB:
 
     def find_article_candidates(self, concept_name: str) -> list[WikiArticleRecord]:
         concept_lower = concept_name.casefold()
-        alias_rows = self._conn.execute(
-            "SELECT alias FROM concept_aliases WHERE lower(concept_name) = lower(?)",
-            (concept_name,),
-        ).fetchall()
-        aliases = {row[0].casefold() for row in alias_rows}
+        aliases = {a.casefold() for a in self.get_aliases(concept_name)}
 
         matches: list[WikiArticleRecord] = []
         for article in self.list_articles():
@@ -2069,7 +2409,23 @@ class StateDB:
             ):
                 if self._conn.execute(sql, (n,)).fetchone():
                     return True
-        # An alias `name` claimed by a *different* concept.
+        # An alias label_key claimed by a *different* entity.
+        if self._has_table("concept_labels"):
+            key = _ck(name)
+            ex_key = _ck(exclude_concept) if exclude_concept else None
+            row = self._conn.execute(
+                """
+                SELECT 1 FROM concept_labels cl
+                JOIN concept_entities ce ON ce.id = cl.entity_id AND ce.status = 'active'
+                JOIN concept_labels cl_p ON cl_p.entity_id = ce.id AND cl_p.role = 'preferred'
+                WHERE cl.label_key = ?
+                  AND (? IS NULL OR cl_p.label_key != ?)
+                LIMIT 1
+                """,
+                (key, ex_key, ex_key),
+            ).fetchone()
+            return row is not None
+        # Pre-v18 fallback.
         row = self._conn.execute(
             "SELECT 1 FROM concept_aliases "
             "WHERE lower(alias) = ? AND (? IS NULL OR lower(concept_name) != ?) LIMIT 1",
@@ -2083,21 +2439,12 @@ class StateDB:
         No substring fallback — use this for destructive operations (rename) where a
         fuzzy neighbour (e.g. "Net" -> "Network") would silently target the wrong
         concept. Fuzzy callers (ingest, query, MCP) want find_concept_by_name_or_alias.
-        Scope matches that helper: concepts + concept_aliases (not knowledge_items).
         """
-        q_lower = query.strip().casefold()
-        row = self._conn.execute(
-            "SELECT DISTINCT name FROM concepts WHERE lower(name) = ? LIMIT 1",
-            (q_lower,),
-        ).fetchone()
-        if row:
-            return row["name"], self.aliases_for_concept(row["name"])
-        row = self._conn.execute(
-            "SELECT concept_name FROM concept_aliases WHERE lower(alias) = ? LIMIT 1",
-            (q_lower,),
-        ).fetchone()
-        if row:
-            return row["concept_name"], self.aliases_for_concept(row["concept_name"])
+        result = self.resolve_label(query)
+        if result.ids and not result.ambiguous:
+            preferred = self.preferred_label_for_entity(result.ids[0])
+            if preferred:
+                return preferred, self.aliases_for_concept(preferred)
         return None
 
     def rename_concept(self, old_name: str, new_name: str) -> None:
@@ -2112,6 +2459,9 @@ class StateDB:
         item_mentions is intentionally left untouched: those rows are generic
         source-evidence mentions, not concept canonical binding.
         """
+        entity_id = self.entity_id_for_name(old_name)
+        new_lk = _ck(new_name)
+        new_mk = _mk(new_name)
         with self._tx():
             self._conn.execute(
                 "UPDATE concepts SET name = ? WHERE lower(name) = lower(?)",
@@ -2127,6 +2477,18 @@ class StateDB:
                 "WHERE lower(concept_name) = lower(?) AND lower(alias) = lower(?)",
                 (new_name, new_name),
             )
+            # Update concept_labels: change preferred label.
+            if entity_id is not None and new_lk:
+                # Drop any alias that would collide with the new preferred label_key first.
+                self._conn.execute(
+                    "DELETE FROM concept_labels WHERE entity_id=? AND role='alias' AND label_key=?",
+                    (entity_id, new_lk),
+                )
+                self._conn.execute(
+                    "UPDATE concept_labels SET label=?, label_key=?, match_key=?"
+                    " WHERE entity_id=? AND role='preferred'",
+                    (new_name, new_lk, new_mk, entity_id),
+                )
             self._conn.execute(
                 "UPDATE concept_compile_state SET concept_name = ? "
                 "WHERE lower(concept_name) = lower(?)",
@@ -2647,6 +3009,12 @@ class StateDB:
         return int(self._conn.execute("SELECT COUNT(DISTINCT name) FROM concepts").fetchone()[0])
 
     def count_aliases(self) -> int:
+        if self._has_table("concept_labels"):
+            return int(
+                self._conn.execute(
+                    "SELECT COUNT(*) FROM concept_labels WHERE role = 'alias'"
+                ).fetchone()[0]
+            )
         if not self._has_table("concept_aliases"):
             return 0
         return int(self._conn.execute("SELECT COUNT(*) FROM concept_aliases").fetchone()[0])

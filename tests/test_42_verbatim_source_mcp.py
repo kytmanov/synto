@@ -183,7 +183,7 @@ def test_fts5_migration_skipped_when_unavailable(tmp_path: Path, monkeypatch) ->
     db = StateDB(tmp_path / "state.db")
 
     version = db._conn.execute("SELECT version FROM schema_version WHERE id = 1").fetchone()[0]
-    assert version == 17, "schema must still advance even when FTS5 is unavailable"
+    assert version == 18, "schema must still advance even when FTS5 is unavailable"
     assert not db.source_segments_fts_exists(), "FTS table must not be created without FTS5"
     trigger_count = db._conn.execute(
         "SELECT count(*) FROM sqlite_master"
@@ -431,14 +431,9 @@ def test_get_source_passages_alias_resolution(vault: Path) -> None:
     db = StateDB(vault / ".synto" / "state.db")
     _insert_source(db, "book1")
     _insert_segment(db, "book1:p:0:aa", "book1", "the passage body", ordinal=0)
-    _insert_concept(db, "Quantum Mechanics")
+    db.replace_concepts_for_source("raw/book1.md", ["Quantum Mechanics"])
     _insert_occurrence(db, "Quantum Mechanics", "book1:p:0:aa")
-    # Insert alias
-    db._conn.execute(
-        "INSERT OR IGNORE INTO concept_aliases (concept_name, alias) VALUES (?, ?)",
-        ("Quantum Mechanics", "QM"),
-    )
-    db._conn.commit()
+    db.upsert_aliases("Quantum Mechanics", ["QM"])
     handlers = _make_handlers(vault, db)
     by_canonical = handlers["get_source_passages"]("Quantum Mechanics")
     by_alias = handlers["get_source_passages"]("QM")

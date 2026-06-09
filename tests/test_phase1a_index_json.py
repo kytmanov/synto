@@ -60,14 +60,20 @@ def test_generate_index_json_is_schema_valid_and_deterministic(vault, config, db
     assert payload["pack"]["capabilities"] == ["articles", "concepts"]
     assert payload["pack"]["language"] == ["fr"]
     assert payload["articles"][0]["aliases"] == ["Alias Topic"]
+    assert payload["articles"][0]["entity_id"] == db.entity_id_for_name("Topic")
+    assert payload["identity_log"] == []
     assert payload["papers"] == []
-    assert payload["source_concepts"] == [
-        {
-            "source_path": "raw/a.md",
-            "content_hash": "raw-h1",
-            "concepts": ["Second", "Topic"],
-        }
-    ]
+    sc = payload["source_concepts"]
+    assert len(sc) == 1
+    assert sc[0]["source_path"] == "raw/a.md"
+    assert sc[0]["content_hash"] == "raw-h1"
+    # concepts are now {name, entity_id} dicts; names must match (sorted)
+    assert [c["name"] for c in sc[0]["concepts"]] == ["Second", "Topic"]
+    assert all(isinstance(c["entity_id"], str) for c in sc[0]["concepts"])
+    # entity_ids must round-trip back to their preferred labels
+    assert all(
+        db.preferred_label_for_entity(c["entity_id"]) == c["name"] for c in sc[0]["concepts"]
+    )
 
 
 def test_generate_index_json_expands_capabilities_when_segments_exist(vault, config, db) -> None:
