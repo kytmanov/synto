@@ -1078,8 +1078,8 @@ def run_server(
     else:
         allowed = ", ".join(transport_security.allowed_hosts) if transport_security else ""
         ipv6_wildcard_note = (
-            "\n`--host ::` only auto-allows loopback; add remote IPv6 literals or public "
-            "hostnames with --allowed-host."
+            "`--host ::` only auto-allows loopback; add remote IPv6 literals or public "
+            "hostnames with --allowed-host.\n"
             if host == "::"
             else ""
         )
