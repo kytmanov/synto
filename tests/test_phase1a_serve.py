@@ -54,6 +54,7 @@ def test_serve_help_works():
     assert "--name" in result.output
     assert "--host" in result.output
     assert "--port" in result.output
+    assert "--allowed-host" in result.output
     assert "list_articles" in result.output
 
 
@@ -79,6 +80,8 @@ def test_serve_cli_passes_streamable_http_options(vault, monkeypatch) -> None:
             "0.0.0.0",
             "--port",
             "8765",
+            "--allowed-host",
+            "synto.example.com",
         ],
     )
 
@@ -91,6 +94,7 @@ def test_serve_cli_passes_streamable_http_options(vault, monkeypatch) -> None:
                 "name": "synto",
                 "host": "0.0.0.0",
                 "port": 8765,
+                "allowed_hosts": ("synto.example.com",),
             },
         )
     ]
@@ -173,12 +177,91 @@ def test_run_server_streamable_http_uses_remote_fastmcp_settings(
     assert fastmcp_cls.call_args.kwargs["port"] == 8765
     assert fastmcp_cls.call_args.kwargs["json_response"] is True
     assert fastmcp_cls.call_args.kwargs["stateless_http"] is True
+    # DNS-rebinding protection must be wired for the HTTP transport, with loopback
+    # always accepted so a non-routable bind is never silently left unprotected.
+    security = fastmcp_cls.call_args.kwargs["transport_security"]
+    assert security is not None
+    assert security.enable_dns_rebinding_protection is True
+    assert "127.0.0.1:*" in security.allowed_hosts
     fastmcp_cls.return_value.run.assert_called_once_with(transport="streamable-http")
 
     captured = capsys.readouterr()
     assert "synto MCP server ready (streamable-http)" in captured.err
     assert "http://0.0.0.0:8765/mcp" in captured.err
     assert "No authentication is enabled" in captured.err
+    assert "DNS-rebinding protection" in captured.err
+
+
+def test_dns_rebinding_settings_block_foreign_hosts_and_allow_declared_ones() -> None:
+    """The allow-list must reject an attacker-controlled Host (the rebinding vector)
+    while accepting loopback, the bind host, and operator-declared proxy hostnames —
+    verified against the SDK's real validator, not just our list-building."""
+    pytest.importorskip("mcp.server.transport_security")
+    from mcp.server.transport_security import TransportSecurityMiddleware
+
+    from synto.serve import _dns_rebinding_settings
+
+    settings = _dns_rebinding_settings("10.0.0.5", 8000, ("synto.example.com",))
+    guard = TransportSecurityMiddleware(settings)
+
+    assert guard._validate_host("127.0.0.1:8000") is True
+    assert guard._validate_host("10.0.0.5:8000") is True
+    assert guard._validate_host("synto.example.com") is True
+    assert guard._validate_host("evil.attacker.com") is False
+    assert guard._validate_host(None) is False
+
+    # A reverse proxy forwards its own public Host/Origin. The host already passed
+    # above; the origin must pass on BOTH the default-port (omitted) and an explicit
+    # non-default port — the bug that made --allowed-host misleading for proxies.
+    assert guard._validate_origin("https://synto.example.com") is True
+    assert guard._validate_origin("https://synto.example.com:8443") is True
+    assert guard._validate_origin("https://evil.attacker.com:8443") is False
+
+
+def test_dns_rebinding_settings_bracket_ipv6_bind() -> None:
+    """An explicit IPv6 bind must accept bracketed Host/Origin headers ([addr]:port),
+    the only form HTTP uses — a bare allow-list entry silently rejects them."""
+    pytest.importorskip("mcp.server.transport_security")
+    from mcp.server.transport_security import TransportSecurityMiddleware
+
+    from synto.serve import _dns_rebinding_settings
+
+    guard = TransportSecurityMiddleware(_dns_rebinding_settings("2001:db8::5", 8000, ()))
+
+    assert guard._validate_host("[2001:db8::5]:8000") is True
+    assert guard._validate_origin("https://[2001:db8::5]:8000") is True
+    assert guard._validate_host("[2001:db8::99]:8000") is False
+
+
+def test_dns_rebinding_settings_wildcard_ipv6_requires_explicit_allow_list() -> None:
+    """`--host ::` should not imply trust for every routable IPv6 on the machine.
+
+    Wildcard IPv6 binds stay loopback-only unless the operator explicitly names the
+    public literal/hostname with --allowed-host.
+    """
+    pytest.importorskip("mcp.server.transport_security")
+    from mcp.server.transport_security import TransportSecurityMiddleware
+
+    from synto.serve import _dns_rebinding_settings
+
+    guard = TransportSecurityMiddleware(_dns_rebinding_settings("::", 8000, ()))
+
+    assert guard._validate_host("[::1]:8000") is True
+    assert guard._validate_origin("https://[::1]:8000") is True
+    assert guard._validate_host("[2001:db8::5]:8000") is False
+    assert guard._validate_origin("https://[2001:db8::5]:8000") is False
+
+
+def test_dns_rebinding_settings_wildcard_ipv6_accepts_explicit_allowed_host() -> None:
+    pytest.importorskip("mcp.server.transport_security")
+    from mcp.server.transport_security import TransportSecurityMiddleware
+
+    from synto.serve import _dns_rebinding_settings
+
+    guard = TransportSecurityMiddleware(_dns_rebinding_settings("::", 8000, ("[2001:db8::5]",)))
+
+    assert guard._validate_host("[2001:db8::5]:8000") is True
+    assert guard._validate_origin("https://[2001:db8::5]:8000") is True
 
 
 def test_mcp_sdk_fastmcp_api_is_compatible_when_installed():

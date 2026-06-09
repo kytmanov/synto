@@ -30,7 +30,7 @@ dependencies = [
     "python-frontmatter>=1.1",
     "python-ulid>=2.0",
     "pymupdf4llm>=0.0.5",
-    "mcp>=1.0,<2.0",
+    "mcp>=1.10,<2.0",
     "tomli-w>=1.2.0",
 ]
 

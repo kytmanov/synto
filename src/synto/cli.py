@@ -2945,7 +2945,15 @@ def watch(vault_str, auto_approve):
     show_default=True,
     help="Port to bind in streamable-http mode.",
 )
-def serve(vault_str, transport, name, host, port):
+@click.option(
+    "--allowed-host",
+    "allowed_hosts",
+    multiple=True,
+    help="Extra Host header value to accept in streamable-http mode (DNS-rebinding "
+    "allow-list). Repeatable. Add your public/proxy hostname when behind a reverse proxy, "
+    "or a remote IPv6 literal when binding --host ::.",
+)
+def serve(vault_str, transport, name, host, port, allowed_hosts):
     """Run the read-only MCP server.
 
     Exposes read-only vault tools — articles (`list_articles`, `read_article`,
@@ -2954,12 +2962,21 @@ def serve(vault_str, transport, name, host, port):
     `answer_question` (the one tool that calls the configured model). Tool
     visibility and source access are controlled by `[mcp]` settings in `synto.toml`.
     `streamable-http` listens at /mcp and does not enable authentication; expose it
-    only on a trusted network or behind a proxy/firewall.
+    only on a trusted network or behind a proxy/firewall. It enforces DNS-rebinding
+    protection (loopback + the bind host are accepted; `--host ::` stays loopback-only
+    unless you add remote IPv6 literals/hostnames with --allowed-host).
     """
     from .serve import run_server
 
     config = _load_config(vault_str)
-    run_server(config.vault, transport=transport, name=name, host=host, port=port)
+    run_server(
+        config.vault,
+        transport=transport,
+        name=name,
+        host=host,
+        port=port,
+        allowed_hosts=allowed_hosts,
+    )
 
 
 # ── run ───────────────────────────────────────────────────────────────────────

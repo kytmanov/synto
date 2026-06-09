@@ -891,6 +891,114 @@ def build_tool_handlers(
     return handlers
 
 
+_IPV4_WILDCARD_BIND_HOSTS = {"0.0.0.0", ""}
+_IPV6_WILDCARD_BIND_HOSTS = {"::"}
+_LOOPBACK_BASE_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+
+def _detect_lan_ipv4() -> str | None:
+    """Best-effort local IPv4 for a wildcard (0.0.0.0) bind.
+
+    Uses a UDP socket whose connect() only sets the default route — no packets are
+    sent — so it works offline and reflects the address a LAN client would reach.
+    """
+    import socket
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("192.0.2.1", 80))  # TEST-NET-1, never routable
+        ip = s.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        s.close()
+    return ip if ip and not ip.startswith("127.") else None
+
+
+def _bracket_ipv6(host: str) -> str:
+    """Wrap a bare IPv6 literal in brackets so it matches HTTP Host/Origin syntax.
+
+    HTTP carries IPv6 as `[2001:db8::5]:8000`, but a bare address has no brackets.
+    Hostnames, IPv4, and already-bracketed values pass through unchanged.
+    """
+    import ipaddress
+
+    if host.startswith("["):
+        return host
+    try:
+        is_v6 = ipaddress.ip_address(host).version == 6
+    except ValueError:
+        return host
+    return f"[{host}]" if is_v6 else host
+
+
+def _split_host_port(value: str) -> tuple[str, str | None]:
+    """Split an --allowed-host value into (base, port), handling bracketed/bare IPv6."""
+    import ipaddress
+
+    if value.startswith("["):
+        inner, _, rest = value[1:].partition("]")
+        return inner, (rest[1:] if rest.startswith(":") else None)
+    try:
+        if ipaddress.ip_address(value).version == 6:
+            return value, None  # bare IPv6: the colons are the address, not a port
+    except ValueError:
+        pass
+    base, _, port = value.partition(":")
+    return base, (port or None)
+
+
+def _dns_rebinding_settings(host: str, port: int, extra_hosts: tuple[str, ...]):
+    """Build DNS-rebinding protection for the streamable-http transport.
+
+    The MCP SDK rejects any request whose Host/Origin header is not allow-listed, the
+    standard defense against a browser being tricked into reaching a local/LAN server.
+    We seed the allow-list from what the bind implies — loopback always, the concrete
+    bind host, and (for a 0.0.0.0 bind) the detected LAN IPv4 — and let the operator add
+    public hostnames via --allowed-host so a reverse-proxy deployment, which forwards
+    its own Host header, is not silently blocked. `--host ::` stays loopback-only unless
+    the operator explicitly allow-lists a public hostname or IPv6 literal.
+    """
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    # Ordered de-dup (insertion order preserved) so the startup banner is deterministic.
+    allowed_hosts: dict[str, None] = {}
+    allowed_origins: dict[str, None] = {}
+
+    def _add(base: str, *, exact_port: str | None = None) -> None:
+        b = _bracket_ipv6(base)
+        # The bare entries are not optional: the SDK's `:*` pattern only matches when the
+        # header carries a port, so a proxy on 443 forwarding `Host: name` (default port
+        # omitted) would be rejected without them. `:*` does not over-match siblings.
+        allowed_hosts[b] = None
+        allowed_hosts[f"{b}:*"] = None
+        if exact_port:
+            allowed_hosts[f"{b}:{exact_port}"] = None
+        for scheme in ("http", "https"):
+            allowed_origins[f"{scheme}://{b}"] = None
+            allowed_origins[f"{scheme}://{b}:*"] = None
+
+    for base in _LOOPBACK_BASE_HOSTS:
+        _add(base)
+    if host in _IPV4_WILDCARD_BIND_HOSTS:
+        lan = _detect_lan_ipv4()
+        if lan:
+            _add(lan)
+    elif host in _IPV6_WILDCARD_BIND_HOSTS:
+        pass
+    else:
+        _add(host)
+    for raw in extra_hosts:
+        base, raw_port = _split_host_port(raw)
+        _add(base, exact_port=raw_port)
+
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=list(allowed_hosts),
+        allowed_origins=list(allowed_origins),
+    )
+
+
 def run_server(
     vault: Path,
     transport: str = "stdio",
@@ -898,6 +1006,7 @@ def run_server(
     name: str | None = None,
     host: str = "127.0.0.1",
     port: int = 8000,
+    allowed_hosts: tuple[str, ...] = (),
 ) -> None:
     if transport not in {"stdio", "streamable-http"}:
         raise RuntimeError("supported MCP transports are stdio and streamable-http")
@@ -935,6 +1044,11 @@ def run_server(
             "synto.toml, to engage the privacy gate."
         )
     server_name = name or _server_name(vault)
+    transport_security = (
+        _dns_rebinding_settings(host, port, allowed_hosts)
+        if transport == "streamable-http"
+        else None
+    )
     server = FastMCP(
         server_name,
         instructions=_SERVER_INSTRUCTIONS,
@@ -942,6 +1056,7 @@ def run_server(
         port=port,
         json_response=True,
         stateless_http=transport == "streamable-http",
+        transport_security=transport_security,
     )
     handlers = build_tool_handlers(reader, config, db, vault_key, tool_error_cls=ToolError)
     for handler in handlers.values():
@@ -961,11 +1076,21 @@ def run_server(
             flush=True,
         )
     else:
+        allowed = ", ".join(transport_security.allowed_hosts) if transport_security else ""
+        ipv6_wildcard_note = (
+            "`--host ::` only auto-allows loopback; add remote IPv6 literals or public "
+            "hostnames with --allowed-host.\n"
+            if host == "::"
+            else ""
+        )
         print(
             f"synto MCP server ready (streamable-http) — vault: {vault}\n"
             f"Listening at http://{host}:{port}/mcp as {server_name!r}.\n"
             "No authentication is enabled; expose this only on a trusted network "
             "or behind a proxy/firewall.\n"
+            f"DNS-rebinding protection accepts Host headers: {allowed}.\n"
+            "Add public/proxy hostnames with --allowed-host if connections are rejected.\n"
+            f"{ipv6_wildcard_note}"
             "Press Ctrl-C to stop.",
             file=sys.stderr,
             flush=True,
