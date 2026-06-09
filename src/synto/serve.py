@@ -891,19 +891,23 @@ def build_tool_handlers(
     return handlers
 
 
-def run_server(vault: Path, transport: str = "stdio") -> None:
-    if transport != "stdio":
-        raise RuntimeError("Phase 1A supports only stdio transport")
+def run_server(
+    vault: Path,
+    transport: str = "stdio",
+    *,
+    name: str | None = None,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    if transport not in {"stdio", "streamable-http"}:
+        raise RuntimeError("supported MCP transports are stdio and streamable-http")
 
     # The CLI group callback installs a RichHandler pointing at sys.stdout for
-    # interactive use.  In stdio mode stdout is the JSON-RPC channel, so any
-    # log line written there corrupts the protocol.  Suppress the mcp library's
-    # INFO request tracing — it is noise to end users and not safe on this fd.
+    # interactive use. In stdio mode stdout is the JSON-RPC channel, so any log
+    # line written there corrupts the protocol. Route server-side logging to
+    # stderr for both transports so startup/status output is predictable.
     import logging as _logging
 
-    # stdout is the MCP JSON-RPC channel. Route ALL logging (ours + the SDK's
-    # WARNING/ERROR records) to stderr so no log line can corrupt the protocol
-    # stream. The MCP stdio spec explicitly allows server logs on stderr.
     root = _logging.getLogger()
     for handler in list(root.handlers):
         root.removeHandler(handler)
@@ -930,29 +934,44 @@ def run_server(vault: Path, transport: str = "stdio") -> None:
             "Declare licenses on your sources, or set [mcp.source_access] mode explicitly in "
             "synto.toml, to engage the privacy gate."
         )
+    server_name = name or _server_name(vault)
     server = FastMCP(
-        _server_name(vault),
+        server_name,
         instructions=_SERVER_INSTRUCTIONS,
+        host=host,
+        port=port,
         json_response=True,
+        stateless_http=transport == "streamable-http",
     )
     handlers = build_tool_handlers(reader, config, db, vault_key, tool_error_cls=ToolError)
     for handler in handlers.values():
         server.tool()(handler)
 
-    # A stdio MCP server blocks reading JSON-RPC from stdin and prints nothing,
-    # which looks like a hang to anyone who runs it by hand (see issue #30). Emit
-    # a startup line on stderr so the wait is legible. Real clients ignore/capture
-    # stderr; stdout stays reserved for the protocol.
-    print(
-        f"synto MCP server ready (stdio) — vault: {vault}\n"
-        "Waiting for an MCP client to connect; this terminal will stay idle until then.\n"
-        "Launch it from your MCP client config (Claude Code / Cursor / etc.), not by hand.\n"
-        "Press Ctrl-C to stop.",
-        file=sys.stderr,
-        flush=True,
-    )
+    if transport == "stdio":
+        # A stdio MCP server blocks reading JSON-RPC from stdin and prints nothing,
+        # which looks like a hang to anyone who runs it by hand (see issue #30). Emit
+        # a startup line on stderr so the wait is legible. Real clients ignore/capture
+        # stderr; stdout stays reserved for the protocol.
+        print(
+            f"synto MCP server ready (stdio) — vault: {vault}\n"
+            "Waiting for an MCP client to connect; this terminal will stay idle until then.\n"
+            "Launch it from your MCP client config (Claude Code / Cursor / etc.), not by hand.\n"
+            "Press Ctrl-C to stop.",
+            file=sys.stderr,
+            flush=True,
+        )
+    else:
+        print(
+            f"synto MCP server ready (streamable-http) — vault: {vault}\n"
+            f"Listening at http://{host}:{port}/mcp as {server_name!r}.\n"
+            "No authentication is enabled; expose this only on a trusted network "
+            "or behind a proxy/firewall.\n"
+            "Press Ctrl-C to stop.",
+            file=sys.stderr,
+            flush=True,
+        )
 
     try:
-        server.run(transport="stdio")
+        server.run(transport=transport)
     finally:
         db.close()

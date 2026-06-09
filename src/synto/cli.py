@@ -2922,12 +2922,30 @@ def watch(vault_str, auto_approve):
 @click.option("--vault", "vault_str", envvar=VAULT_ENV_VAR, default=None)
 @click.option(
     "--transport",
-    type=click.Choice(["stdio"]),
+    type=click.Choice(["stdio", "streamable-http"]),
     default="stdio",
     show_default=True,
-    help="Phase 1A supports only stdio transport.",
+    help="MCP transport: stdio for client-launched local mode, streamable-http for HTTP.",
 )
-def serve(vault_str, transport):
+@click.option(
+    "--name",
+    default=None,
+    help="MCP server name. Defaults to a vault-derived name.",
+)
+@click.option(
+    "--host",
+    default="127.0.0.1",
+    show_default=True,
+    help="Host/IP to bind in streamable-http mode.",
+)
+@click.option(
+    "--port",
+    type=click.IntRange(1, 65535),
+    default=8000,
+    show_default=True,
+    help="Port to bind in streamable-http mode.",
+)
+def serve(vault_str, transport, name, host, port):
     """Run the read-only MCP server.
 
     Exposes read-only vault tools — articles (`list_articles`, `read_article`,
@@ -2935,12 +2953,13 @@ def serve(vault_str, transport):
     (`list_sources`, `trace_lineage`), the verbatim source-segment tools, and
     `answer_question` (the one tool that calls the configured model). Tool
     visibility and source access are controlled by `[mcp]` settings in `synto.toml`.
-    Requires the optional MCP dependency: `pip install synto[mcp]`.
+    `streamable-http` listens at /mcp and does not enable authentication; expose it
+    only on a trusted network or behind a proxy/firewall.
     """
     from .serve import run_server
 
     config = _load_config(vault_str)
-    run_server(config.vault, transport=transport)
+    run_server(config.vault, transport=transport, name=name, host=host, port=port)
 
 
 # ── run ───────────────────────────────────────────────────────────────────────
