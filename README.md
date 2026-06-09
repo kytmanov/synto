@@ -379,14 +379,22 @@ synto query "what is consistent hashing?" --vault ~/my-wiki
 synto query "explain backpropagation" --vault ~/my-wiki --synthesize
 ```
 
-**Expose as MCP server** (Claude Code, Cursor, any MCP client). `synto serve` is a
-stdio server launched *by* the client, not run by hand — point your client's config at
-it:
+**Expose as MCP server** (Claude Code, Cursor, any MCP client). For local stdio mode,
+`synto serve` is launched *by* the client, not run by hand — point your client's config
+at it:
 ```json
 { "mcpServers": { "synto": { "command": "synto", "args": ["serve", "--vault", "~/my-wiki"] } } }
 ```
 Run by hand it will print a "waiting for a client" line on stderr and otherwise sit
 idle — that is expected, not a hang.
+
+For remote MCP clients that support Streamable HTTP, run:
+```bash
+synto serve --vault ~/my-wiki --transport streamable-http --name synto --host 0.0.0.0 --port 8000
+```
+Then connect the client to `http://<server-host>:8000/mcp`. This mode has no built-in
+authentication; bind to `127.0.0.1` for local-only access, or expose `0.0.0.0` only on
+a trusted network or behind a firewall/reverse proxy.
 
 ---
 
@@ -505,7 +513,7 @@ request as-is and override the matching first-class field, so set computed value
 
 - Full ingest → compile → approve pipeline; supports Markdown notes and Obsidian vaults
 - `synto pack export --target agents` — portable knowledge pack with `INDEX.json` and agent metadata
-- `synto serve` — MCP server with 12 tools. Eight wiki tools: `list_articles`, `read_article`, `find_concept`, `search_articles`, `get_concept`, `list_sources`, `trace_lineage`, `answer_question`. Four verbatim-source tools: `search_source_segments`, `get_source_passages`, `read_source_segment`, `list_segments`. Quality signals (`status`, `confidence`, `source_count`, `single_source`) are surfaced on every article ref so agents can self-filter; `min_status` defaults to `"published"` to keep drafts out of agent context.
+- `synto serve` — MCP server with stdio and Streamable HTTP transports, exposing 12 tools. Eight wiki tools: `list_articles`, `read_article`, `find_concept`, `search_articles`, `get_concept`, `list_sources`, `trace_lineage`, `answer_question`. Four verbatim-source tools: `search_source_segments`, `get_source_passages`, `read_source_segment`, `list_segments`. Quality signals (`status`, `confidence`, `source_count`, `single_source`) are surfaced on every article ref so agents can self-filter; `min_status` defaults to `"published"` to keep drafts out of agent context.
 - `synto doctor --backlog` — reads the MCP audit log to show what to ingest next: zero-result queries, single-source concepts in active demand, and the verbatim-vs-`answer_question` tool mix.
 - `synto query` — index-routed Q&A with optional synthesis to `wiki/synthesis/`
 - `synto review` — interactive draft review: approve, reject, edit, or diff before publishing

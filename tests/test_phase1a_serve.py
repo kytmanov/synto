@@ -50,7 +50,60 @@ def test_serve_help_works():
 
     assert result.exit_code == 0
     assert "stdio" in result.output
+    assert "streamable-http" in result.output
+    assert "--name" in result.output
+    assert "--host" in result.output
+    assert "--port" in result.output
     assert "list_articles" in result.output
+
+
+def test_serve_cli_passes_streamable_http_options(vault, monkeypatch) -> None:
+    calls = []
+
+    def fake_run_server(vault_path, **kwargs):
+        calls.append((vault_path, kwargs))
+
+    monkeypatch.setattr("synto.serve.run_server", fake_run_server)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "serve",
+            "--vault",
+            str(vault),
+            "--transport",
+            "streamable-http",
+            "--name",
+            "synto",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "8765",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls == [
+        (
+            vault.resolve(),
+            {
+                "transport": "streamable-http",
+                "name": "synto",
+                "host": "0.0.0.0",
+                "port": 8765,
+            },
+        )
+    ]
+
+
+def test_serve_cli_rejects_invalid_port(vault) -> None:
+    result = CliRunner().invoke(
+        cli,
+        ["serve", "--vault", str(vault), "--transport", "streamable-http", "--port", "70000"],
+    )
+
+    assert result.exit_code != 0
+    assert "Invalid value for '--port'" in result.output
 
 
 def test_run_server_prints_startup_banner_to_stderr_and_keeps_stdout_clean(
@@ -94,6 +147,38 @@ def test_run_server_prints_startup_banner_to_stderr_and_keeps_stdout_clean(
     assert "Press Ctrl-C to stop" in captured.err
     # stdout must stay pristine — a stray byte there corrupts the JSON-RPC stream.
     assert captured.out == ""
+
+
+def test_run_server_streamable_http_uses_remote_fastmcp_settings(
+    vault, monkeypatch, capsys
+) -> None:
+    pytest.importorskip("mcp.server.fastmcp")
+    from unittest.mock import MagicMock
+
+    from synto.serve import run_server
+
+    fastmcp_cls = MagicMock()
+    monkeypatch.setattr("mcp.server.fastmcp.FastMCP", fastmcp_cls)
+
+    run_server(
+        vault,
+        transport="streamable-http",
+        name="synto",
+        host="0.0.0.0",
+        port=8765,
+    )
+
+    assert fastmcp_cls.call_args.args[0] == "synto"
+    assert fastmcp_cls.call_args.kwargs["host"] == "0.0.0.0"
+    assert fastmcp_cls.call_args.kwargs["port"] == 8765
+    assert fastmcp_cls.call_args.kwargs["json_response"] is True
+    assert fastmcp_cls.call_args.kwargs["stateless_http"] is True
+    fastmcp_cls.return_value.run.assert_called_once_with(transport="streamable-http")
+
+    captured = capsys.readouterr()
+    assert "synto MCP server ready (streamable-http)" in captured.err
+    assert "http://0.0.0.0:8765/mcp" in captured.err
+    assert "No authentication is enabled" in captured.err
 
 
 def test_mcp_sdk_fastmcp_api_is_compatible_when_installed():

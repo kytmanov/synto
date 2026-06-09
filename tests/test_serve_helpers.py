@@ -145,9 +145,9 @@ def test_audit_db_error_does_not_raise():
     # No exception raised
 
 
-def test_run_server_rejects_non_stdio_transport():
-    """run_server raises RuntimeError for non-stdio transport."""
+def test_run_server_rejects_unknown_transport():
+    """run_server raises RuntimeError for unknown transports."""
     from synto.serve import run_server
 
-    with pytest.raises(RuntimeError, match="only stdio"):
+    with pytest.raises(RuntimeError, match="supported MCP transports"):
         run_server(Path("/tmp/vault"), transport="http")
