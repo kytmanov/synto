@@ -23,6 +23,7 @@ from ..concept_text import _PAREN_ABBR_RE
 from ..concept_text import base_concept_name as _base_concept_name
 from ..concept_text import clean_concept_text as _clean_concept_text
 from ..concept_text import concept_key as _concept_key
+from ..concept_text import match_key as _match_key
 from ..config import Config
 from ..models import AnalysisResult, Concept, RawNoteRecord, SourceSegment, TermExtractionResult
 from ..paths import rel_posix
@@ -1020,44 +1021,126 @@ def _rewrite_candidates_to_canonicals(
 def _normalize_concepts(
     raw_concepts: list[Concept],
     db: StateDB,
+    rel_path: str = "",
     seed_concepts: list[str] | None = None,
     seed_alias_map: dict[str, str] | None = None,
 ) -> list[tuple[str, list[str]]]:
-    """Dedup against existing canonical concept names using safe deterministic keys.
+    """Dedup against entity labels using match_key resolution (Phase 2).
 
-    Returns (canonical_name, validated_aliases) pairs.
+    Returns (canonical_name, validated_aliases) pairs.  Ambiguous concepts (>1 DB match
+    with no sticky edge) are recorded as ambiguous occurrences and excluded from the list.
+
+    Resolution order for each surface form:
+      1. DB match_key lookup — handles plural/singular variants and stored aliases.
+      2. In-memory safe-key index — handles abbreviation expansion (e.g. "XP" →
+         "Extreme Programming (XP)") and rebuild scenarios where the DB is empty.
+      3. In-run dedup — prevents duplicate minting within one ingest pass.
+      4. Mint new entity.
     """
+    # Build in-memory fallback index from all existing DB names + seeds.
+    # This handles abbreviation expansion and rebuild (DB empty, INDEX.json present).
     existing_names = db.list_all_concept_names()
     if seed_concepts:
-        seen_seed = {name.casefold() for name in seed_concepts}
+        seen_seed = {n.casefold() for n in seed_concepts}
         existing_names = [
             *seed_concepts,
-            *(name for name in existing_names if name.casefold() not in seen_seed),
+            *(n for n in existing_names if n.casefold() not in seen_seed),
         ]
     alias_map = db.list_alias_map()
     if seed_alias_map:
         alias_map = {**seed_alias_map, **alias_map}
-    existing = _build_safe_concept_index(existing_names, alias_map)
-    seen: set[str] = set()
+    mem_index = _build_safe_concept_index(existing_names, alias_map)
+
+    in_run: dict[str, str] = {}  # match_key → canonical_name (minted this run, not in DB yet)
+    seen_ids: set[str] = set()  # entity_ids already included this run
+    seen_keys: set[str] = set()  # concept_keys for new/mem-matched concepts
     result: list[tuple[str, list[str]]] = []
+
     for concept in raw_concepts:
         name = _clean_concept_text(concept.name)
         if not name or _is_noise_concept(name):
             continue
+
+        # Step 1: DB match_key resolution (plural/singular + stored aliases).
+        rr = db.resolve_by_match_key(name)
+
+        if rr.ambiguous:
+            # >1 DB match — try sticky resolution first (decision 18).
+            sticky_id = db.get_sticky_entity_for_source(rel_path, rr.ids)
+            if sticky_id is not None:
+                if sticky_id in seen_ids:
+                    continue
+                seen_ids.add(sticky_id)
+                canonical = db.preferred_label_for_entity(sticky_id) or name
+                seen_keys.add(_concept_key(canonical))
+                alias_candidates = [*_safe_aliases_for_name(name), *concept.aliases]
+                if _concept_key(name) != _concept_key(canonical):
+                    alias_candidates.insert(0, name)
+                result.append((canonical, _validate_aliases(canonical, alias_candidates)))
+            else:
+                # Never silently pick a sense; record for later resolution.
+                db.record_ambiguous_occurrence(
+                    name,
+                    rr.ids,
+                    surface=name,
+                    source_path=rel_path or None,
+                )
+            continue
+
+        if rr.ids:
+            # Exactly one DB match — link to the existing entity.
+            entity_id = rr.ids[0]
+            if entity_id in seen_ids:
+                continue
+            seen_ids.add(entity_id)
+            canonical = db.preferred_label_for_entity(entity_id) or name
+            seen_keys.add(_concept_key(canonical))
+            alias_candidates = [*_safe_aliases_for_name(name), *concept.aliases]
+            if _concept_key(name) != _concept_key(canonical):
+                alias_candidates.insert(0, name)
+            # Collision guard: drop extracted aliases that are already preferred labels of
+            # other active entities — those are merge-candidate signals, not stored aliases.
+            alias_candidates = [
+                a
+                for a in alias_candidates
+                if not db.alias_collides_with_preferred(_concept_key(a), entity_id)
+            ]
+            result.append((canonical, _validate_aliases(canonical, alias_candidates)))
+            continue
+
+        # Step 2: In-memory fallback (abbreviation expansion, rebuild with empty DB).
         safe_keys = [_concept_key(name), _concept_key(_base_concept_name(name))]
         safe_keys.extend(_concept_key(alias) for alias in _safe_aliases_for_name(name))
-        canonical = next(
-            (existing[key] for key in safe_keys if key in existing), _base_concept_name(name)
-        )
-        canonical_key = _concept_key(canonical)
-        if canonical_key in seen:
+        mem_canonical = next((mem_index[k] for k in safe_keys if k in mem_index), None)
+        if mem_canonical is not None:
+            ck = _concept_key(mem_canonical)
+            if ck in seen_keys:
+                continue
+            seen_keys.add(ck)
+            in_run[_match_key(name)] = mem_canonical
+            alias_candidates = [*_safe_aliases_for_name(name), *concept.aliases]
+            if _concept_key(name) != ck:
+                alias_candidates.insert(0, name)
+            result.append((mem_canonical, _validate_aliases(mem_canonical, alias_candidates)))
             continue
-        seen.add(canonical_key)
+
+        # Step 3: In-run dedup — same match_key was minted earlier in this pass.
+        mk = _match_key(name)
+        if mk in in_run:
+            continue
+
+        # Step 4: Mint new concept.
+        canonical = _base_concept_name(name)
+        ck = _concept_key(canonical)
+        if ck in seen_keys:
+            continue
+        seen_keys.add(ck)
+        in_run[mk] = canonical
         alias_candidates = [*_safe_aliases_for_name(name), *concept.aliases]
-        if _concept_key(name) != canonical_key:
+        if _concept_key(name) != ck:
             alias_candidates.insert(0, name)
-        aliases = _validate_aliases(canonical, alias_candidates)
-        result.append((canonical, aliases))
+        result.append((canonical, _validate_aliases(canonical, alias_candidates)))
+
     return result
 
 
@@ -1438,6 +1521,7 @@ def ingest_note(
     normalized = _normalize_concepts(
         concept_candidates,
         db,
+        rel_path,
         seed_concepts,
         seed_alias_map,
     )

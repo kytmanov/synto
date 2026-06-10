@@ -23,6 +23,8 @@ Schema versioning: schema_version table tracks migration level.
          normalized_hash, extractor_version
   v18 — concept_entities + concept_labels (entity identity layer; backfill from
          concepts + concept_aliases; resolve_label seam; INDEX.json seed extended)
+  v19 — concept_occurrences extended (entity_id, surface, resolution_status, source_path,
+         nullable source_segment_id); concept_occurrence_candidates child table
 """
 
 from __future__ import annotations
@@ -126,7 +128,7 @@ def _fts5_available(conn: sqlite3.Connection) -> bool:
         return False
 
 
-_CURRENT_SCHEMA_VERSION = 18
+_CURRENT_SCHEMA_VERSION = 20
 
 
 @dataclass
@@ -288,12 +290,6 @@ CREATE TABLE IF NOT EXISTS blocked_concepts (
     blocked_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS concept_aliases (
-    concept_name TEXT NOT NULL,
-    alias        TEXT NOT NULL,
-    PRIMARY KEY (concept_name, alias)
-);
-
 CREATE TABLE IF NOT EXISTS knowledge_items (
     name       TEXT PRIMARY KEY,
     kind       TEXT NOT NULL DEFAULT 'ambiguous',
@@ -346,7 +342,6 @@ CREATE INDEX IF NOT EXISTS idx_ingest_chunks_source ON ingest_chunks(source_path
 CREATE INDEX IF NOT EXISTS idx_concept_compile_status ON concept_compile_state(status, source_path);
 CREATE INDEX IF NOT EXISTS idx_concept_compile_name ON concept_compile_state(lower(concept_name));
 CREATE INDEX IF NOT EXISTS idx_rejections_concept ON rejections(concept);
-CREATE INDEX IF NOT EXISTS idx_alias_lookup ON concept_aliases(lower(alias));
 CREATE INDEX IF NOT EXISTS idx_items_kind ON knowledge_items(kind);
 CREATE INDEX IF NOT EXISTS idx_items_status ON knowledge_items(status);
 CREATE INDEX IF NOT EXISTS idx_mentions_item ON item_mentions(item_name);
@@ -383,14 +378,32 @@ CREATE TABLE IF NOT EXISTS llm_cache (
 CREATE TABLE IF NOT EXISTS concept_occurrences (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     concept_name      TEXT NOT NULL,
-    source_segment_id TEXT NOT NULL,
+    source_segment_id TEXT,
+    source_path       TEXT,
     ordinal           INTEGER NOT NULL DEFAULT 0,
     confidence        REAL NOT NULL DEFAULT 1.0,
     extraction_run    TEXT,
-    UNIQUE(concept_name, source_segment_id)
+    entity_id         TEXT,
+    surface           TEXT,
+    resolution_status TEXT NOT NULL DEFAULT 'unresolved'
+                      CHECK (resolution_status IN ('resolved', 'ambiguous', 'unresolved'))
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_occ_seg
+    ON concept_occurrences(concept_name, source_segment_id)
+    WHERE source_segment_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_occ_path
+    ON concept_occurrences(concept_name, source_path)
+    WHERE source_path IS NOT NULL AND source_segment_id IS NULL;
 CREATE INDEX IF NOT EXISTS idx_concept_occurrences_concept ON concept_occurrences(concept_name);
+CREATE INDEX IF NOT EXISTS idx_concept_occurrences_entity ON concept_occurrences(entity_id)
+    WHERE entity_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS concept_occurrence_candidates (
+    occurrence_id INTEGER NOT NULL REFERENCES concept_occurrences(id) ON DELETE CASCADE,
+    entity_id     TEXT NOT NULL,
+    PRIMARY KEY (occurrence_id, entity_id)
+);
 
 CREATE TABLE IF NOT EXISTS concept_entities (
     id          TEXT PRIMARY KEY,
@@ -803,6 +816,8 @@ _VERSIONED_MIGRATIONS: dict[int, list[str]] = {
             " ON concept_labels(entity_id) WHERE role = 'preferred'"
         ),
     ],
+    19: [],  # all v19 work happens in the post-hook (_extend_occurrences_v19) for atomicity
+    20: ["DROP TABLE IF EXISTS concept_aliases"],
 }
 
 
@@ -984,6 +999,8 @@ class StateDB:
                 self._normalize_path_separators_v17()
             if version == 18:
                 self._backfill_entities_v18()
+            if version == 19:
+                self._extend_occurrences_v19()
             with self._tx():
                 self._conn.execute(
                     "INSERT OR REPLACE INTO schema_version (id, version) VALUES (1, ?)",
@@ -1482,6 +1499,69 @@ class StateDB:
                 len(collisions),
             )
 
+    def _extend_occurrences_v19(self) -> None:
+        """Extend concept_occurrences + add concept_occurrence_candidates.
+
+        Idempotent: checks for the resolution_status column before running.
+        Uses table-recreation because source_segment_id must become nullable
+        and the UNIQUE constraint must be split into two partial indexes.
+        """
+        cols = {
+            r[1] for r in self._conn.execute("PRAGMA table_info(concept_occurrences)").fetchall()
+        }
+        if "resolution_status" in cols and self._has_table("concept_occurrence_candidates"):
+            return
+        with self._tx():
+            if "resolution_status" not in cols:
+                self._conn.executescript(
+                    """
+                    ALTER TABLE concept_occurrences RENAME TO concept_occurrences_old;
+
+                    CREATE TABLE concept_occurrences (
+                        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                        concept_name      TEXT NOT NULL,
+                        source_segment_id TEXT,
+                        source_path       TEXT,
+                        ordinal           INTEGER NOT NULL DEFAULT 0,
+                        confidence        REAL NOT NULL DEFAULT 1.0,
+                        extraction_run    TEXT,
+                        entity_id         TEXT,
+                        surface           TEXT,
+                        resolution_status TEXT NOT NULL DEFAULT 'unresolved'
+                                          CHECK (resolution_status IN
+                                                 ('resolved', 'ambiguous', 'unresolved'))
+                    );
+
+                    INSERT INTO concept_occurrences
+                        (concept_name, source_segment_id, ordinal, confidence, extraction_run)
+                    SELECT concept_name, source_segment_id, ordinal, confidence, extraction_run
+                    FROM concept_occurrences_old;
+
+                    DROP TABLE concept_occurrences_old;
+
+                    CREATE UNIQUE INDEX idx_occ_seg
+                        ON concept_occurrences(concept_name, source_segment_id)
+                        WHERE source_segment_id IS NOT NULL;
+                    CREATE UNIQUE INDEX idx_occ_path
+                        ON concept_occurrences(concept_name, source_path)
+                        WHERE source_path IS NOT NULL AND source_segment_id IS NULL;
+                    CREATE INDEX idx_concept_occurrences_concept
+                        ON concept_occurrences(concept_name);
+                    CREATE INDEX idx_concept_occurrences_entity
+                        ON concept_occurrences(entity_id)
+                        WHERE entity_id IS NOT NULL;
+                    """
+                )
+            if not self._has_table("concept_occurrence_candidates"):
+                self._conn.execute(
+                    """CREATE TABLE IF NOT EXISTS concept_occurrence_candidates (
+                        occurrence_id INTEGER NOT NULL
+                                      REFERENCES concept_occurrences(id) ON DELETE CASCADE,
+                        entity_id     TEXT NOT NULL,
+                        PRIMARY KEY (occurrence_id, entity_id)
+                    )"""
+                )
+
     def _backfill_compile_state_v6(self) -> None:
         self._ensure_compile_state_rows()
         alias_rows = self._conn.execute(
@@ -1926,7 +2006,189 @@ class StateDB:
         ).fetchone()
         return row[0] if row else None
 
-    # ── Alias facade (reimplemented on concept_labels; concept_aliases kept for Phase 3) ──
+    def alias_collides_with_preferred(self, alias_lk: str, owner_entity_id: str) -> bool:
+        """Return True if alias_lk is already the preferred label of a DIFFERENT active entity.
+
+        Used by the extraction path to detect merge-candidate collisions (issue #54).
+        Does not block cross-language aliases stored via explicit upsert_aliases calls.
+        """
+        if not self._has_table("concept_labels"):
+            return False
+        row = self._conn.execute(
+            """SELECT 1 FROM concept_labels cl
+               JOIN concept_entities ce ON ce.id = cl.entity_id
+               WHERE cl.label_key = ? AND cl.role = 'preferred'
+                 AND cl.entity_id != ? AND ce.status = 'active'""",
+            (alias_lk, owner_entity_id),
+        ).fetchone()
+        return row is not None
+
+    def resolve_by_match_key(self, text: str) -> ResolveResult:
+        """Resolve using match_key (plural/singular folded) — Phase 2 seam.
+
+        "Users" and "User" share match_key "user", so this returns the User entity
+        even when 'users' is not an alias. Returns the same shape as resolve_label.
+        """
+        mk = _mk(text)
+        if not mk:
+            return ResolveResult()
+        if not self._has_table("concept_labels"):
+            return ResolveResult()
+        rows = self._conn.execute(
+            """
+            SELECT DISTINCT cl.entity_id
+            FROM concept_labels cl
+            JOIN concept_entities ce ON ce.id = cl.entity_id
+            WHERE cl.match_key = ? AND ce.status = 'active'
+            """,
+            (mk,),
+        ).fetchall()
+        ids = [r[0] for r in rows]
+        return ResolveResult(ids=ids, ambiguous=len(ids) > 1)
+
+    def get_sticky_entity_for_source(
+        self, source_path: str, candidate_ids: list[str]
+    ) -> str | None:
+        """Return the single candidate entity already linked to source_path, if exactly one.
+
+        Used for sticky resolution (decision 18): when re-ingesting a source that
+        already has an edge to one of the ambiguous candidates, keep that edge.
+        """
+        if not candidate_ids:
+            return None
+        placeholders = ",".join("?" * len(candidate_ids))
+        rows = self._conn.execute(
+            f"""
+            SELECT DISTINCT cl.entity_id
+            FROM concepts c
+            JOIN concept_labels cl ON lower(cl.label) = lower(c.name) AND cl.role = 'preferred'
+            JOIN concept_entities ce ON ce.id = cl.entity_id AND ce.status = 'active'
+            WHERE c.source_path = ? AND cl.entity_id IN ({placeholders})
+            """,
+            (source_path, *candidate_ids),
+        ).fetchall()
+        if len(rows) == 1:
+            return rows[0][0]
+        return None
+
+    def record_resolved_occurrence(
+        self,
+        concept_name: str,
+        entity_id: str,
+        surface: str,
+        *,
+        source_segment_id: str | None = None,
+        source_path: str | None = None,
+        ordinal: int = 0,
+        confidence: float = 1.0,
+        extraction_run: str | None = None,
+    ) -> None:
+        """Record a resolved (1-entity) concept occurrence."""
+        if not self._has_table("concept_occurrences"):
+            return
+        with self._tx():
+            if source_segment_id is not None:
+                self._conn.execute(
+                    """INSERT INTO concept_occurrences
+                       (concept_name, source_segment_id, ordinal, confidence, extraction_run,
+                        entity_id, surface, resolution_status)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, 'resolved')
+                       ON CONFLICT(concept_name, source_segment_id)
+                       WHERE source_segment_id IS NOT NULL
+                       DO UPDATE SET entity_id=excluded.entity_id, surface=excluded.surface,
+                           resolution_status='resolved'""",
+                    (
+                        concept_name,
+                        source_segment_id,
+                        ordinal,
+                        confidence,
+                        extraction_run,
+                        entity_id,
+                        surface,
+                    ),
+                )
+            else:
+                self._conn.execute(
+                    """INSERT INTO concept_occurrences
+                       (concept_name, source_path, ordinal, confidence, extraction_run,
+                        entity_id, surface, resolution_status)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, 'resolved')
+                       ON CONFLICT(concept_name, source_path)
+                       WHERE source_path IS NOT NULL AND source_segment_id IS NULL
+                       DO UPDATE SET entity_id=excluded.entity_id, surface=excluded.surface,
+                           resolution_status='resolved'""",
+                    (
+                        concept_name,
+                        source_path,
+                        ordinal,
+                        confidence,
+                        extraction_run,
+                        entity_id,
+                        surface,
+                    ),
+                )
+
+    def record_ambiguous_occurrence(
+        self,
+        concept_name: str,
+        candidate_ids: list[str],
+        surface: str,
+        *,
+        source_segment_id: str | None = None,
+        source_path: str | None = None,
+        ordinal: int = 0,
+        confidence: float = 1.0,
+        extraction_run: str | None = None,
+    ) -> None:
+        """Record an ambiguous occurrence with N candidate entity IDs."""
+        if not self._has_table("concept_occurrences") or not candidate_ids:
+            return
+        with self._tx():
+            if source_segment_id is not None:
+                cursor = self._conn.execute(
+                    """INSERT INTO concept_occurrences
+                       (concept_name, source_segment_id, ordinal, confidence, extraction_run,
+                        surface, resolution_status)
+                       VALUES (?, ?, ?, ?, ?, ?, 'ambiguous')
+                       ON CONFLICT(concept_name, source_segment_id)
+                       WHERE source_segment_id IS NOT NULL
+                       DO UPDATE SET surface=excluded.surface, resolution_status='ambiguous'
+                       RETURNING id""",
+                    (concept_name, source_segment_id, ordinal, confidence, extraction_run, surface),
+                )
+            else:
+                cursor = self._conn.execute(
+                    """INSERT INTO concept_occurrences
+                       (concept_name, source_path, ordinal, confidence, extraction_run,
+                        surface, resolution_status)
+                       VALUES (?, ?, ?, ?, ?, ?, 'ambiguous')
+                       ON CONFLICT(concept_name, source_path)
+                       WHERE source_path IS NOT NULL AND source_segment_id IS NULL
+                       DO UPDATE SET surface=excluded.surface, resolution_status='ambiguous'
+                       RETURNING id""",
+                    (concept_name, source_path, ordinal, confidence, extraction_run, surface),
+                )
+            row = cursor.fetchone()
+            if row is None:
+                return
+            occ_id = row[0]
+            for eid in candidate_ids:
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO concept_occurrence_candidates"
+                    " (occurrence_id, entity_id) VALUES (?, ?)",
+                    (occ_id, eid),
+                )
+
+    def count_ambiguous_occurrences(self) -> int:
+        """Count unresolved ambiguous occurrence rows (for lint)."""
+        if not self._has_table("concept_occurrences"):
+            return 0
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM concept_occurrences WHERE resolution_status = 'ambiguous'"
+        ).fetchone()
+        return row[0] if row else 0
+
+    # ── Alias facade (backed by concept_labels) ──
 
     def upsert_aliases(self, concept_name: str, aliases: list[str]) -> None:
         """Merge aliases for a concept. Skips self-matches (alias == canonical)."""
@@ -1940,11 +2202,6 @@ class StateDB:
                 alias = alias.strip()
                 if not alias or alias.lower() == canonical_lower:
                     continue
-                # Legacy dual-write — concept_aliases stays in sync until Phase 3 drops it.
-                self._conn.execute(
-                    "INSERT OR IGNORE INTO concept_aliases (concept_name, alias) VALUES (?, ?)",
-                    (concept_name, alias),
-                )
                 # Primary write: concept_labels.
                 if entity_id is not None:
                     alias_lk = _ck(alias)
@@ -1959,16 +2216,6 @@ class StateDB:
 
     def get_aliases(self, concept_name: str) -> list[str]:
         """All aliases stored for a concept (case-insensitive match on concept_name)."""
-        if not self._has_table("concept_labels"):
-            # Pre-v18 DB: fall back to concept_aliases.
-            if not self._has_table("concept_aliases"):
-                return []
-            rows = self._conn.execute(
-                "SELECT alias FROM concept_aliases"
-                " WHERE lower(concept_name) = lower(?) ORDER BY alias",
-                (concept_name,),
-            ).fetchall()
-            return [r[0] for r in rows]
         entity_id = self.entity_id_for_name(concept_name)
         if entity_id is None:
             return []
@@ -1994,17 +2241,6 @@ class StateDB:
 
         Labels claimed by more than one active entity are excluded — they are unsafe to rewrite.
         """
-        if not self._has_table("concept_labels"):
-            # Pre-v18 fallback.
-            rows = self._conn.execute(
-                "SELECT lower(alias) as al, concept_name FROM concept_aliases"
-            ).fetchall()
-            counts: dict[str, int] = {}
-            mapping: dict[str, str] = {}
-            for al, canonical in rows:
-                counts[al] = counts.get(al, 0) + 1
-                mapping[al] = canonical
-            return {al: v for al, v in mapping.items() if counts[al] == 1}
         rows = self._conn.execute(
             """
             SELECT cl.label_key, cl_p.label AS preferred
@@ -2027,27 +2263,6 @@ class StateDB:
         Used by query routing to bridge task-vocabulary questions to source-vocabulary
         page titles. Excludes ambiguous aliases (claimed by >= 2 distinct concepts).
         """
-        if not self._has_table("concept_labels"):
-            # Pre-v18 fallback.
-            if not self._has_table("concept_aliases"):
-                return {}
-            rows = self._conn.execute(
-                """
-                SELECT concept_name, alias
-                FROM concept_aliases
-                WHERE lower(alias) NOT IN (
-                    SELECT lower(alias)
-                    FROM concept_aliases
-                    GROUP BY lower(alias)
-                    HAVING count(DISTINCT lower(concept_name)) >= 2
-                )
-                ORDER BY concept_name, alias
-                """
-            ).fetchall()
-            result: dict[str, list[str]] = {}
-            for concept_name, alias in rows:
-                result.setdefault(concept_name, []).append(alias)
-            return result
         rows = self._conn.execute(
             """
             SELECT cl_p.label AS concept_name, cl.label AS alias
@@ -2073,19 +2288,6 @@ class StateDB:
 
         Used at export time to filter ambiguous aliases. Language-agnostic.
         """
-        if not self._has_table("concept_labels"):
-            if not self._has_table("concept_aliases"):
-                return []
-            rows = self._conn.execute(
-                """
-                SELECT lower(alias)
-                FROM concept_aliases
-                GROUP BY lower(alias)
-                HAVING count(DISTINCT lower(concept_name)) >= ?
-                """,
-                (threshold,),
-            ).fetchall()
-            return [r[0] for r in rows]
         rows = self._conn.execute(
             """
             SELECT cl.label_key
@@ -2103,11 +2305,6 @@ class StateDB:
         """Remove all aliases for a concept."""
         entity_id = self.entity_id_for_name(concept_name)
         with self._tx():
-            # Legacy dual-delete.
-            self._conn.execute(
-                "DELETE FROM concept_aliases WHERE lower(concept_name) = lower(?)",
-                (concept_name,),
-            )
             if entity_id is not None:
                 self._conn.execute(
                     "DELETE FROM concept_labels WHERE entity_id = ? AND role = 'alias'",
@@ -2410,26 +2607,18 @@ class StateDB:
                 if self._conn.execute(sql, (n,)).fetchone():
                     return True
         # An alias label_key claimed by a *different* entity.
-        if self._has_table("concept_labels"):
-            key = _ck(name)
-            ex_key = _ck(exclude_concept) if exclude_concept else None
-            row = self._conn.execute(
-                """
-                SELECT 1 FROM concept_labels cl
-                JOIN concept_entities ce ON ce.id = cl.entity_id AND ce.status = 'active'
-                JOIN concept_labels cl_p ON cl_p.entity_id = ce.id AND cl_p.role = 'preferred'
-                WHERE cl.label_key = ?
-                  AND (? IS NULL OR cl_p.label_key != ?)
-                LIMIT 1
-                """,
-                (key, ex_key, ex_key),
-            ).fetchone()
-            return row is not None
-        # Pre-v18 fallback.
+        key = _ck(name)
+        ex_key = _ck(exclude_concept) if exclude_concept else None
         row = self._conn.execute(
-            "SELECT 1 FROM concept_aliases "
-            "WHERE lower(alias) = ? AND (? IS NULL OR lower(concept_name) != ?) LIMIT 1",
-            (n, ex, ex),
+            """
+            SELECT 1 FROM concept_labels cl
+            JOIN concept_entities ce ON ce.id = cl.entity_id AND ce.status = 'active'
+            JOIN concept_labels cl_p ON cl_p.entity_id = ce.id AND cl_p.role = 'preferred'
+            WHERE cl.label_key = ?
+              AND (? IS NULL OR cl_p.label_key != ?)
+            LIMIT 1
+            """,
+            (key, ex_key, ex_key),
         ).fetchone()
         return row is not None
 
@@ -2451,10 +2640,10 @@ class StateDB:
         """Migrate a concept's identity and behavioral state from ``old`` to ``new``.
 
         Atomically re-keys every table that binds a concept by name: identity
-        (concepts, concept_aliases, concept_compile_state, concept_occurrences,
-        knowledge_items) and behavioral state whose consumers look up by current title
-        (rejections — exact-match guidance; blocked_concepts — skipping silently
-        unblocks; stubs). Caller must guarantee ``new`` is collision-free first.
+        (concepts, concept_compile_state, concept_occurrences, knowledge_items) and
+        behavioral state whose consumers look up by current title (rejections — exact-match
+        guidance; blocked_concepts — skipping silently unblocks; stubs). Caller must
+        guarantee ``new`` is collision-free first.
 
         item_mentions is intentionally left untouched: those rows are generic
         source-evidence mentions, not concept canonical binding.
@@ -2466,16 +2655,6 @@ class StateDB:
             self._conn.execute(
                 "UPDATE concepts SET name = ? WHERE lower(name) = lower(?)",
                 (new_name, old_name),
-            )
-            self._conn.execute(
-                "UPDATE concept_aliases SET concept_name = ? WHERE lower(concept_name) = lower(?)",
-                (new_name, old_name),
-            )
-            # An alias equal to the new canonical is a no-op self-match — drop it.
-            self._conn.execute(
-                "DELETE FROM concept_aliases "
-                "WHERE lower(concept_name) = lower(?) AND lower(alias) = lower(?)",
-                (new_name, new_name),
             )
             # Update concept_labels: change preferred label.
             if entity_id is not None and new_lk:
@@ -3009,15 +3188,11 @@ class StateDB:
         return int(self._conn.execute("SELECT COUNT(DISTINCT name) FROM concepts").fetchone()[0])
 
     def count_aliases(self) -> int:
-        if self._has_table("concept_labels"):
-            return int(
-                self._conn.execute(
-                    "SELECT COUNT(*) FROM concept_labels WHERE role = 'alias'"
-                ).fetchone()[0]
-            )
-        if not self._has_table("concept_aliases"):
-            return 0
-        return int(self._conn.execute("SELECT COUNT(*) FROM concept_aliases").fetchone()[0])
+        return int(
+            self._conn.execute(
+                "SELECT COUNT(*) FROM concept_labels WHERE role = 'alias'"
+            ).fetchone()[0]
+        )
 
     def count_knowledge_items(self) -> int:
         if not self._has_table("knowledge_items"):

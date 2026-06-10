@@ -114,6 +114,7 @@ class ConceptRef:
     name: str
     canonical_article_id: str | None = None
     aliases: tuple[str, ...] = ()
+    entity_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -282,6 +283,8 @@ class Reader(Protocol):
 
     def find_concept(self, query: str) -> ConceptRef | None: ...
 
+    def resolve_concept(self, query: str) -> list[ConceptRef]: ...
+
     def list_terms(self) -> list[TermRef]: ...
 
     def find_term(self, query: str) -> TermRef | None: ...
@@ -402,10 +405,22 @@ class PackReader:
         )
 
     def find_concept(self, query: str) -> ConceptRef | None:
+        """Return the single matching concept, or None if absent or ambiguous."""
+        candidates = self.resolve_concept(query)
+        if len(candidates) == 1:
+            return candidates[0]
+        return None
+
+    def resolve_concept(self, query: str) -> list[ConceptRef]:
+        """Return all concept candidates matching query (by name, alias, or entity_id)."""
+        # Try entity_id direct lookup first.
+        by_id = self._concepts_by_entity_id.get(query)
+        if by_id is not None:
+            return [self._concept_ref_from_entry(by_id)]
         entry = self._concepts_lookup.get(query.casefold())
         if entry is None:
-            return None
-        return self._concept_ref_from_entry(entry)
+            return []
+        return [self._concept_ref_from_entry(entry)]
 
     def list_terms(self) -> list[TermRef]:
         return list(self.index.terms)
@@ -501,8 +516,23 @@ class PackReader:
                     lookup.setdefault(str(alias).casefold(), concept)
         return lookup
 
+    @cached_property
+    def _concepts_by_entity_id(self) -> dict[str, dict[str, object]]:
+        # Build from _concepts_lookup values to avoid calling _load_concepts_json twice.
+        result: dict[str, dict[str, object]] = {}
+        seen: set[int] = set()
+        for entry in self._concepts_lookup.values():
+            if id(entry) in seen:
+                continue
+            seen.add(id(entry))
+            eid = entry.get("entity_id")
+            if isinstance(eid, str) and eid:
+                result.setdefault(eid, entry)
+        return result
+
     def _concept_ref_from_entry(self, entry: dict[str, object]) -> ConceptRef:
         aliases = tuple(str(alias) for alias in entry.get("aliases", []))
+        eid = entry.get("entity_id")
         return ConceptRef(
             name=str(entry["name"]),
             canonical_article_id=(
@@ -511,6 +541,7 @@ class PackReader:
                 else None
             ),
             aliases=aliases,
+            entity_id=str(eid) if isinstance(eid, str) and eid else None,
         )
 
     def _lookup_article(self, name_or_id: str) -> ArticleRef:
@@ -713,19 +744,52 @@ class VaultReader:
         )
 
     def find_concept(self, query: str) -> ConceptRef | None:
+        """Return the single matching concept, or None if absent or ambiguous."""
+        candidates = self.resolve_concept(query)
+        if len(candidates) == 1:
+            return candidates[0]
+        return None
+
+    def resolve_concept(self, query: str) -> list[ConceptRef]:
+        """Return all concept candidates matching query (by name, alias, or entity_id)."""
         db = self._state()
         if db is None:
-            return None
-        result = db.find_concept_by_name_or_alias(query)
-        if result is None:
-            return None
-        name, aliases = result
+            return []
+
+        # Entity_id direct lookup.
+        preferred = db.preferred_label_for_entity(query)
+        if preferred is not None:
+            return [self._vault_concept_ref(db, preferred, query)]
+
+        # match_key resolution: handles plural/singular and exact aliases.
+        rr = db.resolve_by_match_key(query)
+        if not rr.ids:
+            # Substring fallback via the legacy find path.
+            result = db.find_concept_by_name_or_alias(query)
+            if result is None:
+                return []
+            name, _ = result
+            entity_id = db.entity_id_for_name(name)
+            return [self._vault_concept_ref(db, name, entity_id)]
+        return [
+            self._vault_concept_ref(db, db.preferred_label_for_entity(eid) or "", eid)
+            for eid in rr.ids
+            if db.preferred_label_for_entity(eid)
+        ]
+
+    def _vault_concept_ref(self, db: StateDB, name: str, entity_id: str | None) -> ConceptRef:
+        aliases = tuple(db.get_aliases(name))
         article_id = None
         for candidate in db.find_article_candidates(name):
             if candidate.is_published and is_concept_article_path(candidate.path):
                 article_id = candidate.article_id
                 break
-        return ConceptRef(name=name, canonical_article_id=article_id, aliases=tuple(aliases))
+        return ConceptRef(
+            name=name,
+            canonical_article_id=article_id,
+            aliases=aliases,
+            entity_id=entity_id,
+        )
 
     def list_terms(self) -> list[TermRef]:
         state = self._state()

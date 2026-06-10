@@ -406,12 +406,17 @@ def _register_verbatim_source_handlers(
             if max_passages > 20:
                 raise tool_error_cls("max_passages must be at most 20")
             max_passages = max(1, max_passages)
-            resolved = db.find_concept_by_name_or_alias(concept_name)
-            if resolved is None:
-                result_count = 0
-                success = True
-                return {"results": [], "hidden_by_policy": 0, "orphan_segments": 0}
-            canonical, _aliases = resolved
+            # Accept entity_id as concept_name (opaque handle from find_concept response).
+            preferred_from_id = db.preferred_label_for_entity(concept_name)
+            if preferred_from_id is not None:
+                canonical = preferred_from_id
+            else:
+                resolved = db.find_concept_by_name_or_alias(concept_name)
+                if resolved is None:
+                    result_count = 0
+                    success = True
+                    return {"results": [], "hidden_by_policy": 0, "orphan_segments": 0}
+                canonical, _aliases = resolved
             resolved_label = canonical
             rows = db.select_passages_for_concept(canonical, max_passages)
             # select_passages_for_concept already JOINs source_documents and returns
@@ -616,25 +621,35 @@ def build_tool_handlers(
         resolved_label: str | None = None
         arguments = {"query": query}
         try:
-            concept = reader.find_concept(query)
-            if concept is None or not concept.canonical_article_id:
-                result_count = 0
-                success = True
-                return None
-            try:
-                _read_visible_article(reader, concept.canonical_article_id, config.mcp)
-            except ArticleNotFound:
-                result_count = 0
-                success = True
-                return None
-            result_count = 1
-            resolved_label = concept.name
+            candidates = reader.resolve_concept(query)
+            # Filter to candidates that have a readable article.
+            readable: list[dict[str, object]] = []
+            for concept in candidates:
+                if not concept.canonical_article_id:
+                    continue
+                try:
+                    _read_visible_article(reader, concept.canonical_article_id, config.mcp)
+                except ArticleNotFound:
+                    continue
+                entry: dict[str, object] = {
+                    "name": concept.name,
+                    "canonical_article_id": concept.canonical_article_id,
+                    "aliases": list(concept.aliases),
+                }
+                if concept.entity_id:
+                    entry["entity_id"] = concept.entity_id
+                readable.append(entry)
+
+            result_count = len(readable)
             success = True
-            return {
-                "name": concept.name,
-                "canonical_article_id": concept.canonical_article_id,
-                "aliases": list(concept.aliases),
-            }
+            if not readable:
+                return None
+            if len(readable) == 1:
+                resolved_label = readable[0]["name"]  # type: ignore[assignment]
+                return readable[0]
+            # Multiple candidates: return all so the caller can pick a sense.
+            resolved_label = readable[0]["name"]  # type: ignore[assignment]
+            return {"candidates": readable}
         finally:
             _audit(
                 db,

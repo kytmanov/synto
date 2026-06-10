@@ -186,6 +186,7 @@ def _concepts_payload(db: StateDB) -> dict[str, object]:
         concepts.append(
             {
                 "name": name,
+                "entity_id": db.entity_id_for_name(name),
                 "aliases": _filter_export_aliases(db.aliases_for_concept(name), frequent),
                 "canonical_article_id": canonical_article_id,
                 "article_path": article_path,

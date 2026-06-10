@@ -170,13 +170,18 @@ def test_resolve_label_ambiguous_shared_alias(tmp_path: Path) -> None:
 
 
 def test_resolve_label_preferred_label_wins_over_alias(tmp_path: Path) -> None:
-    """Resolving a preferred label of entity A always returns exactly that entity."""
+    """A preferred label stored as an alias of another entity creates an ambiguous surface.
+
+    The collision guard lives in the extraction path (_normalize_concepts), not in
+    upsert_aliases.  Explicit programmatic alias writes (cross-language aliases, tests)
+    are allowed; resolve_label will return ambiguous when they collide.
+    """
     db = StateDB(tmp_path / "state.db")
     db.upsert_concepts("raw/a.md", ["Python"])
     db.upsert_concepts("raw/b.md", ["Python Snake"])
-    db.upsert_aliases("Python Snake", ["Python"])  # alias collides with preferred
+    db.upsert_aliases("Python Snake", ["Python"])  # explicit alias; stored unconditionally
 
-    # "Python" is the preferred label of entity A and an alias of entity B → ambiguous.
+    # "Python" is preferred label of entity A and an alias of entity B → ambiguous.
     result = db.resolve_label("Python")
     assert result.ambiguous
     assert len(result.ids) == 2

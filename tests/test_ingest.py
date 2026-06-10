@@ -462,15 +462,14 @@ def test_normalize_reuses_seeded_index_alias_when_db_empty(vault, config, db):
     result = _normalize_concepts(
         _make_concepts(["гибкая разработка"]),
         db,
-        None,
-        {"гибкая разработка": "Agile Development"},
+        seed_alias_map={"гибкая разработка": "Agile Development"},
     )
 
     assert result == [("Agile Development", ["гибкая разработка"])]
 
 
 def test_normalize_reuses_seeded_canonical_case_when_db_empty(vault, config, db):
-    result = _normalize_concepts(_make_concepts(["api testing"]), db, ["API Testing"])
+    result = _normalize_concepts(_make_concepts(["api testing"]), db, seed_concepts=["API Testing"])
 
     assert result == [("API Testing", [])]
 
