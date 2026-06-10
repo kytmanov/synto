@@ -4143,3 +4143,248 @@ def concept_rename(
                 "[yellow]⚠ Auto-commit skipped — you have staged changes. "
                 "Commit or stash them first.[/yellow]"
             )
+
+
+@concept.command("merge")
+@click.argument("loser")
+@click.argument("winner")
+@click.option("--vault", "vault_str", envvar=VAULT_ENV_VAR, default=None)
+@click.option("--dry-run", is_flag=True, help="Preview changes without writing.")
+@click.option(
+    "--absorb-edits",
+    is_flag=True,
+    help="Append manually-edited loser body into winner article instead of refusing.",
+)
+def concept_merge(
+    loser: str,
+    winner: str,
+    vault_str: str | None,
+    dry_run: bool,
+    absorb_edits: bool,
+) -> None:
+    """Merge concept LOSER into WINNER, retiring the loser article."""
+    from .git_ops import git_commit
+    from .indexer import append_log, generate_index
+    from .pipeline.maintain import ConceptMergeError, merge_concepts
+
+    config = _load_config(vault_str)
+    db = _load_db(config)
+
+    # Always show a preview first, then confirm before running for real.
+    try:
+        preview = merge_concepts(config, db, loser, winner, absorb_edits=absorb_edits, dry_run=True)
+    except ConceptMergeError as exc:
+        click.echo(str(exc), err=True)
+        sys.exit(1)
+
+    console.print(f"[green]Would merge:[/green] {preview.loser} → {preview.winner}")
+    console.print(f"  Labels absorbed: {', '.join(preview.labels_absorbed) or 'none'}")
+    console.print(f"  Articles retired: {preview.files_retired}")
+    console.print(f"  Links rewritten: {preview.links_rewritten}")
+
+    if dry_run:
+        return
+
+    if not click.confirm(f"Merge '{loser}' into '{winner}'? This retires the loser article."):
+        click.echo("Aborted.")
+        sys.exit(0)
+
+    try:
+        report = merge_concepts(
+            config, db, loser, winner, absorb_edits=absorb_edits, dry_run=False
+        )
+    except ConceptMergeError as exc:
+        click.echo(str(exc), err=True)
+        sys.exit(1)
+
+    console.print(f"[green]Merged:[/green] {report.loser} → {report.winner}")
+    generate_index(config, db)
+    append_log(config, f"concept merge | '{report.loser}' → '{report.winner}'")
+
+    if config.pipeline.auto_commit:
+        outcome = git_commit(
+            config.vault,
+            f"concept merge: {report.loser} → {report.winner}",
+            paths=["wiki/", ".synto/"],
+        )
+        if outcome == "committed":
+            console.print("[dim]Git commit created.[/dim]")
+        elif outcome == "failed":
+            console.print("[yellow]⚠ Git commit failed — run 'git status' in your vault.[/yellow]")
+        elif outcome == "blocked":
+            console.print(
+                "[yellow]⚠ Auto-commit skipped — you have staged changes. "
+                "Commit or stash them first.[/yellow]"
+            )
+
+
+@concept.command("split")
+@click.argument("name")
+@click.option("--vault", "vault_str", envvar=VAULT_ENV_VAR, default=None)
+@click.option("--dry-run", is_flag=True, help="Preview changes without writing.")
+@click.option(
+    "--sense",
+    "senses",
+    multiple=True,
+    type=(str, str),
+    metavar="SENSE SOURCE_PATH",
+    help="Assign SOURCE_PATH to SENSE. Repeat for each sense.",
+)
+def concept_split(
+    name: str,
+    vault_str: str | None,
+    dry_run: bool,
+    senses: tuple[tuple[str, str], ...],
+) -> None:
+    """Split concept NAME into multiple senses, each owning a subset of sources."""
+    from .git_ops import git_commit
+    from .indexer import append_log, generate_index
+    from .pipeline.maintain import ConceptSplitError, split_concept
+
+    config = _load_config(vault_str)
+    db = _load_db(config)
+
+    if not senses:
+        # Show sources and prompt interactively on a TTY; fail gracefully otherwise.
+        sources = db.get_sources_for_entities([name]).get(name, [])
+        if not sources:
+            click.echo(f"No sources found for concept '{name}'.", err=True)
+            sys.exit(1)
+        if not sys.stdin.isatty():
+            click.echo(
+                "No --sense options provided and not running in a TTY. "
+                "Use: synto concept split NAME --sense SENSE SOURCE_PATH ...",
+                err=True,
+            )
+            sys.exit(1)
+        click.echo(f"Sources for '{name}':")
+        for i, src in enumerate(sources, 1):
+            click.echo(f"  [{i}] {src}")
+        click.echo("Use --sense SENSE SOURCE_PATH to assign each source to a sense.")
+        sys.exit(0)
+
+    # Group (sense_name, source_path) pairs into [(sense_name, [sources])] tuples.
+    sense_map: dict[str, list[str]] = {}
+    for sense_name, src_path in senses:
+        sense_map.setdefault(sense_name, []).append(src_path)
+    sense_tuples = list(sense_map.items())
+
+    try:
+        report = split_concept(config, db, name, sense_tuples, dry_run=dry_run)
+    except ConceptSplitError as exc:
+        click.echo(str(exc), err=True)
+        sys.exit(1)
+
+    sense_names = [s["name"] for s in report.senses]
+    verb = "Would split" if dry_run else "Split"
+    console.print(f"[green]{verb}:[/green] {report.original} → {', '.join(sense_names)}")
+    if report.stub_path:
+        console.print(f"  Disambiguation stub: {report.stub_path}")
+
+    if dry_run:
+        return
+
+    generate_index(config, db)
+    sense_str = ", ".join(sense_names)
+    append_log(config, f"concept split | '{report.original}' → {sense_str}")
+
+    console.print(f"[green]Split:[/green] {report.original} → {sense_str}")
+    if config.pipeline.auto_commit:
+        outcome = git_commit(
+            config.vault,
+            f"concept split: {report.original} → {sense_str}",
+            paths=["wiki/", ".synto/"],
+        )
+        if outcome == "committed":
+            console.print("[dim]Git commit created.[/dim]")
+        elif outcome == "failed":
+            console.print("[yellow]⚠ Git commit failed — run 'git status' in your vault.[/yellow]")
+        elif outcome == "blocked":
+            console.print(
+                "[yellow]⚠ Auto-commit skipped — you have staged changes. "
+                "Commit or stash them first.[/yellow]"
+            )
+
+
+@concept.command("inspect")
+@click.argument("name")
+@click.option("--vault", "vault_str", envvar=VAULT_ENV_VAR, default=None)
+def concept_inspect(name: str, vault_str: str | None) -> None:
+    """Show entity details, aliases, sources, and merge/split suggestions for NAME."""
+    from .pipeline.maintain import suggest_concept_merges, suggest_concept_splits
+
+    config = _load_config(vault_str)
+    db = _load_db(config)
+
+    eid = db.entity_id_for_name(name)
+    if not eid:
+        click.echo(f"Concept '{name}' not found.", err=True)
+        sys.exit(1)
+
+    pref = db.preferred_label_for_entity(eid)
+    aliases = db.aliases_for_concept(name)
+    sources = db.get_sources_for_entities([name]).get(name, [])
+    _sql_amb = (
+        "SELECT COUNT(*) FROM concept_occurrences"
+        " WHERE lower(concept_name)=lower(?) AND resolution_status='ambiguous'"
+    )
+    ambiguous_row = (
+        db._conn.execute(_sql_amb, (name,)).fetchone()
+        if db._has_table("concept_occurrences")
+        else None
+    )
+    ambiguous = ambiguous_row[0] if ambiguous_row else 0
+
+    console.print(f"[bold]{pref}[/bold]  [dim](entity_id: {eid})[/dim]")
+    if aliases:
+        console.print(f"  Aliases: {', '.join(aliases)}")
+    console.print(f"  Sources: {len(sources)}")
+    for src in sources:
+        console.print(f"    [dim]{src}[/dim]")
+    console.print(f"  Ambiguous occurrences: {ambiguous}")
+
+    # Compile state
+    rows = db._conn.execute(
+        "SELECT status, scheduled_at FROM concept_compile_state WHERE lower(concept_name)=lower(?)",
+        (name,),
+    ).fetchall()
+    if rows:
+        for status, scheduled_at in rows:
+            console.print(f"  Compile state: {status}  (scheduled: {scheduled_at or 'n/a'})")
+    else:
+        console.print("  Compile state: not tracked")
+
+    # Merge suggestions (filter to those involving this concept)
+    merges = suggest_concept_merges(config, db)
+    relevant_merges = [(a, b, s) for a, b, s in merges if a == name or b == name]
+    if relevant_merges:
+        console.print("\n  [yellow]Merge suggestions:[/yellow]")
+        for a, b, score in relevant_merges:
+            other = b if a == name else a
+            console.print(f"    → merge with '{other}'  (score: {score:.2f})")
+
+    # Split suggestions
+    splits = suggest_concept_splits(config, db)
+    relevant_splits = [reason for ent, reason in splits if ent == name]
+    if relevant_splits:
+        console.print("\n  [yellow]Split suggestion:[/yellow]")
+        for reason in relevant_splits:
+            console.print(f"    {reason}")
+
+
+@concept.command("keep")
+@click.argument("surface")
+@click.argument("entity")
+@click.option("--vault", "vault_str", envvar=VAULT_ENV_VAR, default=None)
+def concept_keep(surface: str, entity: str, vault_str: str | None) -> None:
+    """Resolve ambiguous occurrences of SURFACE, assigning them to ENTITY."""
+    config = _load_config(vault_str)
+    db = _load_db(config)
+
+    eid = db.entity_id_for_name(entity)
+    if not eid:
+        click.echo(f"Entity '{entity}' not found.", err=True)
+        sys.exit(1)
+
+    count = db.resolve_ambiguous_occurrences(surface, eid)
+    console.print(f"Resolved {count} ambiguous occurrence(s) of '{surface}' → '{entity}'.")

@@ -32,7 +32,7 @@ def test_llm_cache_schema(tmp_path: Path) -> None:
 def test_current_schema_version_v12() -> None:
     from synto.state import _CURRENT_SCHEMA_VERSION
 
-    assert _CURRENT_SCHEMA_VERSION == 20
+    assert _CURRENT_SCHEMA_VERSION == 21
 
 
 # ---------------------------------------------------------------------------

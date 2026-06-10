@@ -59,6 +59,8 @@ _ADVISORY_ISSUE_TYPES = frozenset(
         "synthesis_chain",
         "stale_lock",
         "missing_media",
+        "label_collision",
+        "orphan_entity",
     }
 )
 
@@ -943,6 +945,35 @@ def run_lint(config: Config, db: StateDB, fix: bool = False) -> LintResult:
                         auto_fixable=False,
                     )
                 )
+
+    # ── Identity checks (advisory) ────────────────────────────────────────────
+    for a_id, b_id, mk in db.find_match_key_collisions():
+        a_label = db.preferred_label_for_entity(a_id)
+        b_label = db.preferred_label_for_entity(b_id)
+        if a_label and b_label:
+            issues.append(
+                LintIssue(
+                    path="",
+                    issue_type="label_collision",
+                    description=(
+                        f"Concepts {a_label!r} and {b_label!r} share match_key {mk!r} "
+                        "— likely plural/singular duplicates."
+                    ),
+                    suggestion=f"Run `synto concept merge {a_label!r} {b_label!r}` to consolidate.",
+                    auto_fixable=False,
+                )
+            )
+
+    for eid, label in db.list_active_entities_without_articles():
+        issues.append(
+            LintIssue(
+                path="",
+                issue_type="orphan_entity",
+                description=f"Active entity {label!r} has no published article.",
+                suggestion="Run `synto compile` to generate an article, or merge/split to resolve.",
+                auto_fixable=False,
+            )
+        )
 
     # ── Health score ──────────────────────────────────────────────────────────
     # Score based on structural wiki health. Graph-quality findings are advisory:

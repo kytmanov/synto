@@ -128,7 +128,7 @@ def _fts5_available(conn: sqlite3.Connection) -> bool:
         return False
 
 
-_CURRENT_SCHEMA_VERSION = 20
+_CURRENT_SCHEMA_VERSION = 21
 
 
 @dataclass
@@ -433,6 +433,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_concept_labels_preferred_global
     ON concept_labels(label_key) WHERE role = 'preferred';
 CREATE UNIQUE INDEX IF NOT EXISTS idx_concept_labels_preferred_per_entity
     ON concept_labels(entity_id) WHERE role = 'preferred';
+
+CREATE TABLE IF NOT EXISTS concept_identity_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    op         TEXT NOT NULL CHECK (op IN ('merge', 'split', 'rename')),
+    entity_ids TEXT NOT NULL,
+    labels     TEXT NOT NULL,
+    meta       TEXT,
+    ts         TEXT NOT NULL
+);
 """
 
 # v17 separator-collision tables resolved by recency, not "POSIX wins" (issue #55 follow-up).
@@ -818,6 +827,16 @@ _VERSIONED_MIGRATIONS: dict[int, list[str]] = {
     ],
     19: [],  # all v19 work happens in the post-hook (_extend_occurrences_v19) for atomicity
     20: ["DROP TABLE IF EXISTS concept_aliases"],
+    21: [
+        """CREATE TABLE IF NOT EXISTS concept_identity_log (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            op         TEXT NOT NULL CHECK (op IN ('merge', 'split', 'rename')),
+            entity_ids TEXT NOT NULL,
+            labels     TEXT NOT NULL,
+            meta       TEXT,
+            ts         TEXT NOT NULL
+        )"""
+    ],
 }
 
 
@@ -2187,6 +2206,353 @@ class StateDB:
             "SELECT COUNT(*) FROM concept_occurrences WHERE resolution_status = 'ambiguous'"
         ).fetchone()
         return row[0] if row else 0
+
+    def resolve_ambiguous_occurrences(self, surface: str, entity_id: str) -> int:
+        """Assign all pending ambiguous occurrences for surface to entity_id.
+
+        Returns the number of rows updated.
+        """
+        with self._tx():
+            cursor = self._conn.execute(
+                """UPDATE concept_occurrences
+                   SET entity_id=?, resolution_status='resolved'
+                   WHERE lower(concept_name)=lower(?) AND resolution_status='ambiguous'""",
+                (entity_id, surface),
+            )
+        return cursor.rowcount
+
+    # ── Identity operations (merge / split) ───────────────────────────────────
+
+    def _log_identity_op(
+        self,
+        op: str,
+        entity_ids: list[str],
+        labels: dict[str, str],
+        meta: dict | None = None,
+    ) -> None:
+        """Append one row to concept_identity_log. Must be called inside a _tx()."""
+        if not self._has_table("concept_identity_log"):
+            return
+        import json as _json
+
+        self._conn.execute(
+            "INSERT INTO concept_identity_log (op, entity_ids, labels, meta, ts)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (
+                op,
+                _json.dumps(entity_ids),
+                _json.dumps(labels),
+                _json.dumps(meta) if meta else None,
+                datetime.now().isoformat(),
+            ),
+        )
+
+    def merge_entities(self, winner_name: str, loser_name: str) -> dict:
+        """Merge loser entity into winner: move all edges, union labels, retire loser.
+
+        Returns a summary dict with keys: winner, loser, sources_moved, labels_absorbed.
+        Raises ValueError if either entity not found, or both are the same.
+        """
+        winner_id = self.entity_id_for_name(winner_name)
+        loser_id = self.entity_id_for_name(loser_name)
+        if winner_id is None:
+            raise ValueError(f"Concept not found: {winner_name!r}")
+        if loser_id is None:
+            raise ValueError(f"Concept not found: {loser_name!r}")
+        if winner_id == loser_id:
+            raise ValueError(f"{winner_name!r} and {loser_name!r} are the same entity")
+
+        now = datetime.now().isoformat()
+        with self._tx():
+            # Snapshot for log.
+            loser_sources = self.get_sources_for_concept(loser_name)
+            loser_aliases_rows = self._conn.execute(
+                "SELECT label FROM concept_labels WHERE entity_id=? AND role='alias'",
+                (loser_id,),
+            ).fetchall()
+            labels_snapshot = {
+                winner_id: winner_name,
+                loser_id: loser_name,
+            }
+
+            # Move source edges.
+            self._conn.execute(
+                "UPDATE concepts SET name=? WHERE lower(name)=lower(?)",
+                (winner_name, loser_name),
+            )
+
+            # Union labels: loser preferred → winner alias; loser aliases → winner aliases.
+            winner_lk = _ck(winner_name)
+            labels_absorbed: list[str] = [loser_name]
+            for row in [{"label": loser_name}, *loser_aliases_rows]:
+                lbl = row["label"] if isinstance(row, dict) else row[0]
+                lk = _ck(lbl)
+                if not lk or lk == winner_lk:
+                    continue
+                self._conn.execute(
+                    "INSERT INTO concept_labels"
+                    " (entity_id, label, label_key, match_key, role, source, created_at)"
+                    " VALUES (?, ?, ?, ?, 'alias', 'extracted', ?)"
+                    " ON CONFLICT(entity_id, label_key) DO NOTHING",
+                    (winner_id, lbl, lk, _mk(lbl), now),
+                )
+                labels_absorbed.append(lbl)
+
+            # Move compile state.
+            self._conn.execute(
+                "UPDATE concept_compile_state SET concept_name=?"
+                " WHERE lower(concept_name)=lower(?)",
+                (winner_name, loser_name),
+            )
+            # Ensure pending rows exist for loser sources now attached to winner.
+            for src in loser_sources:
+                self._conn.execute(
+                    """INSERT INTO concept_compile_state
+                           (concept_name, source_path, status, updated_at)
+                       VALUES (?, ?, 'pending', ?)
+                       ON CONFLICT(concept_name, source_path) DO NOTHING""",
+                    (winner_name, src, now),
+                )
+
+            # Move behavioral state.
+            self._conn.execute(
+                "UPDATE concept_occurrences SET concept_name=?"
+                " WHERE lower(concept_name)=lower(?)",
+                (winner_name, loser_name),
+            )
+            self._conn.execute(
+                "UPDATE rejections SET concept=? WHERE lower(concept)=lower(?)",
+                (winner_name, loser_name),
+            )
+            # Block winner if loser was blocked.
+            was_blocked = self._conn.execute(
+                "SELECT 1 FROM blocked_concepts WHERE lower(concept)=lower(?)",
+                (loser_name,),
+            ).fetchone()
+            if was_blocked:
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO blocked_concepts (concept, blocked_at) VALUES (?,?)",
+                    (winner_name, now),
+                )
+            self._conn.execute(
+                "DELETE FROM blocked_concepts WHERE lower(concept)=lower(?)", (loser_name,)
+            )
+            self._conn.execute(
+                "UPDATE stubs SET concept=? WHERE lower(concept)=lower(?)",
+                (winner_name, loser_name),
+            )
+            # knowledge_items has a UNIQUE(name) constraint. If the winner row already
+            # exists, renaming the loser would conflict — just delete the loser row.
+            winner_ki = self._conn.execute(
+                "SELECT 1 FROM knowledge_items WHERE lower(name)=lower(?)", (winner_name,)
+            ).fetchone()
+            if winner_ki:
+                self._conn.execute(
+                    "DELETE FROM knowledge_items WHERE lower(name)=lower(?)", (loser_name,)
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE knowledge_items SET name=? WHERE lower(name)=lower(?)",
+                    (winner_name, loser_name),
+                )
+
+            # Retire loser entity.
+            self._conn.execute(
+                "UPDATE concept_entities SET status='merged', merged_into=?, updated_at=?"
+                " WHERE id=?",
+                (winner_id, now, loser_id),
+            )
+
+            self._log_identity_op(
+                "merge",
+                [winner_id, loser_id],
+                labels_snapshot,
+                meta={"sources_moved": loser_sources, "labels_absorbed": labels_absorbed},
+            )
+
+        return {
+            "winner": winner_name,
+            "loser": loser_name,
+            "sources_moved": loser_sources,
+            "labels_absorbed": labels_absorbed,
+        }
+
+    def split_entity(
+        self, entity_name: str, senses: list[dict[str, object]]
+    ) -> dict:
+        """Split one entity into multiple senses, each owning a subset of sources.
+
+        senses is a list of {name: str, sources: list[str]}.
+        Each sense gets the bare entity_name as a shared alias.
+        Original entity is retired (status='merged').
+        Returns summary with keys: original, senses (list of {name, entity_id, sources}),
+        stub_needed.
+        """
+        original_id = self.entity_id_for_name(entity_name)
+        if original_id is None:
+            raise ValueError(f"Concept not found: {entity_name!r}")
+        if len(senses) < 2:
+            raise ValueError("split_entity requires at least 2 senses")
+
+        now = datetime.now().isoformat()
+        with self._tx():
+            # Validate all claimed sources belong to this entity.
+            owned = set(self.get_sources_for_concept(entity_name))
+            claimed: set[str] = set()
+            for sense in senses:
+                for src in sense["sources"]:  # type: ignore[union-attr]
+                    if src not in owned:
+                        raise ValueError(
+                            f"Source {src!r} does not belong to entity {entity_name!r}"
+                        )
+                    claimed.add(src)
+            unclaimed = owned - claimed
+            if unclaimed:
+                raise ValueError(
+                    f"Sources not assigned to any sense: {sorted(unclaimed)}"
+                )
+
+            bare_lk = _ck(entity_name)
+            result_senses: list[dict] = []
+
+            for sense in senses:
+                new_name = str(sense["name"])
+                sources = list(sense["sources"])  # type: ignore[arg-type]
+                # Mint new entity.
+                new_id = self._ensure_entity_for_name(new_name, now)
+                if new_id is None:
+                    raise ValueError(f"Cannot mint entity for sense name: {new_name!r}")
+                # Add bare label as a shared alias on the new entity.
+                new_lk = _ck(new_name)
+                if bare_lk and bare_lk != new_lk:
+                    self._conn.execute(
+                        "INSERT INTO concept_labels"
+                        " (entity_id, label, label_key, match_key, role, source, created_at)"
+                        " VALUES (?, ?, ?, ?, 'alias', 'extracted', ?)"
+                        " ON CONFLICT(entity_id, label_key) DO NOTHING",
+                        (new_id, entity_name, bare_lk, _mk(entity_name), now),
+                    )
+                # Move source edges.
+                for src in sources:
+                    self._conn.execute(
+                        "UPDATE concepts SET name=? WHERE name=? AND source_path=?",
+                        (new_name, entity_name, src),
+                    )
+                    # Seed pending compile state.
+                    self._conn.execute(
+                        """INSERT INTO concept_compile_state
+                               (concept_name, source_path, status, updated_at)
+                           VALUES (?, ?, 'pending', ?)
+                           ON CONFLICT(concept_name, source_path) DO UPDATE
+                               SET status='pending', updated_at=excluded.updated_at""",
+                        (new_name, src, now),
+                    )
+                result_senses.append(
+                    {"name": new_name, "entity_id": new_id, "sources": sources}
+                )
+
+            # Retire original entity.
+            self._conn.execute(
+                "UPDATE concept_entities SET status='merged', updated_at=? WHERE id=?",
+                (now, original_id),
+            )
+            self._conn.execute(
+                "UPDATE concept_occurrences SET concept_name=?"
+                " WHERE lower(concept_name)=lower(?) AND resolution_status='resolved'",
+                (result_senses[0]["name"], entity_name),
+            )
+
+            self._log_identity_op(
+                "split",
+                [original_id, *[s["entity_id"] for s in result_senses]],
+                {original_id: entity_name, **{s["entity_id"]: s["name"] for s in result_senses}},
+                meta={"senses": [{"name": s["name"], "sources": s["sources"]}
+                                 for s in result_senses]},
+            )
+
+        return {
+            "original": entity_name,
+            "senses": result_senses,
+            "stub_needed": len(result_senses) >= 2,
+        }
+
+    def get_sources_for_entities(self, names: list[str]) -> dict[str, list[str]]:
+        """Return {name: [source_paths]} for each named entity."""
+        return {name: self.get_sources_for_concept(name) for name in names}
+
+    def find_match_key_collisions(self) -> list[tuple[str, str, str]]:
+        """Return (entity_id_a, entity_id_b, match_key) for active entities sharing a match_key.
+
+        These are fold-collision pairs — merge candidates from plural/singular variants.
+        """
+        if not self._has_table("concept_labels"):
+            return []
+        rows = self._conn.execute(
+            """
+            SELECT DISTINCT a.entity_id, b.entity_id, a.match_key
+            FROM concept_labels a
+            JOIN concept_labels b
+              ON b.match_key = a.match_key AND b.entity_id > a.entity_id
+            JOIN concept_entities ea ON ea.id = a.entity_id AND ea.status = 'active'
+            JOIN concept_entities eb ON eb.id = b.entity_id AND eb.status = 'active'
+            ORDER BY a.match_key
+            """
+        ).fetchall()
+        return [(r[0], r[1], r[2]) for r in rows]
+
+    def list_identity_log(self, limit: int = 200) -> list[dict]:
+        """Return recent identity operations for INDEX.json export."""
+        if not self._has_table("concept_identity_log"):
+            return []
+        import json as _json
+
+        rows = self._conn.execute(
+            "SELECT op, entity_ids, labels, meta, ts"
+            " FROM concept_identity_log ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        result = []
+        for row in rows:
+            entry: dict = {"op": row[0], "ts": row[4]}
+            try:
+                entry["entity_ids"] = _json.loads(row[1])
+            except Exception:
+                entry["entity_ids"] = []
+            try:
+                entry["labels"] = _json.loads(row[2])
+            except Exception:
+                entry["labels"] = {}
+            if row[3]:
+                try:
+                    entry["meta"] = _json.loads(row[3])
+                except Exception:
+                    pass
+            result.append(entry)
+        return result
+
+    def list_active_entities_without_articles(self) -> list[tuple[str, str]]:
+        """Return (entity_id, preferred_label) for active entities with no published article."""
+        if not self._has_table("concept_labels"):
+            return []
+        rows = self._conn.execute(
+            """
+            SELECT ce.id, cl.label
+            FROM concept_entities ce
+            JOIN concept_labels cl ON cl.entity_id = ce.id AND cl.role = 'preferred'
+            WHERE ce.status = 'active'
+              AND NOT EXISTS (
+                  SELECT 1 FROM wiki_articles wa
+                  WHERE wa.status = 'published'
+                    AND (
+                      lower(wa.title) = lower(cl.label)
+                      OR lower(replace(wa.path, '\\', '/'))
+                         LIKE '%/' || lower(cl.label_key) || '.md'
+                    )
+              )
+            ORDER BY cl.label
+            """
+        ).fetchall()
+        return [(r[0], r[1]) for r in rows]
 
     # ── Alias facade (backed by concept_labels) ──
 

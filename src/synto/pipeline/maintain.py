@@ -19,7 +19,7 @@ from pathlib import Path
 import frontmatter as fm_lib
 
 from ..config import Config
-from ..models import LintIssue
+from ..models import LintIssue, WikiArticleRecord
 from ..sanitize import clean_display_name
 from ..state import StateDB
 from ..vault import (
@@ -554,37 +554,407 @@ def suggest_orphan_links(config: Config, db: StateDB) -> list[tuple[str, list[st
 
 
 def suggest_concept_merges(config: Config, db: StateDB) -> list[tuple[str, str, float]]:
-    """
-    Find near-duplicate concept pairs using Jaccard similarity on title tokens.
+    """Find near-duplicate concept pairs via Jaccard similarity and match_key collisions.
 
-    Returns list of (concept_a, concept_b, similarity_score) for pairs > threshold.
-    No LLM required — purely token-overlap based.
+    Returns list of (concept_a, concept_b, similarity_score), sorted by score descending.
+    Score = 1.0 for match_key fold collisions (plural/singular, issue #54);
+    Jaccard threshold applies to token-overlap pairs.
+    No LLM required.
     """
+    seen: set[tuple[str, str]] = set()
+    suggestions: list[tuple[str, str, float]] = []
+
+    # Signal 1: match_key collisions (fold-exact — score 1.0).
+    for _a_id, _b_id, _mk in db.find_match_key_collisions():
+        a_label = db.preferred_label_for_entity(_a_id)
+        b_label = db.preferred_label_for_entity(_b_id)
+        if a_label and b_label:
+            key = (min(a_label, b_label), max(a_label, b_label))
+            if key not in seen:
+                seen.add(key)
+                suggestions.append((a_label, b_label, 1.0))
+
+    # Signal 2: Jaccard token similarity.
     concepts = db.list_all_concept_names()
-    if len(concepts) < 2:
-        return []
+    if len(concepts) >= 2:
+        def tokenize(name: str) -> frozenset[str]:
+            tokens = (re.sub(r"\W+", "", t) for t in re.split(r"[\s\-_]+", name.lower()))
+            return frozenset(t for t in tokens if len(t) > 1)
 
-    def tokenize(name: str) -> frozenset[str]:
-        # Lowercase, split on spaces/hyphens/underscores, strip per-token punctuation, filter short.
-        # Without the strip, "Phase II)" → {"phase", "ii)"} never matches "Phase II" {"phase",
-        # "ii"}, hiding exactly the stray-char duplicates this is meant to surface.
-        tokens = (re.sub(r"\W+", "", t) for t in re.split(r"[\s\-_]+", name.lower()))
-        return frozenset(t for t in tokens if len(t) > 1)
-
-    tokenized = [(c, tokenize(c)) for c in concepts]
-    suggestions = []
-
-    for i, (a, tokens_a) in enumerate(tokenized):
-        for b, tokens_b in tokenized[i + 1 :]:
-            if not tokens_a or not tokens_b:
-                continue
-            intersection = len(tokens_a & tokens_b)
-            union = len(tokens_a | tokens_b)
-            if union == 0:
-                continue
-            score = intersection / union
-            if score >= _CONCEPT_MERGE_THRESHOLD:
-                suggestions.append((a, b, round(score, 2)))
+        tokenized = [(c, tokenize(c)) for c in concepts]
+        for i, (a, tokens_a) in enumerate(tokenized):
+            for b, tokens_b in tokenized[i + 1 :]:
+                if not tokens_a or not tokens_b:
+                    continue
+                intersection = len(tokens_a & tokens_b)
+                union = len(tokens_a | tokens_b)
+                if union == 0:
+                    continue
+                score = intersection / union
+                if score >= _CONCEPT_MERGE_THRESHOLD:
+                    key = (min(a, b), max(a, b))
+                    if key not in seen:
+                        seen.add(key)
+                        suggestions.append((a, b, round(score, 2)))
 
     suggestions.sort(key=lambda x: -x[2])
     return suggestions
+
+
+def suggest_concept_splits(config: Config, db: StateDB) -> list[tuple[str, str]]:
+    """Flag entities whose source set has low internal token overlap (bimodal).
+
+    Returns [(entity_name, reason_str)] for entities that may cover multiple unrelated
+    subjects. Uses the source summary files from wiki/sources/ (first 200 chars).
+    Only checks entities with ≥3 sources. Pure heuristic — no LLM.
+    """
+    results: list[tuple[str, str]] = []
+    concepts = db.list_all_concept_names()
+    sources_dir = config.wiki_dir / "sources"
+
+    def _load_source_summary(source_path: str) -> str:
+        """Read first 200 chars of a source summary from wiki/sources/."""
+        stem = sanitize_filename(Path(source_path).stem)
+        candidate = sources_dir / f"{stem}.md"
+        if candidate.exists():
+            try:
+                _, body = parse_note(candidate)
+                return body[:200]
+            except Exception:
+                pass
+        return ""
+
+    def _tokenize_body(text: str) -> frozenset[str]:
+        tokens = re.split(r"\W+", text.lower())
+        return frozenset(t for t in tokens if len(t) > 3)
+
+    for name in concepts:
+        sources = db.get_sources_for_concept(name)
+        if len(sources) < 3:
+            continue
+        token_sets = [_tokenize_body(_load_source_summary(s)) for s in sources]
+        token_sets = [ts for ts in token_sets if ts]
+        if len(token_sets) < 3:
+            continue
+
+        # Pairwise Jaccard.
+        scores: list[float] = []
+        for i in range(len(token_sets)):
+            for j in range(i + 1, len(token_sets)):
+                u = token_sets[i] | token_sets[j]
+                if not u:
+                    continue
+                scores.append(len(token_sets[i] & token_sets[j]) / len(u))
+
+        if not scores:
+            continue
+        min_score = min(scores)
+        avg_score = sum(scores) / len(scores)
+        # Bimodal signal: very low min similarity but non-trivial average
+        # implies at least one pair of sources is unrelated.
+        if min_score < 0.05 and avg_score > 0.1:
+            results.append(
+                (name, f"min source similarity {min_score:.2f}, avg {avg_score:.2f}")
+            )
+
+    return results
+
+
+class ConceptMergeError(Exception):
+    """Raised when a concept merge cannot proceed."""
+
+
+class ConceptSplitError(Exception):
+    """Raised when a concept split cannot proceed."""
+
+
+@dataclass
+class MergeReport:
+    loser: str = ""
+    winner: str = ""
+    files_retired: list[str] = field(default_factory=list)
+    links_rewritten: int = 0
+    labels_absorbed: list[str] = field(default_factory=list)
+    dry_run: bool = False
+
+
+@dataclass
+class SplitReport:
+    original: str = ""
+    senses: list[dict] = field(default_factory=list)
+    stub_path: str = ""
+    dry_run: bool = False
+
+
+def _retire_article(article_path: Path, drafts_dir: Path) -> str:
+    """Move article to .drafts/ with a date suffix. Returns the new relative path string."""
+    drafts_dir.mkdir(parents=True, exist_ok=True)
+    stem = article_path.stem
+    date_str = datetime.now().strftime("%Y%m%d")
+    target = drafts_dir / f"{stem}_retired_{date_str}.md"
+    # Avoid clobbering if called multiple times on the same day.
+    counter = 0
+    while target.exists():
+        counter += 1
+        target = drafts_dir / f"{stem}_retired_{date_str}_{counter}.md"
+    article_path.rename(target)
+    return str(target)
+
+
+def merge_concepts(
+    config: Config,
+    db: StateDB,
+    loser_name: str,
+    winner_name: str,
+    *,
+    absorb_edits: bool = False,
+    dry_run: bool = False,
+) -> MergeReport:
+    """Merge loser concept into winner: DB identity, retire article, rewrite links.
+
+    absorb_edits=True appends loser's manually-edited body into winner's article
+    before retiring.  Without it, a body-hash mismatch raises ConceptMergeError.
+    """
+    import hashlib
+
+    loser_name = loser_name.strip()
+    winner_name = winner_name.strip()
+    report = MergeReport(loser=loser_name, winner=winner_name, dry_run=dry_run)
+
+    # ── Preflight ──────────────────────────────────────────────────────────────
+    if loser_name == winner_name:
+        raise ConceptMergeError(f"Cannot merge {loser_name!r} into itself")
+
+    loser_id = db.entity_id_for_name(loser_name)
+    winner_id = db.entity_id_for_name(winner_name)
+    if loser_id is None:
+        raise ConceptMergeError(f"Concept not found: {loser_name!r}")
+    if winner_id is None:
+        raise ConceptMergeError(f"Concept not found: {winner_name!r}")
+    if loser_id == winner_id:
+        raise ConceptMergeError(f"{loser_name!r} and {winner_name!r} are the same entity")
+
+    loser_stem = sanitize_filename(loser_name)
+    winner_stem = sanitize_filename(winner_name)
+
+    # Locate loser article (same stem-match logic as rename_concept).
+    loser_key = loser_name.casefold()
+    loser_articles = [
+        art
+        for art in db.list_articles()
+        if art.kind not in ("synthesis", "disambiguation")
+        and (
+            Path(art.path).stem.casefold() == loser_stem.casefold()
+            or art.title.casefold() == loser_key
+        )
+    ]
+
+    # Manual-edit check.
+    for art in loser_articles:
+        art_path = config.vault / art.path
+        if art_path.exists():
+            _, body = parse_note(art_path)
+            body_hash = hashlib.sha256(body.encode()).hexdigest()
+            if art.content_hash and body_hash != art.content_hash and not absorb_edits:
+                raise ConceptMergeError(
+                    f"Article {art.path!r} has been manually edited "
+                    "(on-disk hash ≠ DB content_hash). "
+                    "Pass --absorb-edits to carry the edited body into the winner."
+                )
+
+    if dry_run:
+        report.files_retired = [art.path for art in loser_articles]
+        report.links_rewritten = _rewrite_inbound_links(
+            config, db, loser_stem, winner_stem, winner_name, dry_run=True
+        )
+        result = db.merge_entities(winner_name, loser_name)
+        # merge_entities runs in a real transaction even in dry-run — we need to
+        # roll back by not calling it.  Re-derive labels_absorbed from DB state.
+        report.labels_absorbed = [loser_name, *db.get_aliases(loser_name)]
+        return report
+
+    # ── Mutations ──────────────────────────────────────────────────────────────
+    # Absorb loser's manually-edited body into winner if requested.
+    if absorb_edits:
+        winner_articles = [
+            art
+            for art in db.list_articles()
+            if art.kind not in ("synthesis", "disambiguation")
+            and (
+                Path(art.path).stem.casefold() == winner_stem.casefold()
+                or art.title.casefold() == winner_name.casefold()
+            )
+        ]
+        for loser_art in loser_articles:
+            loser_path = config.vault / loser_art.path
+            if not loser_path.exists():
+                continue
+            _, loser_body = parse_note(loser_path)
+            body_hash = hashlib.sha256(loser_body.encode()).hexdigest()
+            if loser_art.content_hash and body_hash == loser_art.content_hash:
+                continue
+            # Append to winner's article.
+            for winner_art in winner_articles:
+                winner_path = config.vault / winner_art.path
+                if not winner_path.exists():
+                    continue
+                w_meta, w_body = parse_note(winner_path)
+                w_body = w_body.rstrip() + f"\n\n## Absorbed from {loser_name}\n\n{loser_body}"
+                write_note(winner_path, w_meta, w_body)
+                break
+
+    result = db.merge_entities(winner_name, loser_name)
+    report.labels_absorbed = result["labels_absorbed"]
+
+    # Retire loser articles.
+    drafts_dir = config.wiki_dir / ".drafts"
+    for art in loser_articles:
+        art_path = config.vault / art.path
+        if art_path.exists():
+            retired = _retire_article(art_path, drafts_dir)
+            report.files_retired.append(art.path)
+            log.info("merge: retired %s → %s", art.path, retired)
+
+    # Update winner article frontmatter: add absorbed labels to aliases:.
+    winner_articles_post = [
+        art
+        for art in db.list_articles()
+        if art.kind not in ("synthesis", "disambiguation")
+        and (
+            Path(art.path).stem.casefold() == winner_stem.casefold()
+            or art.title.casefold() == winner_name.casefold()
+        )
+    ]
+    for art in winner_articles_post:
+        art_path = config.vault / art.path
+        if not art_path.exists():
+            continue
+        meta, body = parse_note(art_path)
+        existing_aliases = list(meta.get("aliases") or [])
+        added = [
+            lbl
+            for lbl in result["labels_absorbed"]
+            if not any(a.casefold() == lbl.casefold() for a in existing_aliases)
+            and lbl.casefold() != winner_name.casefold()
+        ]
+        if added:
+            meta["aliases"] = [*existing_aliases, *added]
+            write_note(art_path, meta, body)
+
+    report.links_rewritten = _rewrite_inbound_links(
+        config, db, loser_stem, winner_stem, winner_name, dry_run=False
+    )
+    return report
+
+
+def split_concept(
+    config: Config,
+    db: StateDB,
+    entity_name: str,
+    senses: list[tuple[str, list[str]]],
+    *,
+    dry_run: bool = False,
+) -> SplitReport:
+    """Split entity_name into multiple senses, each owning a subset of its sources.
+
+    senses is a list of (new_name, [source_paths]).
+    Creates stub articles for each sense plus a disambiguation stub at the bare label.
+    """
+    entity_name = entity_name.strip()
+    report = SplitReport(original=entity_name, dry_run=dry_run)
+
+    # ── Preflight ──────────────────────────────────────────────────────────────
+    entity_id = db.entity_id_for_name(entity_name)
+    if entity_id is None:
+        raise ConceptSplitError(f"Concept not found: {entity_name!r}")
+    if len(senses) < 2:
+        raise ConceptSplitError("split_concept requires at least 2 senses")
+
+    for new_name, srcs in senses:
+        if not new_name:
+            raise ConceptSplitError("Sense name cannot be empty")
+        existing_id = db.entity_id_for_name(new_name)
+        if existing_id is not None and existing_id != entity_id:
+            raise ConceptSplitError(
+                f"Cannot create sense {new_name!r}: a different concept already uses that name"
+            )
+
+    sense_dicts = [{"name": name, "sources": srcs} for name, srcs in senses]
+
+    if dry_run:
+        report.senses = [{"name": name, "sources": srcs} for name, srcs in senses]
+        report.stub_path = f"wiki/{sanitize_filename(entity_name)}.md"
+        return report
+
+    # ── Mutations ──────────────────────────────────────────────────────────────
+    result = db.split_entity(entity_name, sense_dicts)
+
+    # Find and retire the original article.
+    orig_stem = sanitize_filename(entity_name)
+    orig_articles = [
+        art
+        for art in db.list_articles()
+        if art.kind not in ("synthesis",)
+        and (
+            Path(art.path).stem.casefold() == orig_stem.casefold()
+            or art.title.casefold() == entity_name.casefold()
+        )
+    ]
+    orig_body = ""
+    drafts_dir = config.wiki_dir / ".drafts"
+    primary_sense = result["senses"][0]["name"]
+    for art in orig_articles:
+        art_path = config.vault / art.path
+        if art_path.exists():
+            _, orig_body = parse_note(art_path)
+            _retire_article(art_path, drafts_dir)
+
+    # Create stub articles for each sense.
+    for sense in result["senses"]:
+        new_name = sense["name"]
+        stem = sanitize_filename(new_name)
+        stub_path = config.wiki_dir / f"{stem}.md"
+        body = orig_body if new_name == primary_sense and orig_body else ""
+        if not stub_path.exists():
+            write_note(
+                stub_path,
+                {"title": new_name, "aliases": [entity_name]},
+                body,
+            )
+            log.info("split: created stub %s", stub_path.name)
+        report.senses.append({"name": new_name, "path": str(stub_path.relative_to(config.vault))})
+        db.upsert_article(
+            WikiArticleRecord(
+                path=str(stub_path.relative_to(config.vault)),
+                title=new_name,
+                sources=sense["sources"],
+                content_hash="",
+                status="draft",
+            )
+        )
+
+    # Create disambiguation stub.
+    if result["stub_needed"]:
+        dis_stem = sanitize_filename(entity_name)
+        dis_path = config.wiki_dir / f"{dis_stem}.md"
+        sense_links = "\n".join(
+            f"- [[{s['name']}]]" for s in result["senses"]
+        )
+        dis_body = (
+            f"**{entity_name}** may refer to:\n\n{sense_links}\n"
+        )
+        write_note(dis_path, {"title": entity_name, "kind": "disambiguation"}, dis_body)
+        report.stub_path = str(dis_path.relative_to(config.vault))
+        db.upsert_article(
+            WikiArticleRecord(
+                path=report.stub_path,
+                title=entity_name,
+                sources=[],
+                content_hash="",
+                status="published",
+                kind="disambiguation",
+            )
+        )
+        log.info("split: created disambiguation stub %s", dis_path.name)
+
+    return report

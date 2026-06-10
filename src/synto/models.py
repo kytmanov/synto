@@ -197,6 +197,8 @@ class LintIssue(BaseModel):
         "config_outdated",
         "stale_lock",
         "missing_media",
+        "label_collision",
+        "orphan_entity",
     ]
     description: str
     suggestion: str
@@ -236,7 +238,7 @@ class WikiArticleRecord(BaseModel):
     status: Literal["draft", "verified", "published"] = "draft"
     approved_at: datetime | None = None
     approval_notes: str | None = None
-    kind: Literal["concept", "synthesis"] = "concept"
+    kind: Literal["concept", "synthesis", "disambiguation"] = "concept"
     question_hash: str | None = None
     synthesis_sources: list[VaultRelPath] = Field(default_factory=list)
     synthesis_source_hashes: list[list[str]] = Field(default_factory=list)

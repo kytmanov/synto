@@ -188,7 +188,7 @@ def _build_index_payload(config: Config, db: StateDB) -> dict[str, object]:
             "capabilities": sorted(_compute_capabilities(db)),
         },
         "articles": articles,
-        "identity_log": [],
+        "identity_log": db.list_identity_log(),
         "terms": [],
         "papers": [],
         "sources": _list_sources(db),
