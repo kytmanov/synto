@@ -2461,6 +2461,14 @@ class StateDB:
                 " WHERE lower(concept_name)=lower(?) AND resolution_status='resolved'",
                 (result_senses[0]["name"], entity_name),
             )
+            # Remove stale compile state rows for the original entity. Source edges
+            # were moved to the senses above, so these rows are orphaned — the
+            # scheduler JOIN on concepts.name would silently skip them, but they
+            # would inflate refresh_raw_compile_status counts.
+            self._conn.execute(
+                "DELETE FROM concept_compile_state WHERE lower(concept_name)=lower(?)",
+                (entity_name,),
+            )
 
             self._log_identity_op(
                 "split",

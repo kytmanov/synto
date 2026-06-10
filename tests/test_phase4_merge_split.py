@@ -214,6 +214,42 @@ def test_split_entity_seeds_compile_state(tmp_path: Path) -> None:
     assert "raw/b.md" in by_concept.get("Mercury (element)", [])
 
 
+def test_split_entity_removes_stale_original_compile_state(tmp_path: Path) -> None:
+    """Original entity's compile state rows must be deleted after split.
+
+    If they survive, refresh_raw_compile_status overcounts 'compiled' rows for
+    sources that now belong to the senses.
+    """
+    db = StateDB(tmp_path / "state.db")
+    db.upsert_concepts("raw/a.md", ["Mercury"])
+    db.upsert_concepts("raw/b.md", ["Mercury"])
+    # Simulate a previously-compiled state for the original entity.
+    db.mark_concept_compile_state("Mercury", ["raw/a.md", "raw/b.md"], "compiled")
+
+    db.split_entity(
+        "Mercury",
+        [
+            {"name": "Mercury (planet)", "sources": ["raw/a.md"]},
+            {"name": "Mercury (element)", "sources": ["raw/b.md"]},
+        ],
+    )
+
+    stale = db._conn.execute(
+        "SELECT COUNT(*) FROM concept_compile_state WHERE lower(concept_name)='mercury'"
+    ).fetchone()[0]
+    assert stale == 0, "original entity's compile state rows must be deleted after split"
+
+    # Senses are scheduled for recompile.
+    pending_names = {
+        r[0]
+        for r in db._conn.execute(
+            "SELECT concept_name FROM concept_compile_state WHERE status='pending'"
+        ).fetchall()
+    }
+    assert "Mercury (planet)" in pending_names
+    assert "Mercury (element)" in pending_names
+
+
 def test_split_entity_raises_on_unclaimed_source(tmp_path: Path) -> None:
     db = StateDB(tmp_path / "state.db")
     db.upsert_concepts("raw/a.md", ["Mercury"])
