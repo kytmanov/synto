@@ -282,8 +282,10 @@ def make_verbatim_vault(tmp: Path) -> Path:
         " 'Hidden content here')"
     )
 
-    # Concept linked to two book1 segments at different confidences
-    db._conn.execute("INSERT INTO concepts (name, source_path) VALUES ('Quantum', 'raw/book1.md')")
+    # Concept linked to two book1 segments at different confidences.
+    # Route through the entity layer — concepts is keyed on entity_id since v22,
+    # so a bare-name INSERT no longer satisfies the NOT NULL constraint.
+    db.upsert_concepts("raw/book1.md", ["Quantum"])
     db._conn.execute(
         "INSERT INTO concept_occurrences"
         " (concept_name, source_segment_id, ordinal, confidence)"
