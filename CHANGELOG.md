@@ -4,6 +4,11 @@
 
 ### Added
 
+- Concept identity core: concepts now carry a stable `entity_id` independent of their
+  display name, so homonyms and renames no longer collide. New curation commands
+  `synto concept merge`, `synto concept split`, `synto concept unmerge`, and
+  `synto concept rename` move identity, labels, sources, and compile state as a unit and
+  record each operation in `concept_identity_log`.
 - Remote MCP access over Streamable HTTP: `synto serve --transport streamable-http`
   listens at `/mcp`. There is no built-in authentication, so this mode is meant for a
   trusted network or behind a reverse proxy/firewall. DNS-rebinding protection is
@@ -12,6 +17,16 @@
   remote client connects by IPv6 literal, add the value with the repeatable
   `--allowed-host` flag. A wildcard IPv6 bind (`--host ::`) stays loopback-only unless a
   public hostname or IPv6 literal is explicitly allow-listed.
+
+### Known limitations
+
+- `synto concept unmerge` is best-effort and not fully invertible. It restores the loser's
+  entity, labels, and source edges from the merge log, but recreates the article as an
+  empty stub (the original body stays retired in `wiki/.drafts/`; the next `synto compile`
+  regenerates it) and cannot un-collapse a source that both concepts cited at merge time —
+  that edge returns to the loser, so the winner loses it. Name-keyed ledgers (rejections,
+  blocks, stubs) are not restored. Reverses exactly one merge, the most recent for that
+  concept.
 
 ## [0.5.1] - 2026-06-08
 
