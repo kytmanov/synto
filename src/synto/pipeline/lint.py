@@ -24,7 +24,7 @@ from ..markdown_math import sanitize_obsidian_math
 from ..models import LintIssue, LintResult, WikiArticleRecord
 from ..sanitize import sanitize_tag, sanitize_tags
 from ..state import StateDB
-from ..vault import _MEDIA_EXTENSIONS, extract_wikilinks, parse_note, write_note
+from ..vault import _MEDIA_EXTENSIONS, extract_wikilinks, parse_note, sanitize_filename, write_note
 
 _REQUIRED_FIELDS: frozenset[str] = frozenset({"title", "status", "tags"})
 _LOW_CONFIDENCE_THRESHOLD = 0.3
@@ -61,6 +61,10 @@ _ADVISORY_ISSUE_TYPES = frozenset(
         "missing_media",
         "label_collision",
         "orphan_entity",
+        "ambiguous_label_needs_disambiguation",
+        "stale_legacy_backfill_alias",
+        "homonym_filename_collision",
+        "manual_relabel_adopted",
     }
 )
 
@@ -599,6 +603,113 @@ def _all_wiki_pages(config: Config) -> list[Path]:
     return pages
 
 
+def _check_manual_relabel(config: Config, db: StateDB, issues: list[LintIssue], fix: bool) -> None:
+    """Decision 10: adopt a wiki file the user renamed on disk as the new preferred label.
+
+    Signal: a tracked, published concept article whose file is gone from disk, paired with
+    an untracked wiki file whose body hash equals the tracked row's content_hash (a pure
+    rename, not an edit). Under ``--fix`` the new filename stem becomes the entity's
+    preferred label (old → alias) and inbound links are rewritten. A new stem that already
+    names a *different* active entity is a collision: flag it loudly and never adopt.
+    """
+    from .maintain import _rewrite_inbound_links
+
+    all_articles = db.list_articles()
+    tracked_paths = {a.path for a in all_articles}
+
+    # Untracked ROOT-level wiki files indexed by body hash, for rename matching.
+    # Scoped to concept pages (wiki/*.md) so a merge-retired .drafts/ copy — which shares
+    # the missing article's body hash — can never be mistaken for a manual rename.
+    untracked_by_hash: dict[str, Path] = {}
+    for page in _concept_pages(config):
+        rel = _vault_rel_path(page, config.vault)
+        if rel in tracked_paths:
+            continue
+        try:
+            _, body = parse_note(page)
+        except Exception:
+            continue
+        untracked_by_hash.setdefault(_body_hash(body), page)
+
+    active_preferred = {lbl.casefold() for lbl in db.list_active_preferred_labels()}
+
+    for art in all_articles:
+        if not art.is_published or art.kind != "concept" or not art.content_hash:
+            continue
+        if (config.vault / art.path).exists():
+            continue  # file still where the DB expects it
+        renamed = untracked_by_hash.get(art.content_hash)
+        if renamed is None:
+            continue
+        new_rel = _vault_rel_path(renamed, config.vault)
+        new_label = renamed.stem
+        old_label = db.preferred_label_for_entity(art.entity_id) if art.entity_id else art.title
+        if not old_label or new_label.casefold() == old_label.casefold():
+            continue
+
+        # Collision: the new stem already names a different active entity.
+        if new_label.casefold() in active_preferred:
+            issues.append(
+                LintIssue(
+                    path=new_rel,
+                    issue_type="homonym_filename_collision",
+                    description=(
+                        f"File renamed to {new_label!r} but that label already belongs to "
+                        f"another active concept — not adopting the rename of {old_label!r}."
+                    ),
+                    suggestion="Pick a distinct filename or merge the two concepts.",
+                    auto_fixable=False,
+                )
+            )
+            continue
+
+        if not fix:
+            issues.append(
+                LintIssue(
+                    path=new_rel,
+                    issue_type="manual_relabel_adopted",
+                    description=(
+                        f"File for concept {old_label!r} was renamed to {new_label!r} on disk."
+                    ),
+                    suggestion="Run `synto lint --fix` to adopt it as the preferred label.",
+                    auto_fixable=True,
+                )
+            )
+            continue
+
+        # Adopt under --fix: demote old label to alias, repoint the article, rewrite links.
+        old_stem = sanitize_filename(old_label)
+        new_stem = sanitize_filename(new_label)
+        db.rename_concept(old_label, new_label)
+        db.upsert_aliases(new_label, [old_label])
+        db.update_article_identity(art.path, new_rel, new_label)
+        try:
+            meta, body = parse_note(renamed)
+            meta["title"] = new_label
+            existing = list(meta.get("aliases") or [])
+            if not any(a.casefold() == old_label.casefold() for a in existing):
+                meta["aliases"] = [*existing, old_label]
+            write_note(renamed, meta, body)
+        except Exception:
+            pass
+        links = _rewrite_inbound_links(config, db, old_stem, new_stem, new_label, dry_run=False)
+        # Keep the in-run snapshot consistent for any later relabel this pass.
+        active_preferred.discard(old_label.casefold())
+        active_preferred.add(new_label.casefold())
+        issues.append(
+            LintIssue(
+                path=new_rel,
+                issue_type="manual_relabel_adopted",
+                description=(
+                    f"Adopted manual rename {old_label!r} → {new_label!r}; "
+                    f"{links} inbound link(s) rewritten."
+                ),
+                suggestion="None — the preferred label now matches the filename.",
+                auto_fixable=False,
+            )
+        )
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 
@@ -974,6 +1085,61 @@ def run_lint(config: Config, db: StateDB, fix: bool = False) -> LintResult:
                 auto_fixable=False,
             )
         )
+
+    # Ambiguous bare label (homonym) with no disambiguation stub on disk.
+    existing_stems = {
+        Path(a.path).stem.casefold() for a in db.list_articles() if a.kind == "disambiguation"
+    }
+    for label, n in db.find_ambiguous_active_labels():
+        if sanitize_filename(label).casefold() in existing_stems:
+            continue
+        issues.append(
+            LintIssue(
+                path="",
+                issue_type="ambiguous_label_needs_disambiguation",
+                description=(
+                    f"Label {label!r} resolves to {n} entities but has no disambiguation page."
+                ),
+                suggestion=f"Run `synto concept split` or add a disambiguation stub for {label!r}.",
+                auto_fixable=False,
+            )
+        )
+
+    # Untrusted aliases left over from the v18 legacy backfill.
+    legacy_aliases = db.count_legacy_backfill_aliases()
+    if legacy_aliases:
+        issues.append(
+            LintIssue(
+                path="",
+                issue_type="stale_legacy_backfill_alias",
+                description=(
+                    f"{legacy_aliases} alias(es) still sourced from the v18 legacy backfill."
+                ),
+                suggestion="Review with `synto concept inspect`; merge or bless to clear.",
+                auto_fixable=False,
+            )
+        )
+
+    # Two active entities whose preferred labels sanitize to the same filename.
+    by_stem: dict[str, list[str]] = {}
+    for label in db.list_active_preferred_labels():
+        by_stem.setdefault(sanitize_filename(label).casefold(), []).append(label)
+    for stem, labels in by_stem.items():
+        if len(labels) > 1:
+            issues.append(
+                LintIssue(
+                    path="",
+                    issue_type="homonym_filename_collision",
+                    description=(
+                        f"Entities {labels!r} all map to filename {stem!r}.md — "
+                        "their compile output would collide on disk."
+                    ),
+                    suggestion="Rename one entity to a distinct filename-safe label.",
+                    auto_fixable=False,
+                )
+            )
+
+    _check_manual_relabel(config, db, issues, fix)
 
     # ── Health score ──────────────────────────────────────────────────────────
     # Score based on structural wiki health. Graph-quality findings are advisory:

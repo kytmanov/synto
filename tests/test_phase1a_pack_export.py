@@ -687,3 +687,36 @@ def test_export_source_refs_invalid_quality_type(vault, config, db):
     match = next((r for r in refs if r["title"] == "Typed"), None)
     assert match is not None
     assert match["quality"] == 42
+
+
+def test_routes_payload_emits_per_entity_routes_for_homonyms(db):
+    """Two homonyms must export two distinct article routes, not collapse to one (feature 45).
+
+    The route dedup keys on (kind, surface, path), so each entity's qualified label routes to
+    its own article path — homonyms do not first-wins-overwrite each other.
+    """
+    from synto.pack_export import _routes_payload
+
+    db.upsert_concepts("raw/a.md", ["Mercury (planet)"])
+    db.upsert_concepts("raw/b.md", ["Mercury (element)"])
+    for title, src in [("Mercury (planet)", "raw/a.md"), ("Mercury (element)", "raw/b.md")]:
+        db.upsert_article(
+            WikiArticleRecord(
+                path=f"wiki/{title}.md",
+                title=title,
+                sources=[src],
+                content_hash="h",
+                status="published",
+                entity_id=db.entity_id_for_name(title),
+            )
+        )
+
+    routes = _routes_payload(db, [])["routes"]
+    article_routes = {
+        r["canonical"]: r["path"]
+        for r in routes
+        if r["kind"] == "article" and r["surface"] == r["canonical"]
+    }
+    assert article_routes["Mercury (planet)"] == "articles/Mercury (planet).md"
+    assert article_routes["Mercury (element)"] == "articles/Mercury (element).md"
+    assert article_routes["Mercury (planet)"] != article_routes["Mercury (element)"]

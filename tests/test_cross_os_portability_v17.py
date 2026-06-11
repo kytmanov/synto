@@ -49,12 +49,13 @@ def _seed_windows_built_db(db_path: Path) -> str:
         ("raw\\qubit.md", body_hash, "ingested"),
     )
     db._conn.execute(
-        "INSERT INTO concepts (name, source_path) VALUES (?, ?)",
-        ("Qubit", "raw\\qubit.md"),
+        "INSERT INTO concepts (entity_id, name, source_path) VALUES (?, ?, ?)",
+        ("ent-qubit", "Qubit", "raw\\qubit.md"),
     )
     db._conn.execute(
         "INSERT INTO concept_compile_state "
-        "(concept_name, source_path, status, updated_at) VALUES (?, ?, 'compiled', ?)",
+        "(entity_id, concept_name, source_path, status, updated_at)"
+        " VALUES ('ent-qubit', ?, ?, 'compiled', ?)",
         ("Qubit", "raw\\qubit.md", "2026-01-01"),
     )
     db._conn.execute(
@@ -89,7 +90,7 @@ def test_v17_migration_rewrites_separators_on_a_windows_built_db(tmp_path: Path)
 
     db = StateDB(db_path)  # reopen → runs the v17 migration
 
-    assert db._conn.execute("SELECT version FROM schema_version").fetchone()[0] == 21
+    assert db._conn.execute("SELECT version FROM schema_version").fetchone()[0] == 25
     assert db._conn.execute("SELECT path FROM raw_notes").fetchone()[0] == "raw/qubit.md"
     assert db._conn.execute("SELECT source_path FROM concepts").fetchone()[0] == "raw/qubit.md"
     assert (
@@ -136,7 +137,7 @@ def test_v17_migration_leaves_absolute_master_path_untouched(tmp_path: Path) -> 
 
     db = StateDB(db_path)  # runs v17 then v18
 
-    assert db._conn.execute("SELECT version FROM schema_version").fetchone()[0] == 21
+    assert db._conn.execute("SELECT version FROM schema_version").fetchone()[0] == 25
     path, master = db._conn.execute("SELECT path, master_path FROM generated_assets").fetchone()
     assert master == abs_master  # absolute external path preserved byte-for-byte
     assert path == "assets/doc/img.png"  # vault-relative key untouched (already POSIX)
@@ -317,9 +318,11 @@ def _seed_v16_and_migrate(db_path: Path, inserts: list[tuple[str, tuple]]) -> St
     return StateDB(db_path)
 
 
+# entity_id is hardcoded ('ent') since each of these tests uses a single concept; the v17
+# recency resolver pairs separator-twins by (concept_name, source_path), not entity_id.
 _COMPILE_INSERT = (
-    "INSERT INTO concept_compile_state (concept_name, source_path, status, updated_at) "
-    "VALUES (?, ?, ?, ?)"
+    "INSERT INTO concept_compile_state (entity_id, concept_name, source_path, status, updated_at) "
+    "VALUES ('ent', ?, ?, ?, ?)"
 )
 
 
@@ -469,12 +472,16 @@ def test_v17_recency_resolution_is_loud_only_when_state_diverges(tmp_path: Path,
 
 
 def test_v17_concepts_separator_duplicate_is_lossless_posix_wins(tmp_path: Path) -> None:
-    """concepts carries only its PK (name, source_path), so a separator-duplicate is identical
-    information — collapsing to the single POSIX row is correct, not the silent-loss bug."""
-    insert = "INSERT INTO concepts (name, source_path) VALUES (?, ?)"
+    """concepts is keyed on (entity_id, source_path), so a separator-duplicate of one entity is
+    identical information — collapsing to the single POSIX row is correct, not the silent-loss
+    bug. Both rows seed the same entity_id so the v17 dedup has a real collision to resolve."""
+    insert = "INSERT INTO concepts (entity_id, name, source_path) VALUES (?, ?, ?)"
     db = _seed_v16_and_migrate(
         tmp_path / "state.db",
-        [(insert, ("Qubit", "raw\\q.md")), (insert, ("Qubit", "raw/q.md"))],
+        [
+            (insert, ("ent-qubit", "Qubit", "raw\\q.md")),
+            (insert, ("ent-qubit", "Qubit", "raw/q.md")),
+        ],
     )
     rows = db._conn.execute("SELECT name, source_path FROM concepts").fetchall()
     assert [(r[0], r[1]) for r in rows] == [("Qubit", "raw/q.md")]
@@ -530,8 +537,8 @@ def test_recency_resolver_pairs_twins_across_a_null_secondary_key(tmp_path: Path
     """
     db = StateDB(tmp_path / "state.db")
     insert = (
-        "INSERT INTO concept_compile_state (concept_name, source_path, status, compiled_at, "
-        "updated_at) VALUES (?, ?, ?, NULL, ?)"
+        "INSERT INTO concept_compile_state (entity_id, concept_name, source_path, status, "
+        "compiled_at, updated_at) VALUES ('ent', ?, ?, ?, NULL, ?)"
     )
     db._conn.execute(insert, ("Qubit", "raw\\q.md", "compiled", "2026-03-01"))  # newer
     db._conn.execute(insert, ("Qubit", "raw/q.md", "pending", "2026-01-01"))  # older

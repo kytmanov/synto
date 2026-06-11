@@ -923,6 +923,41 @@ def _load_source_concept_seeds_from_index(config: Config) -> dict[str, tuple[str
     return seeded
 
 
+def _restore_identity_from_index(config: Config, db: StateDB) -> None:
+    """Restore entity ids + identity log from a preserved INDEX.json on a fresh-DB rebuild.
+
+    Durability (decision 13): recreates entities with their ORIGINAL ids (not re-minted) so a
+    deleted-state.db rebuild is lossless. Precedence is enforced in restore_entities_from_seed
+    (state.db wins if it already holds entities). No-op when INDEX.json is absent — that is a
+    normal fresh ingest (both absent → re-mint by label), not a degraded rebuild.
+    """
+    index_path = config.app_dir / "INDEX.json"
+    if not index_path.exists():
+        return
+    try:
+        payload = json.loads(index_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    entries: list[tuple[str, str]] = []
+    for entry in payload.get("source_concepts", []):
+        if not isinstance(entry, dict):
+            continue
+        for concept in entry.get("concepts", []):
+            if isinstance(concept, dict):
+                name, eid = concept.get("name"), concept.get("entity_id")
+                if isinstance(name, str) and isinstance(eid, str) and eid:
+                    entries.append((name, eid))
+    for art in payload.get("articles", []):
+        if isinstance(art, dict):
+            name, eid = art.get("name"), art.get("entity_id")
+            if isinstance(name, str) and isinstance(eid, str) and eid:
+                entries.append((name, eid))
+    restored = db.restore_entities_from_seed(entries)
+    if restored:
+        log.info("Rebuild: restored %d entity identities from INDEX.json seed", restored)
+        db.restore_identity_log(payload.get("identity_log", []))
+
+
 def _matching_seeded_source_concepts(
     source_concept_seeds: dict[str, tuple[str, list[str]]] | None,
     rel_path: str,
@@ -1600,6 +1635,8 @@ def ingest_all(
     seed_alias_map = None
     source_concept_seeds = None
     if not existing_topics:
+        # Lossless rebuild: restore entity ids + identity log before ingest re-mints by label.
+        _restore_identity_from_index(config, db)
         seed_concepts = _load_seed_canonical_names_from_index(config)
         seed_alias_map = _load_seed_alias_map_from_index(config)
         source_concept_seeds = _load_source_concept_seeds_from_index(config)

@@ -816,6 +816,9 @@ def _write_draft(
     post = fm_lib.Post(body, **meta)
     atomic_write(draft_path, fm_lib.dumps(post))
 
+    # Bind the draft to its entity so publish/verify/reject recover identity from the
+    # article, not its title (homonym-safe). The title is the qualified preferred label,
+    # so it resolves to exactly one entity; non-concept/legacy titles resolve to None.
     db.upsert_article(
         WikiArticleRecord(
             path=str(draft_path.relative_to(config.vault)),
@@ -823,6 +826,7 @@ def _write_draft(
             sources=source_paths,
             content_hash=_content_hash(body),
             status="draft",
+            entity_id=db.entity_id_for_name(article_title),
         )
     )
 
@@ -1788,8 +1792,13 @@ def reject_draft(
         draft_path.unlink()
 
     source_paths = article_record.sources if article_record is not None else []
+    entity_id = article_record.entity_id if article_record is not None else None
     if source_paths:
-        db.mark_concept_compile_state(title, source_paths, "pending")
+        # Recover identity from the article binding, not the (possibly homonymous) title.
+        if entity_id is not None:
+            db.mark_compile_state_for_entity(entity_id, source_paths, "pending")
+        else:
+            db.mark_concept_compile_state(title, source_paths, "pending")
 
     if feedback:
         db.add_rejection(title, feedback, body=draft_body)

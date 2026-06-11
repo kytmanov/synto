@@ -128,7 +128,7 @@ def _fts5_available(conn: sqlite3.Connection) -> bool:
         return False
 
 
-_CURRENT_SCHEMA_VERSION = 21
+_CURRENT_SCHEMA_VERSION = 25
 
 
 @dataclass
@@ -166,10 +166,14 @@ CREATE TABLE IF NOT EXISTS raw_notes (
 );
 
 CREATE TABLE IF NOT EXISTS concepts (
-    name        TEXT NOT NULL,
+    entity_id   TEXT NOT NULL,
     source_path TEXT NOT NULL,
-    PRIMARY KEY (name, source_path)
+    name        TEXT NOT NULL,
+    PRIMARY KEY (entity_id, source_path)
 );
+-- idx_concepts_entity is created in the v22 post-hook, NOT here: _SCHEMA runs on
+-- every open before migrations, and a pre-v22 `concepts` table (PK name) has no
+-- entity_id column yet, so indexing it here would fail on the upgrade path.
 
 CREATE TABLE IF NOT EXISTS wiki_articles (
     path           TEXT PRIMARY KEY,
@@ -187,7 +191,8 @@ CREATE TABLE IF NOT EXISTS wiki_articles (
     synthesis_sources TEXT,
     synthesis_source_hashes TEXT,
     article_id     TEXT,
-    last_compile_pipeline TEXT
+    last_compile_pipeline TEXT,
+    entity_id      TEXT
 );
 
 CREATE TABLE IF NOT EXISTS source_documents (
@@ -436,7 +441,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_concept_labels_preferred_per_entity
 
 CREATE TABLE IF NOT EXISTS concept_identity_log (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    op         TEXT NOT NULL CHECK (op IN ('merge', 'split', 'rename')),
+    op         TEXT NOT NULL CHECK (op IN ('merge', 'split', 'rename', 'unmerge')),
     entity_ids TEXT NOT NULL,
     labels     TEXT NOT NULL,
     meta       TEXT,
@@ -837,6 +842,10 @@ _VERSIONED_MIGRATIONS: dict[int, list[str]] = {
             ts         TEXT NOT NULL
         )"""
     ],
+    22: [],  # rebuild `concepts` onto PK (entity_id, source_path) in the post-hook for atomicity
+    23: [],  # rebuild `concept_compile_state` onto PK (entity_id, source_path) in the post-hook
+    24: ["ALTER TABLE wiki_articles ADD COLUMN entity_id TEXT"],  # backfill in the post-hook
+    25: [],  # rebuild concept_identity_log to allow op='unmerge' in the post-hook for atomicity
 }
 
 
@@ -1020,6 +1029,14 @@ class StateDB:
                 self._backfill_entities_v18()
             if version == 19:
                 self._extend_occurrences_v19()
+            if version == 22:
+                self._rebuild_concepts_on_entity_id_v22()
+            if version == 23:
+                self._rebuild_compile_state_on_entity_id_v23()
+            if version == 24:
+                self._backfill_article_entities_v24()
+            if version == 25:
+                self._expand_identity_log_ops_v25()
             with self._tx():
                 self._conn.execute(
                     "INSERT OR REPLACE INTO schema_version (id, version) VALUES (1, ?)",
@@ -1581,6 +1598,208 @@ class StateDB:
                     )"""
                 )
 
+    def _rebuild_concepts_on_entity_id_v22(self) -> None:
+        """Rebuild `concepts` onto PK (entity_id, source_path); keep `name` as a cache.
+
+        Feature 45 Architecture X: identity must flow through entity_id, not the
+        name string. The old PK (name, source_path) made name load-bearing. This
+        rebuild re-keys every source edge on the entity it already resolves to
+        (via the v18 entity layer), carrying `name` as a denormalized display
+        cache refreshed on rename/merge.
+
+        Atomic via _tx(); idempotent via PRAGMA probe (skips if `concepts`
+        already carries entity_id). Two old rows whose distinct names resolve to
+        the same entity for one source collapse to one row (INSERT OR IGNORE) —
+        the dedup this feature intends.
+        """
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(concepts)").fetchall()}
+        if "entity_id" not in cols:
+            now = datetime.now().isoformat()
+            old_rows = self._conn.execute(
+                "SELECT name, source_path FROM concepts ORDER BY name, source_path"
+            ).fetchall()
+            with self._tx():
+                self._conn.execute(
+                    """CREATE TABLE concepts_new (
+                        entity_id   TEXT NOT NULL,
+                        source_path TEXT NOT NULL,
+                        name        TEXT NOT NULL,
+                        PRIMARY KEY (entity_id, source_path)
+                    )"""
+                )
+                for row in old_rows:
+                    name = row["name"]
+                    source_path = row["source_path"]
+                    entity_id = self._ensure_entity_for_name(name, now)
+                    if entity_id is None:
+                        # Degenerate name (empty label_key) — cannot key on identity; drop.
+                        log.warning("v22 rebuild: dropping concept with empty label_key: %r", name)
+                        continue
+                    self._conn.execute(
+                        "INSERT OR IGNORE INTO concepts_new (entity_id, source_path, name)"
+                        " VALUES (?, ?, ?)",
+                        (entity_id, source_path, name),
+                    )
+                self._conn.execute("DROP TABLE concepts")
+                self._conn.execute("ALTER TABLE concepts_new RENAME TO concepts")
+
+        # Recreate indexes for both paths: the rebuild above (old DBs, which drops
+        # the old table and its idx_concept_name) and fresh DBs whose `concepts`
+        # already carries entity_id from _SCHEMA. _SCHEMA's idx_concept_name only
+        # reappears on the next open, so recreate it here for the rebuild path.
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_concepts_entity ON concepts(entity_id)")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_concept_name ON concepts(name)")
+
+        # Path-stability check (feature 45 risk): compile derives the output filename from
+        # the entity's preferred label. On a clean pre-45 upgrade the cached name equals the
+        # preferred label by construction, so a hit here is a pre-existing anomaly worth
+        # surfacing rather than hiding — its published file path may shift on next compile.
+        divergent = self._conn.execute(
+            """SELECT COUNT(*) FROM concepts c
+               JOIN concept_labels cl ON cl.entity_id = c.entity_id AND cl.role = 'preferred'
+               WHERE lower(c.name) != lower(cl.label)"""
+        ).fetchone()[0]
+        if divergent:
+            log.warning(
+                "v22: %d concept row(s) whose cached name differs from the entity's preferred "
+                "label; compile output paths derive from the preferred label",
+                divergent,
+            )
+
+    def _rebuild_compile_state_on_entity_id_v23(self) -> None:
+        """Rebuild `concept_compile_state` onto PK (entity_id, source_path).
+
+        Feature 45 Architecture X: compile scheduling must key on entity identity,
+        not the name string, so two homonyms schedule as distinct units. `concept_name`
+        is carried as a denormalized cache (refreshed on rename/merge). Unlike `concepts`,
+        the _SCHEMA copy of this table stays old-shaped (PK concept_name) because the v6
+        `_validate_v6_tables` hook would reject an entity_id column on the upgrade path;
+        every DB therefore gains entity_id here.
+
+        Atomic via _tx(); idempotent via PRAGMA probe (skips the rebuild if entity_id is
+        already present). Two old rows whose names resolve to one entity for a source
+        collapse to one row (INSERT OR IGNORE).
+        """
+        cols = {
+            r[1] for r in self._conn.execute("PRAGMA table_info(concept_compile_state)").fetchall()
+        }
+        if "entity_id" not in cols:
+            now = datetime.now().isoformat()
+            old_rows = self._conn.execute(
+                "SELECT concept_name, source_path, status, error, compiled_at, updated_at"
+                " FROM concept_compile_state"
+            ).fetchall()
+            with self._tx():
+                self._conn.execute(
+                    """CREATE TABLE concept_compile_state_new (
+                        entity_id    TEXT NOT NULL,
+                        source_path  TEXT NOT NULL,
+                        concept_name TEXT NOT NULL,
+                        status       TEXT NOT NULL DEFAULT 'pending',
+                        error        TEXT,
+                        compiled_at  TEXT,
+                        updated_at   TEXT NOT NULL,
+                        PRIMARY KEY (entity_id, source_path),
+                        CHECK (status IN ('pending', 'failed', 'compiled',
+                                          'deferred_draft', 'deferred_manual_edit'))
+                    )"""
+                )
+                for row in old_rows:
+                    concept_name = row["concept_name"]
+                    entity_id = self._ensure_entity_for_name(concept_name, now)
+                    if entity_id is None:
+                        log.warning(
+                            "v23 rebuild: dropping compile-state with empty label_key: %r",
+                            concept_name,
+                        )
+                        continue
+                    self._conn.execute(
+                        "INSERT OR IGNORE INTO concept_compile_state_new"
+                        " (entity_id, source_path, concept_name, status, error,"
+                        "  compiled_at, updated_at)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            entity_id,
+                            row["source_path"],
+                            concept_name,
+                            row["status"],
+                            row["error"],
+                            row["compiled_at"],
+                            row["updated_at"],
+                        ),
+                    )
+                self._conn.execute("DROP TABLE concept_compile_state")
+                self._conn.execute(
+                    "ALTER TABLE concept_compile_state_new RENAME TO concept_compile_state"
+                )
+        # Recreate indexes for both the rebuild path and fresh DBs (see v22 rationale).
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_concept_compile_status"
+            " ON concept_compile_state(status, source_path)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_concept_compile_name"
+            " ON concept_compile_state(lower(concept_name))"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_concept_compile_entity"
+            " ON concept_compile_state(entity_id)"
+        )
+
+    def _backfill_article_entities_v24(self) -> None:
+        """Bind existing concept articles to their entity via the title→entity bridge.
+
+        Only 'concept' articles are bound; synthesis & disambiguation pages keep
+        entity_id NULL (no single owning entity). Idempotent: only fills NULLs, and a
+        title that is ambiguous/unknown is left NULL rather than guessed.
+        """
+        rows = self._conn.execute(
+            "SELECT path, title FROM wiki_articles WHERE kind = 'concept' AND entity_id IS NULL"
+        ).fetchall()
+        with self._tx():
+            for row in rows:
+                entity_id = self.entity_id_for_name(row["title"])
+                if entity_id is None:
+                    continue
+                self._conn.execute(
+                    "UPDATE wiki_articles SET entity_id = ? WHERE path = ?",
+                    (entity_id, row["path"]),
+                )
+
+    def _expand_identity_log_ops_v25(self) -> None:
+        """Allow op='unmerge' in concept_identity_log (Stage 7 reversibility).
+
+        SQLite cannot ALTER a CHECK constraint, so rebuild the table preserving every
+        row. Atomic via _tx(); idempotent via a probe of the stored table SQL (skips if
+        the definition already permits 'unmerge', e.g. fresh DBs created from _SCHEMA).
+        """
+        if not self._has_table("concept_identity_log"):
+            return
+        row = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='concept_identity_log'"
+        ).fetchone()
+        if row and "unmerge" in (row[0] or ""):
+            return
+        with self._tx():
+            self._conn.execute(
+                """CREATE TABLE concept_identity_log_new (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    op         TEXT NOT NULL CHECK (op IN ('merge', 'split', 'rename', 'unmerge')),
+                    entity_ids TEXT NOT NULL,
+                    labels     TEXT NOT NULL,
+                    meta       TEXT,
+                    ts         TEXT NOT NULL
+                )"""
+            )
+            self._conn.execute(
+                "INSERT INTO concept_identity_log_new (id, op, entity_ids, labels, meta, ts)"
+                " SELECT id, op, entity_ids, labels, meta, ts FROM concept_identity_log"
+            )
+            self._conn.execute("DROP TABLE concept_identity_log")
+            self._conn.execute(
+                "ALTER TABLE concept_identity_log_new RENAME TO concept_identity_log"
+            )
+
     def _backfill_compile_state_v6(self) -> None:
         self._ensure_compile_state_rows()
         alias_rows = self._conn.execute(
@@ -1638,7 +1857,16 @@ class StateDB:
         return None
 
     def _ensure_compile_state_rows(self, source_path: str | None = None) -> None:
-        query = "SELECT name, source_path FROM concepts"
+        # Schema-aware on the INSERT target (concept_compile_state): this runs both at
+        # runtime (compile_state keyed on entity_id, v23) and from the v6 backfill
+        # mid-migration, where compile_state is still name-keyed. compile_state having
+        # entity_id implies v22 ran too, so concepts.entity_id is then readable.
+        ccs_cols = {
+            r[1] for r in self._conn.execute("PRAGMA table_info(concept_compile_state)").fetchall()
+        }
+        has_entity = "entity_id" in ccs_cols
+        cols = "entity_id, name, source_path" if has_entity else "name, source_path"
+        query = f"SELECT {cols} FROM concepts"
         params: tuple[str, ...] = ()
         if source_path is not None:
             query += " WHERE source_path = ?"
@@ -1647,12 +1875,21 @@ class StateDB:
         now = datetime.now().isoformat()
         with self._tx():
             for row in rows:
-                self._conn.execute(
-                    """INSERT OR IGNORE INTO concept_compile_state
-                           (concept_name, source_path, status, error, compiled_at, updated_at)
-                       VALUES (?, ?, 'pending', NULL, NULL, ?)""",
-                    (row["name"], row["source_path"], now),
-                )
+                if has_entity:
+                    self._conn.execute(
+                        """INSERT OR IGNORE INTO concept_compile_state
+                               (entity_id, source_path, concept_name, status, error,
+                                compiled_at, updated_at)
+                           VALUES (?, ?, ?, 'pending', NULL, NULL, ?)""",
+                        (row["entity_id"], row["source_path"], row["name"], now),
+                    )
+                else:
+                    self._conn.execute(
+                        """INSERT OR IGNORE INTO concept_compile_state
+                               (concept_name, source_path, status, error, compiled_at, updated_at)
+                           VALUES (?, ?, 'pending', NULL, NULL, ?)""",
+                        (row["name"], row["source_path"], now),
+                    )
 
     def _refresh_all_raw_compile_statuses(self) -> None:
         rows = self._conn.execute("SELECT path FROM raw_notes").fetchall()
@@ -1866,11 +2103,16 @@ class StateDB:
                 name = name.strip()
                 if not name:
                     continue
+                # Resolve to identity at the write seam: mint if absent, then key
+                # the source edge on entity_id (concepts is entity-keyed since v22).
+                entity_id = self._ensure_entity_for_name(name, now)
+                if entity_id is None:
+                    continue
                 self._conn.execute(
-                    "INSERT OR IGNORE INTO concepts (name, source_path) VALUES (?, ?)",
-                    (name, source_path),
+                    "INSERT OR IGNORE INTO concepts (entity_id, source_path, name)"
+                    " VALUES (?, ?, ?)",
+                    (entity_id, source_path, name),
                 )
-                self._ensure_entity_for_name(name, now)
                 now = datetime.now().isoformat()
                 self._conn.execute(
                     """INSERT OR IGNORE INTO knowledge_items
@@ -1891,33 +2133,42 @@ class StateDB:
             seen.add(cleaned.casefold())
             normalized.append(cleaned)
 
-        existing_rows = self._conn.execute(
-            "SELECT name FROM concepts WHERE source_path = ?", (source_path,)
-        ).fetchall()
-        existing_names = {row["name"] for row in existing_rows}
-        new_names = set(normalized)
-        removed = existing_names - new_names
-
         now = datetime.now().isoformat()
         with self._tx():
-            if removed:
-                placeholders = ",".join("?" * len(removed))
-                params = [source_path, *removed]
+            # Resolve/mint each new name to its entity up front; concepts is keyed
+            # on entity_id (v22), so removal is by entity_id, not by name string.
+            name_to_id: dict[str, str] = {}
+            kept_ids: set[str] = set()
+            for name in normalized:
+                entity_id = self._ensure_entity_for_name(name, now)
+                if entity_id is None:
+                    continue
+                name_to_id[name] = entity_id
+                kept_ids.add(entity_id)
+
+            existing_rows = self._conn.execute(
+                "SELECT entity_id, name FROM concepts WHERE source_path = ?", (source_path,)
+            ).fetchall()
+            removed_ids = [r["entity_id"] for r in existing_rows if r["entity_id"] not in kept_ids]
+            if removed_ids:
+                placeholders = ",".join("?" * len(removed_ids))
                 self._conn.execute(
-                    f"DELETE FROM concepts WHERE source_path = ? AND name IN ({placeholders})",
-                    params,
+                    f"DELETE FROM concepts WHERE source_path = ? AND entity_id IN ({placeholders})",
+                    [source_path, *removed_ids],
                 )
                 self._conn.execute(
-                    (
-                        "DELETE FROM concept_compile_state "
-                        f"WHERE source_path = ? AND concept_name IN ({placeholders})"
-                    ),
-                    params,
+                    "DELETE FROM concept_compile_state "
+                    f"WHERE source_path = ? AND entity_id IN ({placeholders})",
+                    [source_path, *removed_ids],
                 )
             for name in normalized:
+                entity_id = name_to_id.get(name)
+                if entity_id is None:
+                    continue
                 self._conn.execute(
-                    "INSERT OR IGNORE INTO concepts (name, source_path) VALUES (?, ?)",
-                    (name, source_path),
+                    "INSERT OR IGNORE INTO concepts (entity_id, source_path, name)"
+                    " VALUES (?, ?, ?)",
+                    (entity_id, source_path, name),
                 )
                 self._conn.execute(
                     """INSERT OR IGNORE INTO knowledge_items
@@ -1927,16 +2178,17 @@ class StateDB:
                 )
                 self._conn.execute(
                     """INSERT INTO concept_compile_state
-                           (concept_name, source_path, status, error, compiled_at, updated_at)
-                       VALUES (?, ?, 'pending', NULL, NULL, ?)
-                       ON CONFLICT(concept_name, source_path) DO UPDATE SET
+                           (entity_id, source_path, concept_name, status, error,
+                            compiled_at, updated_at)
+                       VALUES (?, ?, ?, 'pending', NULL, NULL, ?)
+                       ON CONFLICT(entity_id, source_path) DO UPDATE SET
+                           concept_name=excluded.concept_name,
                            status='pending',
                            error=NULL,
                            compiled_at=NULL,
                            updated_at=excluded.updated_at""",
-                    (name, source_path, now),
+                    (entity_id, source_path, name, now),
                 )
-                self._ensure_entity_for_name(name, now)
         self.refresh_raw_compile_status(source_path)
 
     def list_all_concept_names(self) -> list[str]:
@@ -1945,10 +2197,22 @@ class StateDB:
         return [r[0] for r in rows]
 
     def get_sources_for_concept(self, name: str) -> list[str]:
-        """Raw note paths linked to a concept (case-insensitive match)."""
+        """Raw note paths linked to a concept, resolved by entity identity.
+
+        Resolves the label to its entity (handles aliases + the denormalized name
+        cache uniformly) then reads source edges by entity_id. Returns [] for an
+        unknown or ambiguous label.
+        """
+        entity_id = self.entity_id_for_name(name)
+        if entity_id is None:
+            return []
+        return self.get_sources_for_entity(entity_id)
+
+    def get_sources_for_entity(self, entity_id: str) -> list[str]:
+        """Raw note paths linked to an entity."""
         rows = self._conn.execute(
-            "SELECT DISTINCT source_path FROM concepts WHERE lower(name) = lower(?)",
-            (name,),
+            "SELECT DISTINCT source_path FROM concepts WHERE entity_id = ?",
+            (entity_id,),
         ).fetchall()
         return [r[0] for r in rows]
 
@@ -2078,11 +2342,10 @@ class StateDB:
         placeholders = ",".join("?" * len(candidate_ids))
         rows = self._conn.execute(
             f"""
-            SELECT DISTINCT cl.entity_id
+            SELECT DISTINCT c.entity_id
             FROM concepts c
-            JOIN concept_labels cl ON lower(cl.label) = lower(c.name) AND cl.role = 'preferred'
-            JOIN concept_entities ce ON ce.id = cl.entity_id AND ce.status = 'active'
-            WHERE c.source_path = ? AND cl.entity_id IN ({placeholders})
+            JOIN concept_entities ce ON ce.id = c.entity_id AND ce.status = 'active'
+            WHERE c.source_path = ? AND c.entity_id IN ({placeholders})
             """,
             (source_path, *candidate_ids),
         ).fetchall()
@@ -2275,11 +2538,15 @@ class StateDB:
                 loser_id: loser_name,
             }
 
-            # Move source edges.
+            # Move source edges onto the winner entity. UPDATE OR IGNORE skips a
+            # row that would collide on (winner_id, source_path) — i.e. both
+            # entities cited the same source — and the leftover loser row is then
+            # deleted, collapsing to a single winner edge.
             self._conn.execute(
-                "UPDATE concepts SET name=? WHERE lower(name)=lower(?)",
-                (winner_name, loser_name),
+                "UPDATE OR IGNORE concepts SET entity_id=?, name=? WHERE entity_id=?",
+                (winner_id, winner_name, loser_id),
             )
+            self._conn.execute("DELETE FROM concepts WHERE entity_id=?", (loser_id,))
 
             # Union labels: loser preferred → winner alias; loser aliases → winner aliases.
             winner_lk = _ck(winner_name)
@@ -2298,27 +2565,42 @@ class StateDB:
                 )
                 labels_absorbed.append(lbl)
 
-            # Move compile state.
+            # Move compile state onto the winner entity (UPDATE OR IGNORE + delete the
+            # leftover collides exactly like the concepts edge-move), refreshing the cache.
             self._conn.execute(
-                "UPDATE concept_compile_state SET concept_name=?"
-                " WHERE lower(concept_name)=lower(?)",
-                (winner_name, loser_name),
+                "UPDATE OR IGNORE concept_compile_state SET entity_id=?, concept_name=?"
+                " WHERE entity_id=?",
+                (winner_id, winner_name, loser_id),
             )
+            self._conn.execute("DELETE FROM concept_compile_state WHERE entity_id=?", (loser_id,))
             # Ensure pending rows exist for loser sources now attached to winner.
             for src in loser_sources:
                 self._conn.execute(
                     """INSERT INTO concept_compile_state
-                           (concept_name, source_path, status, updated_at)
-                       VALUES (?, ?, 'pending', ?)
-                       ON CONFLICT(concept_name, source_path) DO NOTHING""",
-                    (winner_name, src, now),
+                           (entity_id, source_path, concept_name, status, updated_at)
+                       VALUES (?, ?, ?, 'pending', ?)
+                       ON CONFLICT(entity_id, source_path) DO NOTHING""",
+                    (winner_id, src, winner_name, now),
                 )
 
-            # Move behavioral state.
+            # Move behavioral state. Occurrences carry UNIQUE(concept_name, segment/path)
+            # indexes, so a plain rename collides when a segment cited both concepts —
+            # OR IGNORE skips the collisions, then the leftover loser rows are dropped
+            # (same collapse pattern as the concepts / compile_state edge moves above).
             self._conn.execute(
-                "UPDATE concept_occurrences SET concept_name=?"
+                "UPDATE OR IGNORE concept_occurrences SET concept_name=?"
                 " WHERE lower(concept_name)=lower(?)",
                 (winner_name, loser_name),
+            )
+            self._conn.execute(
+                "DELETE FROM concept_occurrences WHERE lower(concept_name)=lower(?)",
+                (loser_name,),
+            )
+            # Repoint resolved occurrences off the now-retired loser entity (no unique
+            # index on entity_id, so this cannot collide).
+            self._conn.execute(
+                "UPDATE concept_occurrences SET entity_id=? WHERE entity_id=?",
+                (winner_id, loser_id),
             )
             self._conn.execute(
                 "UPDATE rejections SET concept=? WHERE lower(concept)=lower(?)",
@@ -2377,9 +2659,7 @@ class StateDB:
             "labels_absorbed": labels_absorbed,
         }
 
-    def split_entity(
-        self, entity_name: str, senses: list[dict[str, object]]
-    ) -> dict:
+    def split_entity(self, entity_name: str, senses: list[dict[str, object]]) -> dict:
         """Split one entity into multiple senses, each owning a subset of sources.
 
         senses is a list of {name: str, sources: list[str]}.
@@ -2408,9 +2688,7 @@ class StateDB:
                     claimed.add(src)
             unclaimed = owned - claimed
             if unclaimed:
-                raise ValueError(
-                    f"Sources not assigned to any sense: {sorted(unclaimed)}"
-                )
+                raise ValueError(f"Sources not assigned to any sense: {sorted(unclaimed)}")
 
             bare_lk = _ck(entity_name)
             result_senses: list[dict] = []
@@ -2418,6 +2696,15 @@ class StateDB:
             for sense in senses:
                 new_name = str(sense["name"])
                 sources = list(sense["sources"])  # type: ignore[arg-type]
+                # The bare label is reserved for the disambiguation page; a sense that
+                # reuses it would resolve back to the original entity (then be retired)
+                # and its stub would be clobbered by the disambiguation stub.
+                if bare_lk and _ck(new_name) == bare_lk:
+                    raise ValueError(
+                        f"Sense {new_name!r} cannot reuse the original label"
+                        f" {entity_name!r} — that name is reserved for the"
+                        " disambiguation page."
+                    )
                 # Mint new entity.
                 new_id = self._ensure_entity_for_name(new_name, now)
                 if new_id is None:
@@ -2432,50 +2719,54 @@ class StateDB:
                         " ON CONFLICT(entity_id, label_key) DO NOTHING",
                         (new_id, entity_name, bare_lk, _mk(entity_name), now),
                     )
-                # Move source edges.
+                # Move source edges onto the sense entity (sources are partitioned
+                # across senses, so no (new_id, src) collision is expected).
                 for src in sources:
                     self._conn.execute(
-                        "UPDATE concepts SET name=? WHERE name=? AND source_path=?",
-                        (new_name, entity_name, src),
+                        "UPDATE OR IGNORE concepts SET entity_id=?, name=?"
+                        " WHERE entity_id=? AND source_path=?",
+                        (new_id, new_name, original_id, src),
                     )
-                    # Seed pending compile state.
+                    # Seed pending compile state on the sense entity.
                     self._conn.execute(
                         """INSERT INTO concept_compile_state
-                               (concept_name, source_path, status, updated_at)
-                           VALUES (?, ?, 'pending', ?)
-                           ON CONFLICT(concept_name, source_path) DO UPDATE
-                               SET status='pending', updated_at=excluded.updated_at""",
-                        (new_name, src, now),
+                               (entity_id, source_path, concept_name, status, updated_at)
+                           VALUES (?, ?, ?, 'pending', ?)
+                           ON CONFLICT(entity_id, source_path) DO UPDATE
+                               SET concept_name=excluded.concept_name,
+                                   status='pending', updated_at=excluded.updated_at""",
+                        (new_id, src, new_name, now),
                     )
-                result_senses.append(
-                    {"name": new_name, "entity_id": new_id, "sources": sources}
-                )
+                result_senses.append({"name": new_name, "entity_id": new_id, "sources": sources})
 
             # Retire original entity.
             self._conn.execute(
                 "UPDATE concept_entities SET status='merged', updated_at=? WHERE id=?",
                 (now, original_id),
             )
+            # OR IGNORE guards the UNIQUE(concept_name, segment/path) indexes (defensive —
+            # the primary sense is a fresh name post-guard, so collisions are unexpected).
             self._conn.execute(
-                "UPDATE concept_occurrences SET concept_name=?"
+                "UPDATE OR IGNORE concept_occurrences SET concept_name=?"
                 " WHERE lower(concept_name)=lower(?) AND resolution_status='resolved'",
                 (result_senses[0]["name"], entity_name),
             )
             # Remove stale compile state rows for the original entity. Source edges
             # were moved to the senses above, so these rows are orphaned — the
-            # scheduler JOIN on concepts.name would silently skip them, but they
+            # scheduler now excludes them anyway (original entity is retired), but they
             # would inflate refresh_raw_compile_status counts.
             self._conn.execute(
-                "DELETE FROM concept_compile_state WHERE lower(concept_name)=lower(?)",
-                (entity_name,),
+                "DELETE FROM concept_compile_state WHERE entity_id=?",
+                (original_id,),
             )
 
             self._log_identity_op(
                 "split",
                 [original_id, *[s["entity_id"] for s in result_senses]],
                 {original_id: entity_name, **{s["entity_id"]: s["name"] for s in result_senses}},
-                meta={"senses": [{"name": s["name"], "sources": s["sources"]}
-                                 for s in result_senses]},
+                meta={
+                    "senses": [{"name": s["name"], "sources": s["sources"]} for s in result_senses]
+                },
             )
 
         return {
@@ -2483,6 +2774,125 @@ class StateDB:
             "senses": result_senses,
             "stub_needed": len(result_senses) >= 2,
         }
+
+    def get_merged_entity_id(self, name: str) -> str | None:
+        """Return the id of a *merged* (retired) entity whose preferred label is ``name``.
+
+        After a merge the loser's label is added as an alias on the winner, so
+        ``resolve_label``/``entity_id_for_name`` resolve ``name`` to the WINNER. Unmerge
+        needs the loser, found here directly via its surviving preferred-label row joined
+        to the retired entity. Most recent merge wins if a label was reused.
+        """
+        if not (self._has_table("concept_entities") and self._has_table("concept_labels")):
+            return None
+        lk = _ck(name)
+        if not lk:
+            return None
+        row = self._conn.execute(
+            "SELECT ce.id FROM concept_entities ce "
+            "JOIN concept_labels cl ON cl.entity_id = ce.id "
+            "WHERE ce.status = 'merged' AND cl.role = 'preferred' AND cl.label_key = ? "
+            "ORDER BY ce.updated_at DESC LIMIT 1",
+            (lk,),
+        ).fetchone()
+        return row[0] if row else None
+
+    def unmerge_entities(self, merged_entity_id: str) -> dict:
+        """Reverse the most recent merge whose loser was ``merged_entity_id``.
+
+        Restores the loser to active, moves its source edges back off the winner, drops
+        the absorbed alias labels from the winner, reseeds the loser's compile state as
+        pending, and re-points occurrences scoped to the restored sources. Identity is
+        recovered from the merge's ``concept_identity_log`` entry.
+
+        Best-effort and reverses exactly ONE merge (the most recent for this loser):
+          - a source cited by BOTH winner and loser at merge time collapsed to one winner
+            edge; unmerge returns it to the loser, so the winner loses that edge (the
+            original split is unrecorded);
+          - name-keyed behavioral ledgers (rejections, blocked_concepts, stubs,
+            knowledge_items) are NOT restored — only source-scoped occurrences are.
+        Raises ValueError if no reversible merge is found for this entity.
+        """
+        log_entry = None
+        for entry in self.list_identity_log(limit=1000):
+            ids = entry.get("entity_ids") or []
+            if entry.get("op") == "merge" and len(ids) == 2 and ids[1] == merged_entity_id:
+                log_entry = entry
+                break
+        if log_entry is None:
+            raise ValueError(f"No merge to reverse for entity {merged_entity_id!r}")
+
+        winner_id = log_entry["entity_ids"][0]
+        loser_id = merged_entity_id
+        labels = log_entry.get("labels") or {}
+        winner_name = labels.get(winner_id) or self.preferred_label_for_entity(winner_id) or ""
+        loser_name = self.preferred_label_for_entity(loser_id) or labels.get(loser_id) or ""
+        meta = log_entry.get("meta") or {}
+        sources_moved = list(meta.get("sources_moved") or [])
+        labels_absorbed = list(meta.get("labels_absorbed") or [])
+
+        # The loser must still be merged into this winner.
+        row = self._conn.execute(
+            "SELECT status, merged_into FROM concept_entities WHERE id=?", (loser_id,)
+        ).fetchone()
+        if row is None or row[0] != "merged" or row[1] != winner_id:
+            raise ValueError(
+                f"Entity {loser_id!r} is not merged into {winner_id!r}; cannot unmerge"
+            )
+
+        now = datetime.now().isoformat()
+        winner_lk = _ck(winner_name)
+        with self._tx():
+            # Reactivate the loser.
+            self._conn.execute(
+                "UPDATE concept_entities SET status='active', merged_into=NULL, updated_at=?"
+                " WHERE id=?",
+                (now, loser_id),
+            )
+            # Move source edges and compile state back off the winner; reseed loser pending.
+            for src in sources_moved:
+                self._conn.execute(
+                    "UPDATE OR IGNORE concepts SET entity_id=?, name=?"
+                    " WHERE entity_id=? AND source_path=?",
+                    (loser_id, loser_name, winner_id, src),
+                )
+                self._conn.execute(
+                    "DELETE FROM concept_compile_state WHERE entity_id=? AND source_path=?",
+                    (winner_id, src),
+                )
+                self._conn.execute(
+                    """INSERT INTO concept_compile_state
+                           (entity_id, source_path, concept_name, status, updated_at)
+                       VALUES (?, ?, ?, 'pending', ?)
+                       ON CONFLICT(entity_id, source_path) DO UPDATE
+                           SET concept_name=excluded.concept_name,
+                               status='pending', updated_at=excluded.updated_at""",
+                    (loser_id, src, loser_name, now),
+                )
+                self._conn.execute(
+                    "UPDATE OR IGNORE concept_occurrences SET concept_name=?"
+                    " WHERE lower(concept_name)=lower(?) AND source_path=?",
+                    (loser_name, winner_name, src),
+                )
+            # Drop the absorbed alias labels from the winner. The loser kept its own label
+            # rows through the merge, so it needs no relabeling.
+            for lbl in labels_absorbed:
+                lk = _ck(lbl)
+                if not lk or lk == winner_lk:
+                    continue
+                self._conn.execute(
+                    "DELETE FROM concept_labels WHERE entity_id=? AND role='alias' AND label_key=?",
+                    (winner_id, lk),
+                )
+
+            self._log_identity_op(
+                "unmerge",
+                [winner_id, loser_id],
+                {winner_id: winner_name, loser_id: loser_name},
+                meta={"sources_restored": sources_moved},
+            )
+
+        return {"winner": winner_name, "loser": loser_name, "sources_restored": sources_moved}
 
     def get_sources_for_entities(self, names: list[str]) -> dict[str, list[str]]:
         """Return {name: [source_paths]} for each named entity."""
@@ -2538,6 +2948,76 @@ class StateDB:
             result.append(entry)
         return result
 
+    def restore_entities_from_seed(self, entries: list[tuple[str, str]]) -> int:
+        """Recreate entities with their ORIGINAL ids + preferred labels from a rebuild seed.
+
+        Durability (decision 13): a vault whose state.db was deleted but whose
+        .synto/INDEX.json survives rebuilds losslessly — entity ids are restored, not
+        re-minted, so the identity log and merge/split history still line up. Precedence:
+        if any entity already exists, state.db wins and this is a no-op (the caller, not
+        this method, decides drift reporting). Returns the count restored.
+        """
+        if not self._has_table("concept_entities") or not self._has_table("concept_labels"):
+            return 0
+        if self._conn.execute("SELECT COUNT(*) FROM concept_entities").fetchone()[0]:
+            return 0  # state.db wins — never overwrite a live DB from a seed
+        now = datetime.now().isoformat()
+        restored = 0
+        seen_lk: set[str] = set()
+        with self._tx():
+            for name, entity_id in entries:
+                if not name or not entity_id:
+                    continue
+                lk = _ck(name)
+                if not lk or lk in seen_lk:
+                    continue
+                seen_lk.add(lk)
+                if self._conn.execute(
+                    "SELECT 1 FROM concept_entities WHERE id=?", (entity_id,)
+                ).fetchone():
+                    continue
+                self._conn.execute(
+                    "INSERT INTO concept_entities (id, kind, status, created_at, updated_at)"
+                    " VALUES (?, 'concept', 'active', ?, ?)",
+                    (entity_id, now, now),
+                )
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO concept_labels"
+                    " (entity_id, label, label_key, match_key, role, source, created_at)"
+                    " VALUES (?, ?, ?, ?, 'preferred', 'extracted', ?)",
+                    (entity_id, name, lk, _mk(name), now),
+                )
+                restored += 1
+        return restored
+
+    def restore_identity_log(self, rows: list[dict]) -> None:
+        """Restore the merge/split/rename log from a rebuild seed (chronological order).
+
+        No-op if the log already has rows (state.db wins). `rows` is in the DESC shape
+        returned by list_identity_log / written to INDEX.json, so it is reversed here.
+        """
+        if not self._has_table("concept_identity_log"):
+            return
+        if self._conn.execute("SELECT COUNT(*) FROM concept_identity_log").fetchone()[0]:
+            return
+        import json as _json
+
+        with self._tx():
+            for r in reversed(rows):
+                if not isinstance(r, dict) or not r.get("op"):
+                    continue
+                self._conn.execute(
+                    "INSERT INTO concept_identity_log (op, entity_ids, labels, meta, ts)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (
+                        r.get("op"),
+                        _json.dumps(r.get("entity_ids", [])),
+                        _json.dumps(r.get("labels", {})),
+                        _json.dumps(r["meta"]) if r.get("meta") else None,
+                        r.get("ts") or datetime.now().isoformat(),
+                    ),
+                )
+
     def list_active_entities_without_articles(self) -> list[tuple[str, str]]:
         """Return (entity_id, preferred_label) for active entities with no published article."""
         if not self._has_table("concept_labels"):
@@ -2561,6 +3041,50 @@ class StateDB:
             """
         ).fetchall()
         return [(r[0], r[1]) for r in rows]
+
+    def find_ambiguous_active_labels(self) -> list[tuple[str, int]]:
+        """Return (label, entity_count) for labels claimed by >=2 active entities.
+
+        A bare homonym label ("Mercury", an alias on both senses after a split) resolves
+        ambiguously and should route to a disambiguation stub. Used by lint.
+        """
+        if not self._has_table("concept_labels"):
+            return []
+        rows = self._conn.execute(
+            """
+            SELECT MIN(cl.label) AS label, COUNT(DISTINCT cl.entity_id) AS n
+            FROM concept_labels cl
+            JOIN concept_entities ce ON ce.id = cl.entity_id AND ce.status = 'active'
+            GROUP BY cl.label_key
+            HAVING n >= 2
+            ORDER BY label
+            """
+        ).fetchall()
+        return [(r[0], int(r[1])) for r in rows]
+
+    def count_legacy_backfill_aliases(self) -> int:
+        """Number of aliases still sourced from the v18 legacy backfill (untrusted)."""
+        if not self._has_table("concept_labels"):
+            return 0
+        return int(
+            self._conn.execute(
+                "SELECT COUNT(*) FROM concept_labels WHERE source='legacy_backfill'"
+            ).fetchone()[0]
+        )
+
+    def list_active_preferred_labels(self) -> list[str]:
+        """Preferred labels of all active concept entities."""
+        if not self._has_table("concept_labels"):
+            return []
+        rows = self._conn.execute(
+            """
+            SELECT cl.label FROM concept_labels cl
+            JOIN concept_entities ce ON ce.id = cl.entity_id AND ce.status = 'active'
+            WHERE cl.role = 'preferred'
+            ORDER BY cl.label
+            """
+        ).fetchall()
+        return [r[0] for r in rows]
 
     # ── Alias facade (backed by concept_labels) ──
 
@@ -2761,12 +3285,15 @@ class StateDB:
         return None
 
     def get_compile_state(self, concept_name: str, source_path: str) -> sqlite3.Row | None:
+        entity_id = self.entity_id_for_name(concept_name)
+        if entity_id is None:
+            return None
+        return self.get_compile_state_for_entity(entity_id, source_path)
+
+    def get_compile_state_for_entity(self, entity_id: str, source_path: str) -> sqlite3.Row | None:
         return self._conn.execute(
-            """
-            SELECT * FROM concept_compile_state
-            WHERE lower(concept_name) = lower(?) AND source_path = ?
-            """,
-            (concept_name, source_path),
+            "SELECT * FROM concept_compile_state WHERE entity_id = ? AND source_path = ?",
+            (entity_id, source_path),
         ).fetchone()
 
     def mark_concept_compile_state(
@@ -2777,29 +3304,76 @@ class StateDB:
         *,
         error: str | None = None,
     ) -> None:
+        """Record compile status for a concept's source edges.
+
+        Name-accepting wrapper: resolves to entity identity (minting if absent, as the
+        ingest seam does) and keys the row on entity_id, carrying concept_name as a cache.
+        Callers that already hold an entity_id should use mark_compile_state_for_entity.
+        """
         now = datetime.now().isoformat()
         with self._tx():
-            for source_path in source_paths:
-                self._conn.execute(
-                    """INSERT INTO concept_compile_state
-                           (concept_name, source_path, status, error, compiled_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?)
-                       ON CONFLICT(concept_name, source_path) DO UPDATE SET
-                           status=excluded.status,
-                           error=excluded.error,
-                           compiled_at=excluded.compiled_at,
-                           updated_at=excluded.updated_at""",
-                    (
-                        concept_name,
-                        source_path,
-                        status,
-                        error,
-                        now if status == "compiled" else None,
-                        now,
-                    ),
-                )
+            entity_id = self._ensure_entity_for_name(concept_name, now)
+            if entity_id is None:
+                return
+            self._mark_compile_state_for_entity(
+                entity_id, concept_name, source_paths, status, error, now
+            )
         for source_path in source_paths:
             self.refresh_raw_compile_status(source_path)
+
+    def mark_compile_state_for_entity(
+        self,
+        entity_id: str,
+        source_paths: list[str],
+        status: str,
+        *,
+        error: str | None = None,
+    ) -> None:
+        """Record compile status keyed directly on entity_id (homonym-safe).
+
+        The concept_name cache is refreshed from the entity's current preferred label.
+        """
+        now = datetime.now().isoformat()
+        concept_name = self.preferred_label_for_entity(entity_id) or ""
+        with self._tx():
+            self._mark_compile_state_for_entity(
+                entity_id, concept_name, source_paths, status, error, now
+            )
+        for source_path in source_paths:
+            self.refresh_raw_compile_status(source_path)
+
+    def _mark_compile_state_for_entity(
+        self,
+        entity_id: str,
+        concept_name: str,
+        source_paths: list[str],
+        status: str,
+        error: str | None,
+        now: str,
+    ) -> None:
+        """Write compile-state rows (must be called inside a _tx)."""
+        for source_path in source_paths:
+            self._conn.execute(
+                """INSERT INTO concept_compile_state
+                       (entity_id, source_path, concept_name, status, error,
+                        compiled_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(entity_id, source_path) DO UPDATE SET
+                       concept_name=excluded.concept_name,
+                       status=excluded.status,
+                       error=excluded.error,
+                       compiled_at=excluded.compiled_at,
+                       updated_at=excluded.updated_at""",
+                (
+                    entity_id,
+                    source_path,
+                    concept_name,
+                    status,
+                    error,
+                    now if status == "compiled" else None,
+                    now,
+                ),
+            )
 
     def clear_deferred_state(
         self, concept_name: str, source_paths: list[str] | None = None
@@ -2917,17 +3491,22 @@ class StateDB:
         return [_row_to_item_mention(row) for row in rows]
 
     def concepts_needing_compile(self) -> list[str]:
-        """Concepts with pending/failed compile state, plus stub concepts.
+        """Preferred labels of concepts with pending/failed compile state, plus stub concepts.
 
-        Excludes blocked and deferred concepts from normal scheduling.
+        Scheduling keys on entity identity: the scheduler joins compile-state to
+        concept_entities (status='active') by entity_id, so a retired/merged entity's
+        stale rows and synthesis/disambiguation pages (no entity_id) never leak in.
+        Two homonyms surface as their two distinct preferred labels.
+        Excludes blocked concepts from normal scheduling.
         """
         rows = self._conn.execute(
             """
-            SELECT DISTINCT ccs.concept_name AS name
+            SELECT DISTINCT cl.label AS name
             FROM concept_compile_state ccs
-            JOIN concepts c ON c.name = ccs.concept_name AND c.source_path = ccs.source_path
+            JOIN concept_entities ce ON ce.id = ccs.entity_id AND ce.status = 'active'
+            JOIN concept_labels cl ON cl.entity_id = ce.id AND cl.role = 'preferred'
             WHERE ccs.status IN ('pending', 'failed')
-              AND lower(ccs.concept_name) NOT IN (SELECT lower(concept) FROM blocked_concepts)
+              AND lower(cl.label) NOT IN (SELECT lower(concept) FROM blocked_concepts)
 
             UNION
 
@@ -3042,11 +3621,13 @@ class StateDB:
                     " WHERE entity_id=? AND role='preferred'",
                     (new_name, new_lk, new_mk, entity_id),
                 )
-            self._conn.execute(
-                "UPDATE concept_compile_state SET concept_name = ? "
-                "WHERE lower(concept_name) = lower(?)",
-                (new_name, old_name),
-            )
+            # Refresh the compile-state name cache for this entity (identity, the
+            # entity_id PK, does not move on a rename).
+            if entity_id is not None:
+                self._conn.execute(
+                    "UPDATE concept_compile_state SET concept_name = ? WHERE entity_id = ?",
+                    (new_name, entity_id),
+                )
             self._conn.execute(
                 "UPDATE concept_occurrences SET concept_name = ? "
                 "WHERE lower(concept_name) = lower(?)",
@@ -3101,13 +3682,13 @@ class StateDB:
                         path, title, sources, content_hash, created_at, updated_at, status,
                         approved_at, approval_notes, kind, question_hash,
                         synthesis_sources, synthesis_source_hashes, article_id,
-                        last_compile_pipeline
+                        last_compile_pipeline, entity_id
                     )
                 VALUES (:path, :title, :sources, :content_hash,
                         :created_at, :updated_at, :status,
                         :approved_at, :approval_notes, :kind, :question_hash,
                         :synthesis_sources, :synthesis_source_hashes, :article_id,
-                        :last_compile_pipeline)
+                        :last_compile_pipeline, :entity_id)
                 ON CONFLICT(path) DO UPDATE SET
                     title=excluded.title,
                     sources=excluded.sources,
@@ -3124,7 +3705,8 @@ class StateDB:
                     last_compile_pipeline=COALESCE(
                         excluded.last_compile_pipeline,
                         wiki_articles.last_compile_pipeline
-                    )""",
+                    ),
+                    entity_id=COALESCE(excluded.entity_id, wiki_articles.entity_id)""",
             {
                 "path": record.path,
                 "title": record.title,
@@ -3141,6 +3723,7 @@ class StateDB:
                 "synthesis_source_hashes": json.dumps(record.synthesis_source_hashes),
                 "article_id": article_id,
                 "last_compile_pipeline": record.last_compile_pipeline,
+                "entity_id": record.entity_id,
             },
         )
 
@@ -3272,6 +3855,17 @@ class StateDB:
             )
         art = self.get_article(path)
         if art:
+            self._mark_article_compiled(art)
+
+    def _mark_article_compiled(self, art: WikiArticleRecord) -> None:
+        """Mark an article's concept compiled, keyed on its bound entity when present.
+
+        Recovers identity from the article's entity_id (homonym-safe) rather than the
+        title; synthesis/disambiguation and legacy un-bound articles fall back to title.
+        """
+        if art.entity_id is not None:
+            self.mark_compile_state_for_entity(art.entity_id, art.sources, "compiled")
+        else:
             self.mark_concept_compile_state(art.title, art.sources, "compiled")
 
     def count_articles_by_status(self, status: str) -> int:
@@ -3298,7 +3892,7 @@ class StateDB:
             )
         art = self.get_article(path)
         if art:
-            self.mark_concept_compile_state(art.title, art.sources, "compiled")
+            self._mark_article_compiled(art)
 
     def delete_article(self, path: str) -> None:
         with self._tx():
@@ -4427,6 +5021,7 @@ def _row_to_article(row: sqlite3.Row) -> WikiArticleRecord:
         last_compile_pipeline=(
             row["last_compile_pipeline"] if "last_compile_pipeline" in keys else None
         ),
+        entity_id=row["entity_id"] if "entity_id" in keys else None,
     )
 
 

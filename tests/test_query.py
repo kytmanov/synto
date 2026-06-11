@@ -194,6 +194,27 @@ def test_find_page_not_found_returns_none(vault, config):
     assert _find_page(config, "Does Not Exist") is None
 
 
+def test_find_page_bare_ambiguous_label_routes_to_disambiguation_stub(vault, config, db):
+    """A bare homonym label resolves to the disambiguation stub, not an arbitrary sense.
+
+    After a split the bare label is an alias on both senses (ambiguous → resolve_alias yields
+    nothing), but the disambiguation stub is a real file at the bare label's path, so exact
+    filename matching routes there (feature 45).
+    """
+    _write_concept_page(config, "Mercury (planet)")
+    _write_concept_page(config, "Mercury (element)")
+    stub = config.wiki_dir / "Mercury.md"
+    write_note(stub, {"title": "Mercury", "kind": "disambiguation"}, "Mercury may refer to:")
+
+    db.upsert_concepts("raw/a.md", ["Mercury (planet)"])
+    db.upsert_concepts("raw/b.md", ["Mercury (element)"])
+    db.upsert_aliases("Mercury (planet)", ["Mercury"])
+    db.upsert_aliases("Mercury (element)", ["Mercury"])
+
+    found = _find_page(config, "Mercury", db=db)
+    assert found == stub
+
+
 def test_find_page_prefers_concept_over_synthesis(vault, config, db):
     concept = config.wiki_dir / "Topic.md"
     synthesis = config.synthesis_dir / "Topic.md"

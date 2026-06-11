@@ -183,7 +183,7 @@ def test_fts5_migration_skipped_when_unavailable(tmp_path: Path, monkeypatch) ->
     db = StateDB(tmp_path / "state.db")
 
     version = db._conn.execute("SELECT version FROM schema_version WHERE id = 1").fetchone()[0]
-    assert version == 21, "schema must still advance even when FTS5 is unavailable"
+    assert version == 25, "schema must still advance even when FTS5 is unavailable"
     assert not db.source_segments_fts_exists(), "FTS table must not be created without FTS5"
     trigger_count = db._conn.execute(
         "SELECT count(*) FROM sqlite_master"
@@ -389,11 +389,9 @@ def test_search_source_segments_returns_source_path(vault: Path) -> None:
 
 
 def _insert_concept(db: StateDB, name: str, source_path: str = "raw/book1.md") -> None:
-    db._conn.execute(
-        "INSERT OR IGNORE INTO concepts (name, source_path) VALUES (?, ?)",
-        (name, source_path),
-    )
-    db._conn.commit()
+    # Route through the entity layer so the concept resolves via concept_labels
+    # (concepts is keyed on entity_id since v22; a bare name INSERT no longer works).
+    db.upsert_concepts(source_path, [name])
 
 
 def _insert_occurrence(

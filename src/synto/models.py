@@ -199,6 +199,10 @@ class LintIssue(BaseModel):
         "missing_media",
         "label_collision",
         "orphan_entity",
+        "ambiguous_label_needs_disambiguation",
+        "stale_legacy_backfill_alias",
+        "homonym_filename_collision",
+        "manual_relabel_adopted",
     ]
     description: str
     suggestion: str
@@ -244,6 +248,10 @@ class WikiArticleRecord(BaseModel):
     synthesis_source_hashes: list[list[str]] = Field(default_factory=list)
     article_id: str | None = None
     last_compile_pipeline: str | None = None
+    # Concept articles bind to their entity at draft time so publish/verify/reject
+    # recover identity from the article, not its (possibly homonymous) title.
+    # NULL for synthesis & disambiguation pages, which have no single entity.
+    entity_id: str | None = None
 
     @property
     def is_draft(self) -> bool:

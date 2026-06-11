@@ -2552,7 +2552,13 @@ def _render_mcp_backlog(db, since: str) -> None:
     default="7d",
     help="Lookback window for --backlog.",
 )
-def doctor(vault_str, backlog, since):
+@click.option(
+    "--reconcile",
+    is_flag=True,
+    default=False,
+    help="Restore entity identity from the INDEX.json seed when state.db is empty (decision 13).",
+)
+def doctor(vault_str, backlog, since, reconcile):
     """Check LLM provider connection, model availability, and vault health."""
     from .client_factory import LLMError, build_router
     from .config import HEALTHCHECK_ROLES, ROLES
@@ -2739,6 +2745,9 @@ def doctor(vault_str, backlog, since):
     else:
         console.print(f'  source-access mode: "{sa.mode}"')
 
+    # ── Concept identity (feature 45) ─────────────────────────────────────────
+    _render_identity_section(config, db, reconcile)
+
     # ── MCP demand-vs-coverage backlog (opt-in via --backlog) ────────────────
     if backlog:
         _render_mcp_backlog(db, since)
@@ -2782,6 +2791,95 @@ def doctor(vault_str, backlog, since):
         console.print("[green][bold]All checks passed.[/bold][/green]")
     else:
         console.print("[yellow][bold]Some checks need attention (see above).[/bold][/yellow]")
+
+
+def _render_identity_section(config, db, reconcile: bool) -> None:
+    """Report the entity identity layer and reconcile against the INDEX.json seed.
+
+    Precedence (decision 13): a live state.db always wins. --reconcile only restores when
+    state.db holds no entities (a rebuild); when both are present and disagree it reports the
+    drift rather than overwriting.
+    """
+    import json as _json
+
+    from .pipeline.ingest import _restore_identity_from_index
+
+    console.print("\n[bold]Concept identity[/bold]")
+    try:
+        active = db._conn.execute(
+            "SELECT COUNT(*) FROM concept_entities WHERE status='active'"
+        ).fetchone()[0]
+        labels = db._conn.execute("SELECT COUNT(*) FROM concept_labels").fetchone()[0]
+        legacy = db._conn.execute(
+            "SELECT COUNT(*) FROM concept_labels WHERE source='legacy_backfill'"
+        ).fetchone()[0]
+    except Exception as exc:  # pragma: no cover — defensive
+        console.print(f"  [yellow]![/yellow] could not read identity tables: {exc}")
+        return
+
+    console.print(f"  [green]✓[/green] {active} active entities, {labels} labels")
+    if legacy:
+        console.print(
+            f"  [yellow]![/yellow] {legacy} legacy_backfill alias(es) (untrusted until reviewed)"
+        )
+
+    collisions = db.find_match_key_collisions()
+    if collisions:
+        console.print(
+            f"  [yellow]![/yellow] {len(collisions)} match_key collision(s) — dedup worklist"
+            " (resolve with [bold]synto concept merge[/bold]):"
+        )
+        for entity_a, entity_b, _mk in collisions[:10]:
+            label_a = db.preferred_label_for_entity(entity_a) or entity_a
+            label_b = db.preferred_label_for_entity(entity_b) or entity_b
+            console.print(f"      [dim]{label_a} ~ {label_b}[/dim]")
+
+    # Reconcile against the committed seed.
+    index_path = config.app_dir / "INDEX.json"
+    if not index_path.exists():
+        return
+    try:
+        payload = _json.loads(index_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+
+    if active == 0:
+        if reconcile:
+            _restore_identity_from_index(config, db)
+            restored = db._conn.execute(
+                "SELECT COUNT(*) FROM concept_entities WHERE status='active'"
+            ).fetchone()[0]
+            console.print(
+                f"  [green]✓[/green] --reconcile: restored {restored} entities from INDEX.json seed"
+            )
+        else:
+            console.print(
+                "  [yellow]![/yellow] state.db has no entities but a seed exists — run"
+                " [bold]synto doctor --reconcile[/bold] for a lossless restore"
+            )
+        return
+
+    # Both present: report drift (state.db wins, never overwritten here).
+    drift = 0
+    for entry in payload.get("source_concepts", []):
+        if not isinstance(entry, dict):
+            continue
+        for concept in entry.get("concepts", []):
+            if not isinstance(concept, dict):
+                continue
+            name, seed_id = concept.get("name"), concept.get("entity_id")
+            if not isinstance(name, str) or not isinstance(seed_id, str) or not seed_id:
+                continue
+            db_id = db.entity_id_for_name(name)
+            if db_id is not None and db_id != seed_id:
+                drift += 1
+    if drift:
+        console.print(
+            f"  [yellow]![/yellow] {drift} label(s) whose entity_id differs from the seed"
+            " — state.db wins; seed is stale (regenerate with [bold]synto index[/bold])"
+        )
+    else:
+        console.print("  [green]✓[/green] identity matches the INDEX.json seed")
 
 
 # ── query ─────────────────────────────────────────────────────────────────────
@@ -4190,9 +4288,7 @@ def concept_merge(
         sys.exit(0)
 
     try:
-        report = merge_concepts(
-            config, db, loser, winner, absorb_edits=absorb_edits, dry_run=False
-        )
+        report = merge_concepts(config, db, loser, winner, absorb_edits=absorb_edits, dry_run=False)
     except ConceptMergeError as exc:
         click.echo(str(exc), err=True)
         sys.exit(1)
@@ -4230,11 +4326,17 @@ def concept_merge(
     metavar="SENSE SOURCE_PATH",
     help="Assign SOURCE_PATH to SENSE. Repeat for each sense.",
 )
+@click.option(
+    "--absorb-edits",
+    is_flag=True,
+    help="Carry a manually-edited original body into the primary sense instead of refusing.",
+)
 def concept_split(
     name: str,
     vault_str: str | None,
     dry_run: bool,
     senses: tuple[tuple[str, str], ...],
+    absorb_edits: bool,
 ) -> None:
     """Split concept NAME into multiple senses, each owning a subset of sources."""
     from .git_ops import git_commit
@@ -4270,7 +4372,9 @@ def concept_split(
     sense_tuples = list(sense_map.items())
 
     try:
-        report = split_concept(config, db, name, sense_tuples, dry_run=dry_run)
+        report = split_concept(
+            config, db, name, sense_tuples, absorb_edits=absorb_edits, dry_run=dry_run
+        )
     except ConceptSplitError as exc:
         click.echo(str(exc), err=True)
         sys.exit(1)
@@ -4293,6 +4397,51 @@ def concept_split(
         outcome = git_commit(
             config.vault,
             f"concept split: {report.original} → {sense_str}",
+            paths=["wiki/", ".synto/"],
+        )
+        if outcome == "committed":
+            console.print("[dim]Git commit created.[/dim]")
+        elif outcome == "failed":
+            console.print("[yellow]⚠ Git commit failed — run 'git status' in your vault.[/yellow]")
+        elif outcome == "blocked":
+            console.print(
+                "[yellow]⚠ Auto-commit skipped — you have staged changes. "
+                "Commit or stash them first.[/yellow]"
+            )
+
+
+@concept.command("unmerge")
+@click.argument("name")
+@click.option("--vault", "vault_str", envvar=VAULT_ENV_VAR, default=None)
+def concept_unmerge(name: str, vault_str: str | None) -> None:
+    """Reverse the most recent merge that retired concept NAME, restoring it."""
+    from .git_ops import git_commit
+    from .indexer import append_log, generate_index
+    from .pipeline.maintain import ConceptUnmergeError, unmerge_concept
+
+    config = _load_config(vault_str)
+    db = _load_db(config)
+
+    try:
+        report = unmerge_concept(config, db, name)
+    except ConceptUnmergeError as exc:
+        click.echo(str(exc), err=True)
+        sys.exit(1)
+
+    console.print(f"[green]Unmerged:[/green] {report.loser} ← {report.winner}")
+    console.print(f"  Sources restored: {len(report.sources_restored)}")
+    if report.stub_path:
+        console.print(
+            f"  Stub recreated: {report.stub_path} [dim](run `synto compile` to fill)[/dim]"
+        )
+
+    generate_index(config, db)
+    append_log(config, f"concept unmerge | '{report.loser}' ← '{report.winner}'")
+
+    if config.pipeline.auto_commit:
+        outcome = git_commit(
+            config.vault,
+            f"concept unmerge: {report.loser} ← {report.winner}",
             paths=["wiki/", ".synto/"],
         )
         if outcome == "committed":
