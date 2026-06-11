@@ -1039,7 +1039,7 @@ if [[ -n "$BRIDGE_CONCEPT" ]]; then
 
     # The alias is contrived so a direct title-match can't explain a hit.
     BRIDGE_ALIAS="wibbletron"
-    python3 - <<PYEOF
+    uv run --project "$REPO_DIR" python - <<PYEOF
 from pathlib import Path
 from synto.state import StateDB
 db = StateDB(Path("$VAULT_DIR/.synto/state.db"))
@@ -1543,7 +1543,7 @@ REPAIR_WIKI=$(find "$VAULT_DIR/wiki" -maxdepth 1 -name "*.md" \
 
 if [[ -n "$REPAIR_WIKI" ]]; then
     # 1. Register a synthetic concept and unambiguous alias in the DB
-    python3 - <<PYEOF
+    uv run --project "$REPO_DIR" python - <<PYEOF
 from pathlib import Path
 from synto.state import StateDB
 db = StateDB(Path("$VAULT_DIR/.synto/state.db"))
@@ -1592,7 +1592,7 @@ MDEOF
     # Cleanup injected content and synthetic article
     sed -i '' '$ d' "$REPAIR_WIKI" 2>/dev/null || sed -i '$ d' "$REPAIR_WIKI" 2>/dev/null || true
     rm -f "$_STC_ARTICLE"
-    python3 - <<PYEOF
+    uv run --project "$REPO_DIR" python - <<PYEOF
 from pathlib import Path
 from synto.state import StateDB
 # Best-effort teardown of the synthetic concept and its labels (entity_id-keyed

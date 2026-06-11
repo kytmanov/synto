@@ -32,6 +32,10 @@ done
 
 SYNTO="uv run --project $PROJECT_DIR synto"
 
+# Portable epoch-milliseconds. GNU `date +%s%3N` is unavailable on BSD/macOS
+# (no %N), so go through python which is already a hard dependency here.
+now_ms() { python3 -c 'import time; print(int(time.time() * 1000))'; }
+
 # ── Setup ─────────────────────────────────────────────────────────────────────
 
 if [[ -z "$VAULT" ]]; then
@@ -73,9 +77,9 @@ export SYNTO_VAULT="$VAULT"
 
 echo ""
 echo "── Ingest ───────────────────────────────────────────────────"
-T_INGEST_START=$(date +%s%3N)
+T_INGEST_START=$(now_ms)
 $SYNTO ingest 2>&1 | grep -E "ingested|Ingested|concept|Concept|chunk|Chunk" || true
-T_INGEST_END=$(date +%s%3N)
+T_INGEST_END=$(now_ms)
 T_INGEST=$(( (T_INGEST_END - T_INGEST_START) ))
 echo "Ingest total: ${T_INGEST}ms"
 
@@ -83,9 +87,9 @@ echo "Ingest total: ${T_INGEST}ms"
 
 echo ""
 echo "── Compile ──────────────────────────────────────────────────"
-T_COMPILE_START=$(date +%s%3N)
+T_COMPILE_START=$(now_ms)
 COMPILE_OUT=$($SYNTO compile 2>&1)
-T_COMPILE_END=$(date +%s%3N)
+T_COMPILE_END=$(now_ms)
 T_COMPILE=$(( (T_COMPILE_END - T_COMPILE_START) ))
 
 # Print lines with timing info
