@@ -397,12 +397,12 @@ CREATE TABLE IF NOT EXISTS concept_occurrences (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_occ_seg
     ON concept_occurrences(concept_name, source_segment_id)
     WHERE source_segment_id IS NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS idx_occ_path
-    ON concept_occurrences(concept_name, source_path)
-    WHERE source_path IS NOT NULL AND source_segment_id IS NULL;
 CREATE INDEX IF NOT EXISTS idx_concept_occurrences_concept ON concept_occurrences(concept_name);
-CREATE INDEX IF NOT EXISTS idx_concept_occurrences_entity ON concept_occurrences(entity_id)
-    WHERE entity_id IS NOT NULL;
+-- idx_occ_path (source_path) and idx_concept_occurrences_entity (entity_id) are NOT created
+-- here: those columns are added by the v19 migration, and this base schema runs (via
+-- executescript) BEFORE migrations. On a pre-v19 vault the columns don't exist yet, so
+-- creating the indexes here would raise "no such column" and block the upgrade. They are
+-- created in _extend_occurrences_v19 instead, which runs for both fresh and upgraded DBs.
 
 CREATE TABLE IF NOT EXISTS concept_occurrence_candidates (
     occurrence_id INTEGER NOT NULL REFERENCES concept_occurrences(id) ON DELETE CASCADE,
@@ -1511,6 +1511,12 @@ class StateDB:
                 alias_lk = _ck(alias)
                 if not alias_lk or alias_lk == _ck(concept_name):
                     continue  # self-alias or empty
+                if alias_lk in seen_preferred_keys:
+                    # The alias is already a preferred label of another concept; importing it would
+                    # make that concept resolve ambiguously (and silently drop its article). Skip it
+                    # — the pair surfaces as a merge candidate via preferred-label match_key, not a
+                    # polluting alias. Same invariant the extraction path enforces.
+                    continue
                 try:
                     self._conn.execute(
                         "INSERT INTO concept_labels"
@@ -1545,7 +1551,16 @@ class StateDB:
         cols = {
             r[1] for r in self._conn.execute("PRAGMA table_info(concept_occurrences)").fetchall()
         }
-        if "resolution_status" in cols and self._has_table("concept_occurrence_candidates"):
+        has_path_index = bool(
+            self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_occ_path'"
+            ).fetchone()
+        )
+        if (
+            "resolution_status" in cols
+            and self._has_table("concept_occurrence_candidates")
+            and has_path_index
+        ):
             return
         with self._tx():
             if "resolution_status" not in cols:
@@ -1597,6 +1612,20 @@ class StateDB:
                         PRIMARY KEY (occurrence_id, entity_id)
                     )"""
                 )
+            # These two indexes reference v19-added columns, so they are NOT in the base
+            # _SCHEMA (which runs before migrations and would crash a pre-v19 vault). Ensure
+            # them here for both the fresh-DB path (table already extended above) and after a
+            # recreation. The recreation block already creates them; IF NOT EXISTS makes this
+            # a no-op there.
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_occ_path"
+                " ON concept_occurrences(concept_name, source_path)"
+                " WHERE source_path IS NOT NULL AND source_segment_id IS NULL"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_concept_occurrences_entity"
+                " ON concept_occurrences(entity_id) WHERE entity_id IS NOT NULL"
+            )
 
     def _rebuild_concepts_on_entity_id_v22(self) -> None:
         """Rebuild `concepts` onto PK (entity_id, source_path); keep `name` as a cache.
@@ -2233,6 +2262,17 @@ class StateDB:
         ).fetchone()
         if row:
             return row[0]
+        # Minting a new preferred label: any existing alias with the same label_key on another
+        # entity is now a collision (an alias may not equal another entity's preferred label —
+        # it would make resolve_label ambiguous and drop the new concept's article at compile).
+        # This is the alias-first ordering of the same guard the extraction path applies before
+        # storing aliases; here the alias was stored before this concept was minted (e.g. across
+        # ingest chunks), so demote it. The pair is still surfaced as a merge candidate via
+        # preferred-label match_key collisions, not via a polluting alias.
+        self._conn.execute(
+            "DELETE FROM concept_labels WHERE role = 'alias' AND label_key = ?",
+            (lk,),
+        )
         entity_id = _generate_article_id()
         self._conn.execute(
             "INSERT INTO concept_entities (id, kind, status, created_at, updated_at)"
@@ -2901,7 +2941,12 @@ class StateDB:
     def find_match_key_collisions(self) -> list[tuple[str, str, str]]:
         """Return (entity_id_a, entity_id_b, match_key) for active entities sharing a match_key.
 
-        These are fold-collision pairs — merge candidates from plural/singular variants.
+        These are fold-collision pairs — merge candidates from plural/singular variants of the
+        canonical name (issue #54: User/Users). Only *preferred* labels are compared: two entities
+        that merely share an extracted *alias* match_key are not duplicates (e.g. "United States"
+        and "Ultrasound" both aliased "US" are a legal shared alias, not a merge candidate), and
+        folding aliases here produces false, confusing merge suggestions whose cited match_key
+        belongs to neither preferred label.
         """
         if not self._has_table("concept_labels"):
             return []
@@ -2913,6 +2958,7 @@ class StateDB:
               ON b.match_key = a.match_key AND b.entity_id > a.entity_id
             JOIN concept_entities ea ON ea.id = a.entity_id AND ea.status = 'active'
             JOIN concept_entities eb ON eb.id = b.entity_id AND eb.status = 'active'
+            WHERE a.role = 'preferred' AND b.role = 'preferred'
             ORDER BY a.match_key
             """
         ).fetchall()

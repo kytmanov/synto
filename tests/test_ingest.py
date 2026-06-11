@@ -1811,3 +1811,45 @@ def test_media_section_stripped_before_llm_analysis(vault, config, db):
     assert "More meaningful text." in prompt_sent
     # Raw file on disk is unchanged — embeds are still there for Obsidian
     assert "![[assets/src-001/img-0-0.png]]" in path.read_text()
+
+
+def test_ingest_note_same_note_alias_collision_keeps_concept_resolvable(vault, config, db):
+    """A concept must not lose its identity to an alias on a sibling concept of the SAME note.
+
+    Real-vault regression: the LLM extracted both "Knowledge Compounding" (its own concept) and
+    "Dynamic Agentic ROI" (carrying "Knowledge Compounding" as an alias). The alias/preferred
+    collision guard ran inside _normalize_concepts, before the batch's entities were minted, so it
+    could not see the sibling concept and let the alias through — "Knowledge Compounding" then
+    resolved to two entities and silently lost its article at compile (12 articles instead of 13).
+    The guard must also run when aliases are persisted, after every entity in the batch exists.
+    """
+    body = (
+        "# Knowledge Compounding\n\n"
+        "Knowledge Compounding is the central idea. The Dynamic Agentic ROI framework extends it. "
+        "Both Knowledge Compounding and Dynamic Agentic ROI are analyzed in depth here.\n"
+    )
+    path = _write_raw(vault, "kc.md", body)
+    analysis = json.dumps(
+        {
+            "summary": "s",
+            "concepts": [
+                {"name": "Knowledge Compounding", "aliases": []},
+                {"name": "Dynamic Agentic ROI", "aliases": ["Knowledge Compounding"]},
+            ],
+            "suggested_topics": ["Knowledge Compounding"],
+            "named_references": [],
+            "quality": "high",
+        }
+    )
+    client = _make_client(analysis)
+
+    result = ingest_note(path, config, client, db)
+    assert result is not None
+
+    rr = db.resolve_label("Knowledge Compounding")
+    assert not rr.ambiguous and len(rr.ids) == 1, "core concept must stay unambiguous"
+    assert db.preferred_label_for_entity(rr.ids[0]) == "Knowledge Compounding"
+    # Both remain distinct concepts; only the polluting alias is dropped.
+    dar = db.entity_id_for_name("Dynamic Agentic ROI")
+    assert dar and dar != rr.ids[0]
+    assert "Knowledge Compounding" not in db.get_aliases("Dynamic Agentic ROI")

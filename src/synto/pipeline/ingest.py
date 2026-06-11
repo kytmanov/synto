@@ -1156,6 +1156,14 @@ def _normalize_concepts(
             alias_candidates = [*_safe_aliases_for_name(name), *concept.aliases]
             if _concept_key(name) != ck:
                 alias_candidates.insert(0, name)
+            # Same collision guard as the link-to-existing branch: an extracted alias that is
+            # already a preferred label of another active entity is a merge signal, not a stored
+            # alias. "" owner = exclude none, so it filters against every active preferred label.
+            alias_candidates = [
+                a
+                for a in alias_candidates
+                if not db.alias_collides_with_preferred(_concept_key(a), "")
+            ]
             result.append((mem_canonical, _validate_aliases(mem_canonical, alias_candidates)))
             continue
 
@@ -1174,6 +1182,14 @@ def _normalize_concepts(
         alias_candidates = [*_safe_aliases_for_name(name), *concept.aliases]
         if _concept_key(name) != ck:
             alias_candidates.insert(0, name)
+        # Collision guard (also applied in the link-to-existing branch): drop an extracted alias
+        # that is already a preferred label of another active entity. Without this, a newly minted
+        # concept (e.g. "Dynamic Agentic ROI") carrying an alias that names an existing concept
+        # ("Knowledge Compounding") makes that concept's label resolve ambiguously, which silently
+        # drops its article at compile. "" owner = filter against every active preferred label.
+        alias_candidates = [
+            a for a in alias_candidates if not db.alias_collides_with_preferred(_concept_key(a), "")
+        ]
         result.append((canonical, _validate_aliases(canonical, alias_candidates)))
 
     return result
@@ -1563,7 +1579,18 @@ def ingest_note(
     canonical_names = [name for name, _ in normalized]
     db.replace_concepts_for_source(rel_path, canonical_names)
     for canonical, aliases in normalized:
-        persistable_aliases = _persistable_aliases(aliases)
+        # Drop any extracted alias that is the preferred label of another active entity. This must
+        # run HERE, after replace_concepts_for_source has minted every entity in this batch:
+        # _normalize_concepts ran before any mint, so it cannot catch a collision between two
+        # concepts of the SAME note (e.g. an alias "Knowledge Compounding" on "Dynamic Agentic ROI"
+        # when "Knowledge Compounding" is itself an extracted concept). Left unfiltered, the label
+        # resolves to two entities and that concept silently loses its article at compile.
+        owner_id = db.entity_id_for_name(canonical) or ""
+        persistable_aliases = [
+            a
+            for a in _persistable_aliases(aliases)
+            if not db.alias_collides_with_preferred(_concept_key(a), owner_id)
+        ]
         if persistable_aliases:
             db.upsert_aliases(canonical, persistable_aliases)
 

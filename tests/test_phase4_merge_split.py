@@ -1057,6 +1057,30 @@ def test_find_match_key_collisions_empty_when_no_overlap(tmp_path: Path) -> None
     assert collisions == []
 
 
+def test_find_match_key_collisions_ignores_alias_only_shared_match_key(tmp_path: Path) -> None:
+    """Only *preferred* labels are merge candidates. Two entities that share only an extracted
+    alias match_key are not duplicates: 'United States' and 'Ultrasound' both aliased 'US' is a
+    legal shared alias (issue #54 / decision 12). Folding aliases here produced false merge
+    suggestions whose cited match_key belonged to neither preferred label.
+    """
+    db = StateDB(tmp_path / "state.db")
+    db.upsert_concepts("raw/a.md", ["United States"])
+    db.upsert_concepts("raw/b.md", ["Ultrasound"])
+    db.upsert_aliases("United States", ["US"])
+    db.upsert_aliases("Ultrasound", ["US"])
+
+    pairs = {
+        frozenset((db.preferred_label_for_entity(a), db.preferred_label_for_entity(b)))
+        for a, b, _ in db.find_match_key_collisions()
+    }
+    assert frozenset({"United States", "Ultrasound"}) not in pairs
+
+    # A genuine preferred plural/singular fold is still detected (issue #54 intent preserved).
+    db.upsert_concepts("raw/c.md", ["User"])
+    db.upsert_concepts("raw/d.md", ["Users"])
+    assert any(mk == "user" for _, _, mk in db.find_match_key_collisions())
+
+
 def test_suggest_concept_merges_includes_match_key_pair(tmp_path: Path) -> None:
     from synto.config import Config
     from synto.pipeline.maintain import suggest_concept_merges

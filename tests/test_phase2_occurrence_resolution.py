@@ -12,11 +12,12 @@ Covers:
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 from synto.models import Concept
 from synto.pipeline.ingest import _normalize_concepts
-from synto.state import ResolveResult, StateDB
+from synto.state import _CURRENT_SCHEMA_VERSION, ResolveResult, StateDB
 
 # ---------------------------------------------------------------------------
 # resolve_by_match_key: plural/singular folding
@@ -296,3 +297,98 @@ def test_normalize_collision_guard_blocks_alias_that_is_another_preferred(
     assert not rr.ambiguous
     assert len(rr.ids) == 1
     assert db.preferred_label_for_entity(rr.ids[0]) == "US"
+
+
+def test_collision_guard_blocks_alias_when_carrying_concept_is_newly_minted(
+    tmp_path: Path,
+) -> None:
+    """The alias-collision guard must also fire in the *mint* branch, not only link-to-existing.
+
+    Real-vault regression: 'Knowledge Compounding' is its own concept; a freshly extracted
+    'Dynamic Agentic ROI' (not yet an entity → minted this pass) listed 'Knowledge Compounding'
+    as an alias. The guard only ran for concepts that resolved to an existing entity, so the
+    alias slipped in, made 'Knowledge Compounding' resolve to two entities, and silently dropped
+    its article at compile (12 articles instead of 13).
+    """
+    db = StateDB(tmp_path / "state.db")
+    db.upsert_concepts("raw/a.md", ["Knowledge Compounding"])  # preferred entity already exists
+
+    # "Dynamic Agentic ROI" is NOT yet an entity → Step 4 (mint) branch.
+    result = _normalize_concepts(
+        [Concept(name="Dynamic Agentic ROI", aliases=["Knowledge Compounding"])],
+        db,
+        rel_path="raw/b.md",
+    )
+    assert len(result) == 1
+    canonical, aliases = result[0]
+    assert canonical == "Dynamic Agentic ROI"
+    assert "Knowledge Compounding" not in aliases  # blocked at mint, not absorbed
+
+    # Persist exactly as the pipeline would and confirm the concept still resolves uniquely.
+    db.upsert_concepts("raw/b.md", [canonical])
+    db.upsert_aliases(canonical, aliases)
+    rr = db.resolve_label("Knowledge Compounding")
+    assert not rr.ambiguous and len(rr.ids) == 1
+    assert db.preferred_label_for_entity(rr.ids[0]) == "Knowledge Compounding"
+
+
+def test_minting_preferred_demotes_colliding_alias_on_other_entity(tmp_path: Path) -> None:
+    """Alias-first ordering of the same bug: an alias equal to a not-yet-minted concept name is
+    stored first (e.g. across ingest chunks), then the concept is minted. Minting its preferred
+    label must demote the colliding alias so the concept resolves unambiguously rather than
+    losing its article.
+    """
+    db = StateDB(tmp_path / "state.db")
+    db.upsert_concepts("raw/b.md", ["Dynamic Agentic ROI"])
+    # Stored unconditionally (the cross-language alias contract) before the concept exists.
+    db.upsert_aliases("Dynamic Agentic ROI", ["Knowledge Compounding"])
+    assert "Knowledge Compounding" in db.get_aliases("Dynamic Agentic ROI")
+
+    db.upsert_concepts("raw/a.md", ["Knowledge Compounding"])  # mint the preferred label
+
+    rr = db.resolve_label("Knowledge Compounding")
+    assert not rr.ambiguous and len(rr.ids) == 1
+    assert db.preferred_label_for_entity(rr.ids[0]) == "Knowledge Compounding"
+    assert "Knowledge Compounding" not in db.get_aliases("Dynamic Agentic ROI")
+
+
+def test_open_pre_v19_occurrences_shape_migrates_without_crash(tmp_path: Path) -> None:
+    """Upgrade-blocker regression: the base _SCHEMA must not index v19-added columns.
+
+    A real pre-v19 vault has concept_occurrences WITHOUT source_path/entity_id. The base schema
+    runs (executescript) before migrations, so creating idx_occ_path there raised
+    'no such column: source_path' and blocked every existing user's upgrade. Opening must
+    succeed, then the v19 migration adds the columns and indexes.
+    """
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE schema_version (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL);
+        INSERT INTO schema_version (id, version) VALUES (1, 18);
+        CREATE TABLE concept_occurrences (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            concept_name      TEXT NOT NULL,
+            source_segment_id TEXT,
+            ordinal           INTEGER NOT NULL DEFAULT 0,
+            confidence        REAL NOT NULL DEFAULT 1.0,
+            extraction_run    TEXT
+        );
+        INSERT INTO concept_occurrences (concept_name, source_segment_id) VALUES ('X', 'seg1');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    db = StateDB(db_path)  # must NOT raise "no such column: source_path"
+    cols = {r[1] for r in db._conn.execute("PRAGMA table_info(concept_occurrences)").fetchall()}
+    assert {"source_path", "entity_id", "surface", "resolution_status"} <= cols
+    idx = {
+        r[0]
+        for r in db._conn.execute("SELECT name FROM sqlite_master WHERE type='index'").fetchall()
+    }
+    assert {"idx_occ_path", "idx_concept_occurrences_entity"} <= idx
+    # The pre-existing occurrence row survives the table recreation, and we reach the head version.
+    assert db._conn.execute("SELECT COUNT(*) FROM concept_occurrences").fetchone()[0] == 1
+    assert db.schema_version() == _CURRENT_SCHEMA_VERSION
+    db.close()

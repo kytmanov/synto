@@ -4183,7 +4183,7 @@ def concept_rename(
 ) -> None:
     """Rename concept OLD_NAME to NEW_NAME across the vault and state DB."""
     from .git_ops import git_commit
-    from .indexer import append_log, generate_index
+    from .indexer import append_log, generate_index, generate_index_json
     from .pipeline.maintain import ConceptRenameError, rename_concept
 
     config = _load_config(vault_str)
@@ -4224,6 +4224,7 @@ def concept_rename(
         return
 
     generate_index(config, db)
+    generate_index_json(config, db)  # refresh the committed identity seed (decision 13)
     append_log(config, f"concept rename | '{report.old_name}' → '{report.new_name}'")
 
     if config.pipeline.auto_commit:
@@ -4262,7 +4263,7 @@ def concept_merge(
 ) -> None:
     """Merge concept LOSER into WINNER, retiring the loser article."""
     from .git_ops import git_commit
-    from .indexer import append_log, generate_index
+    from .indexer import append_log, generate_index, generate_index_json
     from .pipeline.maintain import ConceptMergeError, merge_concepts
 
     config = _load_config(vault_str)
@@ -4295,6 +4296,7 @@ def concept_merge(
 
     console.print(f"[green]Merged:[/green] {report.loser} → {report.winner}")
     generate_index(config, db)
+    generate_index_json(config, db)  # refresh the committed identity seed (decision 13)
     append_log(config, f"concept merge | '{report.loser}' → '{report.winner}'")
 
     if config.pipeline.auto_commit:
@@ -4340,7 +4342,7 @@ def concept_split(
 ) -> None:
     """Split concept NAME into multiple senses, each owning a subset of sources."""
     from .git_ops import git_commit
-    from .indexer import append_log, generate_index
+    from .indexer import append_log, generate_index, generate_index_json
     from .pipeline.maintain import ConceptSplitError, split_concept
 
     config = _load_config(vault_str)
@@ -4389,6 +4391,7 @@ def concept_split(
         return
 
     generate_index(config, db)
+    generate_index_json(config, db)  # refresh the committed identity seed (decision 13)
     sense_str = ", ".join(sense_names)
     append_log(config, f"concept split | '{report.original}' → {sense_str}")
 
@@ -4416,7 +4419,7 @@ def concept_split(
 def concept_unmerge(name: str, vault_str: str | None) -> None:
     """Reverse the most recent merge that retired concept NAME, restoring it."""
     from .git_ops import git_commit
-    from .indexer import append_log, generate_index
+    from .indexer import append_log, generate_index, generate_index_json
     from .pipeline.maintain import ConceptUnmergeError, unmerge_concept
 
     config = _load_config(vault_str)
@@ -4436,6 +4439,7 @@ def concept_unmerge(name: str, vault_str: str | None) -> None:
         )
 
     generate_index(config, db)
+    generate_index_json(config, db)  # refresh the committed identity seed (decision 13)
     append_log(config, f"concept unmerge | '{report.loser}' ← '{report.winner}'")
 
     if config.pipeline.auto_commit:
@@ -4494,12 +4498,12 @@ def concept_inspect(name: str, vault_str: str | None) -> None:
 
     # Compile state
     rows = db._conn.execute(
-        "SELECT status, scheduled_at FROM concept_compile_state WHERE lower(concept_name)=lower(?)",
+        "SELECT status, updated_at FROM concept_compile_state WHERE lower(concept_name)=lower(?)",
         (name,),
     ).fetchall()
     if rows:
-        for status, scheduled_at in rows:
-            console.print(f"  Compile state: {status}  (scheduled: {scheduled_at or 'n/a'})")
+        for status, updated_at in rows:
+            console.print(f"  Compile state: {status}  (updated: {updated_at or 'n/a'})")
     else:
         console.print("  Compile state: not tracked")
 

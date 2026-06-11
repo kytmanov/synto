@@ -6,9 +6,10 @@
 
 - Concept identity core: concepts now carry a stable `entity_id` independent of their
   display name, so homonyms and renames no longer collide. New curation commands
-  `synto concept merge`, `synto concept split`, `synto concept unmerge`, and
-  `synto concept rename` move identity, labels, sources, and compile state as a unit and
-  record each operation in `concept_identity_log`.
+  `synto concept merge`, `synto concept split`, and `synto concept unmerge` move identity,
+  labels, sources, and compile state as a unit and record each operation in
+  `concept_identity_log`; `synto concept rename` relabels an entity in place (old name kept
+  as an alias, inbound links rewritten).
 - Remote MCP access over Streamable HTTP: `synto serve --transport streamable-http`
   listens at `/mcp`. There is no built-in authentication, so this mode is meant for a
   trusted network or behind a reverse proxy/firewall. DNS-rebinding protection is
