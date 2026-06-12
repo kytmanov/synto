@@ -3238,10 +3238,13 @@ def review(vault_str):
             conf_color = (
                 "green" if s.confidence >= 0.6 else "yellow" if s.confidence >= 0.4 else "red"
             )
+            status_display = (
+                "[yellow]✓ staged[/yellow]" if s.status == "verified" else "[dim]draft[/dim]"
+            )
             table.add_row(
                 str(i),
                 escape(s.title),
-                s.status,
+                status_display,
                 f"[{conf_color}]{s.confidence:.2f}[/{conf_color}]",
                 str(s.source_count),
                 str(s.rejection_count),
@@ -3249,15 +3252,44 @@ def review(vault_str):
             )
 
         console.print(table)
-        console.print(
-            "\n[dim]  Type: number=open draft, a=approve all, v=verify all, "
-            "p=publish verified, x=reject all, q=quit[/dim]"
+        # Staging (verify) is an optional power feature, so the "publish only
+        # staged" action is shown only once staged drafts actually exist.
+        n_staged = sum(1 for s in summaries if s.status == "verified")
+        staged_line = (
+            f"\n    g       publish only the {n_staged} staged draft(s)" if n_staged else ""
         )
-        choice = click.prompt("\nChoice", prompt_suffix=" > ").strip().lower()
+        console.print(
+            "\n[dim]  → [bold]Enter[/bold]   review drafts one by one\n"
+            "    number  open a specific draft\n"
+            "    p       publish all — go live\n"
+            "    r       reject all\n"
+            "    v       stage all — sign off without publishing  (optional)\n"
+            f"    q       quit{staged_line}[/dim]"
+        )
+        choice = (
+            click.prompt("\nChoice", prompt_suffix=" > ", default="", show_default=False)
+            .strip()
+            .lower()
+        )
 
-        if choice == "q":
+        def _open(summary):
+            _review_single(
+                summary,
+                config,
+                db,
+                approve_drafts,
+                verify_drafts,
+                reject_draft,
+                compute_diff,
+                compute_rejection_diff,
+                load_draft_content,
+            )
+
+        if choice == "":
+            _open(summaries[0])  # Enter: start the one-by-one walk
+        elif choice == "q":
             return
-        elif choice == "a":
+        elif choice in ("p", "a"):  # `a` is a silent alias for muscle memory
             all_paths = [s.path for s in summaries]
             published = approve_drafts(config, db, all_paths)
             console.print(f"[green]Published {len(published)} article(s).[/green]")
@@ -3269,25 +3301,25 @@ def review(vault_str):
         elif choice == "v":
             all_paths = [s.path for s in summaries]
             verified = verify_drafts(config, db, all_paths)
-            console.print(f"[green]Verified {len(verified)} article(s).[/green]")
+            console.print(f"[green]Staged {len(verified)} article(s).[/green]")
             from .indexer import append_log, generate_index
 
             generate_index(config, db)
             append_log(config, f"review | verified {len(verified)} articles")
             return
-        elif choice == "p":
-            verified_paths = [s.path for s in summaries if s.status == "verified"]
-            if not verified_paths:
-                console.print("[yellow]No verified drafts ready to publish.[/yellow]")
+        elif choice == "g":
+            staged_paths = [s.path for s in summaries if s.status == "verified"]
+            if not staged_paths:
+                console.print("[yellow]No staged drafts ready to publish.[/yellow]")
                 continue
-            published = approve_drafts(config, db, verified_paths)
-            console.print(f"[green]Published {len(published)} verified article(s).[/green]")
+            published = approve_drafts(config, db, staged_paths)
+            console.print(f"[green]Published {len(published)} staged article(s).[/green]")
             from .indexer import append_log, generate_index
 
             generate_index(config, db)
             append_log(config, f"review | published {len(published)} verified articles")
             return
-        elif choice == "x":
+        elif choice in ("r", "x"):  # `x` is a silent alias for muscle memory
             reason = click.prompt("Reason for rejecting all", default="")
             for s in summaries:
                 reject_draft(s.path, config, db, feedback=reason)
@@ -3298,17 +3330,7 @@ def review(vault_str):
             if idx < 0 or idx >= len(summaries):
                 console.print("[red]Invalid selection.[/red]")
                 continue
-            _review_single(
-                summaries[idx],
-                config,
-                db,
-                approve_drafts,
-                verify_drafts,
-                reject_draft,
-                compute_diff,
-                compute_rejection_diff,
-                load_draft_content,
-            )
+            _open(summaries[idx])
         else:
             console.print("[red]Unknown command.[/red]")
 
@@ -3364,27 +3386,24 @@ def _review_single(
         body_display = body[:3000] + ("…" if len(body) > 3000 else "")
         console.print(Panel(escape(body_display), title="Draft"))
 
+        tools_line = "    e edit   d diff" + ("   x rejection diff" if rejections else "")
         console.print(
-            "\n[dim]Type: a=approve, p=publish, v=verify, r=reject, e=edit, "
-            "d=diff vs published, x=rejection diff, s=skip[/dim]"
+            "\n[dim]  → [bold]Enter[/bold]   publish (go live in the wiki)\n"
+            "    r       reject\n"
+            "    l       later — leave as a draft, move on\n"
+            "    v       stage — sign off now, publish later in a batch  (optional)\n"
+            f"{tools_line}[/dim]"
         )
-        raw_action = click.prompt("\nAction", prompt_suffix=" > ").strip()
+        raw_action = click.prompt(
+            "\nAction", prompt_suffix=" > ", default="", show_default=False
+        ).strip()
         action = raw_action.lower()
 
-        if action == "s":
+        # Enter (empty) is the happy path: publish. `a`/`p` are silent aliases
+        # kept for muscle memory; `l`/`s` leave the draft untouched.
+        if action in ("s", "l"):
             return
-        elif action == "a":
-            if not summary.path.exists():
-                console.print("[yellow]Draft disappeared.[/yellow]")
-                return
-            published = approve_drafts(config, db, [summary.path])
-            console.print(f"[green]Published:[/green] {published[0].name if published else '?'}")
-            from .indexer import append_log, generate_index
-
-            generate_index(config, db)
-            append_log(config, f"review | approved {summary.title}")
-            return
-        elif action == "p":
+        elif action in ("", "a", "p"):
             if not summary.path.exists():
                 console.print("[yellow]Draft disappeared.[/yellow]")
                 return
