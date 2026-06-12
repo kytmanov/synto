@@ -151,7 +151,7 @@ def test_v15_migration_is_idempotent_after_partial_failure(tmp_path: Path) -> No
 
     conn = sqlite3.connect(db_path)
     version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
-    assert version == 25
+    assert version == 26
     cols = {r[1] for r in conn.execute("PRAGMA table_info(wiki_articles)").fetchall()}
     assert "is_draft" not in cols
     conn.close()

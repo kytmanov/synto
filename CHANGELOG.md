@@ -10,6 +10,15 @@
   labels, sources, and compile state as a unit and record each operation in
   `concept_identity_log`; `synto concept rename` relabels an entity in place (old name kept
   as an alias, inbound links rewritten).
+- Order-independent concept identity at ingest: whether a surface becomes its own concept is
+  now a function of the accumulated notes, not of ingest order. A surface that some note later
+  extracts as a concept is minted as its own entity even when earlier notes used it only as a
+  weak (LLM-guessed) alias — it is no longer silently blocked or absorbed. The demoted weak
+  alias and the new concept are surfaced as a merge candidate in `synto doctor` and
+  `synto concept inspect` (never a silent split); resolve it with `synto concept merge`, which
+  blesses the alias so it links permanently thereafter. Human-blessed aliases (from a merge or
+  a kept rename) are always respected and never re-minted. Schema migrates to v26 (adds the
+  advisory `concept_merge_candidates` worklist); existing vaults upgrade in place.
 - Remote MCP access over Streamable HTTP: `synto serve --transport streamable-http`
   listens at `/mcp`. There is no built-in authentication, so this mode is meant for a
   trusted network or behind a reverse proxy/firewall. DNS-rebinding protection is

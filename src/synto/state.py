@@ -128,7 +128,7 @@ def _fts5_available(conn: sqlite3.Connection) -> bool:
         return False
 
 
-_CURRENT_SCHEMA_VERSION = 25
+_CURRENT_SCHEMA_VERSION = 26
 
 
 @dataclass
@@ -446,6 +446,20 @@ CREATE TABLE IF NOT EXISTS concept_identity_log (
     labels     TEXT NOT NULL,
     meta       TEXT,
     ts         TEXT NOT NULL
+);
+
+-- Advisory worklist (v26): pairs the identity rule promoted apart but that a human may want
+-- merged (e.g. "GD" extracted as a concept after it was a weak alias of "Gradient Descent").
+-- The pair is ordered by preferred label_key (NOT entity_id, which is random) so the same
+-- logical pair dedups to one row regardless of ingest order. Advisory only; re-derived on
+-- re-ingest, so it stays out of the .synto/INDEX.json durability seed.
+CREATE TABLE IF NOT EXISTS concept_merge_candidates (
+    entity_a   TEXT NOT NULL,
+    entity_b   TEXT NOT NULL,
+    surface    TEXT NOT NULL,
+    reason     TEXT,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (entity_a, entity_b, surface)
 );
 """
 
@@ -846,6 +860,17 @@ _VERSIONED_MIGRATIONS: dict[int, list[str]] = {
     23: [],  # rebuild `concept_compile_state` onto PK (entity_id, source_path) in the post-hook
     24: ["ALTER TABLE wiki_articles ADD COLUMN entity_id TEXT"],  # backfill in the post-hook
     25: [],  # rebuild concept_identity_log to allow op='unmerge' in the post-hook for atomicity
+    26: [
+        # Advisory merge-candidate worklist (single CREATE — atomic on its own, no backfill).
+        """CREATE TABLE IF NOT EXISTS concept_merge_candidates (
+            entity_a   TEXT NOT NULL,
+            entity_b   TEXT NOT NULL,
+            surface    TEXT NOT NULL,
+            reason     TEXT,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (entity_a, entity_b, surface)
+        )"""
+    ],
 }
 
 
@@ -2151,8 +2176,14 @@ class StateDB:
                 )
         self._ensure_compile_state_rows(source_path)
 
-    def replace_concepts_for_source(self, source_path: str, concept_names: list[str]) -> None:
-        """Replace concept links for a source and reset compile state for current concepts."""
+    def replace_concepts_for_source(
+        self, source_path: str, concept_names: list[str]
+    ) -> list[tuple[str, str]]:
+        """Replace concept links for a source and reset compile state for current concepts.
+
+        Returns (demoted_host_entity_id, surface) for each weak alias demoted to mint a name in
+        this batch, so the caller can strip the stale alias from the host article's frontmatter.
+        """
         normalized = []
         seen: set[str] = set()
         for name in concept_names:
@@ -2163,17 +2194,23 @@ class StateDB:
             normalized.append(cleaned)
 
         now = datetime.now().isoformat()
+        # (new_entity, demoted_host, surface) for surfaces minted here that demoted a weak alias
+        # off another entity — recorded as merge candidates after the tx (seam (a), order #1:
+        # the host aliased the surface first, then a later note extracts it as a concept).
+        promoted_pairs: list[tuple[str, str, str]] = []
         with self._tx():
             # Resolve/mint each new name to its entity up front; concepts is keyed
             # on entity_id (v22), so removal is by entity_id, not by name string.
             name_to_id: dict[str, str] = {}
             kept_ids: set[str] = set()
             for name in normalized:
-                entity_id = self._ensure_entity_for_name(name, now)
+                demoted: list[str] = []
+                entity_id = self._ensure_entity_for_name(name, now, demoted_hosts=demoted)
                 if entity_id is None:
                     continue
                 name_to_id[name] = entity_id
                 kept_ids.add(entity_id)
+                promoted_pairs.extend((entity_id, host, name) for host in demoted)
 
             existing_rows = self._conn.execute(
                 "SELECT entity_id, name FROM concepts WHERE source_path = ?", (source_path,)
@@ -2218,7 +2255,10 @@ class StateDB:
                            updated_at=excluded.updated_at""",
                     (entity_id, source_path, name, now),
                 )
+        for new_entity, host, surface in promoted_pairs:
+            self.record_merge_candidate(host, new_entity, surface, reason="promoted-from-alias")
         self.refresh_raw_compile_status(source_path)
+        return [(host, surface) for _new, host, surface in promoted_pairs]
 
     def list_all_concept_names(self) -> list[str]:
         """All unique canonical concept names, sorted."""
@@ -2245,11 +2285,18 @@ class StateDB:
         ).fetchall()
         return [r[0] for r in rows]
 
-    def _ensure_entity_for_name(self, name: str, now: str) -> str | None:
+    def _ensure_entity_for_name(
+        self, name: str, now: str, *, demoted_hosts: list[str] | None = None
+    ) -> str | None:
         """Get or create an entity for a concept name (must be called inside a _tx).
 
         Returns entity_id, or None if name produces an empty label_key.
         Idempotent: a second call for the same name returns the existing entity_id.
+
+        When ``demoted_hosts`` is provided, the entity_ids of any WEAK aliases demoted to
+        mint this preferred label are appended to it, so the ingest write seam can record
+        merge candidates at the call site. Other callers (rebuild/rename/restore) omit it
+        and demote silently — recording there would manufacture spurious candidates.
         """
         if not self._has_table("concept_labels"):
             return None
@@ -2262,15 +2309,23 @@ class StateDB:
         ).fetchone()
         if row:
             return row[0]
-        # Minting a new preferred label: any existing alias with the same label_key on another
-        # entity is now a collision (an alias may not equal another entity's preferred label —
-        # it would make resolve_label ambiguous and drop the new concept's article at compile).
-        # This is the alias-first ordering of the same guard the extraction path applies before
-        # storing aliases; here the alias was stored before this concept was minted (e.g. across
-        # ingest chunks), so demote it. The pair is still surfaced as a merge candidate via
-        # preferred-label match_key collisions, not via a polluting alias.
+        # Minting a new preferred label: a WEAK alias (extracted/legacy_backfill) with the same
+        # label_key on another entity is now a collision (an alias may not equal another entity's
+        # preferred label — it would make resolve_label ambiguous and drop the new concept's
+        # article at compile), so demote it. A human-blessed alias (source user/rename) is NEVER
+        # silently deleted — the classifier links to it before reaching this mint, so a blessed
+        # collision here is a genuine conflict surfaced loudly elsewhere, not data to destroy.
+        if demoted_hosts is not None:
+            host_rows = self._conn.execute(
+                "SELECT DISTINCT entity_id FROM concept_labels"
+                " WHERE role = 'alias' AND label_key = ?"
+                "   AND source IN ('extracted', 'legacy_backfill')",
+                (lk,),
+            ).fetchall()
+            demoted_hosts.extend(r[0] for r in host_rows)
         self._conn.execute(
-            "DELETE FROM concept_labels WHERE role = 'alias' AND label_key = ?",
+            "DELETE FROM concept_labels WHERE role = 'alias' AND label_key = ?"
+            "   AND source IN ('extracted', 'legacy_backfill')",
             (lk,),
         )
         entity_id = _generate_article_id()
@@ -2345,6 +2400,160 @@ class StateDB:
             (alias_lk, owner_entity_id),
         ).fetchone()
         return row is not None
+
+    # ── Role-aware surface classification (v26, order-independent identity) ────
+    # The ingest classifier asks these in order: a surface is a known concept iff it matches a
+    # PREFERRED label or a human-BLESSED alias; matching only WEAK aliases means it should mint
+    # its own entity (and demote those weak aliases). This makes identity a pure function of the
+    # claim-set, independent of ingest order.
+
+    def preferred_entity_for_surface(self, name: str) -> ResolveResult:
+        """Resolve a surface against PREFERRED labels only (exact label_key, then match_key fold).
+
+        Returns ids=[] / ids=[id] / ambiguous like resolve_label. match_key folding handles
+        "Users"→"User"; it is consulted only when exact label_key finds nothing.
+        """
+        if not self._has_table("concept_labels"):
+            return ResolveResult()
+        lk = _ck(name)
+        if not lk:
+            return ResolveResult()
+        rows = self._conn.execute(
+            """SELECT DISTINCT cl.entity_id FROM concept_labels cl
+               JOIN concept_entities ce ON ce.id = cl.entity_id
+               WHERE cl.label_key = ? AND cl.role = 'preferred' AND ce.status = 'active'""",
+            (lk,),
+        ).fetchall()
+        ids = [r[0] for r in rows]
+        if ids:
+            return ResolveResult(ids=ids, ambiguous=len(ids) > 1)
+        mk = _mk(name)
+        if not mk:
+            return ResolveResult()
+        rows = self._conn.execute(
+            """SELECT DISTINCT cl.entity_id FROM concept_labels cl
+               JOIN concept_entities ce ON ce.id = cl.entity_id
+               WHERE cl.match_key = ? AND cl.role = 'preferred' AND ce.status = 'active'""",
+            (mk,),
+        ).fetchall()
+        ids = [r[0] for r in rows]
+        return ResolveResult(ids=ids, ambiguous=len(ids) > 1)
+
+    def blessed_alias_entities_for_surface(self, name: str) -> list[str]:
+        """Active entity_ids carrying ``name`` as a human-blessed alias (source user/rename)."""
+        if not self._has_table("concept_labels"):
+            return []
+        lk = _ck(name)
+        if not lk:
+            return []
+        rows = self._conn.execute(
+            """SELECT DISTINCT cl.entity_id FROM concept_labels cl
+               JOIN concept_entities ce ON ce.id = cl.entity_id
+               WHERE cl.label_key = ? AND cl.role = 'alias'
+                 AND cl.source IN ('user', 'rename') AND ce.status = 'active'""",
+            (lk,),
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    def weak_alias_entities_for_surface(self, name: str) -> list[str]:
+        """Active entity_ids carrying ``name`` as a weak alias (extracted/legacy_backfill)."""
+        if not self._has_table("concept_labels"):
+            return []
+        lk = _ck(name)
+        if not lk:
+            return []
+        rows = self._conn.execute(
+            """SELECT DISTINCT cl.entity_id FROM concept_labels cl
+               JOIN concept_entities ce ON ce.id = cl.entity_id
+               WHERE cl.label_key = ? AND cl.role = 'alias'
+                 AND cl.source IN ('extracted', 'legacy_backfill') AND ce.status = 'active'""",
+            (lk,),
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    def has_disambiguation_stub(self, name: str) -> bool:
+        """True if an active disambiguation stub exists at the bare ``name``.
+
+        A managed homonym (post-split) shares its bare label as a weak alias across senses, which
+        is structurally identical to the bug case (a weak alias on >=2 unrelated hosts). The stub's
+        existence is the only signal distinguishing "route to disambiguation" from "mint + demote".
+        """
+        if not self._has_table("wiki_articles"):
+            return False
+        key = _ck(name)
+        if not key:
+            return False
+        rows = self._conn.execute(
+            "SELECT title FROM wiki_articles WHERE kind = 'disambiguation'"
+        ).fetchall()
+        return any(_ck(r[0]) == key for r in rows)
+
+    # ── Merge-candidate worklist (v26) ────────────────────────────────────────
+
+    def record_merge_candidate(
+        self, entity_x: str, entity_y: str, surface: str, reason: str | None = None
+    ) -> None:
+        """Record an advisory merge candidate for two entities the identity rule kept apart.
+
+        The pair is ordered by the entities' preferred label_key (NOT entity_id, which is a
+        random value) so the same logical pair dedups to one row regardless of ingest order.
+        """
+        if not self._has_table("concept_merge_candidates"):
+            return
+        if not entity_x or not entity_y or entity_x == entity_y:
+            return
+        kx = _ck(self.preferred_label_for_entity(entity_x) or "")
+        ky = _ck(self.preferred_label_for_entity(entity_y) or "")
+        # Deterministic ordering: primary key is the preferred label_key; entity_id is only a
+        # tiebreak for the degenerate same-label_key case (which preferred uniqueness precludes).
+        if (ky, entity_y) < (kx, entity_x):
+            entity_x, entity_y = entity_y, entity_x
+        now = datetime.now().isoformat()
+        with self._tx():
+            self._conn.execute(
+                "INSERT OR IGNORE INTO concept_merge_candidates"
+                " (entity_a, entity_b, surface, reason, created_at) VALUES (?, ?, ?, ?, ?)",
+                (entity_x, entity_y, surface, reason, now),
+            )
+
+    def list_merge_candidates(self) -> list[dict[str, str | None]]:
+        """All merge candidates with both preferred labels resolved for display, newest first.
+
+        Pairs whose entities are no longer both active are skipped (the candidate is stale —
+        a merge/unmerge/rename has since changed the graph)."""
+        if not self._has_table("concept_merge_candidates"):
+            return []
+        rows = self._conn.execute(
+            "SELECT entity_a, entity_b, surface, reason FROM concept_merge_candidates"
+            " ORDER BY created_at DESC, surface"
+        ).fetchall()
+        out: list[dict[str, str | None]] = []
+        for r in rows:
+            label_a = self.preferred_label_for_entity(r[0])
+            label_b = self.preferred_label_for_entity(r[1])
+            if label_a is None or label_b is None:
+                continue
+            out.append(
+                {
+                    "entity_a": r[0],
+                    "entity_b": r[1],
+                    "label_a": label_a,
+                    "label_b": label_b,
+                    "surface": r[2],
+                    "reason": r[3],
+                }
+            )
+        return out
+
+    def clear_merge_candidates_for_entity(self, entity_id: str) -> None:
+        """Drop every merge candidate touching ``entity_id`` (resolved by a curation op)."""
+        if not self._has_table("concept_merge_candidates") or not entity_id:
+            return
+        with self._tx():
+            self._conn.execute(
+                "DELETE FROM concept_merge_candidates WHERE entity_a = ? OR entity_b = ?",
+                (entity_id, entity_id),
+            )
 
     def resolve_by_match_key(self, text: str) -> ResolveResult:
         """Resolve using match_key (plural/singular folded) — Phase 2 seam.
@@ -2589,6 +2798,11 @@ class StateDB:
             self._conn.execute("DELETE FROM concepts WHERE entity_id=?", (loser_id,))
 
             # Union labels: loser preferred → winner alias; loser aliases → winner aliases.
+            # Absorbed labels are blessed (source='user'): the merge is an explicit human decision
+            # that these surfaces map to the winner, so the order-independent ingest rule must
+            # respect them (link, never re-mint) — this is what makes a resolved merge candidate
+            # stick instead of re-fragmenting on the next ingest. Upgrade any pre-existing weak
+            # alias to blessed on conflict for the same reason.
             winner_lk = _ck(winner_name)
             labels_absorbed: list[str] = [loser_name]
             for row in [{"label": loser_name}, *loser_aliases_rows]:
@@ -2599,8 +2813,8 @@ class StateDB:
                 self._conn.execute(
                     "INSERT INTO concept_labels"
                     " (entity_id, label, label_key, match_key, role, source, created_at)"
-                    " VALUES (?, ?, ?, ?, 'alias', 'extracted', ?)"
-                    " ON CONFLICT(entity_id, label_key) DO NOTHING",
+                    " VALUES (?, ?, ?, ?, 'alias', 'user', ?)"
+                    " ON CONFLICT(entity_id, label_key) DO UPDATE SET source='user'",
                     (winner_id, lbl, lk, _mk(lbl), now),
                 )
                 labels_absorbed.append(lbl)
@@ -2684,6 +2898,15 @@ class StateDB:
                 " WHERE id=?",
                 (winner_id, now, loser_id),
             )
+
+            # The merge resolves any candidate pairing winner/loser and orphans pairs touching the
+            # retired loser — drop both so the worklist reflects the new graph.
+            if self._has_table("concept_merge_candidates"):
+                self._conn.execute(
+                    "DELETE FROM concept_merge_candidates"
+                    " WHERE entity_a IN (?, ?) OR entity_b IN (?, ?)",
+                    (winner_id, loser_id, winner_id, loser_id),
+                )
 
             self._log_identity_op(
                 "merge",
@@ -2925,6 +3148,15 @@ class StateDB:
                     (winner_id, lk),
                 )
 
+            # Drop candidates touching either entity — the graph changed; valid pairs re-derive
+            # on the next ingest.
+            if self._has_table("concept_merge_candidates"):
+                self._conn.execute(
+                    "DELETE FROM concept_merge_candidates"
+                    " WHERE entity_a IN (?, ?) OR entity_b IN (?, ?)",
+                    (winner_id, loser_id, winner_id, loser_id),
+                )
+
             self._log_identity_op(
                 "unmerge",
                 [winner_id, loser_id],
@@ -3134,8 +3366,15 @@ class StateDB:
 
     # ── Alias facade (backed by concept_labels) ──
 
-    def upsert_aliases(self, concept_name: str, aliases: list[str]) -> None:
-        """Merge aliases for a concept. Skips self-matches (alias == canonical)."""
+    def upsert_aliases(
+        self, concept_name: str, aliases: list[str], source: str = "extracted"
+    ) -> None:
+        """Merge aliases for a concept. Skips self-matches (alias == canonical).
+
+        ``source`` defaults to 'extracted' (a weak LLM-guessed alias). Curation paths that record a
+        human decision (e.g. rename keeping the old name) pass a blessed source ('rename'/'user')
+        so the order-independent ingest rule links the surface instead of re-minting it.
+        """
         canonical_lower = concept_name.lower()
         canonical_key = _ck(concept_name)
         now = datetime.now().isoformat()
@@ -3153,9 +3392,9 @@ class StateDB:
                         self._conn.execute(
                             "INSERT INTO concept_labels"
                             " (entity_id, label, label_key, match_key, role, source, created_at)"
-                            " VALUES (?, ?, ?, ?, 'alias', 'extracted', ?)"
+                            " VALUES (?, ?, ?, ?, 'alias', ?, ?)"
                             " ON CONFLICT(entity_id, label_key) DO NOTHING",
-                            (entity_id, alias, alias_lk, _mk(alias), now),
+                            (entity_id, alias, alias_lk, _mk(alias), source, now),
                         )
 
     def get_aliases(self, concept_name: str) -> list[str]:
@@ -3200,6 +3439,30 @@ class StateDB:
             counts2[alias_key] = counts2.get(alias_key, 0) + 1
             mapping2[alias_key] = preferred
         return {k: v for k, v in mapping2.items() if counts2[k] == 1}
+
+    def list_blessed_alias_map(self) -> dict[str, str]:
+        """Like list_alias_map but only HUMAN-BLESSED aliases (source user/rename).
+
+        The pre-normalization candidate rewrite uses this so a WEAK (LLM-guessed) alias surface,
+        when later extracted as a concept, is NOT silently folded into its host — it must reach
+        the ingest classifier and mint its own entity (order-independent identity, v26). Blessed
+        aliases are durable human decisions and remain safe to fold.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT cl.label_key, cl_p.label AS preferred
+            FROM concept_labels cl
+            JOIN concept_entities ce ON ce.id = cl.entity_id AND ce.status = 'active'
+            JOIN concept_labels cl_p ON cl_p.entity_id = ce.id AND cl_p.role = 'preferred'
+            WHERE cl.role = 'alias' AND cl.source IN ('user', 'rename')
+            """
+        ).fetchall()
+        counts: dict[str, int] = {}
+        mapping: dict[str, str] = {}
+        for alias_key, preferred in rows:
+            counts[alias_key] = counts.get(alias_key, 0) + 1
+            mapping[alias_key] = preferred
+        return {k: v for k, v in mapping.items() if counts[k] == 1}
 
     def load_concept_alias_map(self) -> dict[str, list[str]]:
         """Return {concept_name: [aliases]} for all concepts with aliases.
@@ -3695,6 +3958,13 @@ class StateDB:
                 "UPDATE stubs SET concept = ? WHERE lower(concept) = lower(?)",
                 (new_name, old_name),
             )
+            # A candidate's stored surface/labels reference the old label — drop those touching the
+            # renamed entity; still-valid pairs re-derive on the next ingest.
+            if entity_id is not None and self._has_table("concept_merge_candidates"):
+                self._conn.execute(
+                    "DELETE FROM concept_merge_candidates WHERE entity_a = ? OR entity_b = ?",
+                    (entity_id, entity_id),
+                )
 
     def update_article_identity(self, old_path: str, new_path: str, new_title: str) -> None:
         """Repoint a tracked article row to a new path/title.
@@ -3834,6 +4104,17 @@ class StateDB:
     def get_article(self, path: str) -> WikiArticleRecord | None:
         row = self._conn.execute("SELECT * FROM wiki_articles WHERE path = ?", (path,)).fetchone()
         return _row_to_article(row) if row else None
+
+    def published_path_for_entity(self, entity_id: str) -> str | None:
+        """Vault-relative path of the published concept article for an entity, or None."""
+        if not self._has_table("wiki_articles") or not entity_id:
+            return None
+        row = self._conn.execute(
+            "SELECT path FROM wiki_articles WHERE entity_id = ? AND status = 'published'"
+            " AND kind = 'concept' LIMIT 1",
+            (entity_id,),
+        ).fetchone()
+        return row[0] if row else None
 
     def list_articles(self, drafts_only: bool = False) -> list[WikiArticleRecord]:
         if drafts_only:

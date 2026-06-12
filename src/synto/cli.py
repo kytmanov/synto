@@ -2834,6 +2834,17 @@ def _render_identity_section(config, db, reconcile: bool) -> None:
             label_b = db.preferred_label_for_entity(entity_b) or entity_b
             console.print(f"      [dim]{label_a} ~ {label_b}[/dim]")
 
+    candidates = db.list_merge_candidates()
+    if candidates:
+        console.print(
+            f"  [yellow]![/yellow] {len(candidates)} merge candidate(s) — a surface promoted to its"
+            " own concept (resolve with [bold]synto concept merge[/bold]):"
+        )
+        for cand in candidates[:10]:
+            console.print(
+                f"      [dim]{cand['label_a']} ~ {cand['label_b']}  (via '{cand['surface']}')[/dim]"
+            )
+
     # Reconcile against the committed seed.
     index_path = config.app_dir / "INDEX.json"
     if not index_path.exists():
@@ -4506,6 +4517,16 @@ def concept_inspect(name: str, vault_str: str | None) -> None:
             console.print(f"  Compile state: {status}  (updated: {updated_at or 'n/a'})")
     else:
         console.print("  Compile state: not tracked")
+
+    # Stored merge candidates touching this entity (a surface promoted off it / onto it).
+    relevant_candidates = [
+        c for c in db.list_merge_candidates() if eid in (c["entity_a"], c["entity_b"])
+    ]
+    if relevant_candidates:
+        console.print("\n  [yellow]Merge candidates:[/yellow]")
+        for cand in relevant_candidates:
+            other = cand["label_b"] if cand["entity_a"] == eid else cand["label_a"]
+            console.print(f"    → merge with '{other}'  (via '{cand['surface']}')")
 
     # Merge suggestions (filter to those involving this concept)
     merges = suggest_concept_merges(config, db)

@@ -214,7 +214,7 @@ def test_fresh_db_is_at_v10(tmp_path: Path) -> None:
 
     conn = sqlite3.connect(db_path)
     version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
-    assert version == _CURRENT_SCHEMA_VERSION == 25
+    assert version == _CURRENT_SCHEMA_VERSION == 26
     conn.close()
 
 
@@ -285,7 +285,7 @@ def test_v8_to_v10_upgrade_preserves_rows(tmp_path: Path) -> None:
 
     conn = sqlite3.connect(db_path)
     version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
-    assert version == 25
+    assert version == 26
     assert conn.execute("SELECT COUNT(*) FROM raw_notes").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM wiki_articles").fetchone()[0] == 1
 

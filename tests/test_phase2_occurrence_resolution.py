@@ -15,6 +15,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+from synto.concept_text import concept_key as _ck
 from synto.models import Concept
 from synto.pipeline.ingest import _normalize_concepts
 from synto.state import _CURRENT_SCHEMA_VERSION, ResolveResult, StateDB
@@ -266,70 +267,79 @@ def test_normalize_users_adds_extracted_alias(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_normalize_collision_guard_blocks_alias_that_is_another_preferred(
-    tmp_path: Path,
-) -> None:
-    """Extracted alias "US" for United States is blocked when "US" is already a preferred entity.
+def _persist_with_collision_seam(db: StateDB, canonical: str, aliases: list[str]) -> None:
+    """Replicate ingest_note's persistence seam (b): store a concept's aliases, dropping any that
+    equal another entity's preferred label and recording that pair as a merge candidate. Mirrors
+    the production loop so these unit tests exercise the same drop+record decision."""
+    owner_id = db.entity_id_for_name(canonical) or ""
+    persistable = []
+    for a in aliases:
+        if db.alias_collides_with_preferred(_ck(a), owner_id):
+            winner = db.entity_id_for_name(a)
+            if owner_id and winner is not None and winner != owner_id:
+                db.record_merge_candidate(owner_id, winner, a, reason="alias-collides-preferred")
+            continue
+        persistable.append(a)
+    if persistable:
+        db.upsert_aliases(canonical, persistable)
 
-    upsert_aliases() stores all aliases unconditionally (cross-language aliases must
-    survive explicit calls).  The collision guard lives in the extraction path:
-    _normalize_concepts filters aliases that would make resolve_label ambiguous.
+
+def test_alias_equal_to_another_preferred_drops_and_records_candidate(tmp_path: Path) -> None:
+    """An LLM alias "US" that equals another entity's preferred label must never be stored as an
+    alias — it is a merge signal, not a synonym. v26 moved this drop from _normalize to the
+    persistence seam, which also records the pair as a merge candidate; the invariant ("US" stays
+    unambiguous) is unchanged.
     """
     db = StateDB(tmp_path / "state.db")
     db.upsert_concepts("raw/a.md", ["US"])  # entity whose preferred label IS "US"
     db.upsert_concepts("raw/b.md", ["United States"])
+    owner = db.entity_id_for_name("United States")
 
-    # Simulate extraction: LLM extracts "US" as an alias of "United States".
-    result = _normalize_concepts(
-        [Concept(name="United States", aliases=["US"])],
-        db,
-        rel_path="raw/b.md",
-    )
-
-    assert len(result) == 1
-    canonical, aliases = result[0]
+    canonical, aliases = _normalize_concepts(
+        [Concept(name="United States", aliases=["US"])], db, rel_path="raw/b.md"
+    )[0]
     assert canonical == "United States"
-    # "US" alias is blocked — it's the preferred label of another active entity.
-    assert "US" not in aliases
+    # The guard relocated: _normalize now carries the surface through to persistence...
+    assert "US" in aliases
+    # ...where alias_collides_with_preferred is the drop decision.
+    assert db.alias_collides_with_preferred(_ck("US"), owner) is True
 
-    # "US" entity's preferred label remains unambiguous.
-    rr = db.resolve_label("US")
-    assert not rr.ambiguous
-    assert len(rr.ids) == 1
+    _persist_with_collision_seam(db, canonical, aliases)
+
+    assert "US" not in db.get_aliases("United States")  # collision not stored
+    rr = db.resolve_label("US")  # other concept stays unambiguous
+    assert not rr.ambiguous and len(rr.ids) == 1
     assert db.preferred_label_for_entity(rr.ids[0]) == "US"
+    assert any(_ck(c["surface"]) == _ck("US") for c in db.list_merge_candidates())
 
 
-def test_collision_guard_blocks_alias_when_carrying_concept_is_newly_minted(
-    tmp_path: Path,
-) -> None:
-    """The alias-collision guard must also fire in the *mint* branch, not only link-to-existing.
-
-    Real-vault regression: 'Knowledge Compounding' is its own concept; a freshly extracted
-    'Dynamic Agentic ROI' (not yet an entity → minted this pass) listed 'Knowledge Compounding'
-    as an alias. The guard only ran for concepts that resolved to an existing entity, so the
-    alias slipped in, made 'Knowledge Compounding' resolve to two entities, and silently dropped
-    its article at compile (12 articles instead of 13).
+def test_collision_dropped_when_carrying_concept_is_newly_minted(tmp_path: Path) -> None:
+    """The collision drop must also fire when the carrying concept is minted this pass (not only
+    link-to-existing). Real-vault regression: a freshly minted 'Dynamic Agentic ROI' listed the
+    existing concept 'Knowledge Compounding' as an alias; unfiltered, that made 'Knowledge
+    Compounding' resolve to two entities and silently dropped its article at compile. The
+    persistence seam drops it and records the merge candidate instead.
     """
     db = StateDB(tmp_path / "state.db")
-    db.upsert_concepts("raw/a.md", ["Knowledge Compounding"])  # preferred entity already exists
+    db.upsert_concepts("raw/a.md", ["Knowledge Compounding"])
 
-    # "Dynamic Agentic ROI" is NOT yet an entity → Step 4 (mint) branch.
-    result = _normalize_concepts(
+    canonical, aliases = _normalize_concepts(
         [Concept(name="Dynamic Agentic ROI", aliases=["Knowledge Compounding"])],
         db,
         rel_path="raw/b.md",
-    )
-    assert len(result) == 1
-    canonical, aliases = result[0]
+    )[0]
     assert canonical == "Dynamic Agentic ROI"
-    assert "Knowledge Compounding" not in aliases  # blocked at mint, not absorbed
 
-    # Persist exactly as the pipeline would and confirm the concept still resolves uniquely.
-    db.upsert_concepts("raw/b.md", [canonical])
-    db.upsert_aliases(canonical, aliases)
+    db.upsert_concepts("raw/b.md", [canonical])  # mint the carrying concept (as the pipeline does)
+    _persist_with_collision_seam(db, canonical, aliases)
+
+    assert "Knowledge Compounding" not in db.get_aliases("Dynamic Agentic ROI")
     rr = db.resolve_label("Knowledge Compounding")
     assert not rr.ambiguous and len(rr.ids) == 1
     assert db.preferred_label_for_entity(rr.ids[0]) == "Knowledge Compounding"
+    assert any(
+        _ck(c["surface"]) == _ck("Knowledge Compounding") for c in db.list_merge_candidates()
+    )
 
 
 def test_minting_preferred_demotes_colliding_alias_on_other_entity(tmp_path: Path) -> None:

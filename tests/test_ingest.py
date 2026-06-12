@@ -440,22 +440,31 @@ def test_normalize_does_not_use_llm_aliases_for_merge(vault, config, db):
     assert [name for name, _ in result] == ["Iterative development"]
 
 
-def test_normalize_reuses_canonical_via_stored_alias(vault, config, db):
+def test_normalize_mints_weak_alias_re_extracted_as_concept(vault, config, db):
+    # Order-independent identity (v26): a surface stored only as a WEAK (LLM-guessed) alias and
+    # later extracted as a concept becomes its OWN entity rather than being silently absorbed —
+    # otherwise identity would depend on which note arrived first. The relationship is surfaced
+    # as a merge candidate (recorded at the write seam) and reconciled with `concept merge`,
+    # which then makes it a blessed alias that links forever.
     db.upsert_concepts("raw/a.md", ["Template Catalog"])
     db.upsert_aliases("Template Catalog", ["Каталог шаблонов"])
 
     result = _normalize_concepts(_make_concepts(["Каталог шаблонов"]), db)
 
-    assert result == [("Template Catalog", ["Каталог шаблонов"])]
+    assert [name for name, _ in result] == ["Каталог шаблонов"]
 
 
-def test_normalize_preserves_cross_language_surface_as_alias(vault, config, db):
+def test_normalize_links_blessed_alias_after_merge(vault, config, db):
+    # The self-heal contract for Option A: `concept merge` blesses the absorbed label
+    # (source='user'), so re-extracting that cross-language surface as a concept LINKS back to the
+    # winner instead of re-minting. Without blessing, the merge would re-fragment every ingest.
     db.upsert_concepts("raw/a.md", ["Decision Heuristics"])
-    db.upsert_aliases("Decision Heuristics", ["эвристики решений"])
+    db.upsert_concepts("raw/b.md", ["эвристики решений"])
+    db.merge_entities("Decision Heuristics", "эвристики решений")  # winner, loser
 
     result = _normalize_concepts(_make_concepts(["эвристики решений"]), db)
 
-    assert result == [("Decision Heuristics", ["эвристики решений"])]
+    assert [name for name, _ in result] == ["Decision Heuristics"]
 
 
 def test_normalize_reuses_seeded_index_alias_when_db_empty(vault, config, db):
@@ -956,9 +965,14 @@ def test_ingest_all_seeds_existing_topics_from_index_when_db_empty(vault, config
     assert "aliases: каталог шаблонов" in prompt.lower()
 
 
-def test_ingest_note_reuses_existing_canonical_via_trusted_alias_from_llm_alias(vault, config, db):
+def test_ingest_note_weak_llm_alias_does_not_fold_cross_language_surface(vault, config, db):
+    # v26 / Option A: only a BLESSED alias pre-folds a candidate to its canonical. "Каталог
+    # шаблонов" here is a weak (LLM-guessed, source='extracted') alias of "Template Catalog", so it
+    # must NOT absorb a newly extracted "Vorlagenkatalog" — that mints its own concept
+    # (order-independent identity). The pair is reconciled by `concept merge`, which blesses the
+    # alias so it links forever afterward.
     db.upsert_concepts("raw/existing.md", ["Template Catalog"])
-    db.upsert_aliases("Template Catalog", ["Каталог шаблонов"])
+    db.upsert_aliases("Template Catalog", ["Каталог шаблонов"])  # weak (extracted)
     path = _write_raw(
         vault,
         "catalog.md",
@@ -977,8 +991,8 @@ def test_ingest_note_reuses_existing_canonical_via_trusted_alias_from_llm_alias(
 
     ingest_note(path, config, client, db)
 
-    assert db.get_concepts_for_sources(["raw/catalog.md"]) == ["Template Catalog"]
-    assert "Vorlagenkatalog" not in db.list_all_concept_names()
+    assert db.get_concepts_for_sources(["raw/catalog.md"]) == ["Vorlagenkatalog"]
+    assert "Vorlagenkatalog" in db.list_all_concept_names()
 
 
 def test_ingest_all_reuses_seeded_aliases_across_full_run(vault, config, db):

@@ -362,7 +362,9 @@ def rename_concept(
 
     db.rename_concept(canonical_old, new_name)
     if keep_alias:
-        db.upsert_aliases(new_name, [canonical_old])
+        # Bless the kept old name (source='rename') so a re-extracted old name links to the new
+        # concept under the order-independent ingest rule instead of re-minting (rename durability).
+        db.upsert_aliases(new_name, [canonical_old], source="rename")
 
     report.links_rewritten = _rewrite_inbound_links(
         config, db, old_stem, new_stem, new_name, dry_run=False
