@@ -855,12 +855,16 @@ def merge_concepts(
             continue
         meta, body = parse_note(art_path)
         existing_aliases = list(meta.get("aliases") or [])
-        added = [
-            lbl
-            for lbl in result["labels_absorbed"]
-            if not any(a.casefold() == lbl.casefold() for a in existing_aliases)
-            and lbl.casefold() != winner_name.casefold()
-        ]
+        # Dedup against existing aliases AND within this batch so a repeated absorbed
+        # label can never write a duplicate alias line into the published frontmatter.
+        seen_aliases = {a.casefold() for a in existing_aliases}
+        added: list[str] = []
+        for lbl in result["labels_absorbed"]:
+            key = lbl.casefold()
+            if key in seen_aliases or key == winner_name.casefold():
+                continue
+            seen_aliases.add(key)
+            added.append(lbl)
         if added:
             meta["aliases"] = [*existing_aliases, *added]
             write_note(art_path, meta, body)

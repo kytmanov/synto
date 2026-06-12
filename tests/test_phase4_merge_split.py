@@ -135,6 +135,26 @@ def test_merge_entities_absorbs_loser_preferred_as_alias(tmp_path: Path) -> None
     assert "ML" in aliases
 
 
+def test_merge_labels_absorbed_has_no_duplicates(tmp_path: Path) -> None:
+    """The loser name must appear once in labels_absorbed, not twice.
+
+    Why it matters: labels_absorbed drives the winner article's aliases: frontmatter.
+    A duplicate here writes a duplicate alias line into the published wiki, which is a
+    visible defect and breaks alias-list idempotency. Regression guard for the seed
+    that double-counted loser_name (it was the loop's first element AND the init value).
+    """
+    db = StateDB(tmp_path / "state.db")
+    db.upsert_concepts("raw/a.md", ["Capital Goods"])
+    db.upsert_concepts("raw/b.md", ["Capital Goods (LLM Tokens)"])
+    db.upsert_aliases("Capital Goods (LLM Tokens)", ["capitalized tokens"], source="extracted")
+
+    result = db.merge_entities("Capital Goods", "Capital Goods (LLM Tokens)")
+
+    absorbed = result["labels_absorbed"]
+    assert len(absorbed) == len(set(absorbed)), f"duplicate in labels_absorbed: {absorbed}"
+    assert absorbed.count("Capital Goods (LLM Tokens)") == 1
+
+
 def test_merge_entities_retires_loser_entity(tmp_path: Path) -> None:
     db = StateDB(tmp_path / "state.db")
     db.upsert_concepts("raw/a.md", ["A"])
@@ -763,6 +783,51 @@ def test_merge_concepts_deletes_loser_article_row(tmp_path: Path) -> None:
     index_body = (vault / "wiki" / "index.md").read_text()
     assert "[[Alpha]]" not in index_body
     assert "Alpha.md" not in index_body
+
+
+def test_merge_concepts_winner_aliases_have_no_duplicates(tmp_path: Path) -> None:
+    """The winner article's aliases: frontmatter must contain no duplicate entries.
+
+    Why it matters: the absorbed-label list seeded the loser name twice, and the
+    frontmatter writer only deduped against pre-existing aliases, so a merge wrote a
+    duplicated alias line into the published wiki. Duplicate aliases are a visible
+    defect and break alias-list idempotency on re-runs. This is the end-to-end guard
+    over the user-visible output (state.py seed + maintain.py writer together).
+    """
+    from synto.config import Config
+    from synto.pipeline.maintain import merge_concepts
+    from synto.vault import parse_note
+
+    vault = tmp_path / "vault"
+    (vault / "raw").mkdir(parents=True)
+    (vault / "wiki").mkdir(parents=True)
+
+    db = StateDB(vault / ".synto" / "state.db")
+    db.upsert_concepts("raw/a.md", ["Capital Goods"])
+    db.upsert_concepts("raw/b.md", ["Capital Goods (LLM Tokens)"])
+    db.upsert_aliases("Capital Goods (LLM Tokens)", ["capitalized tokens"], source="extracted")
+    _article(db, vault, "Capital Goods (LLM Tokens)")
+    # Winner article already carries an alias, exercising the existing-alias dedup too.
+    (vault / "wiki" / "Capital Goods.md").write_text(
+        "---\ntitle: Capital Goods\naliases:\n- capitalized tokens\n---\nbody"
+    )
+    db.upsert_article(
+        WikiArticleRecord(
+            path="wiki/Capital Goods.md",
+            title="Capital Goods",
+            sources=[],
+            content_hash="",
+            status="published",
+        )
+    )
+
+    config = Config.model_validate({"vault": str(vault)})
+    merge_concepts(config, db, "Capital Goods (LLM Tokens)", "Capital Goods", dry_run=False)
+
+    meta, _ = parse_note(vault / "wiki" / "Capital Goods.md")
+    aliases = list(meta.get("aliases") or [])
+    assert len(aliases) == len(set(aliases)), f"duplicate alias in frontmatter: {aliases}"
+    assert aliases.count("Capital Goods (LLM Tokens)") == 1
 
 
 def test_merge_concepts_raises_on_manual_edit_mismatch(tmp_path: Path) -> None:

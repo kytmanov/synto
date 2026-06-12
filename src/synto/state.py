@@ -2804,7 +2804,9 @@ class StateDB:
             # stick instead of re-fragmenting on the next ingest. Upgrade any pre-existing weak
             # alias to blessed on conflict for the same reason.
             winner_lk = _ck(winner_name)
-            labels_absorbed: list[str] = [loser_name]
+            # loser_name is the first element iterated below, so the loop appends it once;
+            # seeding the list with it too would double-count it (duplicate winner alias).
+            labels_absorbed: list[str] = []
             for row in [{"label": loser_name}, *loser_aliases_rows]:
                 lbl = row["label"] if isinstance(row, dict) else row[0]
                 lk = _ck(lbl)
