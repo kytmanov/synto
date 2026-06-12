@@ -58,6 +58,19 @@
     "identity_log": {
       "type": "array"
     },
+    "entity_aliases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["entity_id", "label", "source"],
+        "properties": {
+          "entity_id": {"type": "string", "minLength": 1},
+          "label": {"type": "string", "minLength": 1},
+          "source": {"enum": ["user", "rename"]}
+        },
+        "additionalProperties": false
+      }
+    },
     "terms": {
       "type": "array"
     },

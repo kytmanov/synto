@@ -3228,6 +3228,60 @@ class StateDB:
             result.append(entry)
         return result
 
+    def list_blessed_aliases(self) -> list[dict]:
+        """Return human-blessed aliases (merge/rename) for the INDEX.json durability seed.
+
+        Only ``source IN ('user','rename')`` aliases are exported: these are curation
+        decisions that a re-ingest cannot reproduce, so they must survive a state.db rebuild
+        (restoring them re-arms the re-mint guard). Extracted aliases are intentionally
+        omitted — they regenerate on the next ingest, and blessing them on restore would
+        block the order-independent promotion rule.
+        """
+        if not self._has_table("concept_labels"):
+            return []
+        rows = self._conn.execute(
+            "SELECT entity_id, label, source FROM concept_labels"
+            " WHERE role='alias' AND source IN ('user', 'rename')"
+            " ORDER BY entity_id, label"
+        ).fetchall()
+        return [{"entity_id": r[0], "label": r[1], "source": r[2]} for r in rows]
+
+    def restore_blessed_aliases(self, entries: list[dict]) -> int:
+        """Re-attach human-blessed aliases to restored entities on a fresh-DB rebuild.
+
+        Mirrors restore_entities_from_seed's precedence: only runs when the entity exists
+        (it was just recreated from the seed) and never overwrites a live label. Returns the
+        count restored. Label/match keys are recomputed (deterministic) rather than seeded.
+        """
+        if not self._has_table("concept_labels") or not entries:
+            return 0
+        now = datetime.now().isoformat()
+        restored = 0
+        with self._tx():
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                eid = entry.get("entity_id")
+                label = entry.get("label")
+                source = entry.get("source")
+                if not eid or not label or source not in ("user", "rename"):
+                    continue
+                lk = _ck(label)
+                if not lk:
+                    continue
+                if not self._conn.execute(
+                    "SELECT 1 FROM concept_entities WHERE id=?", (eid,)
+                ).fetchone():
+                    continue
+                cur = self._conn.execute(
+                    "INSERT OR IGNORE INTO concept_labels"
+                    " (entity_id, label, label_key, match_key, role, source, created_at)"
+                    " VALUES (?, ?, ?, ?, 'alias', ?, ?)",
+                    (eid, label, lk, _mk(label), source, now),
+                )
+                restored += cur.rowcount
+        return restored
+
     def restore_entities_from_seed(self, entries: list[tuple[str, str]]) -> int:
         """Recreate entities with their ORIGINAL ids + preferred labels from a rebuild seed.
 

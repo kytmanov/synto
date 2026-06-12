@@ -189,6 +189,7 @@ def _build_index_payload(config: Config, db: StateDB) -> dict[str, object]:
         },
         "articles": articles,
         "identity_log": db.list_identity_log(),
+        "entity_aliases": db.list_blessed_aliases(),
         "terms": [],
         "papers": [],
         "sources": _list_sources(db),

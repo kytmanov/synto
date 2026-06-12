@@ -325,3 +325,61 @@ def test_index_json_seed_carries_entity_id(tmp_path: Path) -> None:
 
     assert "identity_log" in payload
     assert payload["identity_log"] == []
+
+
+def test_blessed_aliases_survive_state_db_rebuild_from_seed(tmp_path: Path) -> None:
+    """A state.db rebuild from INDEX.json must restore human-blessed aliases.
+
+    Why it matters: merge- and rename-blessed aliases are curation decisions a re-ingest
+    cannot reproduce. If they are dropped on rebuild, the re-mint guard is disarmed and a
+    previously-merged duplicate can be re-minted on the next ingest (re-opening #54).
+    Extracted aliases are deliberately NOT exported — they regenerate on ingest, and
+    blessing them on restore would block the order-independent promotion rule.
+    """
+    import json
+
+    from synto.config import Config
+    from synto.indexer import generate_index_json
+    from synto.models import RawNoteRecord
+    from synto.pipeline.ingest import _restore_identity_from_index
+
+    vault = tmp_path
+    (vault / "raw").mkdir()
+    (vault / "wiki").mkdir()
+    (vault / ".synto").mkdir()
+    config = Config(vault=vault)
+    db = StateDB(config.state_db_path)
+
+    db.upsert_raw(RawNoteRecord(path="raw/a.md", content_hash="h1", status="ingested"))
+    db.upsert_raw(RawNoteRecord(path="raw/b.md", content_hash="h2", status="ingested"))
+    db.upsert_concepts("raw/a.md", ["Apple Inc"])
+    db.upsert_concepts("raw/b.md", ["Apple Computer"])
+
+    # Merge mints a blessed ('user') alias; a rename mints a 'rename' alias; an extracted
+    # alias must NOT be exported to the seed.
+    db.merge_entities("Apple Inc", "Apple Computer")
+    db.upsert_aliases("Apple Inc", ["Apple Co"], source="rename")
+    db.upsert_aliases("Apple Inc", ["the fruit company"], source="extracted")
+    eid = db.entity_id_for_name("Apple Inc")
+
+    payload = json.loads(generate_index_json(config, db).read_text(encoding="utf-8"))
+    seed_labels = {a["label"]: a["source"] for a in payload["entity_aliases"]}
+    assert seed_labels == {"Apple Computer": "user", "Apple Co": "rename"}
+
+    # Destroy the regenerable layer; rebuild from the committed seed.
+    db.close()
+    config.state_db_path.unlink()
+    db2 = StateDB(config.state_db_path)
+    _restore_identity_from_index(config, db2)
+
+    # Entity id preserved, and BOTH blessed aliases resolve back to it.
+    assert db2.entity_id_for_name("Apple Inc") == eid
+    assert db2.entity_id_for_name("Apple Computer") == eid
+    assert db2.entity_id_for_name("Apple Co") == eid
+    restored = {
+        r["label"]: r["source"]
+        for r in db2._conn.execute(
+            "SELECT label, source FROM concept_labels WHERE role='alias'"
+        ).fetchall()
+    }
+    assert restored == {"Apple Computer": "user", "Apple Co": "rename"}
