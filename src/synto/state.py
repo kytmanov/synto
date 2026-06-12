@@ -3353,7 +3353,12 @@ class StateDB:
                 )
 
     def list_active_entities_without_articles(self) -> list[tuple[str, str]]:
-        """Return (entity_id, preferred_label) for active entities with no published article."""
+        """Return (entity_id, preferred_label) for active entities with no published or draft article.
+
+        A draft awaiting approval counts as "has an article": the page is already compiled,
+        so flagging it as an orphan (and advising "run compile") would be wrong. Only entities
+        with no article of any kind — a failed compile or a dangling merge/split — are orphans.
+        """
         if not self._has_table("concept_labels"):
             return []
         rows = self._conn.execute(
@@ -3364,7 +3369,7 @@ class StateDB:
             WHERE ce.status = 'active'
               AND NOT EXISTS (
                   SELECT 1 FROM wiki_articles wa
-                  WHERE wa.status = 'published'
+                  WHERE wa.status IN ('published', 'draft')
                     AND (
                       lower(wa.title) = lower(cl.label)
                       OR lower(replace(wa.path, '\\', '/'))

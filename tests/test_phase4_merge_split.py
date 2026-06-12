@@ -1259,3 +1259,36 @@ def test_lint_reports_orphan_entity_for_active_with_no_article(tmp_path: Path) -
     result = run_lint(config, db)
     orphan_issues = [i for i in result.issues if i.issue_type == "orphan_entity"]
     assert orphan_issues, "expected orphan_entity lint issue for active entity with no article"
+
+
+def test_lint_does_not_report_orphan_entity_when_draft_exists(tmp_path: Path) -> None:
+    """A draft awaiting approval is not an orphan: its page is already compiled.
+
+    Flagging it would (wrongly) advise 'run compile' on a concept that already has a draft
+    and only needs approval. orphan_entity must fire only for entities with no article of
+    any kind.
+    """
+    from synto.config import Config
+    from synto.pipeline.lint import run_lint
+
+    vault = tmp_path / "vault"
+    (vault / "raw").mkdir(parents=True)
+    (vault / "wiki" / ".drafts").mkdir(parents=True)
+
+    db = StateDB(vault / ".synto" / "state.db")
+    db.upsert_concepts("raw/a.md", ["DraftedConcept"])
+    db.upsert_article(
+        WikiArticleRecord(
+            path="wiki/.drafts/DraftedConcept.md",
+            title="DraftedConcept",
+            sources=[],
+            content_hash="",
+            status="draft",
+        )
+    )
+
+    config = Config.model_validate({"vault": str(vault)})
+
+    result = run_lint(config, db)
+    orphan_issues = [i for i in result.issues if i.issue_type == "orphan_entity"]
+    assert not orphan_issues, "draft-backed entity must not be flagged as orphan_entity"
