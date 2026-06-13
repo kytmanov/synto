@@ -2384,6 +2384,32 @@ class StateDB:
         ).fetchone()
         return row[0] if row else None
 
+    def count_ambiguous_occurrences_for_label(self, label: str) -> int:
+        """Count ambiguous occurrences for a display label (encapsulates the legacy
+        concept_name column query used by inspect paths).
+        """
+        if not self._has_table("concept_occurrences"):
+            return 0
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM concept_occurrences "
+            "WHERE lower(concept_name)=lower(?) AND resolution_status='ambiguous'",
+            (label,),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def get_compile_state_for_label(self, label: str) -> list[tuple[str, str | None]]:
+        """Return (status, updated_at) rows for a label from the (still partially
+        name-keyed) compile_state table. Thin wrapper so CLI does not do raw SQL.
+        """
+        if not self._has_table("concept_compile_state"):
+            return []
+        rows = self._conn.execute(
+            "SELECT status, updated_at FROM concept_compile_state "
+            "WHERE lower(concept_name)=lower(?)",
+            (label,),
+        ).fetchall()
+        return [(r[0], r[1]) for r in rows]
+
     def alias_collides_with_preferred(self, alias_lk: str, owner_entity_id: str) -> bool:
         """Return True if alias_lk is already the preferred label of a DIFFERENT active entity.
 

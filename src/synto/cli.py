@@ -4619,16 +4619,7 @@ def concept_inspect(name: str, vault_str: str | None) -> None:
     pref = db.preferred_label_for_entity(eid)
     aliases = db.aliases_for_concept(name)
     sources = db.get_sources_for_entities([name]).get(name, [])
-    _sql_amb = (
-        "SELECT COUNT(*) FROM concept_occurrences"
-        " WHERE lower(concept_name)=lower(?) AND resolution_status='ambiguous'"
-    )
-    ambiguous_row = (
-        db._conn.execute(_sql_amb, (name,)).fetchone()
-        if db._has_table("concept_occurrences")
-        else None
-    )
-    ambiguous = ambiguous_row[0] if ambiguous_row else 0
+    ambiguous = db.count_ambiguous_occurrences_for_label(name)
 
     console.print(f"[bold]{pref}[/bold]  [dim](entity_id: {eid})[/dim]")
     if aliases:
@@ -4638,11 +4629,8 @@ def concept_inspect(name: str, vault_str: str | None) -> None:
         console.print(f"    [dim]{src}[/dim]")
     console.print(f"  Ambiguous occurrences: {ambiguous}")
 
-    # Compile state
-    rows = db._conn.execute(
-        "SELECT status, updated_at FROM concept_compile_state WHERE lower(concept_name)=lower(?)",
-        (name,),
-    ).fetchall()
+    # Compile state (via seam; table still has some name-keyed rows)
+    rows = db.get_compile_state_for_label(name)
     if rows:
         for status, updated_at in rows:
             console.print(f"  Compile state: {status}  (updated: {updated_at or 'n/a'})")
