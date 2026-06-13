@@ -49,6 +49,13 @@ def vault(tmp_path: Path) -> Path:
     for sub in ("raw", "wiki", "wiki/.drafts", ".synto"):
         (tmp_path / sub).mkdir(parents=True, exist_ok=True)
     _git(["init"], tmp_path)
+    # Persist identity in the repo config: `synto undo` runs `git revert` in its own
+    # subprocess (git_ops.git_undo), which does not pass the per-call `-c user.*` flags
+    # that the `_git` helper uses. Without repo-local identity the revert cannot commit on
+    # a machine that has no global git identity (e.g. CI), so it silently adds no commit.
+    _git(["config", "user.email", "t@t"], tmp_path)
+    _git(["config", "user.name", "t"], tmp_path)
+    _git(["config", "commit.gpgsign", "false"], tmp_path)
     (tmp_path / "wiki" / "seed.md").write_text("seed")
     _commit(tmp_path, "initial")
     return tmp_path
