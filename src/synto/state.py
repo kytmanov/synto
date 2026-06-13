@@ -44,6 +44,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 from .concept_text import concept_key as _ck
+from .concept_text import legacy_name_key as _lnk
 from .concept_text import match_key as _mk
 from .models import ItemMentionRecord, KnowledgeItemRecord, RawNoteRecord, WikiArticleRecord
 from .paths import rel_posix, to_posix
@@ -2873,6 +2874,11 @@ class StateDB:
             # indexes, so a plain rename collides when a segment cited both concepts —
             # OR IGNORE skips the collisions, then the leftover loser rows are dropped
             # (same collapse pattern as the concepts / compile_state edge moves above).
+            #
+            # NOTE (legacy name-keyed debt, see review): rejections, blocked_concepts,
+            # stubs, and knowledge_items are still keyed by display name (via _lnk).
+            # Unmerge intentionally does not restore them. This is documented and tested;
+            # the helper makes the sites mechanical to find when we decide to migrate them.
             self._conn.execute(
                 "UPDATE OR IGNORE concept_occurrences SET concept_name=?"
                 " WHERE lower(concept_name)=lower(?)",
@@ -2889,13 +2895,13 @@ class StateDB:
                 (winner_id, loser_id),
             )
             self._conn.execute(
-                "UPDATE rejections SET concept=? WHERE lower(concept)=lower(?)",
-                (winner_name, loser_name),
+                "UPDATE rejections SET concept=? WHERE lower(concept)=?",
+                (winner_name, _lnk(loser_name)),
             )
             # Block winner if loser was blocked.
             was_blocked = self._conn.execute(
-                "SELECT 1 FROM blocked_concepts WHERE lower(concept)=lower(?)",
-                (loser_name,),
+                "SELECT 1 FROM blocked_concepts WHERE lower(concept)=?",
+                (_lnk(loser_name),),
             ).fetchone()
             if was_blocked:
                 self._conn.execute(
@@ -2903,20 +2909,20 @@ class StateDB:
                     (winner_name, now),
                 )
             self._conn.execute(
-                "DELETE FROM blocked_concepts WHERE lower(concept)=lower(?)", (loser_name,)
+                "DELETE FROM blocked_concepts WHERE lower(concept)=?", (_lnk(loser_name),)
             )
             self._conn.execute(
-                "UPDATE stubs SET concept=? WHERE lower(concept)=lower(?)",
-                (winner_name, loser_name),
+                "UPDATE stubs SET concept=? WHERE lower(concept)=?",
+                (winner_name, _lnk(loser_name)),
             )
             # knowledge_items has a UNIQUE(name) constraint. If the winner row already
             # exists, renaming the loser would conflict — just delete the loser row.
             winner_ki = self._conn.execute(
-                "SELECT 1 FROM knowledge_items WHERE lower(name)=lower(?)", (winner_name,)
+                "SELECT 1 FROM knowledge_items WHERE lower(name)=?", (_lnk(winner_name),)
             ).fetchone()
             if winner_ki:
                 self._conn.execute(
-                    "DELETE FROM knowledge_items WHERE lower(name)=lower(?)", (loser_name,)
+                    "DELETE FROM knowledge_items WHERE lower(name)=?", (_lnk(loser_name),)
                 )
             else:
                 self._conn.execute(
@@ -3167,7 +3173,7 @@ class StateDB:
                 self._conn.execute(
                     "UPDATE OR IGNORE concept_occurrences SET concept_name=?"
                     " WHERE lower(concept_name)=lower(?) AND source_path=?",
-                    (loser_name, winner_name, src),
+                    (loser_name, _lnk(winner_name), src),
                 )
             # Drop the absorbed alias labels from the winner. The loser kept its own label
             # rows through the merge, so it needs no relabeling.
