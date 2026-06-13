@@ -192,6 +192,32 @@ class PipelineOrchestrator:
             report.failed.extend(r2_failed)
             report.rounds = 2
 
+        # ── Escalation: retry truncated concepts with the soft cap lifted ──────
+        # concept_draft_soft_cap is a target, not a guillotine: a draft truncated under
+        # it is worse than a longer one. Retry once at the full article_max_tokens/context
+        # budget so a soft-cap truncation cannot silently freeze its source note.
+        truncated = [f for f in report.failed if f.reason == FailureReason.TRUNCATED]
+        if truncated and not dry_run:
+            log.info("── Compile escalation (%d truncated) ───────────────────────", len(truncated))
+            truncated_concepts = [f.concept for f in truncated]
+            te = time.monotonic()
+            re_drafts, re_failed, re_timings = _run_compile(
+                config,
+                router,
+                db,
+                concepts=truncated_concepts,
+                dry_run=dry_run,
+                ignore_soft_cap=True,
+            )
+            report.timings["compile_escalation"] = time.monotonic() - te
+            report.compiled += len(re_drafts)
+            draft_paths = draft_paths + re_drafts
+            report.concept_timings.update(re_timings)
+            # Replace the truncated failures with the escalation results (some may now
+            # succeed; any that remain failed genuinely exceed the article ceiling).
+            report.failed = [f for f in report.failed if f.reason != FailureReason.TRUNCATED]
+            report.failed.extend(re_failed)
+
         # ── Approve ────────────────────────────────────────────────────────────
         if auto_approve and draft_paths and not dry_run:
             log.info(
@@ -225,6 +251,7 @@ def _run_compile(
     db: StateDB,
     concepts: list[str] | None,
     dry_run: bool,
+    ignore_soft_cap: bool = False,
 ) -> tuple[list[Path], list[FailureRecord], dict[str, float]]:
     """Run compile_concepts and classify failures by reason."""
     from ..openai_compat_client import LLMBadRequestError, LLMError
@@ -237,6 +264,7 @@ def _run_compile(
             db=db,
             dry_run=dry_run,
             concepts=concepts,
+            ignore_soft_cap=ignore_soft_cap,
         )
     except LLMBadRequestError as e:
         # Bad request (HTTP 400) — non-retryable; mark all as UNKNOWN not TRANSIENT

@@ -575,6 +575,31 @@ def test_ingest_note_returns_analysis_result(vault, config, db):
     assert len(result.concepts) >= 1
 
 
+def test_ingest_strips_ocr_picture_text_before_model(vault, config, db):
+    """OCR 'picture text' gibberish must never reach the fast model (token waste +
+    verbatim-copy risk). Capture the actual prompt sent to generate and assert it's clean."""
+    content = (
+        "# Spectra\n\nReal substantive paragraph about the figure.\n\n"
+        "**==> picture [409 x 22] intentionally omitted <==**\n\n"
+        "**----- Start of picture text -----**<br>\n"
+        "es OVI Ta we -yo OVI CIV L y α<br>**----- End of picture text -----**<br>\n"
+    )
+    path = _write_raw(vault, "spectra.md", content)
+    raw_client = MagicMock()
+    raw_client.generate.return_value = _analysis_json()
+    ingest_note(path, config, as_router(raw_client, config), db)
+
+    prompt = (
+        raw_client.generate.call_args.args[0]
+        if raw_client.generate.call_args.args
+        else (raw_client.generate.call_args.kwargs.get("prompt", ""))
+    )
+    assert "Start of picture text" not in prompt
+    assert "es OVI Ta we" not in prompt
+    assert "intentionally omitted" not in prompt
+    assert "Real substantive paragraph" in prompt  # real content survives
+
+
 def test_ingest_note_stores_status_ingested(vault, config, db):
     path = _write_raw(vault, "note.md", "# Note\n\nSome content here.")
     client = _make_client(_analysis_json())

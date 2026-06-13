@@ -3146,11 +3146,12 @@ def run(
     table.add_column("Time", justify="right")
 
     table.add_row("Ingested", str(report.ingested), f"{report.timings.get('ingest', 0):.1f}s")
-    table.add_row(
-        "Compiled",
-        str(report.compiled),
-        f"{report.timings.get('compile_r1', 0) + report.timings.get('compile_r2', 0):.1f}s",
+    compile_secs = (
+        report.timings.get("compile_r1", 0)
+        + report.timings.get("compile_r2", 0)
+        + report.timings.get("compile_escalation", 0)
     )
+    table.add_row("Compiled", str(report.compiled), f"{compile_secs:.1f}s")
     table.add_row("Published", str(report.published), "")
     if report.held_back > 0:
         table.add_row("Held back", str(report.held_back), "")
@@ -3166,6 +3167,29 @@ def run(
             console.print(f"  [dim]{f.concept}[/dim] ({f.reason.value})")
             if f.error_msg:
                 console.print(f"    [dim]{f.error_msg}[/dim]")
+
+        # Fail loud: a source note stays 'ingested' (never publishes) while any of its
+        # concepts is still failed. Surface those notes explicitly so a failed concept
+        # cannot silently freeze a whole paper.
+        frozen: dict[str, list] = {}
+        for f in report.failed:
+            for sp in db.get_sources_for_concept(f.concept):
+                rec = db.get_raw(sp)
+                if rec is not None and rec.status == "ingested":
+                    frozen.setdefault(sp, []).append(f)
+        if frozen:
+            console.print(
+                f"\n[yellow]⚠ {len(frozen)} note(s) incompletely compiled and will not "
+                f"publish:[/yellow]"
+            )
+            for sp, fails in sorted(frozen.items()):
+                names = ", ".join(f.concept for f in fails)
+                console.print(f"  [bold]{sp}[/bold] ({len(fails)} concept(s) failed: {names})")
+                if any(f.reason.value == "truncated" for f in fails):
+                    console.print(
+                        "    [dim]still truncated at the article ceiling — raise "
+                        "pipeline.article_max_tokens or heavy_ctx, or reduce source size[/dim]"
+                    )
 
     if not dry_run:
         tips: list[str] = []

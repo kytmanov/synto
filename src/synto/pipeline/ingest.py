@@ -39,6 +39,7 @@ from ..vault import (
     parse_note,
     sanitize_filename,
     sanitize_wikilink_target,
+    strip_image_text_blocks,
     write_note,
 )
 from .items import extract_named_reference_items, extract_quoted_title_items, store_extracted_items
@@ -1493,6 +1494,9 @@ def ingest_note(
     # Strip ### Media sections — image paths are opaque to the LLM and waste tokens;
     # the embeds remain in the raw/ file for the human reader in Obsidian.
     body = re.sub(r"\n### Media\n(?:- !\[\[[^\]]*\]\]\n?)*", "\n", body)
+    # Strip extractor OCR "picture text" gibberish before it reaches the model or
+    # the RAG chunker below — same in-memory-only policy as the strips above.
+    body = strip_image_text_blocks(body)
     if meta.get("source") or meta.get("url"):  # web clipper adds these
         body = _preprocess_web_clip(body)
 

@@ -47,6 +47,7 @@ from ..vault import (
     normalize_wikilinks,
     parse_note,
     sanitize_filename,
+    strip_image_text_blocks,
     write_note,
 )
 
@@ -368,6 +369,7 @@ def _gather_sources(
         try:
             _, body = parse_note(p)
             body = _strip_placeholder_embeds(body)
+            body = strip_image_text_blocks(body)
             ref = ref_by_raw.get(rel)
             if ref is not None:
                 parts.append(f"## Source [{ref.id}]: {ref.title} ({ref.raw_path})\n{body}")
@@ -932,6 +934,7 @@ def compile_concepts(
     dry_run: bool = False,
     on_progress: Callable[[int, int, str], None] | None = None,
     concepts: list[str] | None = None,
+    ignore_soft_cap: bool = False,
 ) -> tuple[list[Path], list[str], dict[str, float]]:
     """
     Concept-driven compile: one article per concept needing compile.
@@ -943,7 +946,14 @@ def compile_concepts(
 
     Pass concepts= to compile only a specific subset (e.g. concepts linked to
     recently changed source files). None = compile all needing compile.
+
+    Pass ignore_soft_cap=True to bypass pipeline.concept_draft_soft_cap and let each
+    article use the full article_max_tokens/context budget. Used by the orchestrator's
+    escalation pass to retry concepts that truncated under the soft cap.
     """
+    # The soft cap keeps drafts short by default, but a truncated draft is strictly
+    # worse than a longer one — the escalation pass lifts it to avoid losing content.
+    budget_fn = _article_num_predict if ignore_soft_cap else _concept_draft_num_predict
     all_needing = db.concepts_needing_compile()
     if concepts is not None:
         requested: list[str] = []
@@ -1156,7 +1166,8 @@ def compile_concepts(
         try:
             # Concept drafts stay on a configurable soft output budget so users can
             # keep the default safety rail or explicitly opt back into article_max_tokens.
-            num_predict = _concept_draft_num_predict(
+            # The escalation pass (ignore_soft_cap) swaps in the uncapped budget.
+            num_predict = budget_fn(
                 config,
                 write_prompt,
                 (
@@ -1166,6 +1177,13 @@ def compile_concepts(
                 ),
                 heavy_ctx=heavy.ctx,
             )
+            if ignore_soft_cap:
+                log.info(
+                    "Escalated '%s' output budget to %d (bypassing concept_draft_soft_cap "
+                    "after truncation)",
+                    name,
+                    num_predict,
+                )
         except ValueError as e:
             log.error("Failed to write '%s': %s", name, e)
             _record_failure(name, "context_too_large")
@@ -1244,7 +1262,7 @@ def compile_concepts(
                         inline_source_citations=config.pipeline.inline_source_citations,
                     )
                     try:
-                        fallback_num_predict = _concept_draft_num_predict(
+                        fallback_num_predict = budget_fn(
                             config,
                             fallback_prompt,
                             (
