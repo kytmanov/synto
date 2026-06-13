@@ -3353,7 +3353,7 @@ class StateDB:
                 )
 
     def list_active_entities_without_articles(self) -> list[tuple[str, str]]:
-        """Return (entity_id, preferred_label) for active entities with no published or draft article.
+        """Return (entity_id, preferred_label) for active entities with no published/draft article.
 
         A draft awaiting approval counts as "has an article": the page is already compiled,
         so flagging it as an orphan (and advising "run compile") would be wrong. Only entities
