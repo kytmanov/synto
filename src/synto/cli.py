@@ -4545,7 +4545,16 @@ def concept_split(
 @click.argument("name")
 @click.option("--vault", "vault_str", envvar=VAULT_ENV_VAR, default=None)
 def concept_unmerge(name: str, vault_str: str | None) -> None:
-    """Reverse the most recent merge that retired concept NAME, restoring it."""
+    """Reverse the most recent merge that retired concept NAME, restoring it as a separate entity.
+
+    Limitations (best-effort only):
+    - Name-keyed ledgers (rejections, blocks, stubs) are not restored.
+    - Wiki links that pointed at the loser are not reverted.
+    - The loser is recreated as an empty stub; run `synto compile` to regenerate content.
+    - If the merge used --absorb-edits, the loser's edited body remains in the
+      winner and is not pulled back.
+    See `synto concept unmerge` and the changelog for the full contract.
+    """
     from .git_ops import git_commit
     from .indexer import append_log, generate_index, generate_index_json
     from .pipeline.maintain import ConceptUnmergeError, unmerge_concept
@@ -4565,6 +4574,11 @@ def concept_unmerge(name: str, vault_str: str | None) -> None:
         console.print(
             f"  Stub recreated: {report.stub_path} [dim](run `synto compile` to fill)[/dim]"
         )
+
+    console.print(
+        "[yellow]Note:[/yellow] Name-keyed ledgers (rejections, blocks, stubs) were not restored; "
+        "links to the old name were not reverted. The stub starts empty."
+    )
 
     generate_index(config, db)
     generate_index_json(config, db)  # refresh the committed identity seed (decision 13)

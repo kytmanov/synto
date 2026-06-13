@@ -1049,6 +1049,7 @@ def unmerge_concept(config: Config, db: StateDB, merged_name: str) -> UnmergeRep
     pending, so the next ``synto compile`` regenerates it. Wiki links that were repointed to
     the winner during the merge are NOT reverted — that mapping is not safely reversible.
 
+    Name-keyed behavioral ledgers (rejections, blocked_concepts, stubs) are NOT restored.
     The absorbed alias labels are stripped from the winner's published frontmatter to match the
     DB. The body is NOT touched: if the original merge used ``--absorb-edits``, the loser's edited
     body still lives inside the winner's ``## Absorbed from <loser>`` section and is not pulled
