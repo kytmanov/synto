@@ -2335,24 +2335,98 @@ def eval_cmd(vault_str, queries_path, live, json_out):
 # ── undo ─────────────────────────────────────────────────────────────────────
 
 
+# Identity ops mutate the gitignored state.db; git revert restores the working tree
+# but never the DB, so reverting one of these commits silently diverges DB from disk.
+_IDENTITY_OP_RE = re.compile(r"concept (merge|split|unmerge|rename):")
+
+
+def _is_identity_op_subject(message: str) -> bool:
+    return bool(_IDENTITY_OP_RE.search(message))
+
+
+def _identity_op_reversal_hint(message: str) -> str:
+    """Return the DB-aware reversal instruction for an identity-op commit subject.
+
+    Names are parsed off the stable ``L → W`` / ``L ← W`` subject tail; a subject that
+    does not split cleanly (a name containing the arrow — near-impossible) falls back to
+    a generic instruction rather than crashing.
+    """
+    m = _IDENTITY_OP_RE.search(message)
+    op = m.group(1) if m else ""
+    tail = message[m.end() :].strip() if m else ""
+    if op == "merge" and " → " in tail:
+        loser, _winner = tail.split(" → ", 1)
+        return f'reverse with: synto concept unmerge "{loser.strip()}"'
+    if op == "unmerge" and " ← " in tail:
+        loser, winner = tail.split(" ← ", 1)
+        return f'reverse with: synto concept merge "{loser.strip()}" "{winner.strip()}"'
+    if op == "rename" and " → " in tail:
+        old, new = tail.split(" → ", 1)
+        return f'reverse with: synto concept rename "{new.strip()}" "{old.strip()}"'
+    if op == "split":
+        return "reverse by re-merging the senses with `synto concept merge` (no single inverse)"
+    return (
+        "reverse with the matching `synto concept …` op, not undo — "
+        "state.db is gitignored and will not roll back"
+    )
+
+
 @cli.command()
 @click.option("--vault", "vault_str", envvar=VAULT_ENV_VAR, default=None)
 @click.option("--steps", default=1, show_default=True)
-def undo(vault_str, steps):
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Revert files even when the batch contains a concept identity op "
+    "(state.db will be left diverged).",
+)
+def undo(vault_str, steps, force):
     """Revert last N synto/legacy auto-commits (uses git revert — safe)."""
-    from .git_ops import git_undo
+    from .git_ops import git_log_auto, git_undo
 
     config = _load_config(vault_str)
+
+    # Peek the same batch git_undo would revert. If it contains a concept identity op,
+    # refuse the WHOLE batch (never partially revert) and point at the DB-aware inverse —
+    # git cannot roll back the state.db changes those ops made.
+    commits = git_log_auto(config.vault, n=steps)
+    identity_commits = [c for c in commits if _is_identity_op_subject(c["message"])]
+    if identity_commits and not force:
+        console.print(
+            "[red]Refusing to undo: this batch includes concept identity op(s) whose "
+            "state.db changes git cannot revert.[/red]"
+        )
+        for c in identity_commits:
+            # markup=False: commit subjects carry the literal "[synto]" prefix, which rich
+            # would otherwise parse as a (bogus) style tag and silently drop.
+            console.print(f"  {c['message']}", markup=False)
+            console.print(f"    → {_identity_op_reversal_hint(c['message'])}", markup=False)
+        console.print(
+            "[dim]Re-run with --force to revert files only (state.db will diverge).[/dim]"
+        )
+        sys.exit(1)
+
     try:
         reverted = git_undo(config.vault, steps=steps)
     except RuntimeError as e:
         raise click.ClickException(str(e)) from e
-    if reverted:
-        console.print(f"[green]Reverted {len(reverted)} commit(s):[/green]")
-        for msg in reverted:
-            console.print(f"  {msg}")
-    else:
+    if not reverted:
         console.print("[yellow]No synto or legacy auto-commits found to revert.[/yellow]")
+        return
+    console.print(f"[green]Reverted {len(reverted)} commit(s):[/green]")
+    for msg in reverted:
+        console.print(f"  {msg}", markup=False)
+    if identity_commits:
+        console.print(
+            "[yellow]Note: files were reverted but state.db still reflects the "
+            "merge/split/rename. `synto compile` will NOT reconcile it — use the matching "
+            "`synto concept …` inverse, or rebuild state.db from .synto/INDEX.json.[/yellow]"
+        )
+    else:
+        console.print(
+            "[dim]Note: state.db is not reverted; run `synto compile` if a data op was undone."
+            "[/dim]"
+        )
 
 
 # ── clean ─────────────────────────────────────────────────────────────────────
@@ -2552,7 +2626,13 @@ def _render_mcp_backlog(db, since: str) -> None:
     default="7d",
     help="Lookback window for --backlog.",
 )
-def doctor(vault_str, backlog, since):
+@click.option(
+    "--reconcile",
+    is_flag=True,
+    default=False,
+    help="Restore entity identity from the INDEX.json seed when state.db is empty (decision 13).",
+)
+def doctor(vault_str, backlog, since, reconcile):
     """Check LLM provider connection, model availability, and vault health."""
     from .client_factory import LLMError, build_router
     from .config import HEALTHCHECK_ROLES, ROLES
@@ -2739,6 +2819,9 @@ def doctor(vault_str, backlog, since):
     else:
         console.print(f'  source-access mode: "{sa.mode}"')
 
+    # ── Concept identity (feature 45) ─────────────────────────────────────────
+    _render_identity_section(config, db, reconcile)
+
     # ── MCP demand-vs-coverage backlog (opt-in via --backlog) ────────────────
     if backlog:
         _render_mcp_backlog(db, since)
@@ -2782,6 +2865,106 @@ def doctor(vault_str, backlog, since):
         console.print("[green][bold]All checks passed.[/bold][/green]")
     else:
         console.print("[yellow][bold]Some checks need attention (see above).[/bold][/yellow]")
+
+
+def _render_identity_section(config, db, reconcile: bool) -> None:
+    """Report the entity identity layer and reconcile against the INDEX.json seed.
+
+    Precedence (decision 13): a live state.db always wins. --reconcile only restores when
+    state.db holds no entities (a rebuild); when both are present and disagree it reports the
+    drift rather than overwriting.
+    """
+    import json as _json
+
+    from .pipeline.ingest import _restore_identity_from_index
+
+    console.print("\n[bold]Concept identity[/bold]")
+    try:
+        active = db._conn.execute(
+            "SELECT COUNT(*) FROM concept_entities WHERE status='active'"
+        ).fetchone()[0]
+        labels = db._conn.execute("SELECT COUNT(*) FROM concept_labels").fetchone()[0]
+        legacy = db._conn.execute(
+            "SELECT COUNT(*) FROM concept_labels WHERE source='legacy_backfill'"
+        ).fetchone()[0]
+    except Exception as exc:  # pragma: no cover — defensive
+        console.print(f"  [yellow]![/yellow] could not read identity tables: {exc}")
+        return
+
+    console.print(f"  [green]✓[/green] {active} active entities, {labels} labels")
+    if legacy:
+        console.print(
+            f"  [yellow]![/yellow] {legacy} legacy_backfill alias(es) (untrusted until reviewed)"
+        )
+
+    collisions = db.find_match_key_collisions()
+    if collisions:
+        console.print(
+            f"  [yellow]![/yellow] {len(collisions)} match_key collision(s) — dedup worklist"
+            " (resolve with [bold]synto concept merge[/bold]):"
+        )
+        for entity_a, entity_b, _mk in collisions[:10]:
+            label_a = db.preferred_label_for_entity(entity_a) or entity_a
+            label_b = db.preferred_label_for_entity(entity_b) or entity_b
+            console.print(f"      [dim]{label_a} ~ {label_b}[/dim]")
+
+    candidates = db.list_merge_candidates()
+    if candidates:
+        console.print(
+            f"  [yellow]![/yellow] {len(candidates)} merge candidate(s) — a surface promoted to its"
+            " own concept (resolve with [bold]synto concept merge[/bold]):"
+        )
+        for cand in candidates[:10]:
+            console.print(
+                f"      [dim]{cand['label_a']} ~ {cand['label_b']}  (via '{cand['surface']}')[/dim]"
+            )
+
+    # Reconcile against the committed seed.
+    index_path = config.app_dir / "INDEX.json"
+    if not index_path.exists():
+        return
+    try:
+        payload = _json.loads(index_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+
+    if active == 0:
+        if reconcile:
+            _restore_identity_from_index(config, db)
+            restored = db._conn.execute(
+                "SELECT COUNT(*) FROM concept_entities WHERE status='active'"
+            ).fetchone()[0]
+            console.print(
+                f"  [green]✓[/green] --reconcile: restored {restored} entities from INDEX.json seed"
+            )
+        else:
+            console.print(
+                "  [yellow]![/yellow] state.db has no entities but a seed exists — run"
+                " [bold]synto doctor --reconcile[/bold] for a lossless restore"
+            )
+        return
+
+    # Both present: report drift (state.db wins, never overwritten here).
+    drift = 0
+    for entry in payload.get("source_concepts", []):
+        if not isinstance(entry, dict):
+            continue
+        for concept in entry.get("concepts", []):
+            if not isinstance(concept, dict):
+                continue
+            name, seed_id = concept.get("name"), concept.get("entity_id")
+            if not isinstance(name, str) or not isinstance(seed_id, str) or not seed_id:
+                continue
+            db_id = db.entity_id_for_name(name)
+            if db_id is not None and db_id != seed_id:
+                drift += 1
+    if drift:
+        console.print(
+            f"  [yellow]![/yellow] {drift} label(s) whose entity_id differs from the seed"
+            " — state.db wins; seed is stale (regenerate with [bold]synto index[/bold])"
+        )
+    else:
+        console.print("  [green]✓[/green] identity matches the INDEX.json seed")
 
 
 # ── query ─────────────────────────────────────────────────────────────────────
@@ -3037,11 +3220,12 @@ def run(
     table.add_column("Time", justify="right")
 
     table.add_row("Ingested", str(report.ingested), f"{report.timings.get('ingest', 0):.1f}s")
-    table.add_row(
-        "Compiled",
-        str(report.compiled),
-        f"{report.timings.get('compile_r1', 0) + report.timings.get('compile_r2', 0):.1f}s",
+    compile_secs = (
+        report.timings.get("compile_r1", 0)
+        + report.timings.get("compile_r2", 0)
+        + report.timings.get("compile_escalation", 0)
     )
+    table.add_row("Compiled", str(report.compiled), f"{compile_secs:.1f}s")
     table.add_row("Published", str(report.published), "")
     if report.held_back > 0:
         table.add_row("Held back", str(report.held_back), "")
@@ -3057,6 +3241,29 @@ def run(
             console.print(f"  [dim]{f.concept}[/dim] ({f.reason.value})")
             if f.error_msg:
                 console.print(f"    [dim]{f.error_msg}[/dim]")
+
+        # Fail loud: a source note stays 'ingested' (never publishes) while any of its
+        # concepts is still failed. Surface those notes explicitly so a failed concept
+        # cannot silently freeze a whole paper.
+        frozen: dict[str, list] = {}
+        for f in report.failed:
+            for sp in db.get_sources_for_concept(f.concept):
+                rec = db.get_raw(sp)
+                if rec is not None and rec.status == "ingested":
+                    frozen.setdefault(sp, []).append(f)
+        if frozen:
+            console.print(
+                f"\n[yellow]⚠ {len(frozen)} note(s) incompletely compiled and will not "
+                f"publish:[/yellow]"
+            )
+            for sp, fails in sorted(frozen.items()):
+                names = ", ".join(f.concept for f in fails)
+                console.print(f"  [bold]{sp}[/bold] ({len(fails)} concept(s) failed: {names})")
+                if any(f.reason.value == "truncated" for f in fails):
+                    console.print(
+                        "    [dim]still truncated at the article ceiling — raise "
+                        "pipeline.article_max_tokens or heavy_ctx, or reduce source size[/dim]"
+                    )
 
     if not dry_run:
         tips: list[str] = []
@@ -3129,10 +3336,13 @@ def review(vault_str):
             conf_color = (
                 "green" if s.confidence >= 0.6 else "yellow" if s.confidence >= 0.4 else "red"
             )
+            status_display = (
+                "[yellow]✓ staged[/yellow]" if s.status == "verified" else "[dim]draft[/dim]"
+            )
             table.add_row(
                 str(i),
                 escape(s.title),
-                s.status,
+                status_display,
                 f"[{conf_color}]{s.confidence:.2f}[/{conf_color}]",
                 str(s.source_count),
                 str(s.rejection_count),
@@ -3140,15 +3350,44 @@ def review(vault_str):
             )
 
         console.print(table)
-        console.print(
-            "\n[dim]  Type: number=open draft, a=approve all, v=verify all, "
-            "p=publish verified, x=reject all, q=quit[/dim]"
+        # Staging (verify) is an optional power feature, so the "publish only
+        # staged" action is shown only once staged drafts actually exist.
+        n_staged = sum(1 for s in summaries if s.status == "verified")
+        staged_line = (
+            f"\n    g       publish only the {n_staged} staged draft(s)" if n_staged else ""
         )
-        choice = click.prompt("\nChoice", prompt_suffix=" > ").strip().lower()
+        console.print(
+            "\n[dim]  → [bold]Enter[/bold]   review drafts one by one\n"
+            "    number  open a specific draft\n"
+            "    p       publish all — go live\n"
+            "    r       reject all\n"
+            "    v       stage all — sign off without publishing  (optional)\n"
+            f"    q       quit{staged_line}[/dim]"
+        )
+        choice = (
+            click.prompt("\nChoice", prompt_suffix=" > ", default="", show_default=False)
+            .strip()
+            .lower()
+        )
 
-        if choice == "q":
+        def _open(summary):
+            _review_single(
+                summary,
+                config,
+                db,
+                approve_drafts,
+                verify_drafts,
+                reject_draft,
+                compute_diff,
+                compute_rejection_diff,
+                load_draft_content,
+            )
+
+        if choice == "":
+            _open(summaries[0])  # Enter: start the one-by-one walk
+        elif choice == "q":
             return
-        elif choice == "a":
+        elif choice in ("p", "a"):  # `a` is a silent alias for muscle memory
             all_paths = [s.path for s in summaries]
             published = approve_drafts(config, db, all_paths)
             console.print(f"[green]Published {len(published)} article(s).[/green]")
@@ -3160,25 +3399,25 @@ def review(vault_str):
         elif choice == "v":
             all_paths = [s.path for s in summaries]
             verified = verify_drafts(config, db, all_paths)
-            console.print(f"[green]Verified {len(verified)} article(s).[/green]")
+            console.print(f"[green]Staged {len(verified)} article(s).[/green]")
             from .indexer import append_log, generate_index
 
             generate_index(config, db)
             append_log(config, f"review | verified {len(verified)} articles")
             return
-        elif choice == "p":
-            verified_paths = [s.path for s in summaries if s.status == "verified"]
-            if not verified_paths:
-                console.print("[yellow]No verified drafts ready to publish.[/yellow]")
+        elif choice == "g":
+            staged_paths = [s.path for s in summaries if s.status == "verified"]
+            if not staged_paths:
+                console.print("[yellow]No staged drafts ready to publish.[/yellow]")
                 continue
-            published = approve_drafts(config, db, verified_paths)
-            console.print(f"[green]Published {len(published)} verified article(s).[/green]")
+            published = approve_drafts(config, db, staged_paths)
+            console.print(f"[green]Published {len(published)} staged article(s).[/green]")
             from .indexer import append_log, generate_index
 
             generate_index(config, db)
             append_log(config, f"review | published {len(published)} verified articles")
             return
-        elif choice == "x":
+        elif choice in ("r", "x"):  # `x` is a silent alias for muscle memory
             reason = click.prompt("Reason for rejecting all", default="")
             for s in summaries:
                 reject_draft(s.path, config, db, feedback=reason)
@@ -3189,17 +3428,7 @@ def review(vault_str):
             if idx < 0 or idx >= len(summaries):
                 console.print("[red]Invalid selection.[/red]")
                 continue
-            _review_single(
-                summaries[idx],
-                config,
-                db,
-                approve_drafts,
-                verify_drafts,
-                reject_draft,
-                compute_diff,
-                compute_rejection_diff,
-                load_draft_content,
-            )
+            _open(summaries[idx])
         else:
             console.print("[red]Unknown command.[/red]")
 
@@ -3255,27 +3484,24 @@ def _review_single(
         body_display = body[:3000] + ("…" if len(body) > 3000 else "")
         console.print(Panel(escape(body_display), title="Draft"))
 
+        tools_line = "    e edit   d diff" + ("   x rejection diff" if rejections else "")
         console.print(
-            "\n[dim]Type: a=approve, p=publish, v=verify, r=reject, e=edit, "
-            "d=diff vs published, x=rejection diff, s=skip[/dim]"
+            "\n[dim]  → [bold]Enter[/bold]   publish (go live in the wiki)\n"
+            "    r       reject\n"
+            "    l       later — leave as a draft, move on\n"
+            "    v       stage — sign off now, publish later in a batch  (optional)\n"
+            f"{tools_line}[/dim]"
         )
-        raw_action = click.prompt("\nAction", prompt_suffix=" > ").strip()
+        raw_action = click.prompt(
+            "\nAction", prompt_suffix=" > ", default="", show_default=False
+        ).strip()
         action = raw_action.lower()
 
-        if action == "s":
+        # Enter (empty) is the happy path: publish. `a`/`p` are silent aliases
+        # kept for muscle memory; `l`/`s` leave the draft untouched.
+        if action in ("s", "l"):
             return
-        elif action == "a":
-            if not summary.path.exists():
-                console.print("[yellow]Draft disappeared.[/yellow]")
-                return
-            published = approve_drafts(config, db, [summary.path])
-            console.print(f"[green]Published:[/green] {published[0].name if published else '?'}")
-            from .indexer import append_log, generate_index
-
-            generate_index(config, db)
-            append_log(config, f"review | approved {summary.title}")
-            return
-        elif action == "p":
+        elif action in ("", "a", "p"):
             if not summary.path.exists():
                 console.print("[yellow]Draft disappeared.[/yellow]")
                 return
@@ -4085,7 +4311,7 @@ def concept_rename(
 ) -> None:
     """Rename concept OLD_NAME to NEW_NAME across the vault and state DB."""
     from .git_ops import git_commit
-    from .indexer import append_log, generate_index
+    from .indexer import append_log, generate_index, generate_index_json
     from .pipeline.maintain import ConceptRenameError, rename_concept
 
     config = _load_config(vault_str)
@@ -4126,6 +4352,7 @@ def concept_rename(
         return
 
     generate_index(config, db)
+    generate_index_json(config, db)  # refresh the committed identity seed (decision 13)
     append_log(config, f"concept rename | '{report.old_name}' → '{report.new_name}'")
 
     if config.pipeline.auto_commit:
@@ -4143,3 +4370,312 @@ def concept_rename(
                 "[yellow]⚠ Auto-commit skipped — you have staged changes. "
                 "Commit or stash them first.[/yellow]"
             )
+
+
+@concept.command("merge")
+@click.argument("loser")
+@click.argument("winner")
+@click.option("--vault", "vault_str", envvar=VAULT_ENV_VAR, default=None)
+@click.option("--dry-run", is_flag=True, help="Preview changes without writing.")
+@click.option(
+    "--absorb-edits",
+    is_flag=True,
+    help="Append manually-edited loser body into winner article instead of refusing.",
+)
+def concept_merge(
+    loser: str,
+    winner: str,
+    vault_str: str | None,
+    dry_run: bool,
+    absorb_edits: bool,
+) -> None:
+    """Merge concept LOSER into WINNER, retiring the loser article."""
+    from .git_ops import git_commit
+    from .indexer import append_log, generate_index, generate_index_json
+    from .pipeline.maintain import ConceptMergeError, merge_concepts
+
+    config = _load_config(vault_str)
+    db = _load_db(config)
+
+    # Always show a preview first, then confirm before running for real.
+    try:
+        preview = merge_concepts(config, db, loser, winner, absorb_edits=absorb_edits, dry_run=True)
+    except ConceptMergeError as exc:
+        click.echo(str(exc), err=True)
+        sys.exit(1)
+
+    console.print(f"[green]Would merge:[/green] {preview.loser} → {preview.winner}")
+    console.print(f"  Labels absorbed: {', '.join(preview.labels_absorbed) or 'none'}")
+    console.print(f"  Articles retired: {preview.files_retired}")
+    console.print(f"  Links rewritten: {preview.links_rewritten}")
+
+    if dry_run:
+        return
+
+    if not click.confirm(f"Merge '{loser}' into '{winner}'? This retires the loser article."):
+        click.echo("Aborted.")
+        sys.exit(0)
+
+    try:
+        report = merge_concepts(config, db, loser, winner, absorb_edits=absorb_edits, dry_run=False)
+    except ConceptMergeError as exc:
+        click.echo(str(exc), err=True)
+        sys.exit(1)
+
+    console.print(f"[green]Merged:[/green] {report.loser} → {report.winner}")
+    generate_index(config, db)
+    generate_index_json(config, db)  # refresh the committed identity seed (decision 13)
+    append_log(config, f"concept merge | '{report.loser}' → '{report.winner}'")
+
+    if config.pipeline.auto_commit:
+        outcome = git_commit(
+            config.vault,
+            f"concept merge: {report.loser} → {report.winner}",
+            paths=["wiki/", ".synto/"],
+        )
+        if outcome == "committed":
+            console.print("[dim]Git commit created.[/dim]")
+        elif outcome == "failed":
+            console.print("[yellow]⚠ Git commit failed — run 'git status' in your vault.[/yellow]")
+        elif outcome == "blocked":
+            console.print(
+                "[yellow]⚠ Auto-commit skipped — you have staged changes. "
+                "Commit or stash them first.[/yellow]"
+            )
+
+
+@concept.command("split")
+@click.argument("name")
+@click.option("--vault", "vault_str", envvar=VAULT_ENV_VAR, default=None)
+@click.option("--dry-run", is_flag=True, help="Preview changes without writing.")
+@click.option(
+    "--sense",
+    "senses",
+    multiple=True,
+    type=(str, str),
+    metavar="SENSE SOURCE_PATH",
+    help="Assign SOURCE_PATH to SENSE. Repeat for each sense.",
+)
+@click.option(
+    "--absorb-edits",
+    is_flag=True,
+    help="Carry a manually-edited original body into the primary sense instead of refusing.",
+)
+def concept_split(
+    name: str,
+    vault_str: str | None,
+    dry_run: bool,
+    senses: tuple[tuple[str, str], ...],
+    absorb_edits: bool,
+) -> None:
+    """Split concept NAME into multiple senses, each owning a subset of sources."""
+    from .git_ops import git_commit
+    from .indexer import append_log, generate_index, generate_index_json
+    from .pipeline.maintain import ConceptSplitError, split_concept
+
+    config = _load_config(vault_str)
+    db = _load_db(config)
+
+    if not senses:
+        # Show sources and prompt interactively on a TTY; fail gracefully otherwise.
+        sources = db.get_sources_for_entities([name]).get(name, [])
+        if not sources:
+            click.echo(f"No sources found for concept '{name}'.", err=True)
+            sys.exit(1)
+        if not sys.stdin.isatty():
+            click.echo(
+                "No --sense options provided and not running in a TTY. "
+                "Use: synto concept split NAME --sense SENSE SOURCE_PATH ...",
+                err=True,
+            )
+            sys.exit(1)
+        click.echo(f"Sources for '{name}':")
+        for i, src in enumerate(sources, 1):
+            click.echo(f"  [{i}] {src}")
+        click.echo("Use --sense SENSE SOURCE_PATH to assign each source to a sense.")
+        sys.exit(0)
+
+    # Group (sense_name, source_path) pairs into [(sense_name, [sources])] tuples.
+    sense_map: dict[str, list[str]] = {}
+    for sense_name, src_path in senses:
+        sense_map.setdefault(sense_name, []).append(src_path)
+    sense_tuples = list(sense_map.items())
+
+    try:
+        report = split_concept(
+            config, db, name, sense_tuples, absorb_edits=absorb_edits, dry_run=dry_run
+        )
+    except ConceptSplitError as exc:
+        click.echo(str(exc), err=True)
+        sys.exit(1)
+
+    sense_names = [s["name"] for s in report.senses]
+    verb = "Would split" if dry_run else "Split"
+    console.print(f"[green]{verb}:[/green] {report.original} → {', '.join(sense_names)}")
+    if report.stub_path:
+        console.print(f"  Disambiguation stub: {report.stub_path}")
+
+    if dry_run:
+        return
+
+    generate_index(config, db)
+    generate_index_json(config, db)  # refresh the committed identity seed (decision 13)
+    sense_str = ", ".join(sense_names)
+    append_log(config, f"concept split | '{report.original}' → {sense_str}")
+
+    console.print(f"[green]Split:[/green] {report.original} → {sense_str}")
+    if config.pipeline.auto_commit:
+        outcome = git_commit(
+            config.vault,
+            f"concept split: {report.original} → {sense_str}",
+            paths=["wiki/", ".synto/"],
+        )
+        if outcome == "committed":
+            console.print("[dim]Git commit created.[/dim]")
+        elif outcome == "failed":
+            console.print("[yellow]⚠ Git commit failed — run 'git status' in your vault.[/yellow]")
+        elif outcome == "blocked":
+            console.print(
+                "[yellow]⚠ Auto-commit skipped — you have staged changes. "
+                "Commit or stash them first.[/yellow]"
+            )
+
+
+@concept.command("unmerge")
+@click.argument("name")
+@click.option("--vault", "vault_str", envvar=VAULT_ENV_VAR, default=None)
+def concept_unmerge(name: str, vault_str: str | None) -> None:
+    """Reverse the most recent merge that retired concept NAME, restoring it."""
+    from .git_ops import git_commit
+    from .indexer import append_log, generate_index, generate_index_json
+    from .pipeline.maintain import ConceptUnmergeError, unmerge_concept
+
+    config = _load_config(vault_str)
+    db = _load_db(config)
+
+    try:
+        report = unmerge_concept(config, db, name)
+    except ConceptUnmergeError as exc:
+        click.echo(str(exc), err=True)
+        sys.exit(1)
+
+    console.print(f"[green]Unmerged:[/green] {report.loser} ← {report.winner}")
+    console.print(f"  Sources restored: {len(report.sources_restored)}")
+    if report.stub_path:
+        console.print(
+            f"  Stub recreated: {report.stub_path} [dim](run `synto compile` to fill)[/dim]"
+        )
+
+    generate_index(config, db)
+    generate_index_json(config, db)  # refresh the committed identity seed (decision 13)
+    append_log(config, f"concept unmerge | '{report.loser}' ← '{report.winner}'")
+
+    if config.pipeline.auto_commit:
+        outcome = git_commit(
+            config.vault,
+            f"concept unmerge: {report.loser} ← {report.winner}",
+            paths=["wiki/", ".synto/"],
+        )
+        if outcome == "committed":
+            console.print("[dim]Git commit created.[/dim]")
+        elif outcome == "failed":
+            console.print("[yellow]⚠ Git commit failed — run 'git status' in your vault.[/yellow]")
+        elif outcome == "blocked":
+            console.print(
+                "[yellow]⚠ Auto-commit skipped — you have staged changes. "
+                "Commit or stash them first.[/yellow]"
+            )
+
+
+@concept.command("inspect")
+@click.argument("name")
+@click.option("--vault", "vault_str", envvar=VAULT_ENV_VAR, default=None)
+def concept_inspect(name: str, vault_str: str | None) -> None:
+    """Show entity details, aliases, sources, and merge/split suggestions for NAME."""
+    from .pipeline.maintain import suggest_concept_merges, suggest_concept_splits
+
+    config = _load_config(vault_str)
+    db = _load_db(config)
+
+    eid = db.entity_id_for_name(name)
+    if not eid:
+        click.echo(f"Concept '{name}' not found.", err=True)
+        sys.exit(1)
+
+    pref = db.preferred_label_for_entity(eid)
+    aliases = db.aliases_for_concept(name)
+    sources = db.get_sources_for_entities([name]).get(name, [])
+    _sql_amb = (
+        "SELECT COUNT(*) FROM concept_occurrences"
+        " WHERE lower(concept_name)=lower(?) AND resolution_status='ambiguous'"
+    )
+    ambiguous_row = (
+        db._conn.execute(_sql_amb, (name,)).fetchone()
+        if db._has_table("concept_occurrences")
+        else None
+    )
+    ambiguous = ambiguous_row[0] if ambiguous_row else 0
+
+    console.print(f"[bold]{pref}[/bold]  [dim](entity_id: {eid})[/dim]")
+    if aliases:
+        console.print(f"  Aliases: {', '.join(aliases)}")
+    console.print(f"  Sources: {len(sources)}")
+    for src in sources:
+        console.print(f"    [dim]{src}[/dim]")
+    console.print(f"  Ambiguous occurrences: {ambiguous}")
+
+    # Compile state
+    rows = db._conn.execute(
+        "SELECT status, updated_at FROM concept_compile_state WHERE lower(concept_name)=lower(?)",
+        (name,),
+    ).fetchall()
+    if rows:
+        for status, updated_at in rows:
+            console.print(f"  Compile state: {status}  (updated: {updated_at or 'n/a'})")
+    else:
+        console.print("  Compile state: not tracked")
+
+    # Stored merge candidates touching this entity (a surface promoted off it / onto it).
+    relevant_candidates = [
+        c for c in db.list_merge_candidates() if eid in (c["entity_a"], c["entity_b"])
+    ]
+    if relevant_candidates:
+        console.print("\n  [yellow]Merge candidates:[/yellow]")
+        for cand in relevant_candidates:
+            other = cand["label_b"] if cand["entity_a"] == eid else cand["label_a"]
+            console.print(f"    → merge with '{other}'  (via '{cand['surface']}')")
+
+    # Merge suggestions (filter to those involving this concept)
+    merges = suggest_concept_merges(config, db)
+    relevant_merges = [(a, b, s) for a, b, s in merges if a == name or b == name]
+    if relevant_merges:
+        console.print("\n  [yellow]Merge suggestions:[/yellow]")
+        for a, b, score in relevant_merges:
+            other = b if a == name else a
+            console.print(f"    → merge with '{other}'  (score: {score:.2f})")
+
+    # Split suggestions
+    splits = suggest_concept_splits(config, db)
+    relevant_splits = [reason for ent, reason in splits if ent == name]
+    if relevant_splits:
+        console.print("\n  [yellow]Split suggestion:[/yellow]")
+        for reason in relevant_splits:
+            console.print(f"    {reason}")
+
+
+@concept.command("keep")
+@click.argument("surface")
+@click.argument("entity")
+@click.option("--vault", "vault_str", envvar=VAULT_ENV_VAR, default=None)
+def concept_keep(surface: str, entity: str, vault_str: str | None) -> None:
+    """Resolve ambiguous occurrences of SURFACE, assigning them to ENTITY."""
+    config = _load_config(vault_str)
+    db = _load_db(config)
+
+    eid = db.entity_id_for_name(entity)
+    if not eid:
+        click.echo(f"Entity '{entity}' not found.", err=True)
+        sys.exit(1)
+
+    count = db.resolve_ambiguous_occurrences(surface, eid)
+    console.print(f"Resolved {count} ambiguous occurrence(s) of '{surface}' → '{entity}'.")

@@ -4,6 +4,21 @@
 
 ### Added
 
+- Concept identity core: concepts now carry a stable `entity_id` independent of their
+  display name, so homonyms and renames no longer collide. New curation commands
+  `synto concept merge`, `synto concept split`, and `synto concept unmerge` move identity,
+  labels, sources, and compile state as a unit and record each operation in
+  `concept_identity_log`; `synto concept rename` relabels an entity in place (old name kept
+  as an alias, inbound links rewritten).
+- Order-independent concept identity at ingest: whether a surface becomes its own concept is
+  now a function of the accumulated notes, not of ingest order. A surface that some note later
+  extracts as a concept is minted as its own entity even when earlier notes used it only as a
+  weak (LLM-guessed) alias — it is no longer silently blocked or absorbed. The demoted weak
+  alias and the new concept are surfaced as a merge candidate in `synto doctor` and
+  `synto concept inspect` (never a silent split); resolve it with `synto concept merge`, which
+  blesses the alias so it links permanently thereafter. Human-blessed aliases (from a merge or
+  a kept rename) are always respected and never re-minted. Schema migrates to v26 (adds the
+  advisory `concept_merge_candidates` worklist); existing vaults upgrade in place.
 - Remote MCP access over Streamable HTTP: `synto serve --transport streamable-http`
   listens at `/mcp`. There is no built-in authentication, so this mode is meant for a
   trusted network or behind a reverse proxy/firewall. DNS-rebinding protection is
@@ -12,6 +27,37 @@
   remote client connects by IPv6 literal, add the value with the repeatable
   `--allowed-host` flag. A wildcard IPv6 bind (`--host ::`) stays loopback-only unless a
   public hostname or IPv6 literal is explicitly allow-listed.
+
+### Fixed
+
+- `synto undo` no longer silently diverges the database on concept identity ops. Because
+  `state.db` is gitignored, reverting a `concept merge/split/unmerge/rename` commit restored
+  the files but not the database, leaving the vault inconsistent while reporting success.
+  `undo` now refuses such a batch and names the database-aware inverse (e.g.
+  `synto concept unmerge` for a merge); pass `--force` to revert the files anyway, with a
+  clear warning that the database is left diverged.
+- `synto concept unmerge` now strips the absorbed aliases from the winner article's
+  frontmatter, matching the database. Previously the retired label lingered in the published
+  `aliases:` list and kept resolving links to the winner after the unmerge.
+- `synto concept merge` now absorbs the loser's canonical preferred label instead of the
+  exact casing typed on the command line, so the blessed alias and the previewed
+  "Labels absorbed" list both reflect the real label.
+- Disambiguation stubs created by `synto concept split` are now written with complete
+  frontmatter and a stored content hash, and the linter no longer flags disambiguation pages
+  as `missing_frontmatter` or `stale` (covers stubs created before this fix).
+- `synto concept merge --absorb-edits` now updates the winner's stored content hash after
+  appending the absorbed body, so the freshly merged article is no longer immediately
+  reported as manually edited / stale.
+
+### Known limitations
+
+- `synto concept unmerge` is best-effort and not fully invertible. It restores the loser's
+  entity, labels, and source edges from the merge log, but recreates the article as an
+  empty stub (the original body stays retired in `wiki/.drafts/`; the next `synto compile`
+  regenerates it) and cannot un-collapse a source that both concepts cited at merge time —
+  that edge returns to the loser, so the winner loses it. Name-keyed ledgers (rejections,
+  blocks, stubs) are not restored. Reverses exactly one merge, the most recent for that
+  concept.
 
 ## [0.5.1] - 2026-06-08
 

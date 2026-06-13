@@ -167,6 +167,7 @@ def _build_index_payload(config: Config, db: StateDB) -> dict[str, object]:
     articles = [
         {
             "id": record.article_id or "",
+            "entity_id": db.entity_id_for_name(record.title) or "",
             "name": record.title,
             "path": record.path,
             "summary": None,
@@ -187,6 +188,8 @@ def _build_index_payload(config: Config, db: StateDB) -> dict[str, object]:
             "capabilities": sorted(_compute_capabilities(db)),
         },
         "articles": articles,
+        "identity_log": db.list_identity_log(),
+        "entity_aliases": db.list_blessed_aliases(),
         "terms": [],
         "papers": [],
         "sources": _list_sources(db),
@@ -224,7 +227,9 @@ def _list_source_concept_seeds(db: StateDB) -> list[dict[str, object]]:
         {
             "source_path": source_path,
             "content_hash": content_hash,
-            "concepts": concepts,
+            "concepts": [
+                {"name": name, "entity_id": db.entity_id_for_name(name) or ""} for name in concepts
+            ],
         }
         for source_path, content_hash, concepts in db.list_source_concept_seeds()
     ]

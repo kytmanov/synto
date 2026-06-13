@@ -17,6 +17,7 @@ from synto.vault import (
     rename_wikilink_targets,
     sanitize_filename,
     sanitize_wikilink_target,
+    strip_image_text_blocks,
     write_note,
 )
 
@@ -586,3 +587,44 @@ def test_rename_repoints_case_variant_links():
         body, "Quantm Computing", "Quantum Computing", "Quantum Computing"
     )
     assert out == "See [[Quantum Computing]] and [[Quantum Computing]]."
+
+
+# ── strip_image_text_blocks ─────────────────────────────────────────────────────
+
+# Real extractor output: an "omitted" marker line, then a Start/End block whose body
+# is OCR gibberish. Feeding this to an LLM wastes tokens and risks verbatim copying,
+# so it must be gone before the body reaches a model.
+_OCR_BLOCK = (
+    "**==> picture [409 x 22] intentionally omitted <==**\n\n"
+    "**----- Start of picture text -----**<br>\n"
+    "es OVI Ta we -yo OVI CIV L y α<br>**----- End of picture text -----**<br>\n"
+)
+
+
+def test_strip_removes_block_and_marker_but_keeps_prose():
+    body = f"Real intro paragraph.\n\n{_OCR_BLOCK}\n**Figure 2.** Caption that is real."
+    out = strip_image_text_blocks(body)
+    assert "Start of picture text" not in out
+    assert "End of picture text" not in out
+    assert "intentionally omitted" not in out
+    assert "es OVI Ta we" not in out  # the gibberish itself is gone
+    assert "Real intro paragraph." in out
+    assert "**Figure 2.** Caption that is real." in out
+
+
+def test_strip_handles_multiple_blocks():
+    body = f"A\n{_OCR_BLOCK}\nB\n{_OCR_BLOCK}\nC"
+    out = strip_image_text_blocks(body)
+    assert "picture text" not in out
+    # Non-greedy match must not swallow the prose between the two blocks.
+    assert "A" in out and "B" in out and "C" in out
+
+
+def test_strip_is_noop_on_clean_text():
+    body = "# Title\n\nA normal paragraph with no extractor markers at all."
+    assert strip_image_text_blocks(body) == body
+
+
+def test_strip_tolerates_dash_count_and_whitespace():
+    body = "**---  Start of picture text  ---**<br>junk<br>**--- End of picture text ---**<br>"
+    assert "picture text" not in strip_image_text_blocks(body)

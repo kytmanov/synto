@@ -525,3 +525,95 @@ def test_orchestrator_fix_creates_stubs(config, db):
 
     assert "issues" in stubs_called_with  # create_stubs was called
     assert report.stubs_created == 1
+
+
+# ── Truncation escalation (Fix 2) ───────────────────────────────────────────────
+
+
+def test_escalation_budget_exceeds_soft_cap(config):
+    """The escalation budget (article ceiling) must be larger than the soft-capped one —
+    otherwise the retry is pointless."""
+    from synto.pipeline.compile import _article_num_predict, _concept_draft_num_predict
+
+    config.pipeline.concept_draft_soft_cap = 512  # aggressive cap
+    capped = _concept_draft_num_predict(config, "prompt", "system", heavy_ctx=8192)
+    uncapped = _article_num_predict(config, "prompt", "system", heavy_ctx=8192)
+    assert uncapped > capped
+
+
+def _seed_one_truncating_concept(db):
+    db.upsert_raw(RawNoteRecord(path="raw/a.md", content_hash="h1", status="ingested"))
+    db.upsert_concepts("raw/a.md", ["Fails"])
+
+
+_TRUNC_ERR = (
+    "ollama: output truncated at max_tokens=2400 (finish_reason=length). "
+    "Raise pipeline.article_max_tokens in your synto.toml"
+)
+
+
+def test_escalation_unfreezes_soft_cap_truncated_note(config, db):
+    """A concept truncated under the soft cap is retried with the cap lifted; on success
+    its source note flips ingested → compiled instead of freezing forever."""
+    import synto.pipeline.compile as compile_mod
+    import synto.pipeline.lint as lint_mod
+    from synto.models import LintResult
+
+    config.pipeline.auto_commit = False
+    _seed_one_truncating_concept(db)
+
+    original_compile = compile_mod.compile_concepts
+    original_lint = lint_mod.run_lint
+
+    def fake_compile(**kwargs):
+        d = kwargs["db"]
+        if kwargs.get("ignore_soft_cap"):  # escalation pass — now it fits
+            d.mark_concept_compile_state("Fails", ["raw/a.md"], "compiled")
+            return ([config.drafts_dir / "Fails.md"], [], {})
+        d.mark_concept_compile_state("Fails", ["raw/a.md"], "failed", error=_TRUNC_ERR)
+        return ([], ["Fails"], {})
+
+    compile_mod.compile_concepts = fake_compile
+    lint_mod.run_lint = lambda config, db: LintResult(issues=[], health_score=100.0, summary="")
+    try:
+        orch = PipelineOrchestrator(config, make_mock_client(), db)
+        report = orch.run(paths=[])
+    finally:
+        compile_mod.compile_concepts = original_compile
+        lint_mod.run_lint = original_lint
+
+    assert db.get_raw("raw/a.md").status == "compiled"  # note unfrozen
+    assert not [f for f in report.failed if f.reason == FailureReason.TRUNCATED]
+    assert report.compiled == 1
+
+
+def test_escalation_still_truncated_keeps_note_frozen(config, db):
+    """If a concept truncates even at the article ceiling, it stays failed and its source
+    note stays ingested — surfaced as a failure, never silently published."""
+    import synto.pipeline.compile as compile_mod
+    import synto.pipeline.lint as lint_mod
+    from synto.models import LintResult
+
+    config.pipeline.auto_commit = False
+    _seed_one_truncating_concept(db)
+
+    original_compile = compile_mod.compile_concepts
+    original_lint = lint_mod.run_lint
+
+    def fake_compile(**kwargs):
+        # Truncates regardless of the budget — genuinely too large.
+        kwargs["db"].mark_concept_compile_state("Fails", ["raw/a.md"], "failed", error=_TRUNC_ERR)
+        return ([], ["Fails"], {})
+
+    compile_mod.compile_concepts = fake_compile
+    lint_mod.run_lint = lambda config, db: LintResult(issues=[], health_score=100.0, summary="")
+    try:
+        orch = PipelineOrchestrator(config, make_mock_client(), db)
+        report = orch.run(paths=[])
+    finally:
+        compile_mod.compile_concepts = original_compile
+        lint_mod.run_lint = original_lint
+
+    assert db.get_raw("raw/a.md").status == "ingested"  # still frozen
+    truncated = [f for f in report.failed if f.reason == FailureReason.TRUNCATED]
+    assert len(truncated) == 1 and truncated[0].concept == "Fails"

@@ -535,19 +535,22 @@ if [[ "$SOURCE_COUNT" -gt 0 ]]; then
     soft_check "source pages have concept wikilinks" "test '$CONCEPT_LINKS' -ge 1"
 fi
 
-# #28: concept_aliases table should be populated after ingest
+# #28: alias labels should be populated after ingest. Aliases moved from the
+# dropped concept_aliases table to concept_labels (role='alias') in schema v20.
 ALIAS_COUNT=$(python3 - <<PYEOF
 import sqlite3
 conn = sqlite3.connect("$VAULT_DIR/.synto/state.db")
 try:
-    n = conn.execute("SELECT COUNT(*) FROM concept_aliases").fetchone()[0]
+    n = conn.execute(
+        "SELECT COUNT(*) FROM concept_labels WHERE role='alias'"
+    ).fetchone()[0]
     print(n)
 except Exception:
     print(0)
 conn.close()
 PYEOF
 )
-soft_check "concept_aliases table populated after ingest (issue #28)" \
+soft_check "alias labels populated after ingest (issue #28)" \
     "test '$ALIAS_COUNT' -gt 0"
 info "Aliases stored in DB: $ALIAS_COUNT"
 
@@ -561,10 +564,15 @@ NON_TRIVIAL_ALIASES=$(python3 - <<PYEOF
 import sqlite3
 conn = sqlite3.connect("$VAULT_DIR/.synto/state.db")
 try:
+    # An alias label is non-trivial when it differs from its entity's preferred
+    # label (not just the lowercase fallback of the canonical name).
     n = conn.execute("""
-        SELECT COUNT(*) FROM concept_aliases
-        WHERE length(alias) >= 3
-          AND lower(alias) != lower(concept_name)
+        SELECT COUNT(*) FROM concept_labels a
+        JOIN concept_labels p
+          ON p.entity_id = a.entity_id AND p.role = 'preferred'
+        WHERE a.role = 'alias'
+          AND length(a.label) >= 3
+          AND lower(a.label) != lower(p.label)
     """).fetchone()[0]
     print(n)
 except Exception:
@@ -1031,15 +1039,12 @@ if [[ -n "$BRIDGE_CONCEPT" ]]; then
 
     # The alias is contrived so a direct title-match can't explain a hit.
     BRIDGE_ALIAS="wibbletron"
-    python3 - <<PYEOF
-import sqlite3
-conn = sqlite3.connect("$VAULT_DIR/.synto/state.db")
-conn.execute(
-    "INSERT OR IGNORE INTO concept_aliases (concept_name, alias) VALUES (?, ?)",
-    ("$BRIDGE_CONCEPT", "$BRIDGE_ALIAS"),
-)
-conn.commit()
-conn.close()
+    uv run --project "$REPO_DIR" python - <<PYEOF
+from pathlib import Path
+from synto.state import StateDB
+db = StateDB(Path("$VAULT_DIR/.synto/state.db"))
+db.upsert_aliases("$BRIDGE_CONCEPT", ["$BRIDGE_ALIAS"])
+db.close()
 PYEOF
 
     _BR_RC=0
@@ -1538,21 +1543,16 @@ REPAIR_WIKI=$(find "$VAULT_DIR/wiki" -maxdepth 1 -name "*.md" \
 
 if [[ -n "$REPAIR_WIKI" ]]; then
     # 1. Register a synthetic concept and unambiguous alias in the DB
-    python3 - <<PYEOF
-import sqlite3
-conn = sqlite3.connect("$VAULT_DIR/.synto/state.db")
-# Insert concept if not present (idempotent); schema: (name, source_path)
-conn.execute("""
-    INSERT OR IGNORE INTO concepts (name, source_path)
-    VALUES ('Smoke Test Concept', 'raw/smoke-test-concept.md')
-""")
-# Register unambiguous alias
-conn.execute("""
-    INSERT OR IGNORE INTO concept_aliases (concept_name, alias)
-    VALUES ('Smoke Test Concept', 'STC alias')
-""")
-conn.commit()
-conn.close()
+    uv run --project "$REPO_DIR" python - <<PYEOF
+from pathlib import Path
+from synto.state import StateDB
+db = StateDB(Path("$VAULT_DIR/.synto/state.db"))
+# Register the synthetic concept (mints an entity_id) and its unambiguous alias
+# through the app API — concepts.entity_id is NOT NULL and aliases live in
+# concept_labels since schema v20/v22.
+db.upsert_concepts("raw/smoke-test-concept.md", ["Smoke Test Concept"])
+db.upsert_aliases("Smoke Test Concept", ["STC alias"])
+db.close()
 PYEOF
 
     # 2. Write a minimal published article for the concept so fix_broken_links
@@ -1592,13 +1592,23 @@ MDEOF
     # Cleanup injected content and synthetic article
     sed -i '' '$ d' "$REPAIR_WIKI" 2>/dev/null || sed -i '$ d' "$REPAIR_WIKI" 2>/dev/null || true
     rm -f "$_STC_ARTICLE"
-    python3 - <<PYEOF
-import sqlite3
-conn = sqlite3.connect("$VAULT_DIR/.synto/state.db")
-conn.execute("DELETE FROM concept_aliases WHERE alias = 'STC alias'")
-conn.execute("DELETE FROM concepts WHERE name = 'Smoke Test Concept' AND source_path = 'raw/smoke-test-concept.md'")
-conn.commit()
-conn.close()
+    uv run --project "$REPO_DIR" python - <<PYEOF
+from pathlib import Path
+from synto.state import StateDB
+# Best-effort teardown of the synthetic concept and its labels (entity_id-keyed
+# tables since v20/v22). Resolve the entity, then drop its rows.
+db = StateDB(Path("$VAULT_DIR/.synto/state.db"))
+try:
+    eid = db.entity_id_for_name("Smoke Test Concept")
+    if eid is not None:
+        db._conn.execute("DELETE FROM concept_labels WHERE entity_id = ?", (eid,))
+        db._conn.execute("DELETE FROM concept_entities WHERE id = ?", (eid,))
+    db._conn.execute(
+        "DELETE FROM concepts WHERE source_path = 'raw/smoke-test-concept.md'"
+    )
+    db._conn.commit()
+finally:
+    db.close()
 PYEOF
 else
     pass "alias repair test skipped (no wiki article available)"

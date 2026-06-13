@@ -315,6 +315,12 @@ def _snapshot_wiki(wiki_dir: Path) -> list[PageSnapshot]:
 def _diff_pages(
     current_pages: list[PageSnapshot], challenger_pages: list[PageSnapshot]
 ) -> PageDiffSummary:
+    # Deterministic label/path matching by design (feature 45): entity_id and article_id are
+    # minted independently in each contestant vault and never seed across runs, so they are not
+    # comparable here. path == sanitize_filename(preferred_label).md, so path-first matching is
+    # exactly the qualified-label match — homonyms ("Mercury (planet)" vs "(element)") land on
+    # distinct paths and diff independently. Title is only a cross-vault filename-divergence
+    # fallback.
     cur_by_path = {p.path: p for p in current_pages}
     cur_by_title = {p.title.lower(): p for p in current_pages}
     added: list[str] = []

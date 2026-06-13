@@ -10,7 +10,6 @@ import hashlib
 import json
 import logging
 import re
-import unicodedata
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -20,10 +19,15 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel as _BaseModel
 
+from ..concept_text import _PAREN_ABBR_RE
+from ..concept_text import base_concept_name as _base_concept_name
+from ..concept_text import clean_concept_text as _clean_concept_text
+from ..concept_text import concept_key as _concept_key
+from ..concept_text import match_key as _match_key
 from ..config import Config
+from ..indexer import append_log
 from ..models import AnalysisResult, Concept, RawNoteRecord, SourceSegment, TermExtractionResult
 from ..paths import rel_posix
-from ..sanitize import clean_display_name
 from ..state import StateDB
 from ..structured_output import request_structured
 
@@ -35,6 +39,7 @@ from ..vault import (
     parse_note,
     sanitize_filename,
     sanitize_wikilink_target,
+    strip_image_text_blocks,
     write_note,
 )
 from .items import extract_named_reference_items, extract_quoted_title_items, store_extracted_items
@@ -640,40 +645,8 @@ _NOISE_CONCEPT_KEYS = frozenset(
     }
 )
 
-_PAREN_ABBR_RE = re.compile(r"^(?P<base>.+?)\s*\((?P<abbr>[A-ZА-Я0-9][A-ZА-Я0-9.+-]{1,8})\)$")
-_SURROUNDING_QUOTES_RE = re.compile(r"^[`'\"“”‘’«»]+|[`'\"“”‘’«»]+$")
 _REWRITE_ALIAS_PREFIX = "__synto_rewrite_alias__:"
 _LEGACY_REWRITE_ALIAS_PREFIX = "__olw_rewrite_alias__:"
-
-
-def _clean_concept_text(text: str) -> str:
-    text = unicodedata.normalize("NFKC", text).strip()
-    text = _SURROUNDING_QUOTES_RE.sub("", text).strip()
-    # Drop dangling/unbalanced punctuation (e.g. "Phase II)") so a stray char can't mint a concept
-    # name that diverges into its own file. Runs before _base_concept_name, which expects balanced
-    # "(ABBR)" and is unaffected — clean_display_name only trims unbalanced edge brackets.
-    text = clean_display_name(text)
-    return re.sub(r"\s+", " ", text)
-
-
-def _concept_key(text: str) -> str:
-    """Deterministic key for safe concept matching; not used as display text."""
-    text = _clean_concept_text(text).casefold()
-    text = re.sub(r"[_\-/:]+", " ", text)
-    text = re.sub(r"[^\w\s]+", " ", text, flags=re.UNICODE)
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def _base_concept_name(text: str) -> str:
-    """Strip only safe parenthetical abbreviations, e.g. Extreme Programming (XP)."""
-    cleaned = _clean_concept_text(text)
-    match = _PAREN_ABBR_RE.match(cleaned)
-    if not match:
-        return cleaned
-    abbr = match.group("abbr")
-    if not abbr.isupper():
-        return cleaned
-    return match.group("base").strip()
 
 
 def _safe_aliases_for_name(text: str) -> list[str]:
@@ -808,6 +781,38 @@ def _display_aliases(aliases: list[str]) -> list[str]:
     return [_decode_rewrite_alias(alias)[0] for alias in aliases]
 
 
+def _strip_demoted_alias_from_host(config: Config, db: StateDB, host_id: str, surface: str) -> None:
+    """Remove a demoted alias from a host concept article's frontmatter (no recompile).
+
+    When a surface a host held as a weak alias becomes its own concept, the host's on-disk
+    ``aliases:`` would still claim it — making ``[[surface]]`` resolve ambiguously in the vault.
+    This strips just that alias; the body is untouched, so content_hash (and manual-edit
+    protection) is preserved. No-op when the host has no published article yet — the DB demotion
+    is the source of truth and a stale-frontmatter read must never fail the ingest.
+    """
+    rel = db.published_path_for_entity(host_id)
+    if not rel:
+        return
+    path = config.vault / rel
+    if not path.exists():
+        return
+    try:
+        meta, body = parse_note(path)
+    except Exception:  # noqa: BLE001
+        return
+    existing = list(meta.get("aliases") or [])
+    surface_key = _concept_key(surface)
+    kept = [a for a in existing if _concept_key(str(a)) != surface_key]
+    if len(kept) == len(existing):
+        return
+    if kept:
+        meta["aliases"] = kept
+    else:
+        meta.pop("aliases", None)
+    write_note(path, meta, body)
+    append_log(config, f"relink: demoted alias {surface!r} from {rel} (now its own concept)")
+
+
 def _build_safe_concept_index(
     names: list[str], alias_map: dict[str, str] | None = None
 ) -> dict[str, str]:
@@ -933,6 +938,12 @@ def _load_source_concept_seeds_from_index(config: Config) -> dict[str, tuple[str
         concepts: list[str] = []
         seen: set[str] = set()
         for concept in raw_concepts:
+            # Accept both legacy string format and new {name, entity_id} dict format.
+            if isinstance(concept, dict):
+                raw_name = concept.get("name")
+                if not isinstance(raw_name, str):
+                    continue
+                concept = raw_name
             if not isinstance(concept, str):
                 continue
             cleaned = _clean_concept_text(concept)
@@ -944,6 +955,46 @@ def _load_source_concept_seeds_from_index(config: Config) -> dict[str, tuple[str
         if source_path and content_hash and concepts:
             seeded[source_path] = (content_hash, concepts)
     return seeded
+
+
+def _restore_identity_from_index(config: Config, db: StateDB) -> None:
+    """Restore entity ids + identity log from a preserved INDEX.json on a fresh-DB rebuild.
+
+    Durability (decision 13): recreates entities with their ORIGINAL ids (not re-minted) so a
+    deleted-state.db rebuild is lossless. Precedence is enforced in restore_entities_from_seed
+    (state.db wins if it already holds entities). No-op when INDEX.json is absent — that is a
+    normal fresh ingest (both absent → re-mint by label), not a degraded rebuild.
+    """
+    index_path = config.app_dir / "INDEX.json"
+    if not index_path.exists():
+        return
+    try:
+        payload = json.loads(index_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    entries: list[tuple[str, str]] = []
+    for entry in payload.get("source_concepts", []):
+        if not isinstance(entry, dict):
+            continue
+        for concept in entry.get("concepts", []):
+            if isinstance(concept, dict):
+                name, eid = concept.get("name"), concept.get("entity_id")
+                if isinstance(name, str) and isinstance(eid, str) and eid:
+                    entries.append((name, eid))
+    for art in payload.get("articles", []):
+        if isinstance(art, dict):
+            name, eid = art.get("name"), art.get("entity_id")
+            if isinstance(name, str) and isinstance(eid, str) and eid:
+                entries.append((name, eid))
+    restored = db.restore_entities_from_seed(entries)
+    if restored:
+        log.info("Rebuild: restored %d entity identities from INDEX.json seed", restored)
+        db.restore_identity_log(payload.get("identity_log", []))
+        # Blessed (merge/rename) aliases cannot be regenerated by re-ingest, so the seed
+        # carries them with provenance — re-arm the re-mint guard on rebuild.
+        blessed = db.restore_blessed_aliases(payload.get("entity_aliases", []))
+        if blessed:
+            log.info("Rebuild: restored %d blessed aliases from INDEX.json seed", blessed)
 
 
 def _matching_seeded_source_concepts(
@@ -1044,44 +1095,146 @@ def _rewrite_candidates_to_canonicals(
 def _normalize_concepts(
     raw_concepts: list[Concept],
     db: StateDB,
+    rel_path: str = "",
     seed_concepts: list[str] | None = None,
     seed_alias_map: dict[str, str] | None = None,
 ) -> list[tuple[str, list[str]]]:
-    """Dedup against existing canonical concept names using safe deterministic keys.
+    """Dedup against entity labels using match_key resolution (Phase 2).
 
-    Returns (canonical_name, validated_aliases) pairs.
+    Returns (canonical_name, validated_aliases) pairs.  Ambiguous concepts (>1 DB match
+    with no sticky edge) are recorded as ambiguous occurrences and excluded from the list.
+
+    Resolution order for each surface form:
+      1. DB match_key lookup — handles plural/singular variants and stored aliases.
+      2. In-memory safe-key index — handles abbreviation expansion (e.g. "XP" →
+         "Extreme Programming (XP)") and rebuild scenarios where the DB is empty.
+      3. In-run dedup — prevents duplicate minting within one ingest pass.
+      4. Mint new entity.
     """
+    # Build in-memory fallback index from all existing DB names + seeds.
+    # This handles abbreviation expansion and rebuild (DB empty, INDEX.json present).
     existing_names = db.list_all_concept_names()
     if seed_concepts:
-        seen_seed = {name.casefold() for name in seed_concepts}
+        seen_seed = {n.casefold() for n in seed_concepts}
         existing_names = [
             *seed_concepts,
-            *(name for name in existing_names if name.casefold() not in seen_seed),
+            *(n for n in existing_names if n.casefold() not in seen_seed),
         ]
     alias_map = db.list_alias_map()
     if seed_alias_map:
         alias_map = {**seed_alias_map, **alias_map}
-    existing = _build_safe_concept_index(existing_names, alias_map)
-    seen: set[str] = set()
+    mem_index = _build_safe_concept_index(existing_names, alias_map)
+
+    in_run: dict[str, str] = {}  # match_key → canonical_name (minted this run, not in DB yet)
+    seen_ids: set[str] = set()  # entity_ids already included this run
+    seen_keys: set[str] = set()  # concept_keys for new/mem-matched concepts
     result: list[tuple[str, list[str]]] = []
+
+    def _link(entity_id: str) -> None:
+        """Append a (canonical, aliases) pair linking the current surface to an existing entity.
+
+        Aliases colliding with another entity's preferred label are NOT filtered here. The
+        persistence seam in ingest_note drops them AND records the merge candidate, so every
+        preferred-collision drop happens at one place — which is what makes the candidate set a
+        function of the claim-set, not of ingest order.
+        """
+        seen_ids.add(entity_id)
+        canonical = db.preferred_label_for_entity(entity_id) or name
+        seen_keys.add(_concept_key(canonical))
+        alias_candidates = [*_safe_aliases_for_name(name), *concept.aliases]
+        if _concept_key(name) != _concept_key(canonical):
+            alias_candidates.insert(0, name)
+        result.append((canonical, _validate_aliases(canonical, alias_candidates)))
+
     for concept in raw_concepts:
         name = _clean_concept_text(concept.name)
         if not name or _is_noise_concept(name):
             continue
-        safe_keys = [_concept_key(name), _concept_key(_base_concept_name(name))]
-        safe_keys.extend(_concept_key(alias) for alias in _safe_aliases_for_name(name))
-        canonical = next(
-            (existing[key] for key in safe_keys if key in existing), _base_concept_name(name)
-        )
-        canonical_key = _concept_key(canonical)
-        if canonical_key in seen:
+
+        # Order-independent role-aware classification (v26). A surface is an existing concept iff
+        # it matches a PREFERRED label or a human-BLESSED alias. Matching only WEAK aliases means
+        # it is its own concept — minting demotes those weak aliases and records a merge candidate
+        # at the write seam, so identity no longer depends on which paper arrived first.
+
+        # 1. Preferred-label match (exact label_key, then match_key fold for plural/singular).
+        pref = db.preferred_entity_for_surface(name)
+        if pref.ambiguous:
+            # >1 preferred (genuine homonym) — sticky-resolve to the source's existing sense, else
+            # record for later resolution; never silently pick a sense (decision 18).
+            sticky_id = db.get_sticky_entity_for_source(rel_path, pref.ids)
+            if sticky_id is not None:
+                if sticky_id not in seen_ids:
+                    _link(sticky_id)
+            else:
+                db.record_ambiguous_occurrence(
+                    name, pref.ids, surface=name, source_path=rel_path or None
+                )
             continue
-        seen.add(canonical_key)
+        if pref.ids:
+            if pref.ids[0] not in seen_ids:
+                _link(pref.ids[0])
+            continue
+
+        # 2. Human-blessed alias match (user/rename) — respect the curation decision.
+        blessed = db.blessed_alias_entities_for_surface(name)
+        if len(blessed) > 1:
+            db.record_ambiguous_occurrence(
+                name, blessed, surface=name, source_path=rel_path or None
+            )
+            continue
+        if blessed:
+            if blessed[0] not in seen_ids:
+                _link(blessed[0])
+            continue
+
+        # 3. Managed homonym: a disambiguation stub exists at the bare name (post-split). The bare
+        #    label is an intentionally-shared weak alias across senses, so route to resolution
+        #    rather than mint — the stub's existence is what distinguishes this from the bug case.
+        if db.has_disambiguation_stub(name):
+            cands = db.weak_alias_entities_for_surface(name) or db.resolve_label(name).ids
+            db.record_ambiguous_occurrence(name, cands, surface=name, source_path=rel_path or None)
+            continue
+
+        # 4. Else mint. Consult the abbreviation heuristic ONLY when no entity already holds this
+        #    surface as a weak alias: a stored weak alias means the surface is its own concept under
+        #    the order-independent rule (demoted + surfaced as a merge candidate at the write seam),
+        #    so it must not be silently absorbed by the heuristic mem-index.
+        if not db.weak_alias_entities_for_surface(name):
+            safe_keys = [_concept_key(name), _concept_key(_base_concept_name(name))]
+            safe_keys.extend(_concept_key(alias) for alias in _safe_aliases_for_name(name))
+            mem_canonical = next((mem_index[k] for k in safe_keys if k in mem_index), None)
+            if mem_canonical is not None:
+                ck = _concept_key(mem_canonical)
+                if ck in seen_keys:
+                    continue
+                seen_keys.add(ck)
+                in_run[_match_key(name)] = mem_canonical
+                alias_candidates = [*_safe_aliases_for_name(name), *concept.aliases]
+                if _concept_key(name) != ck:
+                    alias_candidates.insert(0, name)
+                result.append((mem_canonical, _validate_aliases(mem_canonical, alias_candidates)))
+                continue
+
+        # In-run dedup — same match_key was minted earlier in this pass.
+        mk = _match_key(name)
+        if mk in in_run:
+            continue
+
+        # Mint new concept.
+        canonical = _base_concept_name(name)
+        ck = _concept_key(canonical)
+        if ck in seen_keys:
+            continue
+        seen_keys.add(ck)
+        in_run[mk] = canonical
         alias_candidates = [*_safe_aliases_for_name(name), *concept.aliases]
-        if _concept_key(name) != canonical_key:
+        if _concept_key(name) != ck:
             alias_candidates.insert(0, name)
-        aliases = _validate_aliases(canonical, alias_candidates)
-        result.append((canonical, aliases))
+        # Aliases colliding with another entity's preferred label are dropped (and recorded as a
+        # merge candidate) at the persistence seam in ingest_note, not here — keeping every
+        # preferred-collision drop at one place so the candidate set is order-independent.
+        result.append((canonical, _validate_aliases(canonical, alias_candidates)))
+
     return result
 
 
@@ -1341,6 +1494,9 @@ def ingest_note(
     # Strip ### Media sections — image paths are opaque to the LLM and waste tokens;
     # the embeds remain in the raw/ file for the human reader in Obsidian.
     body = re.sub(r"\n### Media\n(?:- !\[\[[^\]]*\]\]\n?)*", "\n", body)
+    # Strip extractor OCR "picture text" gibberish before it reaches the model or
+    # the RAG chunker below — same in-memory-only policy as the strips above.
+    body = strip_image_text_blocks(body)
     if meta.get("source") or meta.get("url"):  # web clipper adds these
         body = _preprocess_web_clip(body)
 
@@ -1439,7 +1595,9 @@ def ingest_note(
             *seed_concepts,
             *(name for name in existing_names if name.casefold() not in seen_seed),
         ]
-    db_alias_map = db.list_alias_map()
+    # Only BLESSED aliases pre-fold a candidate to its canonical here; a weak (LLM-guessed) alias
+    # surface re-extracted as a concept must reach _normalize_concepts and mint (order-independent).
+    blessed_alias_map = db.list_blessed_alias_map()
     quality_cap = {"high": max_concepts, "medium": min(max_concepts, 4), "low": 2}
     effective_max = quality_cap.get(result.quality or "low", max_concepts)
     filtered_candidates = _filter_concept_candidates(result.concepts, result, body, path.name)
@@ -1456,19 +1614,40 @@ def ingest_note(
     concept_candidates = _rewrite_candidates_to_canonicals(
         concept_candidates,
         existing_names,
-        db_alias_map,
+        blessed_alias_map,
         seed_alias_map,
     )[:max_concepts]
     normalized = _normalize_concepts(
         concept_candidates,
         db,
+        rel_path,
         seed_concepts,
         seed_alias_map,
     )
     canonical_names = [name for name, _ in normalized]
-    db.replace_concepts_for_source(rel_path, canonical_names)
+    for host_id, surface in db.replace_concepts_for_source(rel_path, canonical_names):
+        _strip_demoted_alias_from_host(config, db, host_id, surface)
     for canonical, aliases in normalized:
-        persistable_aliases = _persistable_aliases(aliases)
+        # Drop any extracted alias that is the preferred label of another active entity. This must
+        # run HERE, after replace_concepts_for_source has minted every entity in this batch:
+        # _normalize_concepts ran before any mint, so it cannot catch a collision between two
+        # concepts of the SAME note (e.g. an alias "Knowledge Compounding" on "Dynamic Agentic ROI"
+        # when "Knowledge Compounding" is itself an extracted concept). Left unfiltered, the label
+        # resolves to two entities and that concept silently loses its article at compile.
+        owner_id = db.entity_id_for_name(canonical) or ""
+        persistable_aliases = []
+        for a in _persistable_aliases(aliases):
+            if db.alias_collides_with_preferred(_concept_key(a), owner_id):
+                # The alias equals another entity's preferred label — dropping it keeps that label
+                # unambiguous. Surface the pair as a merge candidate (seam (b), order #2: the
+                # surface was already minted as its own concept, now a host wants it as an alias).
+                winner_id = db.entity_id_for_name(a)
+                if owner_id and winner_id is not None and winner_id != owner_id:
+                    db.record_merge_candidate(
+                        owner_id, winner_id, a, reason="alias-collides-preferred"
+                    )
+                continue
+            persistable_aliases.append(a)
         if persistable_aliases:
             db.upsert_aliases(canonical, persistable_aliases)
 
@@ -1540,6 +1719,8 @@ def ingest_all(
     seed_alias_map = None
     source_concept_seeds = None
     if not existing_topics:
+        # Lossless rebuild: restore entity ids + identity log before ingest re-mints by label.
+        _restore_identity_from_index(config, db)
         seed_concepts = _load_seed_canonical_names_from_index(config)
         seed_alias_map = _load_seed_alias_map_from_index(config)
         source_concept_seeds = _load_source_concept_seeds_from_index(config)

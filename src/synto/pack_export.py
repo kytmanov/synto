@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from .concept_text import concept_key as _ck
 from .config import Config
 from .paths import to_posix
 from .readers import ArticleFilter, ArticleRef, VaultReader
@@ -136,9 +137,7 @@ def _manifest_payload(
 
 def _filter_export_aliases(aliases: list[str], frequent: frozenset[str] = frozenset()) -> list[str]:
     """Drop path-like, over-long, and ambiguous (multi-concept) aliases from export."""
-    return [
-        a for a in aliases if "/" not in a and len(a.split()) <= 4 and a.casefold() not in frequent
-    ]
+    return [a for a in aliases if "/" not in a and len(a.split()) <= 4 and _ck(a) not in frequent]
 
 
 def _find_cross_language_related(raw_concepts: list[dict]) -> dict[str, list[str]]:
@@ -187,6 +186,7 @@ def _concepts_payload(db: StateDB) -> dict[str, object]:
         concepts.append(
             {
                 "name": name,
+                "entity_id": db.entity_id_for_name(name),
                 "aliases": _filter_export_aliases(db.aliases_for_concept(name), frequent),
                 "canonical_article_id": canonical_article_id,
                 "article_path": article_path,

@@ -504,6 +504,26 @@ def test_apply_draft_media_mode_drops_unknown_filename_in_omit_mode():
     assert "diagram" not in result
 
 
+def test_gather_sources_strips_ocr_picture_text(vault, config):
+    """Source material handed to the heavy model must not include OCR picture-text
+    gibberish — otherwise the writer can copy it verbatim into the article."""
+    from synto.pipeline.compile import _gather_sources
+
+    raw = config.vault / "raw" / "paper.md"
+    raw.write_text(
+        "# Paper\n\nReal source sentence.\n\n"
+        "**==> picture [499 x 200] intentionally omitted <==**\n\n"
+        "**----- Start of picture text -----**<br>\n"
+        "1.0<br>Ne VIII 775 HI Ly<br>F125LP<br>**----- End of picture text -----**<br>\n",
+        encoding="utf-8",
+    )
+    combined, resolved = _gather_sources(["raw/paper.md"], config.vault)
+    assert "Real source sentence." in combined
+    assert "Start of picture text" not in combined
+    assert "Ne VIII 775" not in combined
+    assert "intentionally omitted" not in combined
+
+
 # ── confidence gate ───────────────────────────────────────────────────────────
 
 

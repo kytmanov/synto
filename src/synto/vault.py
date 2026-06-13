@@ -41,6 +41,31 @@ def update_frontmatter(path: Path, updates: dict[str, Any]) -> None:
     write_note(path, meta, body)
 
 
+# ── Content cleaning ──────────────────────────────────────────────────────────
+
+# PDF→markdown extractors (the arXiv import flow here) replace figures with an
+# OCR transcription of the pixels, wrapped in marker lines. The transcription is
+# gibberish for an LLM (e.g. "es OVI Ta we -yo OVI CIV L y α") — it wastes tokens
+# and risks being copied verbatim into articles. We strip the markers + their body
+# in-memory before the content reaches a model; the raw/ file is left intact so the
+# human still sees the figure context in Obsidian. Coupled to that extractor's
+# marker format; tolerant of dash-count and surrounding whitespace.
+_PICTURE_TEXT_BLOCK_RE = re.compile(
+    r"\*\*-+\s*Start of picture text\s*-+\*\*.*?\*\*-+\s*End of picture text\s*-+\*\*(?:<br>)?",
+    re.IGNORECASE | re.DOTALL,
+)
+_OMITTED_PICTURE_RE = re.compile(
+    r"\*\*==>\s*picture\b[^\n]*?intentionally omitted\s*<==\*\*",
+    re.IGNORECASE,
+)
+
+
+def strip_image_text_blocks(body: str) -> str:
+    """Remove extractor OCR 'picture text' blocks and 'picture … omitted' markers."""
+    body = _PICTURE_TEXT_BLOCK_RE.sub("", body)
+    return _OMITTED_PICTURE_RE.sub("", body)
+
+
 # ── Wikilinks ─────────────────────────────────────────────────────────────────
 
 _WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]")

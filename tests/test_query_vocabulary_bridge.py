@@ -44,13 +44,8 @@ def db(config):
 
 
 def _seed_aliases(db: StateDB, concept_name: str, aliases: list[str]) -> None:
-    """Insert concept + aliases directly into the DB."""
-    with db._tx():
-        for alias in aliases:
-            db._conn.execute(
-                "INSERT OR IGNORE INTO concept_aliases (concept_name, alias) VALUES (?, ?)",
-                (concept_name, alias),
-            )
+    """Insert concept + aliases via the DB API (dual-writes to concept_aliases + concept_labels)."""
+    db.upsert_aliases(concept_name, aliases)
 
 
 def _write_index(config: Config, content: str) -> None:

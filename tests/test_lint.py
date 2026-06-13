@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -10,7 +11,7 @@ from synto.config import Config
 from synto.models import WikiArticleRecord
 from synto.pipeline.lint import run_lint
 from synto.state import StateDB
-from synto.vault import write_note
+from synto.vault import parse_note, write_note
 
 
 @pytest.fixture
@@ -999,3 +1000,171 @@ def test_missing_media_detected_in_raw_note(config, db):
     result = run_lint(config, db)
     missing = [i for i in result.issues if i.issue_type == "missing_media"]
     assert any("missing.png" in i.description for i in missing)
+
+
+# ── Identity checks (feature 45) ───────────────────────────────────────────────
+
+
+def test_ambiguous_label_flagged_when_no_disambiguation_page(config, db):
+    # A split leaves the bare label "Mercury" as a shared alias on two senses.
+    # Without a disambiguation page on disk, the bare label is unresolvable — flag it.
+    db.upsert_concepts("raw/planets.md", ["Mercury"])
+    db.upsert_concepts("raw/chemistry.md", ["Mercury"])
+    db.split_entity(
+        "Mercury",
+        [
+            {"name": "Mercury (planet)", "sources": ["raw/planets.md"]},
+            {"name": "Mercury (element)", "sources": ["raw/chemistry.md"]},
+        ],
+    )
+
+    result = run_lint(config, db)
+    ambiguous = [i for i in result.issues if i.issue_type == "ambiguous_label_needs_disambiguation"]
+    assert any("Mercury" in i.description for i in ambiguous)
+
+
+def test_ambiguous_label_suppressed_by_disambiguation_page(config, db):
+    # The same split, but a disambiguation page now exists on disk — the check must
+    # consult db.list_articles() (the line that previously crashed on `all_articles`)
+    # and suppress the warning.
+    db.upsert_concepts("raw/planets.md", ["Mercury"])
+    db.upsert_concepts("raw/chemistry.md", ["Mercury"])
+    db.split_entity(
+        "Mercury",
+        [
+            {"name": "Mercury (planet)", "sources": ["raw/planets.md"]},
+            {"name": "Mercury (element)", "sources": ["raw/chemistry.md"]},
+        ],
+    )
+    dis_path = config.wiki_dir / "Mercury.md"
+    write_note(dis_path, {"title": "Mercury", "kind": "disambiguation"}, "may refer to:")
+    db.upsert_article(
+        WikiArticleRecord(
+            path="wiki/Mercury.md",
+            title="Mercury",
+            sources=[],
+            content_hash="",
+            status="published",
+            kind="disambiguation",
+        )
+    )
+
+    result = run_lint(config, db)
+    ambiguous = [i for i in result.issues if i.issue_type == "ambiguous_label_needs_disambiguation"]
+    assert not ambiguous
+
+
+# ── Manual-rename-as-relabel (Decision 10) ─────────────────────────────────────
+
+
+def _publish_concept(config: Config, db: StateDB, name: str, body: str) -> str:
+    """Create an entity + a published concept article on disk, tracked with its hash."""
+    db.upsert_concepts("raw/source.md", [name])
+    eid = db.entity_id_for_name(name)
+    path = config.wiki_dir / f"{name}.md"
+    write_note(path, {"title": name, "status": "published", "tags": ["t"]}, body)
+    _, on_disk_body = parse_note(path)
+    db.upsert_article(
+        WikiArticleRecord(
+            path=f"wiki/{name}.md",
+            title=name,
+            sources=["raw/source.md"],
+            content_hash=hashlib.sha256(on_disk_body.encode()).hexdigest(),
+            status="published",
+            kind="concept",
+            entity_id=eid,
+        )
+    )
+    return eid
+
+
+def test_manual_relabel_flagged_without_fix(config, db):
+    eid = _publish_concept(config, db, "Foo", "Body about Foo.")
+    # User renames the file on disk; body is unchanged.
+    (config.wiki_dir / "Foo.md").rename(config.wiki_dir / "Bar.md")
+
+    result = run_lint(config, db)  # no fix
+    relabel = [i for i in result.issues if i.issue_type == "manual_relabel_adopted"]
+    assert relabel and "Bar" in relabel[0].description
+    # Nothing adopted: preferred label is still "Foo".
+    assert db.preferred_label_for_entity(eid) == "Foo"
+
+
+def test_manual_relabel_adopted_under_fix(config, db):
+    eid = _publish_concept(config, db, "Foo", "Body about Foo.")
+    # A page linking to the old name, to prove inbound links get rewritten.
+    write_note(
+        config.wiki_dir / "Linker.md",
+        {"title": "Linker", "status": "published", "tags": ["t"]},
+        "See [[Foo]] for details.",
+    )
+    (config.wiki_dir / "Foo.md").rename(config.wiki_dir / "Bar.md")
+
+    run_lint(config, db, fix=True)
+
+    # Preferred label adopted the new filename; old name demoted to an alias.
+    assert db.preferred_label_for_entity(eid) == "Bar"
+    assert "Foo" in {a for a in db.get_aliases("Bar")}
+    # Inbound link rewritten to the new stem.
+    assert "[[Bar]]" in (config.wiki_dir / "Linker.md").read_text()
+
+
+def test_manual_relabel_collision_not_adopted(config, db):
+    foo_id = _publish_concept(config, db, "Foo", "Body about Foo.")
+    # A second active entity already owns the label "Bar".
+    db.upsert_concepts("raw/bar.md", ["Bar"])
+    assert db.preferred_label_for_entity(db.entity_id_for_name("Bar")) == "Bar"
+    # User renames Foo's file to "Bar.md" — colliding with the Bar entity's label.
+    (config.wiki_dir / "Foo.md").rename(config.wiki_dir / "Bar.md")
+
+    result = run_lint(config, db, fix=True)
+    collisions = [i for i in result.issues if i.issue_type == "homonym_filename_collision"]
+    assert collisions
+    # Foo must not have been silently relabeled to the colliding name.
+    assert db.preferred_label_for_entity(foo_id) == "Foo"
+
+
+# ── Disambiguation stubs (F4) ──────────────────────────────────────────────────
+
+
+def test_disambiguation_stub_not_flagged_missing_or_stale(vault, config, db):
+    """Disambiguation stubs are auto-generated system pages. Legacy ones (written before the
+    creation-site fix) carry bare frontmatter and an empty DB content_hash, so the generic
+    missing_frontmatter/stale checks fire on every run — pure noise, and --fix would inject
+    bogus fields into a generated page. A real concept page must still be flagged on both axes.
+    """
+    dis = config.wiki_dir / "Mercury.md"
+    write_note(
+        dis,
+        {"title": "Mercury", "kind": "disambiguation"},  # legacy bare frontmatter
+        "**Mercury** may refer to:\n\n- [[Mercury (planet)]]\n",
+    )
+    db.upsert_article(
+        WikiArticleRecord(
+            path="wiki/Mercury.md",
+            title="Mercury",
+            sources=[],
+            content_hash="",  # legacy empty hash vs a real body → would read as stale
+            status="published",
+            kind="disambiguation",
+        )
+    )
+    # Control: an ordinary concept page that genuinely is missing fields and stale.
+    normal = config.wiki_dir / "Normal.md"
+    write_note(normal, {"title": "Normal"}, "Body about normal.")
+    db.upsert_article(
+        WikiArticleRecord(
+            path="wiki/Normal.md",
+            title="Normal",
+            sources=[],
+            content_hash="deadbeef",
+            status="published",
+        )
+    )
+
+    result = run_lint(config, db)
+    flagged = {(i.path, i.issue_type) for i in result.issues}
+    assert ("wiki/Mercury.md", "missing_frontmatter") not in flagged
+    assert ("wiki/Mercury.md", "stale") not in flagged
+    assert ("wiki/Normal.md", "missing_frontmatter") in flagged
+    assert ("wiki/Normal.md", "stale") in flagged

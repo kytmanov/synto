@@ -41,7 +41,6 @@ V7_ERA_INDEXES = {
     "idx_concept_compile_status",
     "idx_concept_compile_name",
     "idx_rejections_concept",
-    "idx_alias_lookup",
     "idx_items_kind",
     "idx_items_status",
     "idx_mentions_item",
@@ -215,7 +214,7 @@ def test_fresh_db_is_at_v10(tmp_path: Path) -> None:
 
     conn = sqlite3.connect(db_path)
     version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
-    assert version == _CURRENT_SCHEMA_VERSION == 17
+    assert version == _CURRENT_SCHEMA_VERSION == 26
     conn.close()
 
 
@@ -282,13 +281,24 @@ def test_v8_to_v10_upgrade_preserves_rows(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
     _build_v8_db(db_path)
 
-    StateDB(db_path)
+    db = StateDB(db_path)
 
     conn = sqlite3.connect(db_path)
     version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
-    assert version == 17
+    assert version == 26
     assert conn.execute("SELECT COUNT(*) FROM raw_notes").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM wiki_articles").fetchone()[0] == 1
+
+    # v22 rebuild: the legacy concepts row ('Test Concept', 'raw/old.md') must be
+    # re-keyed onto the entity backfilled at v18 — name carried as a cache, source
+    # edge resolvable by entity identity, not the name string.
+    crow = conn.execute("SELECT entity_id, source_path, name FROM concepts").fetchone()
+    assert crow is not None
+    entity_id, source_path, name = crow
+    assert name == "Test Concept"
+    assert source_path == "raw/old.md"
+    assert entity_id and entity_id == db.entity_id_for_name("Test Concept")
+    assert db.get_sources_for_concept("Test Concept") == ["raw/old.md"]
     conn.close()
 
 

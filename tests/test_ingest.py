@@ -440,37 +440,45 @@ def test_normalize_does_not_use_llm_aliases_for_merge(vault, config, db):
     assert [name for name, _ in result] == ["Iterative development"]
 
 
-def test_normalize_reuses_canonical_via_stored_alias(vault, config, db):
+def test_normalize_mints_weak_alias_re_extracted_as_concept(vault, config, db):
+    # Order-independent identity (v26): a surface stored only as a WEAK (LLM-guessed) alias and
+    # later extracted as a concept becomes its OWN entity rather than being silently absorbed —
+    # otherwise identity would depend on which note arrived first. The relationship is surfaced
+    # as a merge candidate (recorded at the write seam) and reconciled with `concept merge`,
+    # which then makes it a blessed alias that links forever.
     db.upsert_concepts("raw/a.md", ["Template Catalog"])
     db.upsert_aliases("Template Catalog", ["Каталог шаблонов"])
 
     result = _normalize_concepts(_make_concepts(["Каталог шаблонов"]), db)
 
-    assert result == [("Template Catalog", ["Каталог шаблонов"])]
+    assert [name for name, _ in result] == ["Каталог шаблонов"]
 
 
-def test_normalize_preserves_cross_language_surface_as_alias(vault, config, db):
+def test_normalize_links_blessed_alias_after_merge(vault, config, db):
+    # The self-heal contract for Option A: `concept merge` blesses the absorbed label
+    # (source='user'), so re-extracting that cross-language surface as a concept LINKS back to the
+    # winner instead of re-minting. Without blessing, the merge would re-fragment every ingest.
     db.upsert_concepts("raw/a.md", ["Decision Heuristics"])
-    db.upsert_aliases("Decision Heuristics", ["эвристики решений"])
+    db.upsert_concepts("raw/b.md", ["эвристики решений"])
+    db.merge_entities("Decision Heuristics", "эвристики решений")  # winner, loser
 
     result = _normalize_concepts(_make_concepts(["эвристики решений"]), db)
 
-    assert result == [("Decision Heuristics", ["эвристики решений"])]
+    assert [name for name, _ in result] == ["Decision Heuristics"]
 
 
 def test_normalize_reuses_seeded_index_alias_when_db_empty(vault, config, db):
     result = _normalize_concepts(
         _make_concepts(["гибкая разработка"]),
         db,
-        None,
-        {"гибкая разработка": "Agile Development"},
+        seed_alias_map={"гибкая разработка": "Agile Development"},
     )
 
     assert result == [("Agile Development", ["гибкая разработка"])]
 
 
 def test_normalize_reuses_seeded_canonical_case_when_db_empty(vault, config, db):
-    result = _normalize_concepts(_make_concepts(["api testing"]), db, ["API Testing"])
+    result = _normalize_concepts(_make_concepts(["api testing"]), db, seed_concepts=["API Testing"])
 
     assert result == [("API Testing", [])]
 
@@ -565,6 +573,31 @@ def test_ingest_note_returns_analysis_result(vault, config, db):
     assert result is not None
     assert result.quality == "high"
     assert len(result.concepts) >= 1
+
+
+def test_ingest_strips_ocr_picture_text_before_model(vault, config, db):
+    """OCR 'picture text' gibberish must never reach the fast model (token waste +
+    verbatim-copy risk). Capture the actual prompt sent to generate and assert it's clean."""
+    content = (
+        "# Spectra\n\nReal substantive paragraph about the figure.\n\n"
+        "**==> picture [409 x 22] intentionally omitted <==**\n\n"
+        "**----- Start of picture text -----**<br>\n"
+        "es OVI Ta we -yo OVI CIV L y α<br>**----- End of picture text -----**<br>\n"
+    )
+    path = _write_raw(vault, "spectra.md", content)
+    raw_client = MagicMock()
+    raw_client.generate.return_value = _analysis_json()
+    ingest_note(path, config, as_router(raw_client, config), db)
+
+    prompt = (
+        raw_client.generate.call_args.args[0]
+        if raw_client.generate.call_args.args
+        else (raw_client.generate.call_args.kwargs.get("prompt", ""))
+    )
+    assert "Start of picture text" not in prompt
+    assert "es OVI Ta we" not in prompt
+    assert "intentionally omitted" not in prompt
+    assert "Real substantive paragraph" in prompt  # real content survives
 
 
 def test_ingest_note_stores_status_ingested(vault, config, db):
@@ -957,9 +990,14 @@ def test_ingest_all_seeds_existing_topics_from_index_when_db_empty(vault, config
     assert "aliases: каталог шаблонов" in prompt.lower()
 
 
-def test_ingest_note_reuses_existing_canonical_via_trusted_alias_from_llm_alias(vault, config, db):
+def test_ingest_note_weak_llm_alias_does_not_fold_cross_language_surface(vault, config, db):
+    # v26 / Option A: only a BLESSED alias pre-folds a candidate to its canonical. "Каталог
+    # шаблонов" here is a weak (LLM-guessed, source='extracted') alias of "Template Catalog", so it
+    # must NOT absorb a newly extracted "Vorlagenkatalog" — that mints its own concept
+    # (order-independent identity). The pair is reconciled by `concept merge`, which blesses the
+    # alias so it links forever afterward.
     db.upsert_concepts("raw/existing.md", ["Template Catalog"])
-    db.upsert_aliases("Template Catalog", ["Каталог шаблонов"])
+    db.upsert_aliases("Template Catalog", ["Каталог шаблонов"])  # weak (extracted)
     path = _write_raw(
         vault,
         "catalog.md",
@@ -978,8 +1016,8 @@ def test_ingest_note_reuses_existing_canonical_via_trusted_alias_from_llm_alias(
 
     ingest_note(path, config, client, db)
 
-    assert db.get_concepts_for_sources(["raw/catalog.md"]) == ["Template Catalog"]
-    assert "Vorlagenkatalog" not in db.list_all_concept_names()
+    assert db.get_concepts_for_sources(["raw/catalog.md"]) == ["Vorlagenkatalog"]
+    assert "Vorlagenkatalog" in db.list_all_concept_names()
 
 
 def test_ingest_all_reuses_seeded_aliases_across_full_run(vault, config, db):
@@ -1812,3 +1850,45 @@ def test_media_section_stripped_before_llm_analysis(vault, config, db):
     assert "More meaningful text." in prompt_sent
     # Raw file on disk is unchanged — embeds are still there for Obsidian
     assert "![[assets/src-001/img-0-0.png]]" in path.read_text()
+
+
+def test_ingest_note_same_note_alias_collision_keeps_concept_resolvable(vault, config, db):
+    """A concept must not lose its identity to an alias on a sibling concept of the SAME note.
+
+    Real-vault regression: the LLM extracted both "Knowledge Compounding" (its own concept) and
+    "Dynamic Agentic ROI" (carrying "Knowledge Compounding" as an alias). The alias/preferred
+    collision guard ran inside _normalize_concepts, before the batch's entities were minted, so it
+    could not see the sibling concept and let the alias through — "Knowledge Compounding" then
+    resolved to two entities and silently lost its article at compile (12 articles instead of 13).
+    The guard must also run when aliases are persisted, after every entity in the batch exists.
+    """
+    body = (
+        "# Knowledge Compounding\n\n"
+        "Knowledge Compounding is the central idea. The Dynamic Agentic ROI framework extends it. "
+        "Both Knowledge Compounding and Dynamic Agentic ROI are analyzed in depth here.\n"
+    )
+    path = _write_raw(vault, "kc.md", body)
+    analysis = json.dumps(
+        {
+            "summary": "s",
+            "concepts": [
+                {"name": "Knowledge Compounding", "aliases": []},
+                {"name": "Dynamic Agentic ROI", "aliases": ["Knowledge Compounding"]},
+            ],
+            "suggested_topics": ["Knowledge Compounding"],
+            "named_references": [],
+            "quality": "high",
+        }
+    )
+    client = _make_client(analysis)
+
+    result = ingest_note(path, config, client, db)
+    assert result is not None
+
+    rr = db.resolve_label("Knowledge Compounding")
+    assert not rr.ambiguous and len(rr.ids) == 1, "core concept must stay unambiguous"
+    assert db.preferred_label_for_entity(rr.ids[0]) == "Knowledge Compounding"
+    # Both remain distinct concepts; only the polluting alias is dropped.
+    dar = db.entity_id_for_name("Dynamic Agentic ROI")
+    assert dar and dar != rr.ids[0]
+    assert "Knowledge Compounding" not in db.get_aliases("Dynamic Agentic ROI")

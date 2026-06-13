@@ -96,11 +96,11 @@ def _last_mcp_meta(db: StateDB) -> dict:
 
 
 def _mock_reader_with_concept(name: str) -> MagicMock:
-    """A reader whose find_concept resolves `name` to a visible published article."""
+    """A reader whose resolve_concept resolves `name` to a visible published article."""
     reader = MagicMock()
-    reader.find_concept.return_value = ConceptRef(
-        name=name, canonical_article_id="art-1", aliases=()
-    )
+    reader.resolve_concept.return_value = [
+        ConceptRef(name=name, canonical_article_id="art-1", aliases=())
+    ]
     reader.read_article.return_value = Article(
         id="art-1",
         name=name,
@@ -116,7 +116,7 @@ def _make_find_concept_handler(db: StateDB, *, detailed: bool, reader: MagicMock
     config = Config(vault=Path("/tmp/vault"), mcp=mcp)
     if reader is None:
         reader = MagicMock()
-        reader.find_concept.return_value = None
+        reader.resolve_concept.return_value = []
     handlers = build_tool_handlers(reader, config, db, vault_key="vk")
     return handlers["find_concept"]
 
