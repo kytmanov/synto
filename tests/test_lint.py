@@ -1122,3 +1122,49 @@ def test_manual_relabel_collision_not_adopted(config, db):
     assert collisions
     # Foo must not have been silently relabeled to the colliding name.
     assert db.preferred_label_for_entity(foo_id) == "Foo"
+
+
+# ── Disambiguation stubs (F4) ──────────────────────────────────────────────────
+
+
+def test_disambiguation_stub_not_flagged_missing_or_stale(vault, config, db):
+    """Disambiguation stubs are auto-generated system pages. Legacy ones (written before the
+    creation-site fix) carry bare frontmatter and an empty DB content_hash, so the generic
+    missing_frontmatter/stale checks fire on every run — pure noise, and --fix would inject
+    bogus fields into a generated page. A real concept page must still be flagged on both axes.
+    """
+    dis = config.wiki_dir / "Mercury.md"
+    write_note(
+        dis,
+        {"title": "Mercury", "kind": "disambiguation"},  # legacy bare frontmatter
+        "**Mercury** may refer to:\n\n- [[Mercury (planet)]]\n",
+    )
+    db.upsert_article(
+        WikiArticleRecord(
+            path="wiki/Mercury.md",
+            title="Mercury",
+            sources=[],
+            content_hash="",  # legacy empty hash vs a real body → would read as stale
+            status="published",
+            kind="disambiguation",
+        )
+    )
+    # Control: an ordinary concept page that genuinely is missing fields and stale.
+    normal = config.wiki_dir / "Normal.md"
+    write_note(normal, {"title": "Normal"}, "Body about normal.")
+    db.upsert_article(
+        WikiArticleRecord(
+            path="wiki/Normal.md",
+            title="Normal",
+            sources=[],
+            content_hash="deadbeef",
+            status="published",
+        )
+    )
+
+    result = run_lint(config, db)
+    flagged = {(i.path, i.issue_type) for i in result.issues}
+    assert ("wiki/Mercury.md", "missing_frontmatter") not in flagged
+    assert ("wiki/Mercury.md", "stale") not in flagged
+    assert ("wiki/Normal.md", "missing_frontmatter") in flagged
+    assert ("wiki/Normal.md", "stale") in flagged

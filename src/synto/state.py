@@ -2804,10 +2804,14 @@ class StateDB:
             # stick instead of re-fragmenting on the next ingest. Upgrade any pre-existing weak
             # alias to blessed on conflict for the same reason.
             winner_lk = _ck(winner_name)
-            # loser_name is the first element iterated below, so the loop appends it once;
+            # Absorb the loser's canonical preferred label (its stored casing), not the raw
+            # CLI input casing, so labels_absorbed/report and the winner's blessed alias carry
+            # the loser's real label. All other loser_name uses below are lower()-keyed and
+            # unaffected. loser_pref is the first element iterated, so the loop appends it once;
             # seeding the list with it too would double-count it (duplicate winner alias).
+            loser_pref = self.preferred_label_for_entity(loser_id) or loser_name
             labels_absorbed: list[str] = []
-            for row in [{"label": loser_name}, *loser_aliases_rows]:
+            for row in [{"label": loser_pref}, *loser_aliases_rows]:
                 lbl = row["label"] if isinstance(row, dict) else row[0]
                 lk = _ck(lbl)
                 if not lk or lk == winner_lk:
@@ -3166,7 +3170,12 @@ class StateDB:
                 meta={"sources_restored": sources_moved},
             )
 
-        return {"winner": winner_name, "loser": loser_name, "sources_restored": sources_moved}
+        return {
+            "winner": winner_name,
+            "loser": loser_name,
+            "sources_restored": sources_moved,
+            "labels_absorbed": labels_absorbed,
+        }
 
     def get_sources_for_entities(self, names: list[str]) -> dict[str, list[str]]:
         """Return {name: [source_paths]} for each named entity."""

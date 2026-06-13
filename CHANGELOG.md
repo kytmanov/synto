@@ -28,6 +28,27 @@
   `--allowed-host` flag. A wildcard IPv6 bind (`--host ::`) stays loopback-only unless a
   public hostname or IPv6 literal is explicitly allow-listed.
 
+### Fixed
+
+- `synto undo` no longer silently diverges the database on concept identity ops. Because
+  `state.db` is gitignored, reverting a `concept merge/split/unmerge/rename` commit restored
+  the files but not the database, leaving the vault inconsistent while reporting success.
+  `undo` now refuses such a batch and names the database-aware inverse (e.g.
+  `synto concept unmerge` for a merge); pass `--force` to revert the files anyway, with a
+  clear warning that the database is left diverged.
+- `synto concept unmerge` now strips the absorbed aliases from the winner article's
+  frontmatter, matching the database. Previously the retired label lingered in the published
+  `aliases:` list and kept resolving links to the winner after the unmerge.
+- `synto concept merge` now absorbs the loser's canonical preferred label instead of the
+  exact casing typed on the command line, so the blessed alias and the previewed
+  "Labels absorbed" list both reflect the real label.
+- Disambiguation stubs created by `synto concept split` are now written with complete
+  frontmatter and a stored content hash, and the linter no longer flags disambiguation pages
+  as `missing_frontmatter` or `stale` (covers stubs created before this fix).
+- `synto concept merge --absorb-edits` now updates the winner's stored content hash after
+  appending the absorbed body, so the freshly merged article is no longer immediately
+  reported as manually edited / stale.
+
 ### Known limitations
 
 - `synto concept unmerge` is best-effort and not fully invertible. It restores the loser's

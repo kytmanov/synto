@@ -1292,3 +1292,156 @@ def test_lint_does_not_report_orphan_entity_when_draft_exists(tmp_path: Path) ->
     result = run_lint(config, db)
     orphan_issues = [i for i in result.issues if i.issue_type == "orphan_entity"]
     assert not orphan_issues, "draft-backed entity must not be flagged as orphan_entity"
+
+
+# ---------------------------------------------------------------------------
+# QA findings F2/F3/F4/F5 — reversal + consistency regressions
+# ---------------------------------------------------------------------------
+
+
+def test_unmerge_strips_absorbed_alias_from_winner_frontmatter(tmp_path: Path) -> None:
+    """F2: unmerge must remove the absorbed loser label from the winner's published aliases.
+
+    Why it matters: the DB drops the absorbed alias on unmerge, but a stale aliases: line in
+    the winner's frontmatter still advertises the retired surface — Obsidian and link routing
+    would keep resolving it to the winner, silently undoing the unmerge for readers. An alias
+    the winner legitimately holds for its own reasons must survive the round-trip.
+    """
+    from synto.config import Config
+    from synto.pipeline.maintain import merge_concepts, unmerge_concept
+    from synto.vault import parse_note
+
+    vault = tmp_path / "vault"
+    (vault / "raw").mkdir(parents=True)
+    (vault / "wiki").mkdir(parents=True)
+
+    db = StateDB(vault / ".synto" / "state.db")
+    db.upsert_concepts("raw/a.md", ["Alpha"])
+    db.upsert_concepts("raw/b.md", ["Beta"])
+    # Beta owns an unrelated alias that must outlive the merge/unmerge round-trip.
+    db.upsert_aliases("Beta", ["bravo"], source="extracted")
+    (vault / "wiki" / "Beta.md").write_text("---\ntitle: Beta\naliases:\n- bravo\n---\nbody")
+    db.upsert_article(
+        WikiArticleRecord(
+            path="wiki/Beta.md", title="Beta", sources=[], content_hash="", status="published"
+        )
+    )
+    _article(db, vault, "Alpha")
+    config = Config.model_validate({"vault": str(vault)})
+
+    merge_concepts(config, db, "Alpha", "Beta", dry_run=False)
+    meta, _ = parse_note(vault / "wiki" / "Beta.md")
+    assert "Alpha" in (meta.get("aliases") or []), "merge should have absorbed Alpha as an alias"
+
+    unmerge_concept(config, db, "Alpha")
+    meta, _ = parse_note(vault / "wiki" / "Beta.md")
+    aliases = meta.get("aliases") or []
+    assert "Alpha" not in aliases, "unmerge must strip the absorbed alias from frontmatter"
+    assert "bravo" in aliases, "an alias the winner legitimately keeps must survive"
+
+
+def test_merge_concepts_absorbs_loser_canonical_label_not_cli_casing(tmp_path: Path) -> None:
+    """F3: merge blesses the loser's stored preferred label, not the CLI input casing.
+
+    Why it matters: the absorbed alias becomes a blessed surface that future ingests must
+    respect. Persisting the user's ad-hoc casing ("foo bar") instead of the canonical
+    "Foo Bar" advertises a label the rest of the system never minted. The dry-run preview
+    (shown before the confirm prompt) must agree with what the real merge stores.
+    """
+    from synto.config import Config
+    from synto.pipeline.maintain import merge_concepts
+
+    vault = tmp_path / "vault"
+    (vault / "raw").mkdir(parents=True)
+    (vault / "wiki").mkdir(parents=True)
+
+    db = StateDB(vault / ".synto" / "state.db")
+    db.upsert_concepts("raw/a.md", ["Foo Bar"])  # canonical preferred casing
+    db.upsert_concepts("raw/b.md", ["Winner"])
+    _article(db, vault, "Foo Bar")
+    _article(db, vault, "Winner")
+    config = Config.model_validate({"vault": str(vault)})
+
+    preview = merge_concepts(config, db, "foo bar", "Winner", dry_run=True)
+    assert "Foo Bar" in preview.labels_absorbed
+    assert "foo bar" not in preview.labels_absorbed, "preview must show canonical casing"
+
+    report = merge_concepts(config, db, "foo bar", "Winner", dry_run=False)
+    assert "Foo Bar" in report.labels_absorbed
+    assert "Foo Bar" in db.aliases_for_concept("Winner")
+
+
+def test_split_disambiguation_stub_is_lint_clean_at_creation(tmp_path: Path) -> None:
+    """F4 (root cause): a fresh disambiguation stub carries full frontmatter and a DB
+    content_hash matching its on-disk body, so it is never spuriously flagged stale /
+    missing_frontmatter — independent of the lint-side guard for legacy stubs.
+    """
+    import hashlib
+
+    from synto.config import Config
+    from synto.pipeline.maintain import split_concept
+    from synto.vault import parse_note
+
+    vault = tmp_path / "vault"
+    (vault / "raw").mkdir(parents=True)
+    (vault / "wiki").mkdir(parents=True)
+
+    db = StateDB(vault / ".synto" / "state.db")
+    db.upsert_concepts("raw/planets.md", ["Mercury"])
+    db.upsert_concepts("raw/chem.md", ["Mercury"])
+    config = Config.model_validate({"vault": str(vault)})
+
+    report = split_concept(
+        config,
+        db,
+        "Mercury",
+        [("Mercury (planet)", ["raw/planets.md"]), ("Mercury (element)", ["raw/chem.md"])],
+        dry_run=False,
+    )
+
+    meta, body = parse_note(vault / report.stub_path)
+    assert meta.get("status") == "published"
+    assert "tags" in meta
+    rec = db.get_article(report.stub_path)
+    assert rec is not None
+    assert rec.content_hash, "stub must store a real content_hash, not empty"
+    assert rec.content_hash == hashlib.sha256(body.encode()).hexdigest()
+
+
+def test_merge_absorb_edits_persists_winner_content_hash(tmp_path: Path) -> None:
+    """F5: --absorb-edits rewrites the winner body, so its DB content_hash must be updated.
+
+    Why it matters: without it the winner instantly mismatches its tracked hash, so lint
+    reports it stale and every later protected op treats the freshly-merged article as
+    manually edited — defeating the protection it is supposed to provide.
+    """
+    import hashlib
+
+    from synto.config import Config
+    from synto.pipeline.lint import run_lint
+    from synto.pipeline.maintain import merge_concepts
+    from synto.vault import parse_note
+
+    vault = tmp_path / "vault"
+    (vault / "raw").mkdir(parents=True)
+    (vault / "wiki" / ".drafts").mkdir(parents=True)
+
+    db = StateDB(vault / ".synto" / "state.db")
+    db.upsert_concepts("raw/a.md", ["Alpha"])
+    db.upsert_concepts("raw/b.md", ["Beta"])
+    # Loser carries a manual edit (content_hash="" forces the absorb append to run).
+    _article(db, vault, "Alpha", body="alpha manual edit")
+    _article(db, vault, "Beta", body="beta body")
+    config = Config.model_validate({"vault": str(vault)})
+
+    merge_concepts(config, db, "Alpha", "Beta", absorb_edits=True, dry_run=False)
+
+    _, winner_body = parse_note(vault / "wiki" / "Beta.md")
+    assert "Absorbed from Alpha" in winner_body, "absorb should have appended the loser body"
+    rec = db.get_article("wiki/Beta.md")
+    assert rec is not None
+    assert rec.content_hash == hashlib.sha256(winner_body.encode()).hexdigest()
+
+    result = run_lint(config, db)
+    stale = [i for i in result.issues if i.issue_type == "stale" and i.path == "wiki/Beta.md"]
+    assert not stale, "winner must not be flagged stale after its body hash is persisted"

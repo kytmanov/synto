@@ -787,13 +787,17 @@ def merge_concepts(
         # label whose key matches the winner's, so filter those out to keep the
         # preview honest.
         winner_key = _ck(winner_name)
+        # Resolve the loser's canonical preferred label so the preview matches what the real
+        # merge will absorb (merge_entities blesses the stored casing, not the CLI input).
+        loser_pref = db.preferred_label_for_entity(loser_id) or loser_name
         report.labels_absorbed = [
-            lbl for lbl in (loser_name, *db.get_aliases(loser_name)) if _ck(lbl) != winner_key
+            lbl for lbl in (loser_pref, *db.get_aliases(loser_name)) if _ck(lbl) != winner_key
         ]
         return report
 
     # ── Mutations ──────────────────────────────────────────────────────────────
     # Absorb loser's manually-edited body into winner if requested.
+    absorbed_winner_paths: set[Path] = set()
     if absorb_edits:
         winner_articles = [
             art
@@ -820,6 +824,7 @@ def merge_concepts(
                 w_meta, w_body = parse_note(winner_path)
                 w_body = w_body.rstrip() + f"\n\n## Absorbed from {loser_name}\n\n{loser_body}"
                 write_note(winner_path, w_meta, w_body)
+                absorbed_winner_paths.add(winner_path)
                 break
 
     result = db.merge_entities(winner_name, loser_name)
@@ -868,6 +873,20 @@ def merge_concepts(
         if added:
             meta["aliases"] = [*existing_aliases, *added]
             write_note(art_path, meta, body)
+
+    # After an absorb, the winner body changed but its DB content_hash still reflects the
+    # pre-absorb body — leaving it flagged stale. Persist the new hash. The body is final here
+    # (the alias write above only touched frontmatter); hash the on-disk round-tripped body
+    # (frontmatter strips the trailing newline) like compile's publish path.
+    for winner_path in absorbed_winner_paths:
+        rel = str(winner_path.relative_to(config.vault))
+        rec = db.get_article(rel)
+        if rec is None:
+            continue
+        _, w_ondisk = parse_note(winner_path)
+        new_hash = hashlib.sha256(w_ondisk.encode()).hexdigest()
+        if rec.content_hash != new_hash:
+            db.upsert_article(rec.model_copy(update={"content_hash": new_hash}))
 
     report.links_rewritten = _rewrite_inbound_links(
         config, db, loser_stem, winner_stem, winner_name, dry_run=False
@@ -995,14 +1014,24 @@ def split_concept(
         dis_path = config.wiki_dir / f"{dis_stem}.md"
         sense_links = "\n".join(f"- [[{s['name']}]]" for s in result["senses"])
         dis_body = f"**{entity_name}** may refer to:\n\n{sense_links}\n"
-        write_note(dis_path, {"title": entity_name, "kind": "disambiguation"}, dis_body)
+        # Write full frontmatter and persist the real body hash: the stub is a published page
+        # with real content, so a content_hash="" / bare frontmatter would make lint flag it
+        # stale + missing_frontmatter on the next run (same anti-pattern as the absorb path).
+        write_note(
+            dis_path,
+            {"title": entity_name, "kind": "disambiguation", "status": "published", "tags": []},
+            dis_body,
+        )
+        # Hash the body as it round-trips through the writer (frontmatter strips the trailing
+        # newline), so the stored hash matches what lint re-reads — mirrors compile's publish path.
+        _, dis_ondisk = parse_note(dis_path)
         report.stub_path = str(dis_path.relative_to(config.vault))
         db.upsert_article(
             WikiArticleRecord(
                 path=report.stub_path,
                 title=entity_name,
                 sources=[],
-                content_hash="",
+                content_hash=hashlib.sha256(dis_ondisk.encode()).hexdigest(),
                 status="published",
                 kind="disambiguation",
             )
@@ -1019,6 +1048,14 @@ def unmerge_concept(config: Config, db: StateDB, merged_name: str) -> UnmergeRep
     reversibility contract). The loser's article is recreated as an empty stub and reseeded
     pending, so the next ``synto compile`` regenerates it. Wiki links that were repointed to
     the winner during the merge are NOT reverted — that mapping is not safely reversible.
+
+    The absorbed alias labels are stripped from the winner's published frontmatter to match the
+    DB. The body is NOT touched: if the original merge used ``--absorb-edits``, the loser's edited
+    body still lives inside the winner's ``## Absorbed from <loser>`` section and is not pulled
+    back here (body surgery is unsafe — the user may have edited since). Because the recreated
+    loser stub is empty and the next ``compile`` regenerates it from sources, a
+    ``merge --absorb-edits`` → ``unmerge`` round-trip loses the loser's manual edits; copy that
+    section back by hand if you need them.
     """
     merged_name = merged_name.strip()
     loser_id = db.get_merged_entity_id(merged_name)
@@ -1035,6 +1072,34 @@ def unmerge_concept(config: Config, db: StateDB, merged_name: str) -> UnmergeRep
         loser=result["loser"],
         sources_restored=result["sources_restored"],
     )
+
+    # Strip the absorbed aliases from the winner's published frontmatter (mirror of the merge
+    # writer in reverse). Keep any alias the winner legitimately retains post-unmerge — guards
+    # against an absorbed label that the winner also owned for its own reasons.
+    winner_stem = sanitize_filename(result["winner"])
+    absorbed = {lbl.casefold() for lbl in result.get("labels_absorbed", [])}
+    survivors = {a.casefold() for a in db.get_aliases(result["winner"])}
+    to_drop = absorbed - survivors
+    if to_drop:
+        winner_articles = [
+            art
+            for art in db.list_articles()
+            if art.kind not in ("synthesis", "disambiguation")
+            and (
+                Path(art.path).stem.casefold() == winner_stem.casefold()
+                or art.title.casefold() == result["winner"].casefold()
+            )
+        ]
+        for art in winner_articles:
+            art_path = config.vault / art.path
+            if not art_path.exists():
+                continue
+            meta, body = parse_note(art_path)
+            existing = list(meta.get("aliases") or [])
+            kept = [a for a in existing if a.casefold() not in to_drop]
+            if len(kept) != len(existing):
+                meta["aliases"] = kept
+                write_note(art_path, meta, body)
 
     # Recreate a stub so the reactivated entity has a page again (next compile fills it).
     stub_path = config.wiki_dir / f"{sanitize_filename(result['loser'])}.md"

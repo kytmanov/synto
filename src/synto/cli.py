@@ -2335,24 +2335,98 @@ def eval_cmd(vault_str, queries_path, live, json_out):
 # ── undo ─────────────────────────────────────────────────────────────────────
 
 
+# Identity ops mutate the gitignored state.db; git revert restores the working tree
+# but never the DB, so reverting one of these commits silently diverges DB from disk.
+_IDENTITY_OP_RE = re.compile(r"concept (merge|split|unmerge|rename):")
+
+
+def _is_identity_op_subject(message: str) -> bool:
+    return bool(_IDENTITY_OP_RE.search(message))
+
+
+def _identity_op_reversal_hint(message: str) -> str:
+    """Return the DB-aware reversal instruction for an identity-op commit subject.
+
+    Names are parsed off the stable ``L → W`` / ``L ← W`` subject tail; a subject that
+    does not split cleanly (a name containing the arrow — near-impossible) falls back to
+    a generic instruction rather than crashing.
+    """
+    m = _IDENTITY_OP_RE.search(message)
+    op = m.group(1) if m else ""
+    tail = message[m.end() :].strip() if m else ""
+    if op == "merge" and " → " in tail:
+        loser, _winner = tail.split(" → ", 1)
+        return f'reverse with: synto concept unmerge "{loser.strip()}"'
+    if op == "unmerge" and " ← " in tail:
+        loser, winner = tail.split(" ← ", 1)
+        return f'reverse with: synto concept merge "{loser.strip()}" "{winner.strip()}"'
+    if op == "rename" and " → " in tail:
+        old, new = tail.split(" → ", 1)
+        return f'reverse with: synto concept rename "{new.strip()}" "{old.strip()}"'
+    if op == "split":
+        return "reverse by re-merging the senses with `synto concept merge` (no single inverse)"
+    return (
+        "reverse with the matching `synto concept …` op, not undo — "
+        "state.db is gitignored and will not roll back"
+    )
+
+
 @cli.command()
 @click.option("--vault", "vault_str", envvar=VAULT_ENV_VAR, default=None)
 @click.option("--steps", default=1, show_default=True)
-def undo(vault_str, steps):
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Revert files even when the batch contains a concept identity op "
+    "(state.db will be left diverged).",
+)
+def undo(vault_str, steps, force):
     """Revert last N synto/legacy auto-commits (uses git revert — safe)."""
-    from .git_ops import git_undo
+    from .git_ops import git_log_auto, git_undo
 
     config = _load_config(vault_str)
+
+    # Peek the same batch git_undo would revert. If it contains a concept identity op,
+    # refuse the WHOLE batch (never partially revert) and point at the DB-aware inverse —
+    # git cannot roll back the state.db changes those ops made.
+    commits = git_log_auto(config.vault, n=steps)
+    identity_commits = [c for c in commits if _is_identity_op_subject(c["message"])]
+    if identity_commits and not force:
+        console.print(
+            "[red]Refusing to undo: this batch includes concept identity op(s) whose "
+            "state.db changes git cannot revert.[/red]"
+        )
+        for c in identity_commits:
+            # markup=False: commit subjects carry the literal "[synto]" prefix, which rich
+            # would otherwise parse as a (bogus) style tag and silently drop.
+            console.print(f"  {c['message']}", markup=False)
+            console.print(f"    → {_identity_op_reversal_hint(c['message'])}", markup=False)
+        console.print(
+            "[dim]Re-run with --force to revert files only (state.db will diverge).[/dim]"
+        )
+        sys.exit(1)
+
     try:
         reverted = git_undo(config.vault, steps=steps)
     except RuntimeError as e:
         raise click.ClickException(str(e)) from e
-    if reverted:
-        console.print(f"[green]Reverted {len(reverted)} commit(s):[/green]")
-        for msg in reverted:
-            console.print(f"  {msg}")
-    else:
+    if not reverted:
         console.print("[yellow]No synto or legacy auto-commits found to revert.[/yellow]")
+        return
+    console.print(f"[green]Reverted {len(reverted)} commit(s):[/green]")
+    for msg in reverted:
+        console.print(f"  {msg}", markup=False)
+    if identity_commits:
+        console.print(
+            "[yellow]Note: files were reverted but state.db still reflects the "
+            "merge/split/rename. `synto compile` will NOT reconcile it — use the matching "
+            "`synto concept …` inverse, or rebuild state.db from .synto/INDEX.json.[/yellow]"
+        )
+    else:
+        console.print(
+            "[dim]Note: state.db is not reverted; run `synto compile` if a data op was undone."
+            "[/dim]"
+        )
 
 
 # ── clean ─────────────────────────────────────────────────────────────────────
