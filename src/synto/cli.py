@@ -4545,7 +4545,16 @@ def concept_split(
 @click.argument("name")
 @click.option("--vault", "vault_str", envvar=VAULT_ENV_VAR, default=None)
 def concept_unmerge(name: str, vault_str: str | None) -> None:
-    """Reverse the most recent merge that retired concept NAME, restoring it."""
+    """Reverse the most recent merge that retired concept NAME, restoring it as a separate entity.
+
+    Limitations (best-effort only):
+    - Name-keyed ledgers (rejections, blocks, stubs) are not restored.
+    - Wiki links that pointed at the loser are not reverted.
+    - The loser is recreated as an empty stub; run `synto compile` to regenerate content.
+    - If the merge used --absorb-edits, the loser's edited body remains in the
+      winner and is not pulled back.
+    See `synto concept unmerge` and the changelog for the full contract.
+    """
     from .git_ops import git_commit
     from .indexer import append_log, generate_index, generate_index_json
     from .pipeline.maintain import ConceptUnmergeError, unmerge_concept
@@ -4565,6 +4574,11 @@ def concept_unmerge(name: str, vault_str: str | None) -> None:
         console.print(
             f"  Stub recreated: {report.stub_path} [dim](run `synto compile` to fill)[/dim]"
         )
+
+    console.print(
+        "[yellow]Note:[/yellow] Name-keyed ledgers (rejections, blocks, stubs) were not restored; "
+        "links to the old name were not reverted. The stub starts empty."
+    )
 
     generate_index(config, db)
     generate_index_json(config, db)  # refresh the committed identity seed (decision 13)
@@ -4605,16 +4619,7 @@ def concept_inspect(name: str, vault_str: str | None) -> None:
     pref = db.preferred_label_for_entity(eid)
     aliases = db.aliases_for_concept(name)
     sources = db.get_sources_for_entities([name]).get(name, [])
-    _sql_amb = (
-        "SELECT COUNT(*) FROM concept_occurrences"
-        " WHERE lower(concept_name)=lower(?) AND resolution_status='ambiguous'"
-    )
-    ambiguous_row = (
-        db._conn.execute(_sql_amb, (name,)).fetchone()
-        if db._has_table("concept_occurrences")
-        else None
-    )
-    ambiguous = ambiguous_row[0] if ambiguous_row else 0
+    ambiguous = db.count_ambiguous_occurrences_for_label(name)
 
     console.print(f"[bold]{pref}[/bold]  [dim](entity_id: {eid})[/dim]")
     if aliases:
@@ -4624,11 +4629,8 @@ def concept_inspect(name: str, vault_str: str | None) -> None:
         console.print(f"    [dim]{src}[/dim]")
     console.print(f"  Ambiguous occurrences: {ambiguous}")
 
-    # Compile state
-    rows = db._conn.execute(
-        "SELECT status, updated_at FROM concept_compile_state WHERE lower(concept_name)=lower(?)",
-        (name,),
-    ).fetchall()
+    # Compile state (via seam; table still has some name-keyed rows)
+    rows = db.get_compile_state_for_label(name)
     if rows:
         for status, updated_at in rows:
             console.print(f"  Compile state: {status}  (updated: {updated_at or 'n/a'})")
