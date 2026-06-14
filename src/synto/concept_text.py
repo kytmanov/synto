@@ -73,13 +73,3 @@ def _fold_token(token: str) -> str:
     ):
         return token[:-1]
     return token
-
-
-def legacy_name_key(text: str) -> str:
-    """Folding key for the remaining name-keyed legacy tables
-    (rejections, stubs, blocked_concepts, knowledge_items, and some occurrence
-    paths). This makes the 'still on display names' debt greppable and mechanical
-    to migrate later. Reuses the same normalization as concept_key for consistency
-    with how surfaces are matched elsewhere.
-    """
-    return concept_key(text)

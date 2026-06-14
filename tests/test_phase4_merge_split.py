@@ -1551,3 +1551,85 @@ def test_unmerge_does_not_restore_name_keyed_ledger(tmp_path: Path) -> None:
     # For strictness we assert the count did not increase due to the unmerge.
     # (A more advanced test could query by timestamp; this keeps the diff small.)
     assert rejs <= 1, "unmerge must not re-create name-keyed rejection state for the loser"
+
+
+# ---------------------------------------------------------------------------
+# punctuated-name ledger matching (regression: asymmetric _lnk match key)
+# ---------------------------------------------------------------------------
+
+
+def test_merge_moves_name_keyed_ledger_for_punctuated_name(tmp_path: Path) -> None:
+    """Merge must move rejections/stubs/blocked rows for a punctuated concept name.
+
+    These ledgers are keyed by display name and only need a case-insensitive match.
+    A folding match key (concept_key('Node.js')='node js') would miss the stored
+    'node.js' row — and 'C++' would fold to 'c', colliding with an unrelated 'C'.
+    The contract is symmetric lower() matching on the literal display name.
+    """
+    from synto.config import Config
+    from synto.pipeline.maintain import merge_concepts
+
+    vault = tmp_path / "vault"
+    (vault / "raw").mkdir(parents=True)
+    (vault / "wiki").mkdir(parents=True)
+
+    db = StateDB(vault / ".synto" / "state.db")
+    db.upsert_concepts("raw/a.md", ["Node.js"])
+    db.upsert_concepts("raw/b.md", ["Beta"])
+    _article(db, vault, "Node.js")
+    _article(db, vault, "Beta")
+    config = Config.model_validate({"vault": str(vault)})
+
+    db.add_rejection("Node.js", "too vague")
+    db.add_stub("Node.js")
+    db.mark_concept_blocked("Node.js")
+
+    merge_concepts(config, db, "Node.js", "Beta", absorb_edits=False, dry_run=False)
+
+    def _count(table: str, name: str) -> int:
+        return db._conn.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE lower(concept) = lower(?)", (name,)
+        ).fetchone()[0]
+
+    # The loser's ledger rows moved to the winner; none orphaned under the loser name.
+    assert _count("rejections", "Node.js") == 0
+    assert _count("rejections", "Beta") >= 1
+    assert _count("stubs", "Node.js") == 0
+    assert _count("stubs", "Beta") >= 1
+    assert _count("blocked_concepts", "Node.js") == 0
+    assert _count("blocked_concepts", "Beta") >= 1
+
+
+def test_merge_punctuated_winner_with_knowledge_items_does_not_crash(tmp_path: Path) -> None:
+    """Merge must not crash when the winner name is punctuated and both sides have items.
+
+    knowledge_items has UNIQUE(name). Under a folding match key, winner-detection
+    (_lnk('Node.js')='node js') misses the existing 'node.js' row, so the rename
+    branch runs and violates UNIQUE(name), aborting the whole merge. Case-insensitive
+    matching finds the winner row and takes the delete-loser branch instead.
+    """
+    from synto.config import Config
+    from synto.models import KnowledgeItemRecord
+    from synto.pipeline.maintain import merge_concepts
+
+    vault = tmp_path / "vault"
+    (vault / "raw").mkdir(parents=True)
+    (vault / "wiki").mkdir(parents=True)
+
+    db = StateDB(vault / ".synto" / "state.db")
+    db.upsert_concepts("raw/a.md", ["Node.js"])
+    db.upsert_concepts("raw/b.md", ["Beta"])
+    _article(db, vault, "Node.js")
+    _article(db, vault, "Beta")
+    config = Config.model_validate({"vault": str(vault)})
+
+    db.upsert_item(KnowledgeItemRecord(name="Node.js"))
+    db.upsert_item(KnowledgeItemRecord(name="Beta"))
+
+    # Winner is the punctuated name; must not raise on the UNIQUE(name) path.
+    merge_concepts(config, db, "Beta", "Node.js", absorb_edits=False, dry_run=False)
+
+    rows = db._conn.execute(
+        "SELECT name FROM knowledge_items WHERE lower(name) = lower(?)", ("Node.js",)
+    ).fetchall()
+    assert len(rows) == 1, "winner knowledge_items row should survive as the single row"
