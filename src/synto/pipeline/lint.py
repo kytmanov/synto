@@ -681,7 +681,10 @@ def _check_manual_relabel(config: Config, db: StateDB, issues: list[LintIssue], 
         old_stem = sanitize_filename(old_label)
         new_stem = sanitize_filename(new_label)
         db.rename_concept(old_label, new_label)
-        db.upsert_aliases(new_label, [old_label])
+        # Bless the demoted old label (source='rename') so a re-extracted old name links to the
+        # winner instead of minting a new entity — parity with `concept rename` (maintain.py),
+        # otherwise the adopted rename re-fragments on the next ingest.
+        db.upsert_aliases(new_label, [old_label], source="rename")
         db.update_article_identity(art.path, new_rel, new_label)
         try:
             meta, body = parse_note(renamed)

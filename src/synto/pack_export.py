@@ -177,16 +177,20 @@ def _concepts_payload(db: StateDB) -> dict[str, object]:
     for name in db.list_all_concept_names():
         canonical_article_id = None
         article_path = None
+        article_entity_id = None
         for article in db.find_article_candidates(name):
             if not article.is_published or not is_concept_article_path(article.path):
                 continue
             canonical_article_id = article.article_id
             article_path = _pack_article_path(article.path)
+            article_entity_id = article.entity_id
             break
         concepts.append(
             {
                 "name": name,
-                "entity_id": db.entity_id_for_name(name),
+                # Prefer the published article's bound entity_id; re-resolving by name yields None
+                # for an ambiguous label, shipping the concept with no resolvable identity.
+                "entity_id": article_entity_id or db.entity_id_for_name(name),
                 "aliases": _filter_export_aliases(db.aliases_for_concept(name), frequent),
                 "canonical_article_id": canonical_article_id,
                 "article_path": article_path,

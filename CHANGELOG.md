@@ -1,5 +1,27 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- `synto concept merge` no longer aborts when both concepts have a stub row: the
+  name-keyed `stubs` move now collapses on collision instead of hitting a primary-key
+  constraint.
+- Name-keyed writes (e.g. compile-state marking) for a label whose preferred owner was
+  retired by a merge now resolve to the active winner instead of attaching to the dead
+  entity (and silently vanishing).
+- Upgrades from schema &lt; 6 no longer drop the "already compiled" marks for published
+  articles, which had forced a full recompile after upgrade.
+- `synto lint --fix` adopting a manual file rename now blesses the old label (parity with
+  `synto concept rename`), so it no longer re-fragments into a new concept on the next
+  ingest.
+- `synto concept unmerge` keeps an absorbed alias that another still-merged concept also
+  contributed, and uses the winner's current label when it was renamed after the merge.
+- Plural/singular concept folding no longer collapses short singular nouns ending in `s`
+  (e.g. `Lens` no longer folds onto an unrelated `Len`).
+- The published `INDEX.json` and pack export now emit each article's bound `entity_id`
+  rather than re-resolving it by name, which dropped identity for homonym/renamed titles.
+
 ## [0.6.0] - 2026-06-14
 
 ### Added

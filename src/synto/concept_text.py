@@ -68,8 +68,13 @@ def _fold_token(token: str) -> str:
         return token[:-3] + "y"
     if token.endswith("sses"):
         return token[:-2]  # sses -> ss
-    if token.endswith("s") and not (
-        token.endswith("ss") or token.endswith("us") or token.endswith("is")
+    # Strip a plural -s only when the singular stem stays >= 4 chars. This keeps the User/Users
+    # fold while protecting short singular nouns that merely end in s (Lens, Tens, Buns) from
+    # folding onto an unrelated concept (Len, Ten, Bun) and minting a spurious merge candidate.
+    if (
+        token.endswith("s")
+        and not (token.endswith("ss") or token.endswith("us") or token.endswith("is"))
+        and len(token) - 1 >= 4
     ):
         return token[:-1]
     return token

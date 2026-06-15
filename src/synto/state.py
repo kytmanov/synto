@@ -1864,15 +1864,26 @@ class StateDB:
             alias_map.setdefault(row["concept_name"], set()).add(row["alias"])
 
         articles = self.list_articles()
-        for row in self._conn.execute("SELECT name, source_path FROM concepts").fetchall():
-            concept_name = row["name"]
-            source_path = row["source_path"]
-            article = self._match_article_for_concept_v6(
-                concept_name, source_path, articles, alias_map
-            )
-            if article is None:
-                continue
-            self.mark_concept_compile_state(concept_name, [source_path], "compiled")
+        now = datetime.now().isoformat()
+        # This hook runs at v6, before concept_labels (v18) and the entity_id column (v23) exist.
+        # mark_concept_compile_state now resolves through _ensure_entity_for_name, which returns
+        # None without concept_labels and silently writes nothing — so the published-article marks
+        # were being dropped, forcing a full recompile after upgrade. Write the name-keyed row
+        # directly (the v6 schema); v23's rebuild carries it forward onto entity_id.
+        with self._tx():
+            for row in self._conn.execute("SELECT name, source_path FROM concepts").fetchall():
+                concept_name = row["name"]
+                source_path = row["source_path"]
+                article = self._match_article_for_concept_v6(
+                    concept_name, source_path, articles, alias_map
+                )
+                if article is None:
+                    continue
+                self._conn.execute(
+                    "UPDATE concept_compile_state SET status='compiled', compiled_at=?,"
+                    " updated_at=? WHERE concept_name=? AND source_path=?",
+                    (now, now, concept_name, source_path),
+                )
 
         self._refresh_all_raw_compile_statuses()
 
@@ -2303,12 +2314,27 @@ class StateDB:
         lk = _ck(name)
         if not lk:
             return None
+        # The global unique index keeps at most one preferred row per label_key, regardless of
+        # entity status — and a merge-loser KEEPS its preferred row (get_merged_entity_id/unmerge
+        # depend on it). So a hit here can point at a RETIRED entity. Resolve to the live identity:
+        #   - active            → return it.
+        #   - merged (by merge) → chase merged_into to the active winner (the surface now belongs
+        #                         to the winner, which holds this label as an alias).
+        #   - merged (by split, merged_into NULL) → return None: the bare label is now a
+        #                         disambiguation surface with no single owner.
+        # Never return the dead id, and never fall through to mint — minting a preferred row with
+        # this label_key would collide on idx_concept_labels_preferred_global.
         row = self._conn.execute(
-            "SELECT entity_id FROM concept_labels WHERE label_key = ? AND role = 'preferred'",
+            "SELECT cl.entity_id, ce.status, ce.merged_into FROM concept_labels cl"
+            " JOIN concept_entities ce ON ce.id = cl.entity_id"
+            " WHERE cl.label_key = ? AND cl.role = 'preferred'",
             (lk,),
         ).fetchone()
-        if row:
-            return row[0]
+        if row is not None:
+            entity_id, status, merged_into = row[0], row[1], row[2]
+            if status != "merged":
+                return entity_id
+            return self._active_entity_after_merge(merged_into)
         # Minting a new preferred label: a WEAK alias (extracted/legacy_backfill) with the same
         # label_key on another entity is now a collision (an alias may not equal another entity's
         # preferred label — it would make resolve_label ambiguous and drop the new concept's
@@ -2341,6 +2367,26 @@ class StateDB:
             (entity_id, name, lk, _mk(name), now),
         )
         return entity_id
+
+    def _active_entity_after_merge(self, entity_id: str | None) -> str | None:
+        """Follow the merged_into chain from entity_id to the first active entity.
+
+        Returns None if the chain dead-ends at a NULL merged_into on a still-merged entity
+        (e.g. a split-retired original, which has no single successor) or hits a cycle.
+        """
+        seen: set[str] = set()
+        current = entity_id
+        while current is not None and current not in seen:
+            seen.add(current)
+            row = self._conn.execute(
+                "SELECT status, merged_into FROM concept_entities WHERE id = ?", (current,)
+            ).fetchone()
+            if row is None:
+                return None
+            if row[0] != "merged":
+                return current
+            current = row[1]
+        return None
 
     # ── Entity identity (feature 45, Phase 1) ─────────────────────────────────
 
@@ -2910,10 +2956,14 @@ class StateDB:
             self._conn.execute(
                 "DELETE FROM blocked_concepts WHERE lower(concept)=lower(?)", (loser_name,)
             )
+            # stubs.concept is PRIMARY KEY: if the winner already has a stub row, a plain
+            # rename collides. OR IGNORE skips the collision, then the leftover loser row is
+            # deleted — same collapse pattern as blocked_concepts above.
             self._conn.execute(
-                "UPDATE stubs SET concept=? WHERE lower(concept)=lower(?)",
+                "UPDATE OR IGNORE stubs SET concept=? WHERE lower(concept)=lower(?)",
                 (winner_name, loser_name),
             )
+            self._conn.execute("DELETE FROM stubs WHERE lower(concept)=lower(?)", (loser_name,))
             # knowledge_items has a UNIQUE(name) constraint. If the winner row already
             # exists, renaming the loser would conflict — just delete the loser row.
             winner_ki = self._conn.execute(
@@ -3097,6 +3147,30 @@ class StateDB:
         ).fetchone()
         return row[0] if row else None
 
+    def _alias_owed_by_other_merge(
+        self, winner_id: str, excluding_loser_id: str, label_key: str
+    ) -> bool:
+        """True if a still-merged loser other than excluding_loser_id contributed label_key.
+
+        Used by unmerge to avoid stripping an absorbed alias that another active merge still owes
+        to the winner.
+        """
+        for entry in self.list_identity_log(limit=1000):
+            if entry.get("op") != "merge":
+                continue
+            ids = entry.get("entity_ids") or []
+            if len(ids) != 2 or ids[0] != winner_id or ids[1] == excluding_loser_id:
+                continue
+            row = self._conn.execute(
+                "SELECT status, merged_into FROM concept_entities WHERE id=?", (ids[1],)
+            ).fetchone()
+            if row is None or row[0] != "merged" or row[1] != winner_id:
+                continue
+            meta = entry.get("meta") or {}
+            if any(_ck(a) == label_key for a in (meta.get("labels_absorbed") or [])):
+                return True
+        return False
+
     def unmerge_entities(self, merged_entity_id: str) -> dict:
         """Reverse the most recent merge whose loser was ``merged_entity_id``.
 
@@ -3125,7 +3199,10 @@ class StateDB:
         winner_id = log_entry["entity_ids"][0]
         loser_id = merged_entity_id
         labels = log_entry.get("labels") or {}
-        winner_name = labels.get(winner_id) or self.preferred_label_for_entity(winner_id) or ""
+        # Prefer the entity's CURRENT preferred label over the merge-time snapshot: if the winner
+        # was renamed after the merge, the logged name is stale and the name-keyed restore queries
+        # below would match nothing.
+        winner_name = self.preferred_label_for_entity(winner_id) or labels.get(winner_id) or ""
         loser_name = self.preferred_label_for_entity(loser_id) or labels.get(loser_id) or ""
         meta = log_entry.get("meta") or {}
         sources_moved = list(meta.get("sources_moved") or [])
@@ -3179,6 +3256,11 @@ class StateDB:
             for lbl in labels_absorbed:
                 lk = _ck(lbl)
                 if not lk or lk == winner_lk:
+                    continue
+                # Don't drop an alias that another still-merged loser also contributed to this
+                # winner — it is still owed. (merge A→B and C→B both absorbing 'foo': unmerging A
+                # must keep 'foo' because C is still merged into B and maps it.)
+                if self._alias_owed_by_other_merge(winner_id, loser_id, lk):
                     continue
                 self._conn.execute(
                     "DELETE FROM concept_labels WHERE entity_id=? AND role='alias' AND label_key=?",

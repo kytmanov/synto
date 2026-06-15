@@ -167,7 +167,10 @@ def _build_index_payload(config: Config, db: StateDB) -> dict[str, object]:
     articles = [
         {
             "id": record.article_id or "",
-            "entity_id": db.entity_id_for_name(record.title) or "",
+            # Prefer the authoritative entity_id bound on the row (v24 backfill); only fall back to
+            # name resolution when it is NULL. Re-resolving by title emits "" for a homonym/diverged
+            # title even though the row holds a definite id.
+            "entity_id": record.entity_id or db.entity_id_for_name(record.title) or "",
             "name": record.title,
             "path": record.path,
             "summary": None,

@@ -1109,6 +1109,24 @@ def test_manual_relabel_adopted_under_fix(config, db):
     assert "[[Bar]]" in (config.wiki_dir / "Linker.md").read_text()
 
 
+def test_manual_relabel_adopted_blesses_old_label(config, db):
+    """The demoted old label must be a BLESSED alias (source='rename'), not a weak 'extracted'
+    one — parity with `concept rename`. A weak alias would re-mint the old name on the next
+    ingest, re-fragmenting the concept the adoption just unified.
+    """
+    eid = _publish_concept(config, db, "Foo", "Body about Foo.")
+    (config.wiki_dir / "Foo.md").rename(config.wiki_dir / "Bar.md")
+
+    run_lint(config, db, fix=True)
+
+    row = db._conn.execute(
+        "SELECT source FROM concept_labels WHERE entity_id=? AND lower(label)=lower('Foo')",
+        (eid,),
+    ).fetchone()
+    assert row is not None, "old label should survive as an alias"
+    assert row[0] == "rename", f"expected blessed 'rename' source, got {row[0]!r}"
+
+
 def test_manual_relabel_collision_not_adopted(config, db):
     foo_id = _publish_concept(config, db, "Foo", "Body about Foo.")
     # A second active entity already owns the label "Bar".
