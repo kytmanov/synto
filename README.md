@@ -126,30 +126,64 @@ abstract/methods/results structure; an `api_docs` prompt preserves parameter nam
 source types also get higher built-in concept ceilings during ingest: `textbook` defaults to
 25 concepts and `paper` to 15 unless you set an explicit override in `synto.toml`.
 
-**Concept identity and curation.** Concepts have a stable `entity_id` separate from any
-display name or surface form. This makes homonym handling, renames, and alias "blessing"
-durable and order-independent. Ingest that later extracts a prior weak alias as its own
-concept creates an explicit merge candidate instead of silently absorbing it.
+**Concept identity and curation.** A concept's identity is a stable `entity_id`, not its
+name. Names and surface forms are just labels pointing at that id, so you can rename,
+merge, and split concepts without the changes depending on ingest order. Three situations
+come up as your vault grows:
 
-Curation commands (all support `--dry-run` and TTY confirmation):
+- **Aliases** — several names for one concept (`qubit`, `Qubit`, `qubits`).
+- **Homonyms** — one surface form that means two different concepts (`mercury` the planet
+  vs. the element).
+- **Senses** — one concept that was over-merged and should split into separate ones.
 
-- `synto doctor` / `synto maintain` — surface match-key collisions and merge candidates.
-- `synto concept inspect NAME` — show the backing entity, blessed aliases, sources, ambiguous
+```
+IDENTITY   many surface forms + aliases  →  one stable entity_id
+
+   surface forms + aliases  ──►  [ entity_id ] ─┬─►  rename  relabel; old name kept as alias
+   "qubit"  "Qubit"  "qubits"                   ├─►  merge   fold a second entity into this one
+                                                └─►  split   one entity → several named senses
+
+HOMONYM    one surface, two existing entities  →  pick which one
+
+   "mercury"  (ambiguous)  ┬─►  Planet
+                           └─►  Element     →  keep "mercury" Planet  (assign its occurrences)
+```
+
+Ingest that later extracts a prior weak alias as its own concept records an explicit merge
+candidate instead of silently absorbing it, so you decide.
+
+**Diagnose:**
+
+- `synto doctor` / `synto maintain` — surface duplicate-name collisions and merge candidates.
+- `synto concept inspect NAME` — show the backing entity, its aliases, sources, ambiguous
   occurrences, and suggested actions.
-- `synto concept keep SURFACE ENTITY` — permanently bless a surface as an alias of an entity.
-- `synto concept merge LOSER WINNER [--absorb-edits]` — move sources and edges, retire the
-  loser article, and absorb its labels as blessed aliases on the winner.
-- `synto concept split NAME --sense S1 PATH ...` — partition a concept's sources across
-  multiple senses and create a disambiguation stub at the original name.
-- `synto concept unmerge NAME` — best-effort reverse of the most recent merge for that name
-  (name-keyed ledgers such as rejections are not restored; shared source edges at merge time
-  are not un-collapsed; the loser is recreated as an empty stub — run `synto compile` to
-  repopulate it; absorbed edit bodies from `--absorb-edits` merges stay in the winner).
-- `synto concept rename OLD NEW [--keep-old-alias]` — relabel in place while (by default)
-  keeping the old name as a blessed alias.
+
+**Reshape identity** (all support `--dry-run`, auto-commit, and are reversible with `synto undo`):
+
+- `synto concept rename OLD NEW [--keep-old-alias]` — relabel in place, keeping the old name
+  as an alias by default so re-ingested notes don't recreate it.
+- `synto concept merge LOSER WINNER [--absorb-edits]` — move sources and edges onto the
+  winner, retire the loser article, and keep the loser's labels as aliases on the winner.
+- `synto concept split NAME --sense SENSE SOURCE_PATH ...` — partition a concept's sources
+  across senses (repeat `--sense` per source) and leave a disambiguation page at the old name.
+- `synto concept unmerge NAME` — best-effort reverse of the most recent merge for that name.
+  Several things are not restored; see `synto concept unmerge --help` for the exact contract.
+
+**Resolve homonyms:**
+
+- `synto concept keep SURFACE ENTITY` — assign the ambiguous occurrences of a surface form to
+  one entity. This updates the state DB directly; it does not auto-commit and is not reversible
+  with `synto undo`.
+
+Example — splitting a homonym into two concepts:
+
+```bash
+synto concept split Mercury --sense planet raw/astronomy.md --sense element raw/chemistry.md
+```
 
 `git revert` on a curation commit will not restore the database (`.synto/state.db` is
-gitignored). `synto undo` detects these batches and names the correct inverse command.
+gitignored). For the auto-committing commands above, `synto undo` detects these batches and
+names the correct inverse command.
 
 ---
 
@@ -564,9 +598,10 @@ request as-is and override the matching first-class field, so set computed value
 - `synto query` — index-routed Q&A with optional synthesis to `wiki/synthesis/`
 - `synto review` — interactive draft review: approve, reject, edit, or diff before publishing
 - `synto concept rename|merge|split|unmerge|inspect|keep` — stable entity identity and
-  curation: `synto doctor`/`maintain` surface candidates and collisions; `inspect` + `keep`
-  for diagnosis and blessing; `merge`/`split` move sources and create disambiguation pages;
-  `unmerge` is best-effort with explicit limitations (see command help); `--dry-run` everywhere.
+  curation: `synto doctor`/`maintain` surface candidates and collisions; `inspect` diagnoses
+  and `keep` resolves homonyms; `merge` folds two concepts into one and `split` creates a
+  disambiguation page; `unmerge` is best-effort with explicit limitations (see command help);
+  `--dry-run` on `rename`/`merge`/`split`.
 - `synto watch` — file watcher: auto-ingest and compile on every save
 - `synto maintain` — wiki health check, stub creation, orphan cleanup
 - `synto eval` — offline structural evaluation (coverage, citation support, link resolution)
