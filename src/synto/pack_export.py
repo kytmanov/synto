@@ -190,7 +190,7 @@ def _concepts_payload(db: StateDB) -> dict[str, object]:
                 "name": name,
                 # Prefer the published article's bound entity_id; re-resolving by name yields None
                 # for an ambiguous label, shipping the concept with no resolvable identity.
-                "entity_id": article_entity_id or db.entity_id_for_name(name),
+                "entity_id": article_entity_id or db.entity_id_for_name(name) or "",
                 "aliases": _filter_export_aliases(db.aliases_for_concept(name), frequent),
                 "canonical_article_id": canonical_article_id,
                 "article_path": article_path,
@@ -328,7 +328,7 @@ def _pack_index_payload(
             {
                 "source_path": source_path,
                 "content_hash": content_hash,
-                "concepts": concepts,
+                "concepts": [{"name": name, "entity_id": eid} for (name, eid) in concepts],
             }
             for source_path, content_hash, concepts in db.list_source_concept_seeds()
         ],
@@ -472,8 +472,11 @@ def _export_source_refs(
             normalized_raw = to_posix(raw_path.strip())
             referenced_by_raw.setdefault(normalized_raw, []).append(_pack_article_path(ref.path))
 
+    # Source-reference "concepts" is a list of names; list_source_concept_seeds now also
+    # carries the bound entity_id (for the index payload), so project the name off here.
     concepts_by_raw = {
-        source_path: concepts for source_path, _hash, concepts in db.list_source_concept_seeds()
+        source_path: [name for (name, _eid) in concepts]
+        for source_path, _hash, concepts in db.list_source_concept_seeds()
     }
     raw_hashes = {record.path: record.content_hash for record in db.list_raw()}
     refs: list[dict[str, object]] = []

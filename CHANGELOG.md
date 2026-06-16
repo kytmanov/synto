@@ -10,8 +10,10 @@
 - Name-keyed writes (e.g. compile-state marking) for a label whose preferred owner was
   retired by a merge now resolve to the active winner instead of attaching to the dead
   entity (and silently vanishing).
-- Upgrades from schema &lt; 6 no longer drop the "already compiled" marks for published
-  articles, which had forced a full recompile after upgrade.
+- Upgrades from a schema &lt; 6 vault no longer abort: the v6 backfill wrote the "already
+  compiled" mark for published articles through an entity-keyed path that raised
+  `no such column: entity_id` against the still name-keyed compile-state table; it now writes
+  the name-keyed row directly, preserving the mark (no forced recompile) without crashing.
 - `synto lint --fix` adopting a manual file rename now blesses the old label (parity with
   `synto concept rename`), so it no longer re-fragments into a new concept on the next
   ingest.
@@ -21,6 +23,9 @@
   (e.g. `Lens` no longer folds onto an unrelated `Len`).
 - The published `INDEX.json` and pack export now emit each article's bound `entity_id`
   rather than re-resolving it by name, which dropped identity for homonym/renamed titles.
+- `synto concept merge` advances a published article's `entity_id` onto the winner so
+  exports never emit a retired id, and `synto concept unmerge` repoints exactly those
+  articles back to the restored concept.
 
 ## [0.6.0] - 2026-06-14
 

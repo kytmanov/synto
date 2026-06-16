@@ -230,9 +230,7 @@ def _list_source_concept_seeds(db: StateDB) -> list[dict[str, object]]:
         {
             "source_path": source_path,
             "content_hash": content_hash,
-            "concepts": [
-                {"name": name, "entity_id": db.entity_id_for_name(name) or ""} for name in concepts
-            ],
+            "concepts": [{"name": name, "entity_id": eid} for (name, eid) in concepts],
         }
         for source_path, content_hash, concepts in db.list_source_concept_seeds()
     ]
