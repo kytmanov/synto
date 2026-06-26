@@ -797,6 +797,8 @@ class VaultReader:
             return []
         if not state._has_table("concept_occurrences"):
             return []
+        # Bare read on a read-only StateDB (open_readonly), single-threaded reader path — no
+        # in-process writer shares this connection, so it need not go through StateDB._read().
         rows = state._conn.execute(
             "SELECT concept_name, MAX(confidence) as confidence "
             "FROM concept_occurrences GROUP BY concept_name ORDER BY concept_name"

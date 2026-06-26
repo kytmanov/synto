@@ -21,42 +21,54 @@ class LLMCache:
         return hashlib.sha256(data.encode()).hexdigest()
 
     def get(self, model: str, messages: list[dict], namespace: str = "") -> str | None:
+        # Route through StateDB._tx() rather than committing on the shared connection directly:
+        # under parallel ingest these run on worker threads, and a bare commit() would land
+        # inside the main thread's open transaction and corrupt it (#75). _tx() serializes via
+        # the StateDB lock and keeps the SELECT + hit-count UPDATE in one transaction.
         key = self._key(model, messages, namespace)
-        row = self._db._conn.execute(
-            "SELECT response_json FROM llm_cache WHERE cache_key = ?", (key,)
-        ).fetchone()
-        if row is None:
-            return None
-        self._db._conn.execute(
-            "UPDATE llm_cache SET hit_count = hit_count + 1, last_hit_at = ? WHERE cache_key = ?",
-            (datetime.now().isoformat(), key),
-        )
-        self._db._conn.commit()
-        return row["response_json"]
+        with self._db._tx() as conn:
+            # Returning inside the `with` is intentional: the contextmanager's __exit__ runs on
+            # return, committing the hit-count UPDATE and releasing the lock for both branches.
+            row = conn.execute(
+                "SELECT response_json FROM llm_cache WHERE cache_key = ?", (key,)
+            ).fetchone()
+            if row is None:
+                return None
+            conn.execute(
+                "UPDATE llm_cache SET hit_count = hit_count + 1, last_hit_at = ? "
+                "WHERE cache_key = ?",
+                (datetime.now().isoformat(), key),
+            )
+            return row["response_json"]
 
     def put(self, model: str, messages: list[dict], response: str, namespace: str = "") -> None:
         key = self._key(model, messages, namespace)
-        self._db._conn.execute(
-            "INSERT OR REPLACE INTO llm_cache (cache_key, model, response_json, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (key, model, response, datetime.now().isoformat()),
-        )
-        self._db._conn.commit()
+        with self._db._tx() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO llm_cache (cache_key, model, response_json, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (key, model, response, datetime.now().isoformat()),
+            )
 
     def clear(self, older_than_days: int | None = None) -> int:
-        if older_than_days is None:
-            cursor = self._db._conn.execute("DELETE FROM llm_cache")
-        else:
-            cutoff = (datetime.now() - timedelta(days=older_than_days)).isoformat()
-            cursor = self._db._conn.execute("DELETE FROM llm_cache WHERE created_at < ?", (cutoff,))
-        self._db._conn.commit()
-        return cursor.rowcount
+        with self._db._tx() as conn:
+            if older_than_days is None:
+                cursor = conn.execute("DELETE FROM llm_cache")
+            else:
+                cutoff = (datetime.now() - timedelta(days=older_than_days)).isoformat()
+                cursor = conn.execute("DELETE FROM llm_cache WHERE created_at < ?", (cutoff,))
+            # Returning inside the `with` commits the DELETE and releases the lock on exit.
+            return cursor.rowcount
 
     def stats(self) -> dict:
-        row = self._db._conn.execute(
-            "SELECT COUNT(*) as total_entries, COALESCE(SUM(hit_count), 0) as total_hits "
-            "FROM llm_cache"
-        ).fetchone()
+        # Read under the StateDB lock for consistency with get/put/clear: a single shared
+        # connection is mutated by other threads under parallel ingest, so even this read goes
+        # through the serialized read path rather than touching _conn directly (#75).
+        with self._db._read() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) as total_entries, COALESCE(SUM(hit_count), 0) as total_hits "
+                "FROM llm_cache"
+            ).fetchone()
         total_entries = row["total_entries"]
         total_hits = row["total_hits"]
         # Each entry represents one cache miss (initial put); hits are subsequent reuses.
