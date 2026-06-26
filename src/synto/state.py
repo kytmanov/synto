@@ -1864,15 +1864,28 @@ class StateDB:
             alias_map.setdefault(row["concept_name"], set()).add(row["alias"])
 
         articles = self.list_articles()
-        for row in self._conn.execute("SELECT name, source_path FROM concepts").fetchall():
-            concept_name = row["name"]
-            source_path = row["source_path"]
-            article = self._match_article_for_concept_v6(
-                concept_name, source_path, articles, alias_map
-            )
-            if article is None:
-                continue
-            self.mark_concept_compile_state(concept_name, [source_path], "compiled")
+        now = datetime.now().isoformat()
+        # mark_concept_compile_state resolves through _ensure_entity_for_name then writes via
+        # _mark_compile_state_for_entity, which INSERTs an entity_id. At this v6 hook that path is
+        # broken: _SCHEMA (run on every open before migrations) has already created concept_labels,
+        # so _ensure_entity_for_name does NOT short-circuit — it mints an entity — but
+        # concept_compile_state is still the name-keyed v6 shape (the entity_id rebuild is v23), so
+        # the INSERT raises "no such column: entity_id" and aborts the whole upgrade. Write the
+        # name-keyed row directly here; v23's rebuild carries it forward onto entity_id.
+        with self._tx():
+            for row in self._conn.execute("SELECT name, source_path FROM concepts").fetchall():
+                concept_name = row["name"]
+                source_path = row["source_path"]
+                article = self._match_article_for_concept_v6(
+                    concept_name, source_path, articles, alias_map
+                )
+                if article is None:
+                    continue
+                self._conn.execute(
+                    "UPDATE concept_compile_state SET status='compiled', compiled_at=?,"
+                    " updated_at=? WHERE concept_name=? AND source_path=?",
+                    (now, now, concept_name, source_path),
+                )
 
         self._refresh_all_raw_compile_statuses()
 
@@ -2303,12 +2316,27 @@ class StateDB:
         lk = _ck(name)
         if not lk:
             return None
+        # The global unique index keeps at most one preferred row per label_key, regardless of
+        # entity status — and a merge-loser KEEPS its preferred row (get_merged_entity_id/unmerge
+        # depend on it). So a hit here can point at a RETIRED entity. Resolve to the live identity:
+        #   - active            → return it.
+        #   - merged (by merge) → chase merged_into to the active winner (the surface now belongs
+        #                         to the winner, which holds this label as an alias).
+        #   - merged (by split, merged_into NULL) → return None: the bare label is now a
+        #                         disambiguation surface with no single owner.
+        # Never return the dead id, and never fall through to mint — minting a preferred row with
+        # this label_key would collide on idx_concept_labels_preferred_global.
         row = self._conn.execute(
-            "SELECT entity_id FROM concept_labels WHERE label_key = ? AND role = 'preferred'",
+            "SELECT cl.entity_id, ce.status, ce.merged_into FROM concept_labels cl"
+            " JOIN concept_entities ce ON ce.id = cl.entity_id"
+            " WHERE cl.label_key = ? AND cl.role = 'preferred'",
             (lk,),
         ).fetchone()
-        if row:
-            return row[0]
+        if row is not None:
+            entity_id, status, merged_into = row[0], row[1], row[2]
+            if status != "merged":
+                return entity_id
+            return self._active_entity_after_merge(merged_into)
         # Minting a new preferred label: a WEAK alias (extracted/legacy_backfill) with the same
         # label_key on another entity is now a collision (an alias may not equal another entity's
         # preferred label — it would make resolve_label ambiguous and drop the new concept's
@@ -2341,6 +2369,26 @@ class StateDB:
             (entity_id, name, lk, _mk(name), now),
         )
         return entity_id
+
+    def _active_entity_after_merge(self, entity_id: str | None) -> str | None:
+        """Follow the merged_into chain from entity_id to the first active entity.
+
+        Returns None if the chain dead-ends at a NULL merged_into on a still-merged entity
+        (e.g. a split-retired original, which has no single successor) or hits a cycle.
+        """
+        seen: set[str] = set()
+        current = entity_id
+        while current is not None and current not in seen:
+            seen.add(current)
+            row = self._conn.execute(
+                "SELECT status, merged_into FROM concept_entities WHERE id = ?", (current,)
+            ).fetchone()
+            if row is None:
+                return None
+            if row[0] != "merged":
+                return current
+            current = row[1]
+        return None
 
     # ── Entity identity (feature 45, Phase 1) ─────────────────────────────────
 
@@ -2771,16 +2819,15 @@ class StateDB:
         """Append one row to concept_identity_log. Must be called inside a _tx()."""
         if not self._has_table("concept_identity_log"):
             return
-        import json as _json
 
         self._conn.execute(
             "INSERT INTO concept_identity_log (op, entity_ids, labels, meta, ts)"
             " VALUES (?, ?, ?, ?, ?)",
             (
                 op,
-                _json.dumps(entity_ids),
-                _json.dumps(labels),
-                _json.dumps(meta) if meta else None,
+                json.dumps(entity_ids),
+                json.dumps(labels),
+                json.dumps(meta) if meta else None,
                 datetime.now().isoformat(),
             ),
         )
@@ -2893,6 +2940,23 @@ class StateDB:
                 "UPDATE concept_occurrences SET entity_id=? WHERE entity_id=?",
                 (winner_id, loser_id),
             )
+            # Repoint wiki_articles.entity_id (v24) so that published concept articles
+            # whose title matched the loser continue to carry a live entity_id in
+            # INDEX.json and pack exports rather than a retired "merged" one.
+            # (Articles are title-bound snapshots at publish time; explicit merge
+            # advances the binding for durable identity, matching how source edges
+            # and occurrences are moved.) Record the exact paths repointed so unmerge can
+            # reverse precisely, mirroring sources_moved.
+            articles_repointed = [
+                str(r[0])
+                for r in self._conn.execute(
+                    "SELECT path FROM wiki_articles WHERE entity_id=?", (loser_id,)
+                ).fetchall()
+            ]
+            self._conn.execute(
+                "UPDATE wiki_articles SET entity_id=? WHERE entity_id=?",
+                (winner_id, loser_id),
+            )
             self._conn.execute(
                 "UPDATE rejections SET concept=? WHERE lower(concept)=lower(?)",
                 (winner_name, loser_name),
@@ -2910,10 +2974,14 @@ class StateDB:
             self._conn.execute(
                 "DELETE FROM blocked_concepts WHERE lower(concept)=lower(?)", (loser_name,)
             )
+            # stubs.concept is PRIMARY KEY: if the winner already has a stub row, a plain
+            # rename collides. OR IGNORE skips the collision, then the leftover loser row is
+            # deleted — same collapse pattern as blocked_concepts above.
             self._conn.execute(
-                "UPDATE stubs SET concept=? WHERE lower(concept)=lower(?)",
+                "UPDATE OR IGNORE stubs SET concept=? WHERE lower(concept)=lower(?)",
                 (winner_name, loser_name),
             )
+            self._conn.execute("DELETE FROM stubs WHERE lower(concept)=lower(?)", (loser_name,))
             # knowledge_items has a UNIQUE(name) constraint. If the winner row already
             # exists, renaming the loser would conflict — just delete the loser row.
             winner_ki = self._conn.execute(
@@ -2949,7 +3017,11 @@ class StateDB:
                 "merge",
                 [winner_id, loser_id],
                 labels_snapshot,
-                meta={"sources_moved": loser_sources, "labels_absorbed": labels_absorbed},
+                meta={
+                    "sources_moved": loser_sources,
+                    "labels_absorbed": labels_absorbed,
+                    "articles_repointed": articles_repointed,
+                },
             )
 
         return {
@@ -3097,13 +3169,44 @@ class StateDB:
         ).fetchone()
         return row[0] if row else None
 
+    def _alias_owed_by_other_merge(
+        self, winner_id: str, excluding_loser_id: str, label_key: str
+    ) -> bool:
+        """True if a still-merged loser other than excluding_loser_id contributed label_key.
+
+        Used by unmerge to avoid stripping an absorbed alias that another active merge still owes
+        to the winner. Scans ALL merge rows for this winner (no row cap): a deep curation history
+        must not let an older still-active merge's claim fall outside a fixed scan window, or
+        unmerge would drop the still-owed alias — the exact bug this guard exists to prevent.
+        """
+        if not self._has_table("concept_identity_log"):
+            return False
+
+        rows = self._conn.execute(
+            "SELECT entity_ids, meta FROM concept_identity_log WHERE op='merge'"
+        ).fetchall()
+        for entity_ids_json, meta_json in rows:
+            ids = json.loads(entity_ids_json)
+            if len(ids) != 2 or ids[0] != winner_id or ids[1] == excluding_loser_id:
+                continue
+            row = self._conn.execute(
+                "SELECT status, merged_into FROM concept_entities WHERE id=?", (ids[1],)
+            ).fetchone()
+            if row is None or row[0] != "merged" or row[1] != winner_id:
+                continue
+            meta = json.loads(meta_json) if meta_json else {}
+            if any(_ck(a) == label_key for a in (meta.get("labels_absorbed") or [])):
+                return True
+        return False
+
     def unmerge_entities(self, merged_entity_id: str) -> dict:
         """Reverse the most recent merge whose loser was ``merged_entity_id``.
 
         Restores the loser to active, moves its source edges back off the winner, drops
         the absorbed alias labels from the winner, reseeds the loser's compile state as
-        pending, and re-points occurrences scoped to the restored sources. Identity is
-        recovered from the merge's ``concept_identity_log`` entry.
+        pending, re-points occurrences scoped to the restored sources, and repoints back the
+        exact wiki_articles the merge moved (recorded in meta). Identity is recovered from the
+        merge's ``concept_identity_log`` entry.
 
         Best-effort and reverses exactly ONE merge (the most recent for this loser):
           - a source cited by BOTH winner and loser at merge time collapsed to one winner
@@ -3114,22 +3217,49 @@ class StateDB:
         Raises ValueError if no reversible merge is found for this entity.
         """
         log_entry = None
-        for entry in self.list_identity_log(limit=1000):
-            ids = entry.get("entity_ids") or []
-            if entry.get("op") == "merge" and len(ids) == 2 and ids[1] == merged_entity_id:
-                log_entry = entry
-                break
+        if self._has_table("concept_identity_log"):
+            # Direct unbounded scan (DESC) for the *most recent* merge whose loser matches.
+            # Mirrors the design of _alias_owed_by_other_merge (full WHERE op='merge' scan);
+            # list_identity_log caps at a "recent" window for INDEX export and must not be used
+            # for unmerge discovery (old merges would be invisible despite the entity still being
+            # marked merged and get_merged_entity_id succeeding).
+            rows = self._conn.execute(
+                "SELECT op, entity_ids, labels, meta, ts FROM concept_identity_log "
+                "WHERE op='merge' ORDER BY id DESC"
+            ).fetchall()
+            for op, eids_json, labels_json, meta_json, ts in rows:
+                try:
+                    ids = json.loads(eids_json)
+                except Exception:
+                    continue
+                if len(ids) == 2 and ids[1] == merged_entity_id:
+                    entry: dict = {"op": op, "ts": ts, "entity_ids": ids}
+                    try:
+                        entry["labels"] = json.loads(labels_json) if labels_json else {}
+                    except Exception:
+                        entry["labels"] = {}
+                    if meta_json:
+                        try:
+                            entry["meta"] = json.loads(meta_json)
+                        except Exception:
+                            pass
+                    log_entry = entry
+                    break
         if log_entry is None:
             raise ValueError(f"No merge to reverse for entity {merged_entity_id!r}")
 
         winner_id = log_entry["entity_ids"][0]
         loser_id = merged_entity_id
         labels = log_entry.get("labels") or {}
-        winner_name = labels.get(winner_id) or self.preferred_label_for_entity(winner_id) or ""
+        # Prefer the entity's CURRENT preferred label over the merge-time snapshot: if the winner
+        # was renamed after the merge, the logged name is stale and the name-keyed restore queries
+        # below would match nothing.
+        winner_name = self.preferred_label_for_entity(winner_id) or labels.get(winner_id) or ""
         loser_name = self.preferred_label_for_entity(loser_id) or labels.get(loser_id) or ""
         meta = log_entry.get("meta") or {}
         sources_moved = list(meta.get("sources_moved") or [])
         labels_absorbed = list(meta.get("labels_absorbed") or [])
+        articles_repointed = list(meta.get("articles_repointed") or [])
 
         # The loser must still be merged into this winner.
         row = self._conn.execute(
@@ -3174,11 +3304,25 @@ class StateDB:
                     " WHERE lower(concept_name)=lower(?) AND source_path=?",
                     (loser_name, winner_name, src),
                 )
+            # Repoint back exactly the wiki_articles the merge moved (recorded in meta), so a
+            # loser-owned published article recovers its own live entity_id instead of staying
+            # bound to the winner. Guard on the winner binding so we never steal an article that
+            # was rebound elsewhere after the merge.
+            for art_path in articles_repointed:
+                self._conn.execute(
+                    "UPDATE wiki_articles SET entity_id=? WHERE path=? AND entity_id=?",
+                    (loser_id, art_path, winner_id),
+                )
             # Drop the absorbed alias labels from the winner. The loser kept its own label
             # rows through the merge, so it needs no relabeling.
             for lbl in labels_absorbed:
                 lk = _ck(lbl)
                 if not lk or lk == winner_lk:
+                    continue
+                # Don't drop an alias that another still-merged loser also contributed to this
+                # winner — it is still owed. (merge A→B and C→B both absorbing 'foo': unmerging A
+                # must keep 'foo' because C is still merged into B and maps it.)
+                if self._alias_owed_by_other_merge(winner_id, loser_id, lk):
                     continue
                 self._conn.execute(
                     "DELETE FROM concept_labels WHERE entity_id=? AND role='alias' AND label_key=?",
@@ -3242,7 +3386,6 @@ class StateDB:
         """Return recent identity operations for INDEX.json export."""
         if not self._has_table("concept_identity_log"):
             return []
-        import json as _json
 
         rows = self._conn.execute(
             "SELECT op, entity_ids, labels, meta, ts"
@@ -3253,16 +3396,16 @@ class StateDB:
         for row in rows:
             entry: dict = {"op": row[0], "ts": row[4]}
             try:
-                entry["entity_ids"] = _json.loads(row[1])
+                entry["entity_ids"] = json.loads(row[1])
             except Exception:
                 entry["entity_ids"] = []
             try:
-                entry["labels"] = _json.loads(row[2])
+                entry["labels"] = json.loads(row[2])
             except Exception:
                 entry["labels"] = {}
             if row[3]:
                 try:
-                    entry["meta"] = _json.loads(row[3])
+                    entry["meta"] = json.loads(row[3])
                 except Exception:
                     pass
             result.append(entry)
@@ -3374,7 +3517,6 @@ class StateDB:
             return
         if self._conn.execute("SELECT COUNT(*) FROM concept_identity_log").fetchone()[0]:
             return
-        import json as _json
 
         with self._tx():
             for r in reversed(rows):
@@ -3385,9 +3527,9 @@ class StateDB:
                     " VALUES (?, ?, ?, ?, ?)",
                     (
                         r.get("op"),
-                        _json.dumps(r.get("entity_ids", [])),
-                        _json.dumps(r.get("labels", {})),
-                        _json.dumps(r["meta"]) if r.get("meta") else None,
+                        json.dumps(r.get("entity_ids", [])),
+                        json.dumps(r.get("labels", {})),
+                        json.dumps(r["meta"]) if r.get("meta") else None,
                         r.get("ts") or datetime.now().isoformat(),
                     ),
                 )
@@ -3630,23 +3772,28 @@ class StateDB:
         ).fetchall()
         return [r[0] for r in rows]
 
-    def list_source_concept_seeds(self) -> list[tuple[str, str, list[str]]]:
-        """Return content-hash-guarded source-to-concept links for rebuild seeds."""
+    def list_source_concept_seeds(self) -> list[tuple[str, str, list[tuple[str, str]]]]:
+        """Return content-hash-guarded source-to-concept links for rebuild seeds.
+
+        Each concept entry is (name, entity_id) using the eid bound on the concepts row
+        at extraction/upsert time (repointed on merge to follow identity, like other edges).
+        Callers emit the stored eid directly instead of re-resolving the name at export time.
+        """
         if not self._has_table("raw_notes") or not self._has_table("concepts"):
             return []
         rows = self._conn.execute(
             """
-            SELECT c.source_path, r.content_hash, c.name
+            SELECT c.source_path, r.content_hash, c.name, c.entity_id
             FROM concepts c
             JOIN raw_notes r ON r.path = c.source_path
             ORDER BY lower(c.source_path), c.source_path, lower(c.name), c.name
             """
         ).fetchall()
 
-        grouped: list[tuple[str, str, list[str]]] = []
+        grouped: list[tuple[str, str, list[tuple[str, str]]]] = []
         current_path: str | None = None
         current_hash = ""
-        current_concepts: list[str] = []
+        current_concepts: list[tuple[str, str]] = []
         for row in rows:
             source_path = str(row["source_path"])
             if current_path is not None and source_path != current_path:
@@ -3654,7 +3801,7 @@ class StateDB:
                 current_concepts = []
             current_path = source_path
             current_hash = str(row["content_hash"])
-            current_concepts.append(str(row["name"]))
+            current_concepts.append((str(row["name"]), str(row["entity_id"] or "")))
         if current_path is not None:
             grouped.append((current_path, current_hash, current_concepts))
         return grouped

@@ -167,7 +167,10 @@ def _build_index_payload(config: Config, db: StateDB) -> dict[str, object]:
     articles = [
         {
             "id": record.article_id or "",
-            "entity_id": db.entity_id_for_name(record.title) or "",
+            # Prefer the authoritative entity_id bound on the row (v24 backfill); only fall back to
+            # name resolution when it is NULL. Re-resolving by title emits "" for a homonym/diverged
+            # title even though the row holds a definite id.
+            "entity_id": record.entity_id or db.entity_id_for_name(record.title) or "",
             "name": record.title,
             "path": record.path,
             "summary": None,
@@ -227,9 +230,7 @@ def _list_source_concept_seeds(db: StateDB) -> list[dict[str, object]]:
         {
             "source_path": source_path,
             "content_hash": content_hash,
-            "concepts": [
-                {"name": name, "entity_id": db.entity_id_for_name(name) or ""} for name in concepts
-            ],
+            "concepts": [{"name": name, "entity_id": eid} for (name, eid) in concepts],
         }
         for source_path, content_hash, concepts in db.list_source_concept_seeds()
     ]

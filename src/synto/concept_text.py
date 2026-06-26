@@ -68,8 +68,19 @@ def _fold_token(token: str) -> str:
         return token[:-3] + "y"
     if token.endswith("sses"):
         return token[:-2]  # sses -> ss
-    if token.endswith("s") and not (
-        token.endswith("ss") or token.endswith("us") or token.endswith("is")
+    # Strip a plural -s only when the singular stem stays >= 4 chars. This fold drives THREE
+    # consumers: merge-candidate detection (find_match_key_collisions), in-run ingest dedup
+    # (pipeline/ingest.py), and surface resolution (resolve_by_match_key). The >= 4 guard keeps
+    # the User/Users fold while protecting short singular nouns that merely end in s (Lens, Tens,
+    # Buns) from folding onto an unrelated concept (Len, Ten, Bun). Deliberate cost: 4-char
+    # acronym plurals (GPUs/GPU, APIs/API, CPUs/CPU) no longer fold, so they can fragment into
+    # separate concepts. That is accepted because the opposite — folding Lens onto Len — would
+    # let ingest dedup SILENTLY drop one of two distinct concepts (data loss), which is worse
+    # than recoverable fragmentation. See test_match_key_* for the pinned behavior both ways.
+    if (
+        token.endswith("s")
+        and not (token.endswith("ss") or token.endswith("us") or token.endswith("is"))
+        and len(token) - 1 >= 4
     ):
         return token[:-1]
     return token
