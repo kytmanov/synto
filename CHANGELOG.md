@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- Parallel ingest (`pipeline.ingest_parallel`) no longer fails notes with
+  "cannot commit - no transaction is active" / "cannot start a transaction within a
+  transaction": StateDB is now the single serialization point for its shared SQLite
+  connection — a re-entrant lock guards every `_tx()`, and `LLMCache` plus the
+  remaining raw-commit writers (compile-run helpers, source-document upsert, PDF
+  extractor) route through it instead of committing on the connection directly.
 - `synto concept merge` no longer aborts when both concepts have a stub row: the
   name-keyed `stubs` move now collapses on collision instead of hitting a primary-key
   constraint.
