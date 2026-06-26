@@ -133,6 +133,9 @@ def _effective_source_access_mode(
     cached = _effective_mode_cache.get(cache_key)
     if cached is not None:
         return cached
+    # Bare read: the MCP server is read-only and ingest runs in a separate (file-locked) process,
+    # so no in-process writer shares this connection. Result is process-lifetime cached above, so
+    # this need not go through StateDB._read().
     declared = db._conn.execute(
         "SELECT 1 FROM source_documents WHERE license IS NOT NULL LIMIT 1"
     ).fetchone()

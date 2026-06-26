@@ -35,6 +35,7 @@ import inspect
 import json
 import logging
 import sqlite3
+import threading
 import time
 import types
 import uuid
@@ -924,12 +925,43 @@ class DuplicateArticlePathError(SynthesisInsertConflictError):
 
 @_normalizes_db_paths
 class StateDB:
+    """SQLite state store backed by a single Connection shared across threads.
+
+    Threading contract (the connection is opened with check_same_thread=False, so callers — not
+    the driver — are responsible for safe concurrent use):
+
+    - Every write / transaction-control statement (BEGIN/COMMIT/SAVEPOINT, and therefore every
+      INSERT/UPDATE/DELETE) MUST go through ``_tx()``, which holds ``_lock`` for the whole
+      transaction. This is what makes parallel ingest safe (#75): concurrent writers — e.g. the
+      LLM cache on a worker thread vs. checkpoint writes on the main thread — are serialized, so no
+      thread can commit inside another's open transaction.
+    - A read that can run concurrently with a writer MUST use ``_read()`` (same re-entrant lock, no
+      commit). It then serializes against writers — it waits, then reads committed state — rather
+      than racing. Do not assume a bare ``self._conn`` SELECT is safe under concurrency: CPython's
+      sqlite3 Connection shares a statement cache + transaction bookkeeping across threads and
+      releases the GIL inside ``sqlite3_step``.
+    - Bare ``self._conn`` reads are permitted ONLY on single-threaded / main-thread paths (the bulk
+      of query methods here, plus a few external read-only callers). They are not wrapped because no
+      concurrent-reader path exists today and locking every query would tax the common single-thread
+      case for no correctness gain.
+    - The only writes outside ``_tx()`` are the construction/migration bootstrap commits below,
+      which run on the creating thread before any worker thread exists.
+    """
+
     def __init__(self, db_path: Path) -> None:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._tx_depth = 0
+        # The connection is shared across threads (check_same_thread=False) — parallel ingest
+        # runs chunk-analysis workers that write via the LLM cache while the main thread writes
+        # checkpoints. Re-entrant because _tx() nests (savepoints) and StateDB methods call other
+        # _tx() methods on the same thread. Every transaction is serialized through this lock so
+        # no two threads can corrupt the connection's transaction state (#75).
+        self._lock = threading.RLock()
         self._conn.executescript(_SCHEMA)
+        # Construction-only commit: runs on the creating thread before any worker exists, so it is
+        # intentionally outside the _tx()/_lock contract (no concurrency to serialize against yet).
         self._conn.commit()
         self._migrate()
 
@@ -947,6 +979,10 @@ class StateDB:
         self._conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._tx_depth = 0
+        # open_readonly bypasses __init__ (cls.__new__), so _lock must be set here too: a
+        # read-only StateDB can still have an LLMCache attached (stats.py) whose ops route
+        # through _tx(), which acquires this lock.
+        self._lock = threading.RLock()
         return self
 
     def _migrate(self) -> None:
@@ -977,6 +1013,8 @@ class StateDB:
                 self._conn.execute(
                     "INSERT INTO schema_version (id, version) VALUES (1, ?)", (old_version,)
                 )
+            # Migration runs during __init__ on the creating thread; bare commit is intentional
+            # (single-threaded, before workers exist — outside the _tx()/_lock contract).
             self._conn.commit()
 
         # Use ORDER BY rowid DESC LIMIT 1 to be robust against legacy DBs that
@@ -1990,6 +2028,8 @@ class StateDB:
                         "INSERT OR IGNORE INTO concept_aliases (concept_name, alias) VALUES (?, ?)",
                         (name, alias),
                     )
+        # Migration backfill (called only from _migrate during __init__): single-threaded, before
+        # workers exist, so a bare commit outside the _tx()/_lock contract is intentional.
         self._conn.commit()
 
     def _backfill_items_v5(self) -> None:
@@ -2003,6 +2043,8 @@ class StateDB:
                    VALUES (?, 'concept', NULL, 'confirmed', 1.0, ?, ?)""",
                 (name, now, now),
             )
+        # Migration backfill (called only from _migrate during __init__): single-threaded, before
+        # workers exist, so a bare commit outside the _tx()/_lock contract is intentional.
         self._conn.commit()
 
     def close(self) -> None:
@@ -2016,26 +2058,42 @@ class StateDB:
 
     @contextmanager
     def _tx(self):
-        savepoint_name = f"synto_tx_{self._tx_depth}"
-        nested = self._tx_depth > 0
-        self._tx_depth += 1
-        try:
-            if nested:
-                self._conn.execute(f"SAVEPOINT {savepoint_name}")
+        # Held for the whole transaction (depth bookkeeping → yield → finally) so a concurrent
+        # thread's write — e.g. an LLM-cache commit from a parallel-ingest worker — cannot land
+        # inside this transaction and corrupt its state (#75). RLock allows same-thread nesting.
+        with self._lock:
+            savepoint_name = f"synto_tx_{self._tx_depth}"
+            nested = self._tx_depth > 0
+            self._tx_depth += 1
+            try:
+                if nested:
+                    self._conn.execute(f"SAVEPOINT {savepoint_name}")
+                yield self._conn
+                if nested:
+                    self._conn.execute(f"RELEASE SAVEPOINT {savepoint_name}")
+                else:
+                    self._conn.commit()
+            except Exception:
+                if nested:
+                    self._conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name}")
+                    self._conn.execute(f"RELEASE SAVEPOINT {savepoint_name}")
+                else:
+                    self._conn.rollback()
+                raise
+            finally:
+                self._tx_depth -= 1
+
+    @contextmanager
+    def _read(self):
+        """Lock-held read for callers that can run concurrently with a writer.
+
+        Holds ``_lock`` (the same re-entrant lock as ``_tx()``) for the SELECT but never commits,
+        so the read serializes against in-flight transactions — it waits for a writer to finish and
+        then sees committed state — instead of racing on the shared connection. Single-threaded read
+        paths don't need this and use ``self._conn`` directly.
+        """
+        with self._lock:
             yield self._conn
-            if nested:
-                self._conn.execute(f"RELEASE SAVEPOINT {savepoint_name}")
-            else:
-                self._conn.commit()
-        except Exception:
-            if nested:
-                self._conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name}")
-                self._conn.execute(f"RELEASE SAVEPOINT {savepoint_name}")
-            else:
-                self._conn.rollback()
-            raise
-        finally:
-            self._tx_depth -= 1
 
     def _has_table(self, table_name: str) -> bool:
         row = self._conn.execute(
@@ -4239,6 +4297,7 @@ class StateDB:
             )
 
     def _upsert_article_row(self, record: WikiArticleRecord) -> None:
+        """Write one wiki_articles row (must be called inside a _tx)."""
         article_id = self._resolve_article_id(record.path, record.article_id)
         self._conn.execute(
             """INSERT INTO wiki_articles
@@ -4771,13 +4830,13 @@ class StateDB:
         heavy_model: str,
     ) -> None:
         now = datetime.now().isoformat()
-        self._conn.execute(
-            """INSERT OR REPLACE INTO compile_runs
-               (run_ulid, pipeline_json, fast_model, heavy_model, started_at)
-               VALUES (?, ?, ?, ?, ?)""",
-            (run_ulid, pipeline_json, fast_model, heavy_model, now),
-        )
-        self._conn.commit()
+        with self._tx() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO compile_runs
+                   (run_ulid, pipeline_json, fast_model, heavy_model, started_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (run_ulid, pipeline_json, fast_model, heavy_model, now),
+            )
 
     def finish_compile_run(
         self,
@@ -4787,20 +4846,20 @@ class StateDB:
         total_cost_usd: float = 0.0,
     ) -> None:
         now = datetime.now().isoformat()
-        self._conn.execute(
-            """UPDATE compile_runs
-               SET finished_at = ?, article_count = ?, total_tokens = ?, total_cost_usd = ?
-               WHERE run_ulid = ?""",
-            (now, article_count, total_tokens, total_cost_usd, run_ulid),
-        )
-        self._conn.commit()
+        with self._tx() as conn:
+            conn.execute(
+                """UPDATE compile_runs
+                   SET finished_at = ?, article_count = ?, total_tokens = ?, total_cost_usd = ?
+                   WHERE run_ulid = ?""",
+                (now, article_count, total_tokens, total_cost_usd, run_ulid),
+            )
 
     def update_article_compile_run(self, article_path: str, run_ulid: str) -> None:
-        self._conn.execute(
-            "UPDATE wiki_articles SET last_compile_pipeline = ? WHERE path = ?",
-            (run_ulid, article_path),
-        )
-        self._conn.commit()
+        with self._tx() as conn:
+            conn.execute(
+                "UPDATE wiki_articles SET last_compile_pipeline = ? WHERE path = ?",
+                (run_ulid, article_path),
+            )
 
     def get_compile_run(self, run_ulid: str) -> sqlite3.Row | None:
         if not self._has_table("compile_runs"):
@@ -5014,26 +5073,26 @@ class StateDB:
         if biblio is not None:
             meta["bibliographic_metadata"] = biblio.model_dump(exclude_none=True)
 
-        self._conn.execute(
-            """INSERT OR REPLACE INTO source_documents
-               (id, source_type, origin_uri, title, imported_at, raw_hash,
-                normalized_hash, extractor_version, license, redistribution, metadata_json)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                doc.id,
-                getattr(doc, "source_type", "unknown_text"),
-                getattr(doc, "origin_uri", None),
-                getattr(doc, "title", None),
-                imported_at,
-                getattr(doc, "raw_hash", None),
-                getattr(doc, "normalized_hash", None),
-                getattr(doc, "extractor_version", None),
-                getattr(doc, "license", None),
-                getattr(doc, "redistribution", "unknown"),
-                json.dumps(meta) if meta else None,
-            ),
-        )
-        self._conn.commit()
+        with self._tx() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO source_documents
+                   (id, source_type, origin_uri, title, imported_at, raw_hash,
+                    normalized_hash, extractor_version, license, redistribution, metadata_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    doc.id,
+                    getattr(doc, "source_type", "unknown_text"),
+                    getattr(doc, "origin_uri", None),
+                    getattr(doc, "title", None),
+                    imported_at,
+                    getattr(doc, "raw_hash", None),
+                    getattr(doc, "normalized_hash", None),
+                    getattr(doc, "extractor_version", None),
+                    getattr(doc, "license", None),
+                    getattr(doc, "redistribution", "unknown"),
+                    json.dumps(meta) if meta else None,
+                ),
+            )
 
     def get_source_document(self, source_id: str) -> sqlite3.Row | None:
         """Fetch a source document by ID, or None if not found."""

@@ -214,6 +214,11 @@ def extract_pdf(
         final_groups = _split_by_size(heading_groups, max_chars)
 
         segments: list[SourceSegment] = []
+        # Collect DB rows during the loop and persist them in one _tx() afterwards, so the
+        # image file writes below stay outside the connection lock and every DB write goes
+        # through the serialized transaction mechanism (#75) instead of a bare commit().
+        asset_rows: list[tuple] = []
+        segment_rows: list[tuple] = []
         now = datetime.now(UTC).isoformat()
 
         for ordinal, (slug, group_chunks, part_idx) in enumerate(final_groups):
@@ -255,13 +260,7 @@ def extract_pdf(
                         rel_path = f"assets/{source_id}/img-{page}-{img_idx}.{ext}"
                         (vault_root / rel_path).write_bytes(img_bytes)
                         image_refs.append(rel_path)
-                        db._conn.execute(
-                            """INSERT OR REPLACE INTO generated_assets
-                               (path, source_id, asset_type, master_path,
-                                created_at, referenced_by_json)
-                               VALUES (?, ?, 'image', ?, ?, '[]')""",
-                            (rel_path, source_id, str(path), now),
-                        )
+                        asset_rows.append((rel_path, source_id, str(path), now))
 
             # Equations: collect per chunk, preserving original page number for ref keys
             eq_refs: list[str] = []
@@ -289,11 +288,7 @@ def extract_pdf(
             if eq_refs:
                 extra["equation_refs"] = eq_refs
 
-            db._conn.execute(
-                """INSERT OR REPLACE INTO source_segments
-                   (id, identity, ordinal, source_id, structural_locator, content_hash,
-                    text, section_path_json, page_start, page_end, metadata_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?)""",
+            segment_rows.append(
                 (
                     seg_id,
                     identity,
@@ -305,10 +300,26 @@ def extract_pdf(
                     page_range[0],
                     page_range[1],
                     json.dumps(extra) if extra else None,
-                ),
+                )
             )
 
-        db._conn.commit()
+        with db._tx() as conn:
+            if asset_rows:
+                conn.executemany(
+                    """INSERT OR REPLACE INTO generated_assets
+                       (path, source_id, asset_type, master_path,
+                        created_at, referenced_by_json)
+                       VALUES (?, ?, 'image', ?, ?, '[]')""",
+                    asset_rows,
+                )
+            if segment_rows:
+                conn.executemany(
+                    """INSERT OR REPLACE INTO source_segments
+                       (id, identity, ordinal, source_id, structural_locator, content_hash,
+                        text, section_path_json, page_start, page_end, metadata_json)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?)""",
+                    segment_rows,
+                )
         return segments
     finally:
         fitz_doc.close()

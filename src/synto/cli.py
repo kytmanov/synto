@@ -2879,6 +2879,8 @@ def _render_identity_section(config, db, reconcile: bool) -> None:
     from .pipeline.ingest import _restore_identity_from_index
 
     console.print("\n[bold]Concept identity[/bold]")
+    # Bare reads on a single-threaded CLI command — no worker thread shares this connection, so
+    # these need not go through StateDB._read().
     try:
         active = db._conn.execute(
             "SELECT COUNT(*) FROM concept_entities WHERE status='active'"
@@ -2931,6 +2933,7 @@ def _render_identity_section(config, db, reconcile: bool) -> None:
     if active == 0:
         if reconcile:
             _restore_identity_from_index(config, db)
+            # Single-threaded CLI read (see note above) — no concurrent writer on this connection.
             restored = db._conn.execute(
                 "SELECT COUNT(*) FROM concept_entities WHERE status='active'"
             ).fetchone()[0]
