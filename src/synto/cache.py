@@ -27,6 +27,8 @@ class LLMCache:
         # the StateDB lock and keeps the SELECT + hit-count UPDATE in one transaction.
         key = self._key(model, messages, namespace)
         with self._db._tx() as conn:
+            # Returning inside the `with` is intentional: the contextmanager's __exit__ runs on
+            # return, committing the hit-count UPDATE and releasing the lock for both branches.
             row = conn.execute(
                 "SELECT response_json FROM llm_cache WHERE cache_key = ?", (key,)
             ).fetchone()
@@ -55,6 +57,7 @@ class LLMCache:
             else:
                 cutoff = (datetime.now() - timedelta(days=older_than_days)).isoformat()
                 cursor = conn.execute("DELETE FROM llm_cache WHERE created_at < ?", (cutoff,))
+            # Returning inside the `with` commits the DELETE and releases the lock on exit.
             return cursor.rowcount
 
     def stats(self) -> dict:

@@ -9,6 +9,10 @@ transaction state and fail with `cannot commit - no transaction is active` /
 These tests encode the contract that the connection tolerates concurrent transactions + cache
 writes. They go red if the serialization (the StateDB lock + routing cache writes through
 `_tx()`) is removed.
+
+Every bare ``db._conn`` read in this file is intentional: each runs after the relevant worker
+thread has joined (or on a dedicated, single-writer test DB), so there is no concurrent writer and
+the read does not need to go through ``_read()``.
 """
 
 from __future__ import annotations

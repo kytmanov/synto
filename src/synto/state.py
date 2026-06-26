@@ -946,6 +946,9 @@ class StateDB:
       case for no correctness gain.
     - The only writes outside ``_tx()`` are the construction/migration bootstrap commits below,
       which run on the creating thread before any worker thread exists.
+    - ``_tx()`` and ``_read()`` hold ``_lock`` for the whole yielded block, so callers must not do
+      expensive work or blocking I/O while inside one — it stalls every other thread (including
+      parallel-ingest workers). Keep the block to its DB statements.
     """
 
     def __init__(self, db_path: Path) -> None:
@@ -980,8 +983,10 @@ class StateDB:
         self._conn.row_factory = sqlite3.Row
         self._tx_depth = 0
         # open_readonly bypasses __init__ (cls.__new__), so _lock must be set here too: a
-        # read-only StateDB can still have an LLMCache attached (stats.py) whose ops route
-        # through _tx(), which acquires this lock.
+        # read-only StateDB can have an LLMCache attached (stats.py), whose stats() reads via
+        # _read() under this lock. The mutating cache methods (get/put/clear) are unsupported on a
+        # read-only instance — they would raise "attempt to write a readonly database" — and are
+        # never called on one (only writable _load_db() caches feed the LLM clients).
         self._lock = threading.RLock()
         return self
 
