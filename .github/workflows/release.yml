@@ -41,10 +41,26 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Build release notes from CHANGELOG
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          awk -v ver="$VERSION" '
+            $0 ~ "^## \\[" ver "\\]" {found=1; next}
+            found && /^## \[/ {exit}
+            found {print}
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          PREV=$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)
+          if [ -n "$PREV" ]; then
+            printf '\n**Full Changelog**: %s/compare/%s...%s\n' \
+              "${{ github.server_url }}/${{ github.repository }}" "$PREV" "${GITHUB_REF_NAME}" >> RELEASE_NOTES.md
+          fi
+          test -s RELEASE_NOTES.md  # fail the release if the section is missing
+          echo '----- preview -----'; cat RELEASE_NOTES.md
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
+          body_path: RELEASE_NOTES.md
           make_latest: true
 
   publish:
