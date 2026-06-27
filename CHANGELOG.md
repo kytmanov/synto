@@ -1,43 +1,30 @@
 # Changelog
 
-## [Unreleased]
+## [0.6.1] - 2026-06-27
 
 ### Fixed
 
-- Moving a raw note to a different subfolder inside `raw/` no longer triggers a false
-  "Duplicate … skipping" skip or stale `Source not found` compile warnings: ingest now
-  distinguishes a genuine duplicate (old path still on disk) from a move (old path gone) and
-  rekeys the note's derived state (`raw_notes`, `concepts`, `item_mentions`, `ingest_chunks`,
-  `concept_compile_state`, `concept_occurrences`) to the new path. (Provenance for `synto add`
-  imports relocated into a subfolder is a separate limitation — see #76.)
-- Parallel ingest (`pipeline.ingest_parallel`) no longer fails notes with
-  "cannot commit - no transaction is active" / "cannot start a transaction within a
-  transaction": StateDB is now the single serialization point for its shared SQLite
-  connection — a re-entrant lock guards every `_tx()`, and `LLMCache` plus the
-  remaining raw-commit writers (compile-run helpers, source-document upsert, PDF
-  extractor) route through it instead of committing on the connection directly.
-- `synto concept merge` no longer aborts when both concepts have a stub row: the
-  name-keyed `stubs` move now collapses on collision instead of hitting a primary-key
-  constraint.
-- Name-keyed writes (e.g. compile-state marking) for a label whose preferred owner was
-  retired by a merge now resolve to the active winner instead of attaching to the dead
-  entity (and silently vanishing).
-- Upgrades from a schema &lt; 6 vault no longer abort: the v6 backfill wrote the "already
-  compiled" mark for published articles through an entity-keyed path that raised
-  `no such column: entity_id` against the still name-keyed compile-state table; it now writes
-  the name-keyed row directly, preserving the mark (no forced recompile) without crashing.
-- `synto lint --fix` adopting a manual file rename now blesses the old label (parity with
-  `synto concept rename`), so it no longer re-fragments into a new concept on the next
-  ingest.
-- `synto concept unmerge` keeps an absorbed alias that another still-merged concept also
-  contributed, and uses the winner's current label when it was renamed after the merge.
-- Plural/singular concept folding no longer collapses short singular nouns ending in `s`
+- **Moving a raw note between `raw/` subfolders** no longer triggers a false
+  "Duplicate … skipping" or stale `Source not found` warning. Ingest now tells a
+  genuine duplicate from a move and rekeys the note's derived state to the new path.
+  Thanks to @wlewis55 for reporting (#76). (Provenance for `synto add` imports later
+  relocated into a subfolder is a separate, tracked limitation.)
+- **Parallel ingest** (`pipeline.ingest_parallel`) no longer fails notes with
+  "cannot commit / start a transaction": StateDB is now the single serialization point
+  for its shared SQLite connection — every writer routes through a re-entrant-locked
+  `_tx()` instead of committing on the connection directly.
+- **Concept identity & curation** correctness fixes: `concept merge` survives two stub
+  rows and advances a published article's `entity_id` onto the winner; name-keyed writes
+  for a label whose owner was retired now resolve to the live winner; `concept unmerge`
+  keeps a still-shared alias and repoints articles back to the restored concept;
+  `lint --fix` adopting a manual rename blesses the old label like `concept rename`; and
+  the published `INDEX.json` / pack export emit each article's bound `entity_id` rather
+  than re-resolving by name.
+- **Upgrades from a schema &lt; 6 vault** no longer abort: the v6 backfill writes the
+  "already compiled" mark through the name-keyed path, preserving the mark without
+  crashing on a missing `entity_id` column.
+- **Plural/singular folding** no longer collapses short singular nouns ending in `s`
   (e.g. `Lens` no longer folds onto an unrelated `Len`).
-- The published `INDEX.json` and pack export now emit each article's bound `entity_id`
-  rather than re-resolving it by name, which dropped identity for homonym/renamed titles.
-- `synto concept merge` advances a published article's `entity_id` onto the winner so
-  exports never emit a retired id, and `synto concept unmerge` repoints exactly those
-  articles back to the restored concept.
 
 ## [0.6.0] - 2026-06-14
 
