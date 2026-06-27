@@ -1458,12 +1458,20 @@ def ingest_note(
     h = _content_hash(body_for_hash)
 
     # Dedup check
-    existing = db.get_raw_by_hash(h)
-    if existing and existing.path != rel_posix(path, config.vault):
-        log.info("Duplicate of %s, skipping %s", existing.path, path.name)
-        return None
-
     rel_path = rel_posix(path, config.vault)
+    existing = db.get_raw_by_hash(h)
+    if existing and existing.path != rel_path:
+        if (config.vault / existing.path).exists():
+            # Same content at two real paths → genuine duplicate.
+            log.info("Duplicate of %s, skipping %s", existing.path, path.name)
+            return None
+        # Old path is gone → this is a move/rename. Rekey derived state to the new
+        # path, then fall through: the rekeyed row now lives at rel_path and the
+        # already-ingested check below skips if analysis is current, or re-analyzes
+        # if the row was status 'new'/'failed' or the ingest prompt version changed.
+        log.info("Moved %s -> %s, rekeying", existing.path, rel_path)
+        db.rekey_raw_path(existing.path, rel_path)
+
     record = db.get_raw(rel_path)
     current_prompt_version = _ingest_prompt_version(config)
 

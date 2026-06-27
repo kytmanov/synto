@@ -2223,6 +2223,34 @@ class StateDB:
                     (status, error, path),
                 )
 
+    # Every table that keys derived state to a raw note by source_path. Kept in
+    # sync with the live schema by test_state.py::test_rekey_covers_all_source_path_tables.
+    _SOURCE_PATH_TABLES = (
+        "concepts",
+        "item_mentions",
+        "ingest_chunks",
+        "concept_compile_state",
+        "concept_occurrences",
+    )
+
+    def rekey_raw_path(self, old_path: str, new_path: str) -> None:
+        """Move all derived state from old_path to new_path after a raw file is
+        relocated within raw/ (same content, different folder).
+
+        OR REPLACE lets the moved note's state win if a stale row already sits at
+        new_path (rare overwrite-onto-existing case); the displaced state is
+        re-derivable by re-running ingest/compile.
+        """
+        with self._tx():
+            self._conn.execute(
+                "UPDATE OR REPLACE raw_notes SET path=? WHERE path=?", (new_path, old_path)
+            )
+            for table in self._SOURCE_PATH_TABLES:
+                self._conn.execute(
+                    f"UPDATE OR REPLACE {table} SET source_path=? WHERE source_path=?",
+                    (new_path, old_path),
+                )
+
     # ── Concepts ──────────────────────────────────────────────────────────────
 
     def upsert_concepts(self, source_path: str, concept_names: list[str]) -> None:

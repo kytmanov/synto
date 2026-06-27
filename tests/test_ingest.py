@@ -667,6 +667,79 @@ def test_ingest_note_dedup_by_hash(vault, config, db):
     assert client.generate.call_count == 1
 
 
+def _write_raw_sub(vault: Path, relname: str, content: str) -> Path:
+    p = vault / "raw" / relname
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content, encoding="utf-8")
+    return p
+
+
+def test_ingest_note_move_within_raw_rekeys_not_duplicate(vault, config, db):
+    """Moving a note to another subfolder (same content, old path gone) must rekey
+    derived state to the new path, not skip it as a false duplicate (#76). Otherwise
+    the concept source edge keeps pointing at the vanished old path and compile warns
+    'Source not found'."""
+    content = "# Topic\n\nSubstantive body about neural networks and backprop."
+    client = _make_client(_analysis_json(concepts=["Neural Networks"]))
+
+    old = _write_raw_sub(vault, "a/note.md", content)
+    ingest_note(old, config, client, db)
+    assert db.get_sources_for_concept("Neural Networks") == ["raw/a/note.md"]
+
+    # User moves the file to another subfolder (identical content).
+    old.unlink()
+    new = _write_raw_sub(vault, "b/note.md", content)
+    result = ingest_note(new, config, client, db)
+
+    # Content unchanged + already ingested → no re-analysis, but the row and its
+    # source edges now live at the new path.
+    assert result is None
+    assert client.generate.call_count == 1
+    assert db.get_raw("raw/a/note.md") is None
+    rec = db.get_raw("raw/b/note.md")
+    assert rec is not None and rec.status == "ingested"
+    assert db.get_sources_for_concept("Neural Networks") == ["raw/b/note.md"]
+
+
+def test_ingest_note_genuine_duplicate_keeps_original(vault, config, db):
+    """When the original file still exists on disk, a same-content second file is a
+    genuine duplicate and must NOT rekey the original away — the move-vs-duplicate
+    distinction added for #76 must not weaken real dedup."""
+    content = "# Same\n\nIdentical body content here."
+    p1 = _write_raw(vault, "first.md", content)
+    _write_raw(vault, "second.md", content)
+    client = _make_client(_analysis_json())
+    ingest_note(p1, config, client, db)
+    result = ingest_note(vault / "raw" / "second.md", config, client, db)
+
+    assert result is None
+    assert db.get_raw("raw/first.md") is not None  # original untouched (not rekeyed)
+    assert db.get_raw("raw/second.md") is None  # duplicate not tracked
+
+
+def test_ingest_note_move_of_unanalyzed_note_still_analyzes(vault, config, db):
+    """A moved note whose row was never successfully analyzed (status failed/new) must
+    be analyzed at the new path, not silently skipped — this is why rekey falls through
+    to the normal ingest path instead of early-returning (#76)."""
+    content = "# Topic\n\nSubstantive body about quantum computing and qubits."
+    client = _make_client(_analysis_json())
+
+    old = _write_raw_sub(vault, "a/note.md", content)
+    ingest_note(old, config, client, db)
+    db.mark_raw_status("raw/a/note.md", "failed", error="boom")
+    assert client.generate.call_count == 1
+
+    old.unlink()
+    new = _write_raw_sub(vault, "b/note.md", content)
+    result = ingest_note(new, config, client, db)
+
+    assert result is not None  # re-analyzed at the new path
+    assert client.generate.call_count == 2
+    rec = db.get_raw("raw/b/note.md")
+    assert rec is not None and rec.status == "ingested"
+    assert db.get_raw("raw/a/note.md") is None
+
+
 def test_ingest_note_stores_concepts(vault, config, db):
     path = _write_raw(vault, "ml.md", "# ML\n\nNeural networks and backprop.")
     client = _make_client(_analysis_json(concepts=["Neural Networks", "Backpropagation"]))
