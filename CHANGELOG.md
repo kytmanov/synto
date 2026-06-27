@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- Moving a raw note to a different subfolder inside `raw/` no longer triggers a false
+  "Duplicate … skipping" skip or stale `Source not found` compile warnings: ingest now
+  distinguishes a genuine duplicate (old path still on disk) from a move (old path gone) and
+  rekeys the note's derived state (`raw_notes`, `concepts`, `item_mentions`, `ingest_chunks`,
+  `concept_compile_state`, `concept_occurrences`) to the new path. (Provenance for `synto add`
+  imports relocated into a subfolder is a separate limitation — see #76.)
 - Parallel ingest (`pipeline.ingest_parallel`) no longer fails notes with
   "cannot commit - no transaction is active" / "cannot start a transaction within a
   transaction": StateDB is now the single serialization point for its shared SQLite

@@ -822,3 +822,66 @@ def test_open_raises_on_db_newer_than_binary(tmp_path):
 
     with pytest.raises(RuntimeError, match="newer than this synto binary"):
         StateDB(db_path)
+
+
+def test_rekey_raw_path_moves_all_derived_state(db):
+    """Moving a raw note within raw/ must carry every source_path-keyed table to the
+    new path, so compile resolves sources after a folder move instead of warning
+    'Source not found' (#76)."""
+    old, new = "raw/a/note.md", "raw/b/note.md"
+    now = "2026-06-26T00:00:00"
+    db.upsert_raw(RawNoteRecord(path=old, content_hash="h1", status="ingested"))
+    conn = db._conn
+    conn.execute(
+        "INSERT INTO concepts (entity_id, source_path, name) VALUES (?,?,?)",
+        ("e1", old, "Neural Networks"),
+    )
+    conn.execute(
+        "INSERT INTO item_mentions (item_name, source_path, mention_text, evidence_level) "
+        "VALUES (?,?,?,?)",
+        ("Backprop", old, "a mention", "explicit"),
+    )
+    conn.execute(
+        "INSERT INTO ingest_chunks (source_path, content_hash, chunk_index, chunk_count, "
+        "chunk_size, checkpoint_schema, result_json, created_at, updated_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (old, "h1", 0, 1, 1000, 1, "{}", now, now),
+    )
+    conn.execute(
+        "INSERT INTO concept_compile_state "
+        "(concept_name, source_path, status, updated_at, entity_id) VALUES (?,?,?,?,?)",
+        ("Neural Networks", old, "pending", now, "e1"),
+    )
+    conn.execute(
+        "INSERT INTO concept_occurrences (concept_name, source_path) VALUES (?,?)",
+        ("Neural Networks", old),
+    )
+    conn.commit()
+
+    db.rekey_raw_path(old, new)
+
+    assert db.get_raw(old) is None
+    assert db.get_raw(new) is not None
+    for table in StateDB._SOURCE_PATH_TABLES:
+        at_old = conn.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE source_path=?", (old,)
+        ).fetchone()[0]
+        at_new = conn.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE source_path=?", (new,)
+        ).fetchone()[0]
+        assert at_old == 0, f"{table} still references the old path"
+        assert at_new == 1, f"{table} was not moved to the new path"
+
+
+def test_rekey_covers_all_source_path_tables(db):
+    """rekey_raw_path must update every table that has a source_path column. If a
+    future migration adds another such table, this fails until rekey's list is
+    extended — guarding against a silent stale-path blinder (#76)."""
+    conn = db._conn
+    tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+    with_source_path = {
+        t
+        for t in tables
+        if any(col[1] == "source_path" for col in conn.execute(f"PRAGMA table_info({t})"))
+    }
+    assert with_source_path == set(StateDB._SOURCE_PATH_TABLES)
