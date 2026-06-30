@@ -5,9 +5,25 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from synto import openai_compat_client
 from synto.config import Config
 from synto.ollama_client import OllamaClient
 from synto.state import StateDB
+
+
+@pytest.fixture(autouse=True)
+def _no_client_backoff(monkeypatch):
+    """Zero out the transport-retry backoff so error-path tests don't wait ~31s.
+
+    Patches the delay *constant*, not `time.sleep` — `<module>.time` is the shared `time`
+    module singleton, so no-oping its `sleep` would break every timing-sensitive test in the
+    suite (e.g. the watcher's real debounce sleeps). The shared `post_with_transport_retry`
+    helper lives in `openai_compat_client` and reads this constant, so one patch covers the
+    retry path for every client. Same length keeps the attempt count (and exhaustion-test
+    call counts) unchanged.
+    """
+    zeroed = (0.0,) * len(openai_compat_client._CONNECTION_RETRY_DELAYS)
+    monkeypatch.setattr(openai_compat_client, "_CONNECTION_RETRY_DELAYS", zeroed)
 
 
 @pytest.fixture

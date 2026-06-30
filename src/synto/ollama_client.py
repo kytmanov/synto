@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 
 import httpx
 
-from .openai_compat_client import LLMError, LLMTruncatedError
+from .openai_compat_client import LLMError, LLMTruncatedError, post_with_transport_retry
 
 if TYPE_CHECKING:
     from .cache import LLMCache
@@ -124,7 +124,9 @@ class OllamaClient:
             payload["format"] = format
         t0 = time.monotonic()
         try:
-            resp = self._client.post(f"{self.base_url}/api/generate", json=payload)
+            resp = post_with_transport_retry(
+                self._client, f"{self.base_url}/api/generate", payload, provider_name="ollama"
+            )
             resp.raise_for_status()
         except httpx.ConnectError:
             self._last_stats = {"latency_ms": int((time.monotonic() - t0) * 1000)}
@@ -137,6 +139,11 @@ class OllamaClient:
             raise OllamaError(
                 f"Ollama HTTP error: {e.response.status_code} {e.response.text}"
             ) from e
+        except httpx.RequestError as e:
+            # Transport drop (e.g. RemoteProtocolError) that survived the bounded retry.
+            # Without this arm it would escape Ollama-client code unwrapped.
+            self._last_stats = {"latency_ms": int((time.monotonic() - t0) * 1000)}
+            raise OllamaError(f"Ollama connection error: {e}") from e
         body = resp.json()
         self._last_stats = {
             "latency_ms": int((time.monotonic() - t0) * 1000),
@@ -175,13 +182,18 @@ class OllamaClient:
         if not texts:
             return []
         try:
-            resp = self._client.post(
+            resp = post_with_transport_retry(
+                self._client,
                 f"{self.base_url}/api/embed",
-                json={"model": model, "input": texts},
+                {"model": model, "input": texts},
+                provider_name="ollama",
             )
             resp.raise_for_status()
         except httpx.ConnectError:
             raise OllamaError(_STARTUP_HINT)
+        except httpx.RequestError as e:
+            # Transport drop that survived the bounded retry — wrap like the generate path.
+            raise OllamaError(f"Ollama connection error: {e}") from e
         return resp.json()["embeddings"]
 
     def embed(self, text: str, model: str = "nomic-embed-text") -> list[float]:
