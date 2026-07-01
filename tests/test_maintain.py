@@ -292,6 +292,45 @@ def test_normalize_published_alias_links_skips_canonical(config, db):
     assert body_before == body_after
 
 
+def test_normalize_published_alias_links_resyncs_content_hash(config, db):
+    """Rewriting alias links in a published article must keep its DB content_hash current.
+
+    Regression for #83: the normalize pass rewrote the body but left the stored hash
+    stale, so the next `compile` mistook the machine rewrite for a manual edit.
+    """
+    from synto.models import WikiArticleRecord
+    from synto.pipeline.compile import _content_hash
+
+    canonical = "Program Counter"
+    _write_article(config, canonical, "## Body\n\nHolds the next instruction address.")
+    db.upsert_aliases(canonical, ["PC"])
+
+    other = config.wiki_dir / "Other Article.md"
+    post = fm_lib.Post(
+        "[[PC]] is important.", title="Other Article", status="published", tags=[], sources=[]
+    )
+    atomic_write(other, fm_lib.dumps(post))
+    rel = str(other.relative_to(config.vault))
+    _, body_before = parse_note(other)
+    db.upsert_article(
+        WikiArticleRecord(
+            path=rel,
+            title="Other Article",
+            sources=[],
+            content_hash=_content_hash(body_before),
+            status="published",
+        )
+    )
+
+    modified = normalize_published_alias_links(config, db)
+    assert modified >= 1
+
+    _, body_after = parse_note(other)
+    art = db.get_article(rel)
+    assert art is not None
+    assert art.content_hash == _content_hash(body_after)
+
+
 def test_normalize_published_alias_links_dry_run(config, db):
     _write_article(config, "Arithmetic Logic Unit", "## Body\n\nContent.")
     db.upsert_aliases("Arithmetic Logic Unit", ["ALU"])

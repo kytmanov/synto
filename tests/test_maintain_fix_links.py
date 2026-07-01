@@ -369,6 +369,120 @@ def test_fix_broken_links_preserves_punctuation_before_dangling_bracket(config, 
     assert "[[Yahoo]]" not in body
 
 
+def test_fix_broken_links_resyncs_content_hash(config, db):
+    """A machine link-rewrite must not make compile treat the article as manually edited.
+
+    Regression for #83: fix_broken_links rewrote the published body but left the DB
+    content_hash reflecting the pre-rewrite body, so the next `compile` saw
+    on-disk-hash != DB-hash and skipped the concept as 'manually edited'. The stored
+    hash must track the body the writer actually left on disk.
+    """
+    from synto.models import WikiArticleRecord
+    from synto.pipeline.compile import _content_hash
+
+    canonical = "Machine Learning"
+    _write_article(config, canonical, "## Body\n\nContent.")
+    db.upsert_aliases(canonical, ["ML"])
+
+    article = config.wiki_dir / "Test Article.md"
+    post = fm_lib.Post(
+        "See [[ML]] for details.", title="Test Article", status="published", tags=[], sources=[]
+    )
+    atomic_write(article, fm_lib.dumps(post))
+    rel = str(article.relative_to(config.vault))
+    # Register the article as if freshly published: DB hash == on-disk body hash.
+    _, body_before = parse_note(article)
+    db.upsert_article(
+        WikiArticleRecord(
+            path=rel,
+            title="Test Article",
+            sources=[],
+            content_hash=_content_hash(body_before),
+            status="published",
+        )
+    )
+
+    issues = [
+        LintIssue(
+            path=rel,
+            issue_type="broken_link",
+            description="[[ML]] not found",
+            suggestion="Fix link",
+        )
+    ]
+    report = fix_broken_links(config, db, issues)
+    assert report.repaired == 1
+
+    _, body_after = parse_note(article)
+    art = db.get_article(rel)
+    assert art is not None
+    # The stored hash tracks the rewritten body, so compile's manual-edit guard sees no drift …
+    assert art.content_hash == _content_hash(body_after)
+    # … yet remains a faithful fingerprint: a subsequent *real* manual edit is still detected
+    # (the guard is not disabled by a stale/blank hash).
+    assert art.content_hash and art.content_hash != _content_hash(body_after + "\n\nmanual edit")
+
+
+def test_fix_broken_links_preserves_synthesis_kind(config, db):
+    """Repairing a link inside a synthesis page must not demote it to kind='concept'.
+
+    Regression for review Issue 3: the shared _update_article_hash rebuilt a partial
+    WikiArticleRecord, and the upsert clobbered kind/question_hash from the record's defaults —
+    so a synthesis page with a repairable link lost its synthesis identity and provenance.
+    """
+    from synto.models import WikiArticleRecord
+    from synto.pipeline.compile import _content_hash
+
+    canonical = "Machine Learning"
+    _write_article(config, canonical, "## Body\n\nContent.")
+    db.upsert_aliases(canonical, ["ML"])
+
+    synth_dir = config.wiki_dir / "synthesis"
+    synth_dir.mkdir(parents=True, exist_ok=True)
+    synth = synth_dir / "Topic.md"
+    post = fm_lib.Post(
+        "Discusses [[ML]] at length.",
+        title="Topic",
+        status="published",
+        kind="synthesis",
+        question_hash="qh123",
+        tags=[],
+        sources=[],
+    )
+    atomic_write(synth, fm_lib.dumps(post))
+    rel = str(synth.relative_to(config.vault))
+    _, body_before = parse_note(synth)
+    db.upsert_article(
+        WikiArticleRecord(
+            path=rel,
+            title="Topic",
+            sources=[],
+            content_hash=_content_hash(body_before),
+            status="published",
+            kind="synthesis",
+            question_hash="qh123",
+        )
+    )
+
+    issues = [
+        LintIssue(
+            path=rel,
+            issue_type="broken_link",
+            description="[[ML]] not found",
+            suggestion="Fix link",
+        )
+    ]
+    report = fix_broken_links(config, db, issues)
+    assert report.repaired == 1
+
+    art = db.get_article(rel)
+    assert art is not None
+    assert art.kind == "synthesis"  # not demoted to "concept"
+    assert art.question_hash == "qh123"  # provenance intact
+    _, body_after = parse_note(synth)
+    assert art.content_hash == _content_hash(body_after)
+
+
 def test_fix_broken_links_targets_sanitized_stem_not_title(config, db):
     """A title with filename-forbidden chars must be linked by its stem, not the raw title.
 

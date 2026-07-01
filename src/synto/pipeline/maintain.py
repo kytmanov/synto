@@ -10,6 +10,7 @@ Used by `synto maintain` to:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from dataclasses import dataclass, field
@@ -49,6 +50,29 @@ _CONCEPT_MERGE_THRESHOLD = 0.7
 _WIKILINK_REPAIR_RE = re.compile(r"\[\[([^\]|#]+?)(?:#([^\]|]*))?(?:\|([^\]]*))?\]\]")
 
 
+def _ondisk_body_hash(path: Path) -> str:
+    """SHA256 of a file's body as it round-trips on disk (frontmatter strips the trailing
+    newline). Hashing the re-read body — not the in-memory one — keeps the stored hash equal to
+    what compile/lint recompute via parse_note, so a machine-written page is never mistaken for a
+    manual edit (#83)."""
+    _, ondisk = parse_note(path)
+    return hashlib.sha256(ondisk.encode()).hexdigest()
+
+
+def _safe_ondisk_body_hash(path: Path) -> str:
+    """Like _ondisk_body_hash but never raises. On parse failure (e.g. a corrupt lingering stub the
+    tool did not just write) it logs and returns "" — the #83 blank placeholder, treated as
+    regenerable by every manual-edit guard — so the caller can still record the reactivated entity's
+    row instead of aborting the identity op."""
+    try:
+        return _ondisk_body_hash(path)
+    except Exception as exc:
+        log.warning(
+            "could not reparse %s for content_hash; recording blank (regenerable) — %s", path, exc
+        )
+        return ""
+
+
 @dataclass
 class FixReport:
     repaired: int = 0
@@ -79,7 +103,7 @@ def fix_broken_links(
     # Resolve links against lint's authoritative index (concept stems/titles, wiki-relative paths,
     # drafts, and unambiguous aliases) so this repair never diverges from what lint accepts as
     # valid — a second, narrower resolver here is what previously corrupted path-style links.
-    from .lint import _build_title_index
+    from .lint import _build_title_index, _write_fixed_note
 
     title_index = _build_title_index(config, db)
 
@@ -169,7 +193,9 @@ def fix_broken_links(
                 for old, new in repaired_in_file:
                     log.info("dry-run: would rewrite %s → %s in %s", old, new, rel_path)
             else:
-                write_note(page, meta, body)
+                # Persist the rewritten body's hash too, else the next compile mistakes this
+                # machine rewrite for a manual edit (#83). Mirrors _rewrite_inbound_links below.
+                _write_fixed_note(page, rel_path, meta, body, db)
             for old, new in repaired_in_file:
                 report.repaired += 1
                 report.repaired_links.append((rel_path, old, new))
@@ -191,6 +217,8 @@ def normalize_published_alias_links(
 
     Only unambiguous alias rewrites are applied. Returns number of files modified.
     """
+    from .lint import _write_fixed_note
+
     alias_map = db.list_alias_map()
     if not alias_map:
         return 0
@@ -212,7 +240,9 @@ def normalize_published_alias_links(
         if dry_run:
             log.info("dry-run: would normalize alias links in %s", path.name)
         else:
-            write_note(path, meta, new_body)
+            # Keep the DB content_hash in sync with the rewritten body (#83), so a later
+            # compile doesn't read this normalization as a manual edit.
+            _write_fixed_note(path, str(path.relative_to(config.vault)), meta, new_body, db)
             log.info("Normalized alias links in %s", path.name)
         modified += 1
 
@@ -997,13 +1027,17 @@ def split_concept(
                 body,
             )
             log.info("split: created stub %s", stub_path.name)
+        # Persist the real on-disk body hash, not "" — the primary sense carries the original
+        # body, so a "" hash would make the next compile/lint flag this machine-written stub as
+        # manually edited/stale (#83). Also runs for a pre-existing stub: we record on-disk
+        # reality (split targets have no manual-edit gate, unlike the original article).
         report.senses.append({"name": new_name, "path": str(stub_path.relative_to(config.vault))})
         db.upsert_article(
             WikiArticleRecord(
                 path=str(stub_path.relative_to(config.vault)),
                 title=new_name,
                 sources=sense["sources"],
-                content_hash="",
+                content_hash=_safe_ondisk_body_hash(stub_path),
                 status="draft",
             )
         )
@@ -1104,18 +1138,35 @@ def unmerge_concept(config: Config, db: StateDB, merged_name: str) -> UnmergeRep
 
     # Recreate a stub so the reactivated entity has a page again (next compile fills it).
     stub_path = config.wiki_dir / f"{sanitize_filename(result['loser'])}.md"
+    rel_stub = str(stub_path.relative_to(config.vault))
     if not stub_path.exists():
         write_note(stub_path, {"title": result["loser"]}, "")
-        report.stub_path = str(stub_path.relative_to(config.vault))
+        log.info("unmerge: recreated stub %s", stub_path.name)
+    # Ensure the reactivated entity has a tracked row even when the stub file already existed
+    # (lingering file / prior partial failure): merge deleted the loser's row, so without this
+    # the reactivated entity would have a page but no article row. Do the upsert outside the
+    # existence guard — but never clobber a *different* concept that sanitizes to the same
+    # filename (upsert keys on path, so a homonym/disambiguation page could be overwritten and
+    # hashed to the wrong body). Store the real on-disk hash, not "" (else lint flags stale, #83).
+    existing_row = db.get_article(rel_stub)
+    if existing_row is None or existing_row.title.casefold() == result["loser"].casefold():
+        report.stub_path = rel_stub
         db.upsert_article(
             WikiArticleRecord(
-                path=report.stub_path,
+                path=rel_stub,
                 title=result["loser"],
                 sources=db.get_sources_for_concept(result["loser"]),
-                content_hash="",
+                content_hash=_safe_ondisk_body_hash(stub_path),
                 status="draft",
             )
         )
-        log.info("unmerge: recreated stub %s", stub_path.name)
+    else:
+        log.warning(
+            "unmerge: %s already tracked as concept %r; leaving it untouched instead of "
+            "overwriting with the reactivated %r stub row",
+            rel_stub,
+            existing_row.title,
+            result["loser"],
+        )
 
     return report

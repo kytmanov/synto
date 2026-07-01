@@ -515,7 +515,10 @@ def _update_existing_synthesis(
                 path=path,
                 duplicate_detected=duplicate_detected,
             ) from exc
-        if existing.content_hash != _body_hash(existing_body):
+        # A blank content_hash is a "not yet hashed" placeholder, never a manual edit (an empty
+        # body still hashes to a non-empty digest) — treat it as regenerable, matching compile
+        # and lint's manual-edit guards (#83).
+        if existing.content_hash and existing.content_hash != _body_hash(existing_body):
             raise SynthesisManualEditConflictError(
                 f"Existing synthesis at {path} was manually edited; refusing to overwrite.",
                 path=path,

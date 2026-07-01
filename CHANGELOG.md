@@ -4,6 +4,22 @@
 
 ### Fixed
 
+- **`compile` no longer reports machine-generated concepts as "manually edited".** When
+  `synto maintain --fix` repaired broken links or normalized alias links in a published
+  article, it rewrote the article body on disk but left the stored `content_hash`
+  pointing at the old body. The next `compile` then read the mismatch as a hand edit and
+  skipped the concept (`Skipping '…' — manually edited`), forcing a per-article
+  `--force`. These maintenance passes now re-persist the hash of the body they actually
+  wrote, so only genuine manual edits are protected. The `concept split` and
+  `concept unmerge` stubs got the same fix, `lint` no longer reports a freshly
+  machine-written stub as "stale", and `compile`, `lint`, and `query --synthesize`
+  update-in-place now all treat a blank `content_hash` as regenerable rather than edited.
+  `concept unmerge` also re-records the reactivated entity's article row even when its page
+  file is still on disk, without ever overwriting an unrelated concept that shares the same
+  filename. If re-reading a file right after writing it ever fails, the maintenance passes
+  now update the hash best-effort and identity ops still record the entity's row, instead of
+  leaving a stale hash or aborting the run. Thanks to the reporter (#83).
+
 - **Transient connection drops no longer abort a whole note.** A server that closes the
   HTTP connection mid-request (`Server disconnected without sending a response.`,
   connection reset) is now retried with bounded exponential backoff at every LLM client,

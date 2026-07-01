@@ -347,6 +347,181 @@ def test_unmerge_concept_recreates_stub(tmp_path: Path) -> None:
     assert (vault / "wiki" / "Alpha.md").exists()
 
 
+def test_unmerge_concept_stub_stores_current_content_hash(tmp_path: Path) -> None:
+    """The recreated unmerge stub must store its real on-disk body hash, not "".
+
+    Regression for review Issue 1: a "" placeholder hash makes lint flag the fresh
+    machine-written stub as stale on the next run.
+    """
+    from synto.config import Config
+    from synto.pipeline.compile import _content_hash
+    from synto.pipeline.lint import run_lint
+    from synto.pipeline.maintain import unmerge_concept
+    from synto.vault import parse_note
+
+    vault = tmp_path / "vault"
+    (vault / "raw").mkdir(parents=True)
+    db = StateDB(vault / ".synto" / "state.db")
+    db.upsert_concepts("raw/a.md", ["Alpha"])
+    db.upsert_concepts("raw/b.md", ["Beta"])
+    _article(db, vault, "Alpha")
+    _article(db, vault, "Beta")
+    config = Config.model_validate({"vault": str(vault)})
+
+    db.merge_entities("Beta", "Alpha")
+    alpha_file = vault / "wiki" / "Alpha.md"
+    if alpha_file.exists():
+        alpha_file.unlink()
+
+    unmerge_concept(config, db, "Alpha")
+
+    rel = "wiki/Alpha.md"
+    _, body = parse_note(vault / rel)
+    art = db.get_article(rel)
+    assert art is not None
+    assert art.content_hash == _content_hash(body)
+    result = run_lint(config, db)
+    assert not [i for i in result.issues if i.issue_type == "stale" and i.path == rel]
+
+
+def test_unmerge_concept_records_row_when_stub_file_lingers(tmp_path: Path) -> None:
+    """The loser row must be (re)created even when its page file is still on disk.
+
+    Regression for review Issue 1: the DB upsert used to sit inside `if not stub_path.exists():`,
+    so a lingering loser file (or a partial prior failure) left the reactivated entity with a
+    page but a stale/blank content_hash and no refreshed row — the exact #83 stale-hash symptom.
+    The existing recreate test unlinks the file first, so it never exercised this branch.
+    """
+    from synto.config import Config
+    from synto.pipeline.maintain import _ondisk_body_hash, unmerge_concept
+
+    vault = tmp_path / "vault"
+    (vault / "raw").mkdir(parents=True)
+    db = StateDB(vault / ".synto" / "state.db")
+    db.upsert_concepts("raw/a.md", ["Alpha"])
+    db.upsert_concepts("raw/b.md", ["Beta"])
+    _article(db, vault, "Alpha")  # leaves wiki/Alpha.md on disk with content_hash=""
+    _article(db, vault, "Beta")
+    config = Config.model_validate({"vault": str(vault)})
+
+    db.merge_entities("Beta", "Alpha")
+    rel = "wiki/Alpha.md"
+    assert (vault / rel).exists(), "low-level merge keeps the file; the lingering case we test"
+
+    report = unmerge_concept(config, db, "Alpha")
+
+    assert report.stub_path == rel
+    art = db.get_article(rel)
+    assert art is not None
+    assert art.title == "Alpha"
+    # Row refreshed to the real on-disk hash (not the "" placeholder left by _article).
+    assert art.content_hash == _ondisk_body_hash(vault / rel)
+
+
+def test_safe_ondisk_body_hash_returns_blank_on_parse_failure(tmp_path: Path, caplog) -> None:
+    """A corrupt file must yield the "" placeholder, not raise, so stub upserts never abort (#83).
+
+    Regression for review Issue 2: both stub-upsert sites hash the on-disk stub, which can be a
+    lingering pre-existing file with hand-corrupted frontmatter. A raise there would leave the
+    reactivated entity without a row. "" is the documented regenerable placeholder.
+    """
+    import logging
+
+    from synto.pipeline.maintain import _safe_ondisk_body_hash
+
+    bad = tmp_path / "corrupt.md"
+    bad.write_text("---\ntitle: [unterminated\n---\nbody")  # unbalanced YAML -> parse raises
+
+    with caplog.at_level(logging.WARNING):
+        result = _safe_ondisk_body_hash(bad)
+
+    assert result == ""
+    assert "content_hash" in caplog.text
+
+
+def test_unmerge_records_row_when_lingering_stub_is_malformed(tmp_path: Path, caplog) -> None:
+    """Unmerge must still record the reactivated entity's row when its lingering page is corrupt.
+
+    Regression for review Issue 2: the stub upsert hashes the on-disk file; if that lingering file
+    is unparsable the old code raised, aborting the identity op and leaving the entity row-less.
+    The row must be created with the "" placeholder (regenerable) and the failure logged.
+    """
+    import logging
+
+    from synto.config import Config
+    from synto.pipeline.maintain import unmerge_concept
+
+    vault = tmp_path / "vault"
+    (vault / "raw").mkdir(parents=True)
+    db = StateDB(vault / ".synto" / "state.db")
+    db.upsert_concepts("raw/a.md", ["Alpha"])
+    db.upsert_concepts("raw/b.md", ["Beta"])
+    _article(db, vault, "Alpha")
+    _article(db, vault, "Beta")
+    config = Config.model_validate({"vault": str(vault)})
+
+    db.merge_entities("Beta", "Alpha")
+    rel = "wiki/Alpha.md"
+    # Corrupt the lingering loser page so the post-merge reparse in the stub upsert raises.
+    (vault / rel).write_text("---\ntitle: [unterminated\n---\nbody")
+
+    with caplog.at_level(logging.WARNING):
+        report = unmerge_concept(config, db, "Alpha")
+
+    assert report.stub_path == rel
+    art = db.get_article(rel)
+    assert art is not None
+    assert art.title == "Alpha"
+    assert art.content_hash == ""  # regenerable placeholder, op did not abort
+    assert "content_hash" in caplog.text
+
+
+def test_unmerge_concept_does_not_clobber_foreign_page(tmp_path: Path) -> None:
+    """Unmerge must not overwrite an unrelated concept that sanitizes to the loser's filename.
+
+    Regression for review Issue 1's fix: since wiki_articles keys on path, blindly upserting the
+    loser row at an occupied path would clobber a homonym/disambiguation page's row and hash it
+    to the wrong body. A different concept already at that path must be left fully untouched.
+    """
+    from synto.config import Config
+    from synto.pipeline.compile import _content_hash
+    from synto.pipeline.maintain import unmerge_concept
+    from synto.vault import parse_note, write_note
+
+    vault = tmp_path / "vault"
+    (vault / "raw").mkdir(parents=True)
+    db = StateDB(vault / ".synto" / "state.db")
+    db.upsert_concepts("raw/a.md", ["Alpha"])
+    db.upsert_concepts("raw/b.md", ["Beta"])
+    _article(db, vault, "Beta")
+    config = Config.model_validate({"vault": str(vault)})
+
+    db.merge_entities("Beta", "Alpha")
+
+    # A different concept (Gamma) already occupies the path Alpha sanitizes to (contrived
+    # collision standing in for a homonym/disambiguation page).
+    rel = "wiki/Alpha.md"
+    foreign = vault / rel
+    write_note(foreign, {"title": "Gamma", "status": "published"}, "Gamma body")
+    _, fbody = parse_note(foreign)
+    fhash = _content_hash(fbody)
+    db.upsert_article(
+        WikiArticleRecord(
+            path=rel, title="Gamma", sources=[], content_hash=fhash, status="published"
+        )
+    )
+
+    report = unmerge_concept(config, db, "Alpha")
+
+    assert report.stub_path == ""  # we refused to claim the foreign page
+    art = db.get_article(rel)
+    assert art is not None
+    assert art.title == "Gamma", "foreign row must not be clobbered to the loser"
+    assert art.content_hash == fhash, "foreign hash must be untouched"
+    _, after = parse_note(foreign)
+    assert after == fbody, "foreign file body must be untouched"
+
+
 # ---------------------------------------------------------------------------
 # split_entity — DB-level
 # ---------------------------------------------------------------------------
@@ -900,6 +1075,48 @@ def test_split_concept_creates_sense_stubs(tmp_path: Path) -> None:
     assert (vault / "wiki" / "Mercury (planet).md").exists()
     assert (vault / "wiki" / "Mercury (element).md").exists()
     assert len(report.senses) == 2
+
+
+def test_split_concept_sense_stubs_store_current_content_hash(tmp_path: Path) -> None:
+    """Each sense stub's stored hash must match the body the split wrote to disk.
+
+    Regression for #83 (same class): registering a sense stub with content_hash="" while
+    writing a real body (the primary sense inherits the original article's body) makes the
+    next compile/lint treat the machine-written stub as manually edited / stale.
+    """
+    from synto.config import Config
+    from synto.pipeline.compile import _content_hash
+    from synto.pipeline.maintain import split_concept
+    from synto.vault import parse_note
+
+    vault = tmp_path / "vault"
+    (vault / "raw").mkdir(parents=True)
+    (vault / "wiki").mkdir(parents=True)
+
+    db = StateDB(vault / ".synto" / "state.db")
+    db.upsert_concepts("raw/planets.md", ["Mercury"])
+    db.upsert_concepts("raw/chem.md", ["Mercury"])
+    _article(db, vault, "Mercury", body="## About\n\nThe original Mercury body.")
+
+    config = Config.model_validate({"vault": str(vault)})
+
+    split_concept(
+        config,
+        db,
+        "Mercury",
+        [
+            ("Mercury (planet)", ["raw/planets.md"]),
+            ("Mercury (element)", ["raw/chem.md"]),
+        ],
+        dry_run=False,
+    )
+
+    for sense_name in ("Mercury (planet)", "Mercury (element)"):
+        rel = f"wiki/{sense_name}.md"
+        _, body = parse_note(vault / rel)
+        art = db.get_article(rel)
+        assert art is not None
+        assert art.content_hash == _content_hash(body)
 
 
 def test_split_concept_rejects_sense_reusing_original_label(tmp_path: Path) -> None:

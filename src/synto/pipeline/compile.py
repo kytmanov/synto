@@ -1051,7 +1051,15 @@ def compile_concepts(
                 existing_meta, existing_body = parse_note(wiki_path)
                 if not force:
                     art_rec = db.get_article(str(wiki_path.relative_to(config.vault)))
-                    if art_rec and art_rec.content_hash != _content_hash(existing_body):
+                    # An empty content_hash is an explicit "not yet hashed" placeholder, never a
+                    # real edit (an empty body still hashes to a non-empty digest). Treat it as
+                    # regenerable so a machine-written page with a stale/blank hash is not
+                    # mistaken for a manual edit (#83).
+                    if (
+                        art_rec
+                        and art_rec.content_hash
+                        and art_rec.content_hash != _content_hash(existing_body)
+                    ):
                         if dry_run:
                             print(f"  [skip] {name} — published article manually edited")
                             continue
@@ -1059,6 +1067,8 @@ def compile_concepts(
                         db.mark_concept_compile_state(name, source_paths, "deferred_manual_edit")
                         continue
             except Exception:
+                # A malformed published article can't be diffed for manual edits; fall through
+                # and let compile regenerate it rather than skip.
                 pass
 
         if force:
