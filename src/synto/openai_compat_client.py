@@ -63,6 +63,65 @@ _TRANSIENT_CLOUD_ERROR_SIGNALS = (
 )
 _TRANSIENT_CLOUD_RETRY_BUDGET_S = 60.0
 
+# Transport-level failures raised *during* a POST (before any HTTP response is read).
+# These bypass every status/body-based retry loop in the clients, so they get their own
+# bounded retry. A dropped/reset connection ("Server disconnected without sending a
+# response", connection reset) is transient — the request usually succeeds on a re-issue.
+# ReadTimeout is deliberately excluded: it means the model is genuinely slow to produce
+# output, and re-issuing would just waste another full timeout window.
+_RETRYABLE_TRANSPORT_ERRORS = (
+    httpx.RemoteProtocolError,
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.ReadError,
+    httpx.WriteError,
+    httpx.PoolTimeout,
+)
+_CONNECTION_RETRY_DELAYS = (1.0, 2.0, 4.0, 8.0, 16.0)  # ~31s total, bounded
+
+
+def post_with_transport_retry(
+    client: httpx.Client,
+    url: str,
+    payload: dict,
+    *,
+    provider_name: str,
+) -> httpx.Response:
+    """POST, retrying transient transport drops (server disconnect / reset) with backoff.
+
+    Shared by the long-running generate/embed paths of all LLM clients so connection
+    resilience is identical across providers. (Health probes intentionally don't use this —
+    they're meant to fail fast.) Re-raises the last exception once the retry budget is
+    exhausted, leaving each client's terminal handler to wrap it into a clean LLMError /
+    OllamaError.
+    """
+    last_exc: Exception | None = None
+    attempts = 1 + len(_CONNECTION_RETRY_DELAYS)  # initial try + one per backoff delay
+    for i in range(attempts):
+        if i:
+            time.sleep(_CONNECTION_RETRY_DELAYS[i - 1])
+        try:
+            return client.post(url, json=payload)
+        except _RETRYABLE_TRANSPORT_ERRORS as e:
+            last_exc = e
+            if i < len(_CONNECTION_RETRY_DELAYS):
+                log.warning(
+                    "%s: transient transport error (%s), retrying %d/%d after %.0fs",
+                    provider_name,
+                    type(e).__name__,
+                    i + 1,
+                    len(_CONNECTION_RETRY_DELAYS),
+                    _CONNECTION_RETRY_DELAYS[i],
+                )
+            else:
+                log.warning(
+                    "%s: transient transport error (%s) persisted after %d retries, giving up",
+                    provider_name,
+                    type(e).__name__,
+                    len(_CONNECTION_RETRY_DELAYS),
+                )
+    raise last_exc  # type: ignore[misc]  # only reached if every attempt raised a transport error
+
 
 class LLMError(Exception):
     """Base error for all LLM client failures (OllamaError inherits from this)."""
@@ -280,7 +339,9 @@ class OpenAICompatClient:
         delay = 1.0
         waited = 0.0
         while True:
-            resp = self._client.post(self._chat_url(), json=payload)
+            resp = post_with_transport_retry(
+                self._client, self._chat_url(), payload, provider_name=self.provider_name
+            )
             if resp.status_code != 429:
                 return resp
             retry_after = resp.headers.get("Retry-After")
@@ -583,9 +644,11 @@ class OpenAICompatClient:
                 f"(Ollama, Together AI, Mistral AI, Fireworks AI, SiliconFlow)."
             )
         try:
-            resp = self._client.post(
+            resp = post_with_transport_retry(
+                self._client,
                 self._api_url("embeddings"),
-                json={"model": model, "input": texts},
+                {"model": model, "input": texts},
+                provider_name=self.provider_name,
             )
             resp.raise_for_status()
         except httpx.HTTPStatusError as e:

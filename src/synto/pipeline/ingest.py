@@ -1568,7 +1568,7 @@ def ingest_note(
             attribution=chunk_attribution,
         )
     except Exception as e:
-        log.error("Analysis failed for %s: %s", path.name, e)
+        log.error("Analysis failed for %s: %s", path.name, e, exc_info=True)
         db.upsert_raw(
             RawNoteRecord(
                 path=rel_path,

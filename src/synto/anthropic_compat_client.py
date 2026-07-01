@@ -17,7 +17,12 @@ from typing import TYPE_CHECKING
 
 import httpx
 
-from .openai_compat_client import LLMBadRequestError, LLMError, LLMTruncatedError
+from .openai_compat_client import (
+    LLMBadRequestError,
+    LLMError,
+    LLMTruncatedError,
+    post_with_transport_retry,
+)
 
 if TYPE_CHECKING:
     from .cache import LLMCache
@@ -84,7 +89,9 @@ class AnthropicCompatClient:
         delay = 1.0
         waited = 0.0
         while True:
-            resp = self._client.post(self._chat_url(), json=payload)
+            resp = post_with_transport_retry(
+                self._client, self._chat_url(), payload, provider_name=self.provider_name
+            )
             if resp.status_code != 429:
                 return resp
             retry_after = resp.headers.get("Retry-After")

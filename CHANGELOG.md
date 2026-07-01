@@ -1,5 +1,19 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- **Transient connection drops no longer abort a whole note.** A server that closes the
+  HTTP connection mid-request (`Server disconnected without sending a response.`,
+  connection reset) is now retried with bounded exponential backoff at every LLM client,
+  so a single blip during a long ingest no longer fails the note and forces a manual
+  re-run from scratch. Genuine slow generation (read timeouts) is deliberately not
+  retried, and HTTP 400 / unparseable output stay per-request failures. Exhausted Ollama
+  transport errors now surface as a clean `OllamaError` instead of a raw httpx exception,
+  and an exhausted ingest failure logs a full traceback. Thanks to @romancone for
+  reporting (#82).
+
 ## [0.6.1] - 2026-06-27
 
 ### Fixed
