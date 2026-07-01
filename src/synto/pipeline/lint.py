@@ -21,7 +21,7 @@ from pathlib import Path
 
 from ..config import Config
 from ..markdown_math import sanitize_obsidian_math
-from ..models import LintIssue, LintResult, WikiArticleRecord
+from ..models import LintIssue, LintResult
 from ..sanitize import sanitize_tag, sanitize_tags
 from ..state import StateDB
 from ..vault import _MEDIA_EXTENSIONS, extract_wikilinks, parse_note, sanitize_filename, write_note
@@ -344,30 +344,30 @@ def _restore_markdown_links(body: str, replacements: list[tuple[str, str]]) -> s
     return body
 
 
-def _update_article_hash(db: StateDB, rel_path: str, meta: dict, body: str) -> None:
+def _update_article_hash(db: StateDB, rel_path: str, new_hash: str) -> None:
+    # model_copy preserves every field (kind, question_hash, synthesis provenance, …); a
+    # partial WikiArticleRecord would blank them, since upsert overwrites those columns from
+    # the record. Only content_hash changes.
     art = db.get_article(rel_path)
-    if art is None:
+    if art is None or art.content_hash == new_hash:
         return
-    db.upsert_article(
-        WikiArticleRecord(
-            path=art.path,
-            title=art.title or str(meta.get("title", Path(rel_path).stem)),
-            sources=art.sources,
-            content_hash=_body_hash(body),
-            status=art.status,
-            created_at=art.created_at,
-            updated_at=art.updated_at,
-            approved_at=art.approved_at,
-            approval_notes=art.approval_notes,
-        )
-    )
+    db.upsert_article(art.model_copy(update={"content_hash": new_hash}))
 
 
 def _write_fixed_note(page: Path, rel_path: str, meta: dict, body: str, db: StateDB) -> None:
-    if str(meta.get("kind", "")).casefold() == "synthesis" or "question_hash" in meta:
+    is_synthesis = str(meta.get("kind", "")).casefold() == "synthesis" or "question_hash" in meta
+    if is_synthesis:
         meta["content_hash"] = _body_hash(body)
     write_note(page, meta, body)
-    _update_article_hash(db, rel_path, meta, body)
+    # Hash the body as it round-trips on disk (frontmatter strips the trailing newline), so the
+    # stored hash matches what compile/lint later recompute via parse_note. Matches the publish/
+    # absorb pattern and is the exact asymmetry #83 was about.
+    _, ondisk = parse_note(page)
+    new_hash = _body_hash(ondisk)
+    if is_synthesis and meta.get("content_hash") != new_hash:
+        meta["content_hash"] = new_hash
+        write_note(page, meta, body)
+    _update_article_hash(db, rel_path, new_hash)
 
 
 def _title_from_file(path: Path) -> str:
@@ -825,7 +825,9 @@ def run_lint(config: Config, db: StateDB, fix: bool = False) -> LintResult:
         # ── Manually edited (stale hash) ──────────────────────────────────────
         db_rec = db_articles.get(rel_path)
         if db_rec and not is_disambiguation:
-            if _body_hash(body) != db_rec.content_hash:
+            # A blank content_hash is a "not yet hashed" placeholder (a real empty body hashes
+            # to a non-empty digest), never a manual edit — same semantics as compile's guard (#83).
+            if db_rec.content_hash and _body_hash(body) != db_rec.content_hash:
                 issues.append(
                     LintIssue(
                         path=rel_path,

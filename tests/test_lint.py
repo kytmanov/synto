@@ -408,6 +408,57 @@ def test_lint_fix_updates_synthesis_frontmatter_hash_for_malformed_latex(vault, 
     assert post.metadata["content_hash"] == _body_hash(post.content)
 
 
+def test_write_fixed_note_hashes_ondisk_body_not_prewrite(vault, config, db):
+    """_write_fixed_note must store the hash of the body as it round-trips on disk.
+
+    Regression for review Issue 4: it previously hashed the pre-write body. A body ending in a
+    newline hashes differently once the frontmatter round-trip strips it, which would
+    re-introduce the #83 stale/manual-edit false positive.
+    """
+    from synto.pipeline.lint import _body_hash, _write_fixed_note
+
+    page = config.wiki_dir / "Alpha.md"
+    body = "Line one.\n\nLine two.\n"  # trailing newline is stripped on read-back
+    write_note(page, {"title": "Alpha", "status": "published"}, body)
+    rel = "wiki/Alpha.md"
+    db.upsert_article(
+        WikiArticleRecord(
+            path=rel, title="Alpha", sources=[], content_hash="old", status="published"
+        )
+    )
+
+    _write_fixed_note(page, rel, {"title": "Alpha", "status": "published"}, body, db)
+
+    _, ondisk = parse_note(page)
+    assert ondisk != body  # the round-trip stripped the trailing newline
+    art = db.get_article(rel)
+    assert art is not None
+    assert art.content_hash == _body_hash(ondisk)
+    assert art.content_hash != _body_hash(body)  # not the pre-write hash
+
+
+def test_blank_content_hash_not_flagged_stale(vault, config, db):
+    """A machine-written stub carrying the placeholder content_hash="" is not a manual edit.
+
+    Regression for review Issue 2: the stale detector compared hashes with no guard, so any row
+    with the documented "" placeholder (unmerge stubs, crash windows) was always reported stale.
+    """
+    _write_page(config, "Placeholder", "Fresh machine body.")
+    db.upsert_article(
+        WikiArticleRecord(
+            path="wiki/Placeholder.md",
+            title="Placeholder",
+            sources=[],
+            content_hash="",
+            status="published",
+        )
+    )
+
+    result = run_lint(config, db)
+    stale = [i for i in result.issues if i.issue_type == "stale" and "Placeholder" in i.path]
+    assert not stale
+
+
 def test_lint_fix_repairs_plain_source_citations(vault, config, db):
     page = _write_page(
         config,

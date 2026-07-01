@@ -347,6 +347,43 @@ def test_unmerge_concept_recreates_stub(tmp_path: Path) -> None:
     assert (vault / "wiki" / "Alpha.md").exists()
 
 
+def test_unmerge_concept_stub_stores_current_content_hash(tmp_path: Path) -> None:
+    """The recreated unmerge stub must store its real on-disk body hash, not "".
+
+    Regression for review Issue 1: a "" placeholder hash makes lint flag the fresh
+    machine-written stub as stale on the next run.
+    """
+    from synto.config import Config
+    from synto.pipeline.compile import _content_hash
+    from synto.pipeline.lint import run_lint
+    from synto.pipeline.maintain import unmerge_concept
+    from synto.vault import parse_note
+
+    vault = tmp_path / "vault"
+    (vault / "raw").mkdir(parents=True)
+    db = StateDB(vault / ".synto" / "state.db")
+    db.upsert_concepts("raw/a.md", ["Alpha"])
+    db.upsert_concepts("raw/b.md", ["Beta"])
+    _article(db, vault, "Alpha")
+    _article(db, vault, "Beta")
+    config = Config.model_validate({"vault": str(vault)})
+
+    db.merge_entities("Beta", "Alpha")
+    alpha_file = vault / "wiki" / "Alpha.md"
+    if alpha_file.exists():
+        alpha_file.unlink()
+
+    unmerge_concept(config, db, "Alpha")
+
+    rel = "wiki/Alpha.md"
+    _, body = parse_note(vault / rel)
+    art = db.get_article(rel)
+    assert art is not None
+    assert art.content_hash == _content_hash(body)
+    result = run_lint(config, db)
+    assert not [i for i in result.issues if i.issue_type == "stale" and i.path == rel]
+
+
 # ---------------------------------------------------------------------------
 # split_entity — DB-level
 # ---------------------------------------------------------------------------
@@ -900,6 +937,48 @@ def test_split_concept_creates_sense_stubs(tmp_path: Path) -> None:
     assert (vault / "wiki" / "Mercury (planet).md").exists()
     assert (vault / "wiki" / "Mercury (element).md").exists()
     assert len(report.senses) == 2
+
+
+def test_split_concept_sense_stubs_store_current_content_hash(tmp_path: Path) -> None:
+    """Each sense stub's stored hash must match the body the split wrote to disk.
+
+    Regression for #83 (same class): registering a sense stub with content_hash="" while
+    writing a real body (the primary sense inherits the original article's body) makes the
+    next compile/lint treat the machine-written stub as manually edited / stale.
+    """
+    from synto.config import Config
+    from synto.pipeline.compile import _content_hash
+    from synto.pipeline.maintain import split_concept
+    from synto.vault import parse_note
+
+    vault = tmp_path / "vault"
+    (vault / "raw").mkdir(parents=True)
+    (vault / "wiki").mkdir(parents=True)
+
+    db = StateDB(vault / ".synto" / "state.db")
+    db.upsert_concepts("raw/planets.md", ["Mercury"])
+    db.upsert_concepts("raw/chem.md", ["Mercury"])
+    _article(db, vault, "Mercury", body="## About\n\nThe original Mercury body.")
+
+    config = Config.model_validate({"vault": str(vault)})
+
+    split_concept(
+        config,
+        db,
+        "Mercury",
+        [
+            ("Mercury (planet)", ["raw/planets.md"]),
+            ("Mercury (element)", ["raw/chem.md"]),
+        ],
+        dry_run=False,
+    )
+
+    for sense_name in ("Mercury (planet)", "Mercury (element)"):
+        rel = f"wiki/{sense_name}.md"
+        _, body = parse_note(vault / rel)
+        art = db.get_article(rel)
+        assert art is not None
+        assert art.content_hash == _content_hash(body)
 
 
 def test_split_concept_rejects_sense_reusing_original_label(tmp_path: Path) -> None:

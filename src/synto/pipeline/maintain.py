@@ -10,6 +10,7 @@ Used by `synto maintain` to:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from dataclasses import dataclass, field
@@ -49,6 +50,15 @@ _CONCEPT_MERGE_THRESHOLD = 0.7
 _WIKILINK_REPAIR_RE = re.compile(r"\[\[([^\]|#]+?)(?:#([^\]|]*))?(?:\|([^\]]*))?\]\]")
 
 
+def _ondisk_body_hash(path: Path) -> str:
+    """SHA256 of a file's body as it round-trips on disk (frontmatter strips the trailing
+    newline). Hashing the re-read body — not the in-memory one — keeps the stored hash equal to
+    what compile/lint recompute via parse_note, so a machine-written page is never mistaken for a
+    manual edit (#83)."""
+    _, ondisk = parse_note(path)
+    return hashlib.sha256(ondisk.encode()).hexdigest()
+
+
 @dataclass
 class FixReport:
     repaired: int = 0
@@ -79,7 +89,7 @@ def fix_broken_links(
     # Resolve links against lint's authoritative index (concept stems/titles, wiki-relative paths,
     # drafts, and unambiguous aliases) so this repair never diverges from what lint accepts as
     # valid — a second, narrower resolver here is what previously corrupted path-style links.
-    from .lint import _build_title_index
+    from .lint import _build_title_index, _write_fixed_note
 
     title_index = _build_title_index(config, db)
 
@@ -169,7 +179,9 @@ def fix_broken_links(
                 for old, new in repaired_in_file:
                     log.info("dry-run: would rewrite %s → %s in %s", old, new, rel_path)
             else:
-                write_note(page, meta, body)
+                # Persist the rewritten body's hash too, else the next compile mistakes this
+                # machine rewrite for a manual edit (#83). Mirrors _rewrite_inbound_links below.
+                _write_fixed_note(page, rel_path, meta, body, db)
             for old, new in repaired_in_file:
                 report.repaired += 1
                 report.repaired_links.append((rel_path, old, new))
@@ -191,6 +203,8 @@ def normalize_published_alias_links(
 
     Only unambiguous alias rewrites are applied. Returns number of files modified.
     """
+    from .lint import _write_fixed_note
+
     alias_map = db.list_alias_map()
     if not alias_map:
         return 0
@@ -212,7 +226,9 @@ def normalize_published_alias_links(
         if dry_run:
             log.info("dry-run: would normalize alias links in %s", path.name)
         else:
-            write_note(path, meta, new_body)
+            # Keep the DB content_hash in sync with the rewritten body (#83), so a later
+            # compile doesn't read this normalization as a manual edit.
+            _write_fixed_note(path, str(path.relative_to(config.vault)), meta, new_body, db)
             log.info("Normalized alias links in %s", path.name)
         modified += 1
 
@@ -997,13 +1013,17 @@ def split_concept(
                 body,
             )
             log.info("split: created stub %s", stub_path.name)
+        # Persist the real on-disk body hash, not "" — the primary sense carries the original
+        # body, so a "" hash would make the next compile/lint flag this machine-written stub as
+        # manually edited/stale (#83). Also runs for a pre-existing stub: we record on-disk
+        # reality (split targets have no manual-edit gate, unlike the original article).
         report.senses.append({"name": new_name, "path": str(stub_path.relative_to(config.vault))})
         db.upsert_article(
             WikiArticleRecord(
                 path=str(stub_path.relative_to(config.vault)),
                 title=new_name,
                 sources=sense["sources"],
-                content_hash="",
+                content_hash=_ondisk_body_hash(stub_path),
                 status="draft",
             )
         )
@@ -1107,12 +1127,14 @@ def unmerge_concept(config: Config, db: StateDB, merged_name: str) -> UnmergeRep
     if not stub_path.exists():
         write_note(stub_path, {"title": result["loser"]}, "")
         report.stub_path = str(stub_path.relative_to(config.vault))
+        # Store the real on-disk body hash, not "" — else lint flags the fresh machine stub
+        # as stale on the next run (#83).
         db.upsert_article(
             WikiArticleRecord(
                 path=report.stub_path,
                 title=result["loser"],
                 sources=db.get_sources_for_concept(result["loser"]),
-                content_hash="",
+                content_hash=_ondisk_body_hash(stub_path),
                 status="draft",
             )
         )
