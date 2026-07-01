@@ -16,6 +16,7 @@ Fix mode (--fix):
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from pathlib import Path
 
@@ -25,6 +26,8 @@ from ..models import LintIssue, LintResult
 from ..sanitize import sanitize_tag, sanitize_tags
 from ..state import StateDB
 from ..vault import _MEDIA_EXTENSIONS, extract_wikilinks, parse_note, sanitize_filename, write_note
+
+log = logging.getLogger(__name__)
 
 _REQUIRED_FIELDS: frozenset[str] = frozenset({"title", "status", "tags"})
 _LOW_CONFIDENCE_THRESHOLD = 0.3
@@ -363,12 +366,22 @@ def _write_fixed_note(page: Path, rel_path: str, meta: dict, body: str, db: Stat
     write_note(page, meta, body)
     # Hash the body as it round-trips on disk (frontmatter strips the trailing newline), so the
     # stored hash matches what compile/lint later recompute via parse_note. Matches the publish/
-    # absorb pattern and is the exact asymmetry #83 was about.
-    _, ondisk = parse_note(page)
-    new_hash = _body_hash(ondisk)
-    if is_synthesis and meta.get("content_hash") != new_hash:
-        meta["content_hash"] = new_hash
-        write_note(page, meta, body)
+    # absorb pattern and is the exact asymmetry #83 was about. If the reparse of the just-written
+    # file fails (transient FS fault), fall back to hashing the intended body so the DB row is still
+    # updated best-effort — leaving the old hash would reintroduce the #83 stale/manual-edit false
+    # positive, and letting it propagate would abort the caller's whole fix pass.
+    try:
+        _, ondisk = parse_note(page)
+        new_hash = _body_hash(ondisk)
+    except Exception as exc:
+        log.warning(
+            "post-write reparse of %s failed; hashing intended body instead — %s", page, exc
+        )
+        new_hash = _body_hash(body)
+    else:
+        if is_synthesis and meta.get("content_hash") != new_hash:
+            meta["content_hash"] = new_hash
+            write_note(page, meta, body)
     _update_article_hash(db, rel_path, new_hash)
 
 

@@ -437,6 +437,45 @@ def test_write_fixed_note_hashes_ondisk_body_not_prewrite(vault, config, db):
     assert art.content_hash != _body_hash(body)  # not the pre-write hash
 
 
+def test_write_fixed_note_survives_post_write_parse_failure(vault, config, db, monkeypatch, caplog):
+    """A reparse fault right after writing must update the row best-effort, not leave a stale hash.
+
+    Regression for review Issue 1: _write_fixed_note reparses the file it just wrote to hash the
+    round-tripped body. If that parse raises (a transient FS fault), the old code skipped the DB
+    update and let the exception abort the caller's whole fix pass — reintroducing the #83
+    stale/manual-edit false positive. The failure must now be logged loudly and the row updated to
+    the intended body's hash instead of the stale one.
+    """
+    import logging
+
+    from synto.pipeline.lint import _body_hash, _write_fixed_note
+
+    page = config.wiki_dir / "Alpha.md"
+    body = "Fixed machine body."
+    write_note(page, {"title": "Alpha", "status": "published"}, body)
+    rel = "wiki/Alpha.md"
+    db.upsert_article(
+        WikiArticleRecord(
+            path=rel, title="Alpha", sources=[], content_hash="old", status="published"
+        )
+    )
+
+    def _boom(_path):
+        raise OSError("transient read failure")
+
+    # A non-synthesis page reparses exactly once (post-write); write_note does not parse.
+    monkeypatch.setattr("synto.pipeline.lint.parse_note", _boom)
+
+    with caplog.at_level(logging.WARNING):
+        _write_fixed_note(page, rel, {"title": "Alpha", "status": "published"}, body, db)
+
+    art = db.get_article(rel)
+    assert art is not None
+    assert art.content_hash == _body_hash(body)  # best-effort fallback, not the stale "old"
+    assert art.content_hash != "old"
+    assert "post-write reparse" in caplog.text
+
+
 def test_blank_content_hash_not_flagged_stale(vault, config, db):
     """A machine-written stub carrying the placeholder content_hash="" is not a manual edit.
 

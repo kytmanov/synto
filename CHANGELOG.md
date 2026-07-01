@@ -16,7 +16,9 @@
   update-in-place now all treat a blank `content_hash` as regenerable rather than edited.
   `concept unmerge` also re-records the reactivated entity's article row even when its page
   file is still on disk, without ever overwriting an unrelated concept that shares the same
-  filename. Thanks to the reporter (#83).
+  filename. If re-reading a file right after writing it ever fails, the maintenance passes
+  now update the hash best-effort and identity ops still record the entity's row, instead of
+  leaving a stale hash or aborting the run. Thanks to the reporter (#83).
 
 - **Transient connection drops no longer abort a whole note.** A server that closes the
   HTTP connection mid-request (`Server disconnected without sending a response.`,

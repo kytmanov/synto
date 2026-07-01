@@ -59,6 +59,20 @@ def _ondisk_body_hash(path: Path) -> str:
     return hashlib.sha256(ondisk.encode()).hexdigest()
 
 
+def _safe_ondisk_body_hash(path: Path) -> str:
+    """Like _ondisk_body_hash but never raises. On parse failure (e.g. a corrupt lingering stub the
+    tool did not just write) it logs and returns "" — the #83 blank placeholder, treated as
+    regenerable by every manual-edit guard — so the caller can still record the reactivated entity's
+    row instead of aborting the identity op."""
+    try:
+        return _ondisk_body_hash(path)
+    except Exception as exc:
+        log.warning(
+            "could not reparse %s for content_hash; recording blank (regenerable) — %s", path, exc
+        )
+        return ""
+
+
 @dataclass
 class FixReport:
     repaired: int = 0
@@ -1023,7 +1037,7 @@ def split_concept(
                 path=str(stub_path.relative_to(config.vault)),
                 title=new_name,
                 sources=sense["sources"],
-                content_hash=_ondisk_body_hash(stub_path),
+                content_hash=_safe_ondisk_body_hash(stub_path),
                 status="draft",
             )
         )
@@ -1142,7 +1156,7 @@ def unmerge_concept(config: Config, db: StateDB, merged_name: str) -> UnmergeRep
                 path=rel_stub,
                 title=result["loser"],
                 sources=db.get_sources_for_concept(result["loser"]),
-                content_hash=_ondisk_body_hash(stub_path),
+                content_hash=_safe_ondisk_body_hash(stub_path),
                 status="draft",
             )
         )

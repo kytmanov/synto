@@ -418,6 +418,64 @@ def test_unmerge_concept_records_row_when_stub_file_lingers(tmp_path: Path) -> N
     assert art.content_hash == _ondisk_body_hash(vault / rel)
 
 
+def test_safe_ondisk_body_hash_returns_blank_on_parse_failure(tmp_path: Path, caplog) -> None:
+    """A corrupt file must yield the "" placeholder, not raise, so stub upserts never abort (#83).
+
+    Regression for review Issue 2: both stub-upsert sites hash the on-disk stub, which can be a
+    lingering pre-existing file with hand-corrupted frontmatter. A raise there would leave the
+    reactivated entity without a row. "" is the documented regenerable placeholder.
+    """
+    import logging
+
+    from synto.pipeline.maintain import _safe_ondisk_body_hash
+
+    bad = tmp_path / "corrupt.md"
+    bad.write_text("---\ntitle: [unterminated\n---\nbody")  # unbalanced YAML -> parse raises
+
+    with caplog.at_level(logging.WARNING):
+        result = _safe_ondisk_body_hash(bad)
+
+    assert result == ""
+    assert "content_hash" in caplog.text
+
+
+def test_unmerge_records_row_when_lingering_stub_is_malformed(tmp_path: Path, caplog) -> None:
+    """Unmerge must still record the reactivated entity's row when its lingering page is corrupt.
+
+    Regression for review Issue 2: the stub upsert hashes the on-disk file; if that lingering file
+    is unparsable the old code raised, aborting the identity op and leaving the entity row-less.
+    The row must be created with the "" placeholder (regenerable) and the failure logged.
+    """
+    import logging
+
+    from synto.config import Config
+    from synto.pipeline.maintain import unmerge_concept
+
+    vault = tmp_path / "vault"
+    (vault / "raw").mkdir(parents=True)
+    db = StateDB(vault / ".synto" / "state.db")
+    db.upsert_concepts("raw/a.md", ["Alpha"])
+    db.upsert_concepts("raw/b.md", ["Beta"])
+    _article(db, vault, "Alpha")
+    _article(db, vault, "Beta")
+    config = Config.model_validate({"vault": str(vault)})
+
+    db.merge_entities("Beta", "Alpha")
+    rel = "wiki/Alpha.md"
+    # Corrupt the lingering loser page so the post-merge reparse in the stub upsert raises.
+    (vault / rel).write_text("---\ntitle: [unterminated\n---\nbody")
+
+    with caplog.at_level(logging.WARNING):
+        report = unmerge_concept(config, db, "Alpha")
+
+    assert report.stub_path == rel
+    art = db.get_article(rel)
+    assert art is not None
+    assert art.title == "Alpha"
+    assert art.content_hash == ""  # regenerable placeholder, op did not abort
+    assert "content_hash" in caplog.text
+
+
 def test_unmerge_concept_does_not_clobber_foreign_page(tmp_path: Path) -> None:
     """Unmerge must not overwrite an unrelated concept that sanitizes to the loser's filename.
 
