@@ -416,10 +416,11 @@ def test_fix_broken_links_resyncs_content_hash(config, db):
     _, body_after = parse_note(article)
     art = db.get_article(rel)
     assert art is not None
-    # The stored hash tracks the rewritten body …
+    # The stored hash tracks the rewritten body, so compile's manual-edit guard sees no drift …
     assert art.content_hash == _content_hash(body_after)
-    # … so compile's manual-edit guard (blank-tolerant) does not fire on this machine rewrite.
-    assert not (art.content_hash and art.content_hash != _content_hash(body_after))
+    # … yet remains a faithful fingerprint: a subsequent *real* manual edit is still detected
+    # (the guard is not disabled by a stale/blank hash).
+    assert art.content_hash and art.content_hash != _content_hash(body_after + "\n\nmanual edit")
 
 
 def test_fix_broken_links_preserves_synthesis_kind(config, db):

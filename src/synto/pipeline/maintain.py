@@ -1124,20 +1124,35 @@ def unmerge_concept(config: Config, db: StateDB, merged_name: str) -> UnmergeRep
 
     # Recreate a stub so the reactivated entity has a page again (next compile fills it).
     stub_path = config.wiki_dir / f"{sanitize_filename(result['loser'])}.md"
+    rel_stub = str(stub_path.relative_to(config.vault))
     if not stub_path.exists():
         write_note(stub_path, {"title": result["loser"]}, "")
-        report.stub_path = str(stub_path.relative_to(config.vault))
-        # Store the real on-disk body hash, not "" — else lint flags the fresh machine stub
-        # as stale on the next run (#83).
+        log.info("unmerge: recreated stub %s", stub_path.name)
+    # Ensure the reactivated entity has a tracked row even when the stub file already existed
+    # (lingering file / prior partial failure): merge deleted the loser's row, so without this
+    # the reactivated entity would have a page but no article row. Do the upsert outside the
+    # existence guard — but never clobber a *different* concept that sanitizes to the same
+    # filename (upsert keys on path, so a homonym/disambiguation page could be overwritten and
+    # hashed to the wrong body). Store the real on-disk hash, not "" (else lint flags stale, #83).
+    existing_row = db.get_article(rel_stub)
+    if existing_row is None or existing_row.title.casefold() == result["loser"].casefold():
+        report.stub_path = rel_stub
         db.upsert_article(
             WikiArticleRecord(
-                path=report.stub_path,
+                path=rel_stub,
                 title=result["loser"],
                 sources=db.get_sources_for_concept(result["loser"]),
                 content_hash=_ondisk_body_hash(stub_path),
                 status="draft",
             )
         )
-        log.info("unmerge: recreated stub %s", stub_path.name)
+    else:
+        log.warning(
+            "unmerge: %s already tracked as concept %r; leaving it untouched instead of "
+            "overwriting with the reactivated %r stub row",
+            rel_stub,
+            existing_row.title,
+            result["loser"],
+        )
 
     return report

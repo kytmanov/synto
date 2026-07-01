@@ -355,6 +355,8 @@ def _update_article_hash(db: StateDB, rel_path: str, new_hash: str) -> None:
 
 
 def _write_fixed_note(page: Path, rel_path: str, meta: dict, body: str, db: StateDB) -> None:
+    # Copy so the synthesis content_hash writes below don't leak back into the caller's dict.
+    meta = dict(meta)
     is_synthesis = str(meta.get("kind", "")).casefold() == "synthesis" or "question_hash" in meta
     if is_synthesis:
         meta["content_hash"] = _body_hash(body)

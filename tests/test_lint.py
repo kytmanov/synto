@@ -685,6 +685,26 @@ def test_not_stale_when_hash_matches(vault, config, db):
     assert not stale
 
 
+def test_write_fixed_note_does_not_mutate_caller_meta(vault, config, db):
+    """_write_fixed_note must not leak its synthesis content_hash write into the caller's dict.
+
+    Regression for review Issue 6: the function mutated the passed `meta` in place, an
+    observable side-effect on the caller's dict. Callers pass a freshly parsed dict today, but
+    the write is unnecessary and future-fragile.
+    """
+    from synto.pipeline.lint import _write_fixed_note
+
+    path = config.synthesis_dir / "Synth.md"
+    config.synthesis_dir.mkdir(parents=True, exist_ok=True)
+    meta = {"title": "Synth", "kind": "synthesis", "question_hash": "abc"}
+    caller_meta = dict(meta)
+
+    _write_fixed_note(path, str(path.relative_to(vault)), caller_meta, "Body.", db)
+
+    assert caller_meta == meta, "caller's meta dict must be unchanged"
+    assert "content_hash" not in caller_meta
+
+
 # ── Invalid tags ─────────────────────────────────────────────────────────────
 
 

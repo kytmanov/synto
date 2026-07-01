@@ -384,6 +384,86 @@ def test_unmerge_concept_stub_stores_current_content_hash(tmp_path: Path) -> Non
     assert not [i for i in result.issues if i.issue_type == "stale" and i.path == rel]
 
 
+def test_unmerge_concept_records_row_when_stub_file_lingers(tmp_path: Path) -> None:
+    """The loser row must be (re)created even when its page file is still on disk.
+
+    Regression for review Issue 1: the DB upsert used to sit inside `if not stub_path.exists():`,
+    so a lingering loser file (or a partial prior failure) left the reactivated entity with a
+    page but a stale/blank content_hash and no refreshed row — the exact #83 stale-hash symptom.
+    The existing recreate test unlinks the file first, so it never exercised this branch.
+    """
+    from synto.config import Config
+    from synto.pipeline.maintain import _ondisk_body_hash, unmerge_concept
+
+    vault = tmp_path / "vault"
+    (vault / "raw").mkdir(parents=True)
+    db = StateDB(vault / ".synto" / "state.db")
+    db.upsert_concepts("raw/a.md", ["Alpha"])
+    db.upsert_concepts("raw/b.md", ["Beta"])
+    _article(db, vault, "Alpha")  # leaves wiki/Alpha.md on disk with content_hash=""
+    _article(db, vault, "Beta")
+    config = Config.model_validate({"vault": str(vault)})
+
+    db.merge_entities("Beta", "Alpha")
+    rel = "wiki/Alpha.md"
+    assert (vault / rel).exists(), "low-level merge keeps the file; the lingering case we test"
+
+    report = unmerge_concept(config, db, "Alpha")
+
+    assert report.stub_path == rel
+    art = db.get_article(rel)
+    assert art is not None
+    assert art.title == "Alpha"
+    # Row refreshed to the real on-disk hash (not the "" placeholder left by _article).
+    assert art.content_hash == _ondisk_body_hash(vault / rel)
+
+
+def test_unmerge_concept_does_not_clobber_foreign_page(tmp_path: Path) -> None:
+    """Unmerge must not overwrite an unrelated concept that sanitizes to the loser's filename.
+
+    Regression for review Issue 1's fix: since wiki_articles keys on path, blindly upserting the
+    loser row at an occupied path would clobber a homonym/disambiguation page's row and hash it
+    to the wrong body. A different concept already at that path must be left fully untouched.
+    """
+    from synto.config import Config
+    from synto.pipeline.compile import _content_hash
+    from synto.pipeline.maintain import unmerge_concept
+    from synto.vault import parse_note, write_note
+
+    vault = tmp_path / "vault"
+    (vault / "raw").mkdir(parents=True)
+    db = StateDB(vault / ".synto" / "state.db")
+    db.upsert_concepts("raw/a.md", ["Alpha"])
+    db.upsert_concepts("raw/b.md", ["Beta"])
+    _article(db, vault, "Beta")
+    config = Config.model_validate({"vault": str(vault)})
+
+    db.merge_entities("Beta", "Alpha")
+
+    # A different concept (Gamma) already occupies the path Alpha sanitizes to (contrived
+    # collision standing in for a homonym/disambiguation page).
+    rel = "wiki/Alpha.md"
+    foreign = vault / rel
+    write_note(foreign, {"title": "Gamma", "status": "published"}, "Gamma body")
+    _, fbody = parse_note(foreign)
+    fhash = _content_hash(fbody)
+    db.upsert_article(
+        WikiArticleRecord(
+            path=rel, title="Gamma", sources=[], content_hash=fhash, status="published"
+        )
+    )
+
+    report = unmerge_concept(config, db, "Alpha")
+
+    assert report.stub_path == ""  # we refused to claim the foreign page
+    art = db.get_article(rel)
+    assert art is not None
+    assert art.title == "Gamma", "foreign row must not be clobbered to the loser"
+    assert art.content_hash == fhash, "foreign hash must be untouched"
+    _, after = parse_note(foreign)
+    assert after == fbody, "foreign file body must be untouched"
+
+
 # ---------------------------------------------------------------------------
 # split_entity — DB-level
 # ---------------------------------------------------------------------------

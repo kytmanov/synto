@@ -422,6 +422,76 @@ def test_synthesis_update_in_place_preserves_fields(vault, config, db):
     assert "confidence" not in meta
 
 
+def test_synthesis_update_in_place_regenerates_when_hash_blank(vault, config, db):
+    """A blank DB content_hash must be regenerable, not misread as a manual edit.
+
+    Regression for review Issue 3: update_in_place compared "" against the real on-disk body
+    hash and always raised SynthesisManualEditConflictError, refusing regeneration — while
+    compile and lint treat a blank hash as a not-yet-hashed placeholder (#83). The manual-edit
+    guard must be disabled by a blank hash consistently across all three stages.
+    """
+    from synto.pipeline.query import _body_hash, _question_hash, _render_synthesis_body
+
+    _make_concept(config, "Alpha")
+    _make_index(config, ["Alpha"])
+    db.upsert_article(
+        WikiArticleRecord(
+            path="wiki/Alpha.md",
+            title="Alpha",
+            sources=[],
+            content_hash="h1",
+            status="published",
+        )
+    )
+
+    qhash = _question_hash("Same question")
+    rendered = _render_synthesis_body("First synthesis.", ["Alpha"])
+    file_text = _build_synthesis_file_text(
+        rendered,
+        title="Synth",
+        question="Same question",
+        source_pages=["Alpha"],
+        source_page_hashes=[{"path": "wiki/Alpha.md", "hash": "aaa"}],
+        question_hash=qhash,
+        content_hash="",
+        created="2025-01-01",
+    )
+    path = config.synthesis_dir / "Synth.md"
+    path.write_text(file_text, encoding="utf-8")
+    # DB row carries the blank legacy placeholder while the on-disk body hashes to a real digest
+    # — the exact mismatch the old guard misread as a manual edit and refused to overwrite.
+    db.upsert_article(
+        WikiArticleRecord(
+            path=str(path.relative_to(vault)),
+            title="Synth",
+            sources=[],
+            content_hash="",
+            status="published",
+            kind="synthesis",
+            question_hash=qhash,
+            synthesis_sources=["wiki/Alpha.md"],
+            synthesis_source_hashes=[["wiki/Alpha.md", "aaa"]],
+        )
+    )
+
+    result = _save_synthesis(
+        config,
+        db,
+        question="Same question",
+        answer="Updated synthesis.",
+        source_pages=["Alpha"],
+        title="Synth",
+        duplicate_strategy="update_in_place",
+    )
+
+    assert result.resolution == "updated_in_place"
+    _, body_text = parse_note(path)
+    assert "Updated synthesis." in body_text
+    art = db.get_article(str(path.relative_to(vault)))
+    assert art is not None
+    assert art.content_hash == _body_hash(_render_synthesis_body("Updated synthesis.", ["Alpha"]))
+
+
 # ── MCP / reader path ─────────────────────────────────────────────────────
 
 

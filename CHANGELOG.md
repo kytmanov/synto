@@ -12,8 +12,11 @@
   `--force`. These maintenance passes now re-persist the hash of the body they actually
   wrote, so only genuine manual edits are protected. The `concept split` and
   `concept unmerge` stubs got the same fix, `lint` no longer reports a freshly
-  machine-written stub as "stale", and both `compile` and `lint` now treat a blank
-  `content_hash` as regenerable rather than edited. Thanks to the reporter (#83).
+  machine-written stub as "stale", and `compile`, `lint`, and `query --synthesize`
+  update-in-place now all treat a blank `content_hash` as regenerable rather than edited.
+  `concept unmerge` also re-records the reactivated entity's article row even when its page
+  file is still on disk, without ever overwriting an unrelated concept that shares the same
+  filename. Thanks to the reporter (#83).
 
 - **Transient connection drops no longer abort a whole note.** A server that closes the
   HTTP connection mid-request (`Server disconnected without sending a response.`,
