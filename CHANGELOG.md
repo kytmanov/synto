@@ -18,11 +18,6 @@ Two reliability fixes for long local runs.
   connection drops retry with bounded backoff at every LLM client instead of failing the
   note. Slow-generation read timeouts and HTTP 400s still fail fast.
 
-### Thanks
-
-Bug reports from [@romancone](https://github.com/romancone) (#82) and
-[@wlewis55](https://github.com/wlewis55) (#83).
-
 ## [0.6.1] - 2026-06-27
 
 ### Fixed
