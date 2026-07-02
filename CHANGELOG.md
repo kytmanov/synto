@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-07-01
+
+Two reliability fixes for long local runs, both from community bug reports: `compile` no
+longer re-flags maintenance-rewritten articles as hand-edited, and a dropped connection
+mid-request is retried instead of failing the whole note.
+
 ### Fixed
 
 - **`compile` no longer reports machine-generated concepts as "manually edited".** When
@@ -18,7 +24,7 @@
   file is still on disk, without ever overwriting an unrelated concept that shares the same
   filename. If re-reading a file right after writing it ever fails, the maintenance passes
   now update the hash best-effort and identity ops still record the entity's row, instead of
-  leaving a stale hash or aborting the run. Thanks to the reporter (#83).
+  leaving a stale hash or aborting the run. Thanks to @wlewis55 for reporting (#83).
 
 - **Transient connection drops no longer abort a whole note.** A server that closes the
   HTTP connection mid-request (`Server disconnected without sending a response.`,
@@ -29,6 +35,11 @@
   transport errors now surface as a clean `OllamaError` instead of a raw httpx exception,
   and an exhausted ingest failure logs a full traceback. Thanks to @romancone for
   reporting (#82).
+
+### Thanks
+
+This release was driven by bug reports from [@romancone](https://github.com/romancone)
+(#82) and [@wlewis55](https://github.com/wlewis55) (#83).
 
 ## [0.6.1] - 2026-06-27
 

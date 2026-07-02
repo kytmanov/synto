@@ -1,6 +1,6 @@
 [project]
 name = "synto"
-version = "0.6.1"
+version = "0.6.2"
 description = "Turn private notes into local knowledge packs and synthesized wikis"
 readme = "README.md"
 requires-python = ">=3.11"
