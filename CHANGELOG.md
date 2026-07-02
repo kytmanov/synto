@@ -4,42 +4,19 @@
 
 ## [0.6.2] - 2026-07-01
 
-Two reliability fixes for long local runs, both from community bug reports: `compile` no
-longer re-flags maintenance-rewritten articles as hand-edited, and a dropped connection
-mid-request is retried instead of failing the whole note.
+Two reliability fixes for long local runs.
 
 ### Fixed
 
-- **`compile` no longer reports machine-generated concepts as "manually edited".** When
-  `synto maintain --fix` repaired broken links or normalized alias links in a published
-  article, it rewrote the article body on disk but left the stored `content_hash`
-  pointing at the old body. The next `compile` then read the mismatch as a hand edit and
-  skipped the concept (`Skipping '…' — manually edited`), forcing a per-article
-  `--force`. These maintenance passes now re-persist the hash of the body they actually
-  wrote, so only genuine manual edits are protected. The `concept split` and
-  `concept unmerge` stubs got the same fix, `lint` no longer reports a freshly
-  machine-written stub as "stale", and `compile`, `lint`, and `query --synthesize`
-  update-in-place now all treat a blank `content_hash` as regenerable rather than edited.
-  `concept unmerge` also re-records the reactivated entity's article row even when its page
-  file is still on disk, without ever overwriting an unrelated concept that shares the same
-  filename. If re-reading a file right after writing it ever fails, the maintenance passes
-  now update the hash best-effort and identity ops still record the entity's row, instead of
-  leaving a stale hash or aborting the run. Thanks to @wlewis55 for reporting (#83).
+- **`compile` no longer skips auto-generated articles as "manually edited" (#83).** After
+  `maintain --fix` rewrote an article, a stale content hash made the next `compile` treat
+  it as hand-edited and skip it, forcing `--force`. The hash now tracks the written body,
+  so only real edits are protected. Same fix applied to `concept split`/`unmerge` stubs
+  and to `lint`/`query --synthesize` update-in-place.
 
-- **Transient connection drops no longer abort a whole note.** A server that closes the
-  HTTP connection mid-request (`Server disconnected without sending a response.`,
-  connection reset) is now retried with bounded exponential backoff at every LLM client,
-  so a single blip during a long ingest no longer fails the note and forces a manual
-  re-run from scratch. Genuine slow generation (read timeouts) is deliberately not
-  retried, and HTTP 400 / unparseable output stay per-request failures. Exhausted Ollama
-  transport errors now surface as a clean `OllamaError` instead of a raw httpx exception,
-  and an exhausted ingest failure logs a full traceback. Thanks to @romancone for
-  reporting (#82).
-
-### Thanks
-
-This release was driven by bug reports from [@romancone](https://github.com/romancone)
-(#82) and [@wlewis55](https://github.com/wlewis55) (#83).
+- **A dropped connection mid-request no longer fails the whole note (#82).** Transient
+  connection drops retry with bounded backoff at every LLM client instead of failing the
+  note. Slow-generation read timeouts and HTTP 400s still fail fast.
 
 ## [0.6.1] - 2026-06-27
 
