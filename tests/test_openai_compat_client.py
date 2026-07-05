@@ -70,6 +70,50 @@ def test_generate_returns_content_on_finish_stop():
     assert client.generate(prompt="hi", model="m", num_predict=2048) == "hello"
 
 
+def test_gpt5_uses_max_completion_tokens():
+    client = _make_client()
+    client._post_chat = MagicMock(return_value=_ok_response("hello", finish_reason="stop"))
+
+    assert client.generate(prompt="hi", model="gpt-5.5", num_predict=2048) == "hello"
+
+    payload = client._post_chat.call_args.args[0]
+    assert payload["max_completion_tokens"] == 2048
+    assert "max_tokens" not in payload
+
+
+def test_provider_prefixed_gpt5_uses_max_completion_tokens():
+    client = _make_client()
+    client._post_chat = MagicMock(return_value=_ok_response("hello", finish_reason="stop"))
+
+    assert client.generate(prompt="hi", model="openai/gpt-5.5", num_predict=1024) == "hello"
+
+    payload = client._post_chat.call_args.args[0]
+    assert payload["max_completion_tokens"] == 1024
+    assert "max_tokens" not in payload
+
+
+def test_o_series_uses_max_completion_tokens():
+    client = _make_client()
+    client._post_chat = MagicMock(return_value=_ok_response("hello", finish_reason="stop"))
+
+    assert client.generate(prompt="hi", model="o3", num_predict=4096) == "hello"
+
+    payload = client._post_chat.call_args.args[0]
+    assert payload["max_completion_tokens"] == 4096
+    assert "max_tokens" not in payload
+
+
+def test_non_reasoning_model_keeps_max_tokens():
+    client = _make_client()
+    client._post_chat = MagicMock(return_value=_ok_response("hello", finish_reason="stop"))
+
+    assert client.generate(prompt="hi", model="gpt-4.1", num_predict=2048) == "hello"
+
+    payload = client._post_chat.call_args.args[0]
+    assert payload["max_tokens"] == 2048
+    assert "max_completion_tokens" not in payload
+
+
 def test_generate_raises_truncated_on_finish_length():
     """finish_reason='length' raises with the cap surfaced for actionable error."""
     client = _make_client()
@@ -80,6 +124,21 @@ def test_generate_raises_truncated_on_finish_length():
     assert err.max_tokens == 4096
     assert err.finish_reason == "length"
     assert "article_max_tokens" in str(err)
+
+
+def test_generate_raises_truncated_with_max_completion_tokens_cap():
+    """GPT-5/o-series caps use max_completion_tokens but should still surface."""
+    client = _make_client()
+    client._post_chat = MagicMock(return_value=_ok_response("partial...", finish_reason="length"))
+
+    with pytest.raises(LLMTruncatedError) as exc_info:
+        client.generate(prompt="hi", model="gpt-5.5", num_predict=4096)
+
+    err = exc_info.value
+    assert err.max_tokens == 4096
+    payload = client._post_chat.call_args.args[0]
+    assert payload["max_completion_tokens"] == 4096
+    assert "max_tokens" not in payload
 
 
 def test_generate_raises_truncated_on_finish_max_tokens():

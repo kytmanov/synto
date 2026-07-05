@@ -63,6 +63,8 @@ _TRANSIENT_CLOUD_ERROR_SIGNALS = (
 )
 _TRANSIENT_CLOUD_RETRY_BUDGET_S = 60.0
 
+_MAX_COMPLETION_TOKEN_MODEL_PREFIXES = ("gpt-5", "o1", "o3", "o4")
+
 # Transport-level failures raised *during* a POST (before any HTTP response is read).
 # These bypass every status/body-based retry loop in the clients, so they get their own
 # bounded retry. A dropped/reset connection ("Server disconnected without sending a
@@ -78,6 +80,27 @@ _RETRYABLE_TRANSPORT_ERRORS = (
     httpx.PoolTimeout,
 )
 _CONNECTION_RETRY_DELAYS = (1.0, 2.0, 4.0, 8.0, 16.0)  # ~31s total, bounded
+
+
+def _normalized_model_name(model: str) -> str:
+    """Return provider-stripped lowercase model name for family checks."""
+    return (model or "").split("/")[-1].lower()
+
+
+def _uses_max_completion_tokens(model: str) -> bool:
+    """Whether the chat model requires max_completion_tokens instead of max_tokens."""
+    return _normalized_model_name(model).startswith(_MAX_COMPLETION_TOKEN_MODEL_PREFIXES)
+
+
+def _payload_output_token_limit(payload: dict | None) -> int:
+    """Return the requested output cap from either OpenAI chat token field."""
+    if not payload:
+        return 0
+    value = payload.get("max_tokens") or payload.get("max_completion_tokens") or 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def post_with_transport_retry(
@@ -482,7 +505,9 @@ class OpenAICompatClient:
         Call /v1/chat/completions. Signature is identical to OllamaClient.generate().
 
         num_ctx is silently ignored (server-managed for cloud providers).
-        num_predict > 0 maps to max_tokens; -1 omits the field (provider default).
+        num_predict > 0 maps to the provider/model output-token field; -1 omits the
+        field (provider default). Most OpenAI-compatible providers use max_tokens;
+        OpenAI GPT-5/o-series chat models require max_completion_tokens.
         format="json" injects response_format when supports_json_mode=True.
         `think` is a no-op here (Ollama-specific flag); reasoning control for OpenAI-style
         providers is provider-specific — set it via `options` instead.
@@ -507,11 +532,18 @@ class OpenAICompatClient:
             payload["response_format"] = {"type": "json_object"}
 
         if num_predict > 0:
-            payload["max_tokens"] = num_predict
+            token_param = (
+                "max_completion_tokens" if _uses_max_completion_tokens(model) else "max_tokens"
+            )
+            payload[token_param] = num_predict
 
         if options:
             # Provider-native params (top_p, reasoning_effort, ...); merged last to override.
             payload.update(options)
+
+        if _uses_max_completion_tokens(model) and "max_tokens" in payload:
+            payload.setdefault("max_completion_tokens", payload["max_tokens"])
+            payload.pop("max_tokens", None)
 
         t0 = time.monotonic()
         try:
@@ -619,7 +651,7 @@ class OpenAICompatClient:
         is_length_signal = finish_reason in ("length", "max_tokens")
         is_empty_content = not (content or "").strip()
         if is_length_signal or is_empty_content:
-            cap = int(current_payload.get("max_tokens", 0)) if current_payload else 0
+            cap = _payload_output_token_limit(current_payload)
             raise LLMTruncatedError(
                 provider=self.provider_name,
                 max_tokens=cap,
