@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **OpenAI GPT-5/o-series models no longer fail with HTTP 400 (#88).** Those models
+  reject `max_tokens` (requiring `max_completion_tokens`) and non-default `temperature`;
+  compile jobs failed per article. The client now learns both quirks from the provider's
+  own 400 response, retries with the fix, and remembers it for the rest of the run —
+  no model-name list, so Azure deployments, fine-tunes, and future model families work
+  automatically.
+
 ## [0.6.2] - 2026-07-01
 
 Two reliability fixes for long local runs.
