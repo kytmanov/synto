@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- **Review `e` (edit) works on Windows and never kills the session (#92).** The action
+  hardcoded a `vi` fallback, which doesn't exist on Windows, and the resulting
+  `FileNotFoundError` unwound the whole `synto review` run. It now uses Click's
+  cross-platform editor launcher (notepad fallback on Windows) and a launch failure
+  prints a hint and returns to the review menu.
+
 - **Lint no longer flags or rewrites content inside code fences and inline code (#93).**
   JSON like `["apps/*", "packages/*"]` in a fenced block was reported as a malformed
   link (with a corrupting `[[...]]` suggestion), and `--fix` could rewrite embed-like
