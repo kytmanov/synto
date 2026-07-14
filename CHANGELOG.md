@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- **Lint no longer flags or rewrites content inside code fences and inline code (#93).**
+  JSON like `["apps/*", "packages/*"]` in a fenced block was reported as a malformed
+  link (with a corrupting `[[...]]` suggestion), and `--fix` could rewrite embed-like
+  tokens inside fences. All malformed-link/embed/LaTeX/citation scanners now mask code
+  regions first, like the wikilink rewriters always did.
+
 - **Generated files are now written as UTF-8 regardless of the Windows locale (#91).**
   On non-UTF-8 codepages (e.g. cp1251), `synto init` wrote the vault config with the
   system encoding, and the em dash in generated comments then crashed every command
