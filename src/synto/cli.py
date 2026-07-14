@@ -3546,11 +3546,16 @@ def _review_single(
                     console.print(f"[dim]({count}/{db._REJECTION_CAP} rejections)[/dim]")
             return
         elif action == "e":
-            import os
-            import subprocess
-
-            editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
-            subprocess.call([editor, str(summary.path)])
+            # click.edit resolves VISUAL/EDITOR with a per-platform fallback (notepad on
+            # Windows); a hand-rolled "vi" default crashed there (#92). Any launch failure
+            # must keep the review session alive, like the other tool actions d/x.
+            try:
+                click.edit(filename=str(summary.path))
+            except (OSError, click.ClickException):
+                console.print(
+                    "[red]Could not launch an editor.[/red] "
+                    "[dim]Set VISUAL or EDITOR to your editor command.[/dim]"
+                )
         elif action == "d":
             safe_name = sanitize_filename(summary.title)
             wiki_path = config.wiki_dir / f"{safe_name}.md"

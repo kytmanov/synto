@@ -127,3 +127,68 @@ def test_compute_diff_unreadable_published(config, db):
 
     result = compute_diff(draft_path, wiki_path)
     assert result is None
+
+
+# ── review 'e' action: cross-platform editor launch (#92) ─────────────────────
+
+
+def _write_editable_draft(config: Config, title: str = "Alpha") -> Path:
+    config.drafts_dir.mkdir(parents=True, exist_ok=True)
+    post = fm_lib.Post(
+        "Draft body.",
+        title=title,
+        status="draft",
+        tags=[],
+        sources=[],
+        confidence=0.8,
+        created="2024-01-01",
+        updated="2024-01-01",
+    )
+    path = config.drafts_dir / f"{title}.md"
+    atomic_write(path, fm_lib.dumps(post))
+    return path
+
+
+def test_review_edit_action_uses_click_edit(config, db, monkeypatch):
+    """The 'e' action must go through click.edit, which resolves VISUAL/EDITOR and
+    falls back per platform (notepad on Windows) — not a hand-rolled 'vi' default."""
+    import click
+    from click.testing import CliRunner
+
+    from synto.cli import cli
+
+    path = _write_editable_draft(config)
+    monkeypatch.setenv("VISUAL", "true")  # keep an unfixed build from launching vi
+    monkeypatch.setenv("EDITOR", "true")
+    calls: list[str | None] = []
+    monkeypatch.setattr(click, "edit", lambda *a, **kw: calls.append(kw.get("filename")))
+
+    result = CliRunner().invoke(cli, ["review", "--vault", str(config.vault)], input="\ne\nl\nq\n")
+
+    assert result.exit_code == 0, result.output
+    assert calls == [str(path)]
+
+
+def test_review_edit_action_survives_missing_editor(config, db, monkeypatch):
+    """#92: no usable editor must print a hint and keep the review session alive,
+    not unwind the whole command with a traceback."""
+    import click
+    from click.testing import CliRunner
+
+    from synto.cli import cli
+
+    _write_editable_draft(config)
+    monkeypatch.setenv("VISUAL", "true")
+    monkeypatch.setenv("EDITOR", "true")
+
+    def boom(*args, **kwargs):
+        raise click.UsageError("vi: not found")
+
+    monkeypatch.setattr(click, "edit", boom)
+
+    result = CliRunner().invoke(cli, ["review", "--vault", str(config.vault)], input="\ne\nl\nq\n")
+
+    assert result.exit_code == 0, result.output
+    assert "Could not launch an editor" in result.output
+    # The single-draft loop survived the failure: it prompted for an action again.
+    assert result.output.count("Action") >= 2
