@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- **Stub and legacy compiles now record compile lineage.** Articles born from a stub
+  compile (`maintain --fix`) or `compile --legacy` were published without a `lineage`
+  frontmatter block, so `synto trace article` reported "No lineage recorded" for them.
+  Both paths now thread the compile-run id like the default concept path, and legacy
+  runs are tracked in `compile_runs` too.
+
 - **Review `e` (edit) works on Windows and never kills the session (#92).** The action
   hardcoded a `vi` fallback, which doesn't exist on Windows, and the resulting
   `FileNotFoundError` unwound the whole `synto review` run. It now uses Click's

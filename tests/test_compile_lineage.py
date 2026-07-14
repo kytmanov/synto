@@ -177,6 +177,79 @@ def test_frontmatter_lineage_key(tmp_path: Path, config, db) -> None:
     assert "timestamp" in entry
 
 
+def test_stub_frontmatter_lineage_key(tmp_path: Path, config, db) -> None:
+    """Stub compiles are LLM runs too — their drafts must record lineage.
+
+    Regression: stub drafts were written without run_ulid, so published stubs
+    traced to "No lineage recorded" and would be invisible to staleness checks.
+    """
+    from synto.models import SingleArticle
+    from synto.pipeline.compile import compile_concepts
+    from synto.vault import parse_note
+
+    db.add_stub("StubConcept")
+
+    mock_result = SingleArticle(
+        title="StubConcept", content="Stub content.", tags=[], summary="Stub."
+    )
+    client = as_router(MagicMock())
+    with patch("synto.pipeline.compile.request_structured", return_value=mock_result):
+        draft_paths, _, _ = compile_concepts(config, client, db)
+
+    assert draft_paths, "Stub draft should be written"
+    meta, _ = parse_note(draft_paths[0])
+    assert "lineage" in meta, "lineage key missing from stub frontmatter"
+    entry = meta["lineage"][0]
+    assert "compile_run" in entry
+    assert "pipeline" in entry
+    assert "timestamp" in entry
+
+
+def test_legacy_frontmatter_lineage_key(tmp_path: Path, config, db) -> None:
+    """Legacy (--legacy) compiles must record lineage and a compile_runs row.
+
+    Regression: compile_notes had no run identity at all, so legacy-born
+    articles traced to "No lineage recorded".
+    """
+    from synto.models import ArticlePlan, CompilePlan, RawNoteRecord, SingleArticle
+    from synto.pipeline.compile import compile_notes
+    from synto.vault import parse_note
+
+    rel = "raw/legacy_test.md"
+    (config.vault / "raw").mkdir(exist_ok=True)
+    (config.vault / "raw" / "legacy_test.md").write_text("# Legacy test\nContent.\n")
+    db.upsert_raw(RawNoteRecord(path=rel, content_hash="jkl012", status="ingested"))
+
+    plan = CompilePlan(
+        articles=[
+            ArticlePlan(
+                title="LegacyArticle",
+                action="create",
+                path="LegacyArticle.md",
+                reasoning="test",
+                source_paths=[rel],
+            )
+        ]
+    )
+    article = SingleArticle(title="LegacyArticle", content="Content.", tags=[], summary="S.")
+    client = as_router(MagicMock())
+    with patch("synto.pipeline.compile.request_structured", side_effect=[plan, article]):
+        draft_paths, _ = compile_notes(config, client, db)
+
+    assert draft_paths, "Legacy draft should be written"
+    meta, _ = parse_note(draft_paths[0])
+    assert "lineage" in meta, "lineage key missing from legacy frontmatter"
+    entry = meta["lineage"][0]
+    assert "compile_run" in entry
+    assert "pipeline" in entry
+    assert "timestamp" in entry
+
+    row = db._conn.execute("SELECT * FROM compile_runs").fetchone()
+    assert row is not None, "legacy compile should record a compile_runs row"
+    assert row["run_ulid"] == entry["compile_run"]
+    assert row["finished_at"] is not None
+
+
 # ---------------------------------------------------------------------------
 # Stage 5: synto trace article CLI command
 # ---------------------------------------------------------------------------
