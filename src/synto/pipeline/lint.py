@@ -269,7 +269,7 @@ def _check_stale_lock(config: Config, issues: list[LintIssue]) -> None:
     # lock is not stale, and probing it would open a second fd whose close drops
     # the lock under NFS POSIX-lock emulation — so short-circuit on our own PID.
     try:
-        if int(lock_path.read_text().strip()) == os.getpid():
+        if int(lock_path.read_text(encoding="utf-8").strip()) == os.getpid():
             return
     except (ValueError, OSError):
         pass
@@ -280,7 +280,7 @@ def _check_stale_lock(config: Config, issues: list[LintIssue]) -> None:
         if _IS_POSIX:
             return
         try:
-            pid: int | str = int(lock_path.read_text().strip())
+            pid: int | str = int(lock_path.read_text(encoding="utf-8").strip())
         except Exception:
             pid = "unknown"
         issues.append(

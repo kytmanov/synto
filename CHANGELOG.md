@@ -4,6 +4,13 @@
 
 ### Fixed
 
+- **Generated files are now written as UTF-8 regardless of the Windows locale (#91).**
+  On non-UTF-8 codepages (e.g. cp1251), `synto init` wrote the vault config with the
+  system encoding, and the em dash in generated comments then crashed every command
+  with `UnicodeDecodeError`. All file writes/reads and git output now pin UTF-8, a
+  vault already broken this way gets an actionable error instead of a traceback, and
+  a lint rule plus a guard test keep unpinned I/O from coming back.
+
 - **OpenAI GPT-5/o-series models no longer fail with HTTP 400 (#88).** Those models
   reject `max_tokens` (requiring `max_completion_tokens`) and non-default `temperature`;
   compile jobs failed per article. The client now learns both quirks from the provider's

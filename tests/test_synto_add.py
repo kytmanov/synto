@@ -71,7 +71,7 @@ def sample_md(tmp_path: Path) -> Path:
 @pytest.fixture
 def renamed_sample_txt(tmp_path: Path, sample_txt: Path) -> Path:
     p = tmp_path / "renamed-notes.txt"
-    p.write_text(sample_txt.read_text())
+    p.write_text(sample_txt.read_text(encoding="utf-8"), encoding="utf-8")
     return p
 
 
@@ -103,7 +103,7 @@ def test_add_copies_original_to_app_dir(
     source_dir = config.app_dir / "sources"
     copies = list(source_dir.glob("*/original.txt"))
     assert len(copies) == 1
-    assert copies[0].read_text() == sample_txt.read_text()
+    assert copies[0].read_text(encoding="utf-8") == sample_txt.read_text(encoding="utf-8")
 
 
 def test_add_source_id_is_stable(
@@ -446,3 +446,41 @@ def test_load_deps_passes_cache_to_build_router(config: Config) -> None:
     _args, kwargs = mock_build.call_args
     assert "cache" in kwargs, "build_router must be called with cache= keyword"
     assert kwargs["cache"] is not None, "cache must be a live LLMCache, not None"
+
+
+# ---------------------------------------------------------------------------
+# #91: import decoding must not depend on silently mis-applying the host locale
+# ---------------------------------------------------------------------------
+
+
+def test_add_txt_legacy_locale_encoding_falls_back(
+    config: Config, db: StateDB, tmp_path: Path, runner: CliRunner, monkeypatch
+) -> None:
+    """A legacy cp1251 note (not valid UTF-8) must import readably on a cp1251 host:
+    UTF-8 is tried first, then the locale codec — not blind replacement."""
+    p = tmp_path / "legacy.txt"
+    p.write_bytes("Заметки о квантовой запутанности".encode("cp1251"))
+    monkeypatch.setattr("locale.getpreferredencoding", lambda do_setlocale=True: "cp1251")
+
+    result = runner.invoke(cli, ["add", str(p), "--vault", str(config.vault)])
+    assert result.exit_code == 0, result.output
+
+    raw_files = list(config.raw_dir.glob("*.md"))
+    assert len(raw_files) == 1
+    body = raw_files[0].read_text(encoding="utf-8")
+    assert "квантовой запутанности" in body
+    assert "�" not in body
+
+
+def test_add_txt_utf8_content_imports_verbatim(
+    config: Config, db: StateDB, tmp_path: Path, runner: CliRunner
+) -> None:
+    p = tmp_path / "utf8.txt"
+    p.write_text("Заметки — с тире и юникодом", encoding="utf-8")
+
+    result = runner.invoke(cli, ["add", str(p), "--vault", str(config.vault)])
+    assert result.exit_code == 0, result.output
+
+    raw_files = list(config.raw_dir.glob("*.md"))
+    assert len(raw_files) == 1
+    assert "Заметки — с тире и юникодом" in raw_files[0].read_text(encoding="utf-8")

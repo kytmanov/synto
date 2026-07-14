@@ -9,7 +9,10 @@ from .models import AdvisorVerdict, CompareReport, QueryResult, QuerySpec
 
 
 def load_queries(path: Path) -> list[QuerySpec]:
-    data = tomllib.loads(path.read_text())
+    # Binary + tomllib.load matches the vault-config read path: TOML is UTF-8 by spec,
+    # so the host locale must not participate in decoding.
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
     out: list[QuerySpec] = []
     seen_ids: set[str] = set()
     entries = data.get("query", [])

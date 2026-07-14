@@ -236,7 +236,9 @@ def _write_effective_compare_toml(vault: Path, config: Config) -> None:
         # 2400-token soft cap. Prefer a usable preview over strict fidelity for these isolated
         # compare vaults by letting concept drafts use the normal article budget instead.
         pipeline = pipeline.model_copy(update={"concept_draft_soft_cap": "article_max_tokens"})
-    (vault / CONFIG_FILE_NAME).write_text(head + "\n" + to_toml({"pipeline": pipeline}))
+    (vault / CONFIG_FILE_NAME).write_text(
+        head + "\n" + to_toml({"pipeline": pipeline}), encoding="utf-8"
+    )
 
 
 def _should_relax_compare_soft_cap(config: Config) -> bool:
@@ -416,7 +418,7 @@ def _config_summary(config: Config) -> dict[str, str]:
 
 def _write_json(path: Path, data) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, default=str))
+    path.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
 
 
 def _safe_child(root: Path, *parts: str) -> Path:
