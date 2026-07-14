@@ -20,6 +20,10 @@ JSON mode: if supports_json_mode=True, format="json" injects
   response_format: {"type": "json_object"}.
   If the provider returns HTTP 400, the request is retried once without it
   (transparent auto-downgrade for models that reject the field).
+
+Unsupported params: models that reject max_tokens or non-default temperature
+  (OpenAI GPT-5/o-series) are learned from their 400 responses and auto-retried
+  with the fixup — another transparent auto-downgrade, memoized per model.
 """
 
 from __future__ import annotations
@@ -78,6 +82,28 @@ _RETRYABLE_TRANSPORT_ERRORS = (
     httpx.PoolTimeout,
 )
 _CONNECTION_RETRY_DELAYS = (1.0, 2.0, 4.0, 8.0, 16.0)  # ~31s total, bounded
+
+
+def _output_cap_field(payload: dict) -> str | None:
+    """Which output-cap field the payload carries, if any."""
+    for field in ("max_tokens", "max_completion_tokens"):
+        if field in payload:
+            return field
+    return None
+
+
+def _apply_param_fixup(payload: dict, param: str) -> None:
+    """Rewrite the payload in place for a param the provider rejected as unsupported.
+
+    OpenAI GPT-5/o-series chat models reject max_tokens (they require
+    max_completion_tokens) and any non-default temperature. setdefault keeps an
+    explicit user-supplied options={"max_completion_tokens": N} intact.
+    """
+    if param == "max_tokens" and "max_tokens" in payload:
+        payload.setdefault("max_completion_tokens", payload["max_tokens"])
+        payload.pop("max_tokens")
+    elif param == "temperature":
+        payload.pop("temperature", None)
 
 
 def post_with_transport_retry(
@@ -210,6 +236,9 @@ class OpenAICompatClient:
             timeout=timeout,
         )
         self._last_stats: dict = {}
+        # Params a model rejected as unsupported (learned from its 400s), so only the
+        # first request per model per client pays the learning round-trip.
+        self._model_param_fixups: dict[str, set[str]] = {}
         self._cache = cache
         # Account-aware cache namespace (folds in api_key/headers). Falls back to base_url for
         # direct construction so two accounts on one URL never share cached responses.
@@ -356,6 +385,34 @@ class OpenAICompatClient:
             waited += wait
             delay = min(delay * 2, 16.0)
 
+    def _unsupported_param_400(self, resp: httpx.Response, payload: dict) -> str | None:
+        """Payload param this 400 rejects as unsupported (GPT-5/o-series quirks), if any.
+
+        Prefers the JSON envelope's error.param; falls back to message text for
+        providers that omit it (Azure variants). Requires an "unsupported" signal so
+        cap-exceeded 400s (also param=max_tokens) never match — those must reach the
+        halving downgrade instead.
+        """
+        if resp.status_code != 400:
+            return None
+        err_text = resp.text.lower()
+        if "unsupported" not in err_text and "not supported" not in err_text:
+            return None
+        param = None
+        try:
+            body = resp.json()
+        except ValueError:
+            body = None
+        if isinstance(body, dict) and isinstance(body.get("error"), dict):
+            param = body["error"].get("param")
+        if "max_tokens" in payload and (
+            param == "max_tokens" or "max_completion_tokens" in err_text
+        ):
+            return "max_tokens"
+        if "temperature" in payload and (param == "temperature" or "'temperature'" in err_text):
+            return "temperature"
+        return None
+
     def _apply_chat_downgrades(
         self,
         resp: httpx.Response,
@@ -365,6 +422,31 @@ class OpenAICompatClient:
     ) -> tuple[httpx.Response, dict]:
         current_payload = payload
 
+        # Unsupported-param fixups must run before the response_format branch below:
+        # that branch fires on any 400 without reading the error, so a GPT-5 JSON-mode
+        # call rejected for max_tokens would needlessly lose json mode. Loop twice —
+        # a model can reject both params, one 400 at a time.
+        for _ in range(2):
+            param = self._unsupported_param_400(resp, current_payload)
+            if not param:
+                break
+            fixup_note = (
+                "sending max_completion_tokens instead"
+                if param == "max_tokens"
+                else "sampling now uses the model default"
+            )
+            log.warning(
+                "%s: model %s rejects %s, retrying (%s)",
+                self.provider_name,
+                current_payload.get("model"),
+                param,
+                fixup_note,
+            )
+            current_payload = dict(current_payload)
+            _apply_param_fixup(current_payload, param)
+            self._model_param_fixups.setdefault(str(current_payload.get("model")), set()).add(param)
+            resp = self._post_chat(current_payload)
+
         if resp.status_code == 400 and use_json_mode and "response_format" in current_payload:
             log.debug(
                 "%s: HTTP 400 with response_format, retrying without json mode",
@@ -373,19 +455,22 @@ class OpenAICompatClient:
             current_payload = {k: v for k, v in current_payload.items() if k != "response_format"}
             resp = self._post_chat(current_payload)
 
-        if resp.status_code == 400 and "max_tokens" in current_payload:
+        cap_field = _output_cap_field(current_payload)
+        if resp.status_code == 400 and cap_field:
             err_text = resp.text.lower()
             if "tokens to keep" in err_text or "n_keep" in err_text:
                 log.warning(
-                    "%s: HTTP 400 n_keep error, retrying without max_tokens "
+                    "%s: HTTP 400 n_keep error, retrying without %s "
                     "(model n_ctx may be smaller than configured heavy_ctx; "
                     "output is now uncapped for this request)",
                     self.provider_name,
+                    cap_field,
                 )
-                current_payload = {k: v for k, v in current_payload.items() if k != "max_tokens"}
+                current_payload = {k: v for k, v in current_payload.items() if k != cap_field}
                 resp = self._post_chat(current_payload)
 
-        if resp.status_code == 400 and "max_tokens" in current_payload:
+        cap_field = _output_cap_field(current_payload)
+        if resp.status_code == 400 and cap_field:
             err_text = resp.text.lower()
             cloud_cap_signals = (
                 "max_tokens",
@@ -398,23 +483,26 @@ class OpenAICompatClient:
             if any(s in err_text for s in cloud_cap_signals) and any(
                 s in err_text for s in exceed_signals
             ):
-                current_max_tokens = int(current_payload["max_tokens"])
+                current_max_tokens = int(current_payload[cap_field])
                 if current_max_tokens > 512:
                     halved = max(512, current_max_tokens // 2)
                     log.warning(
-                        "%s: HTTP 400 max_tokens exceeds provider limit, halving %d → %d",
+                        "%s: HTTP 400 %s exceeds provider limit, halving %d → %d",
                         self.provider_name,
+                        cap_field,
                         current_max_tokens,
                         halved,
                     )
-                    current_payload = {**current_payload, "max_tokens": halved}
+                    current_payload = {**current_payload, cap_field: halved}
                     resp = self._post_chat(current_payload)
                 else:
                     log.warning(
-                        "%s: HTTP 400 max_tokens exceeds provider limit, but skipping "
-                        "auto-downgrade because max_tokens=%d is already at or below "
+                        "%s: HTTP 400 %s exceeds provider limit, but skipping "
+                        "auto-downgrade because %s=%d is already at or below "
                         "the 512 retry floor",
                         self.provider_name,
+                        cap_field,
+                        cap_field,
                         current_max_tokens,
                     )
 
@@ -483,6 +571,10 @@ class OpenAICompatClient:
 
         num_ctx is silently ignored (server-managed for cloud providers).
         num_predict > 0 maps to max_tokens; -1 omits the field (provider default).
+        If the provider rejects a standard param as unsupported (OpenAI GPT-5/o-series:
+        max_tokens → max_completion_tokens, non-default temperature → dropped), the
+        request auto-retries with the fixup and the model's quirk is remembered for
+        the client's lifetime.
         format="json" injects response_format when supports_json_mode=True.
         `think` is a no-op here (Ollama-specific flag); reasoning control for OpenAI-style
         providers is provider-specific — set it via `options` instead.
@@ -512,6 +604,11 @@ class OpenAICompatClient:
         if options:
             # Provider-native params (top_p, reasoning_effort, ...); merged last to override.
             payload.update(options)
+
+        # Applied post-merge so a user options={"max_tokens": N} override survives the
+        # rename (num_predict only ever writes max_tokens).
+        for param in self._model_param_fixups.get(model, ()):
+            _apply_param_fixup(payload, param)
 
         t0 = time.monotonic()
         try:
@@ -619,7 +716,8 @@ class OpenAICompatClient:
         is_length_signal = finish_reason in ("length", "max_tokens")
         is_empty_content = not (content or "").strip()
         if is_length_signal or is_empty_content:
-            cap = int(current_payload.get("max_tokens", 0)) if current_payload else 0
+            cap_field = _output_cap_field(current_payload) if current_payload else None
+            cap = int(current_payload[cap_field]) if cap_field else 0
             raise LLMTruncatedError(
                 provider=self.provider_name,
                 max_tokens=cap,

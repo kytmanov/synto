@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock
 
 import httpx
@@ -333,6 +334,241 @@ def test_truncated_error_message_for_stop_does_not_suggest_raising_cap():
     assert "no usable content" in msg
     assert "lowering pipeline.article_max_tokens" in msg
     assert "Raise pipeline.article_max_tokens" not in msg
+
+
+# ── Unsupported-parameter fixups (issue #88: GPT-5/o-series reject standard params) ─
+
+
+_UNSUPPORTED_MAX_TOKENS_MSG = (
+    "Unsupported parameter: 'max_tokens' is not supported with this model. "
+    "Use 'max_completion_tokens' instead."
+)
+_UNSUPPORTED_TEMPERATURE_MSG = (
+    "Unsupported value: 'temperature' does not support 0 with this model. "
+    "Only the default (1) is supported."
+)
+
+
+def _unsupported_param_response(param: str, message: str) -> MagicMock:
+    """The exact 400 shape OpenAI returns for GPT-5/o-series unsupported params."""
+    body = {"error": {"message": message, "type": "invalid_request_error", "param": param}}
+    resp = MagicMock()
+    resp.status_code = 400
+    resp.text = json.dumps(body)
+    resp.json.return_value = body
+    resp.raise_for_status.side_effect = httpx.HTTPStatusError(
+        "400", request=MagicMock(), response=resp
+    )
+    return resp
+
+
+def test_unsupported_max_tokens_renames_to_max_completion_tokens():
+    """Issue #88: the provider's own 400 teaches the client which field to send."""
+    client = _make_client()
+    bad = _unsupported_param_response("max_tokens", _UNSUPPORTED_MAX_TOKENS_MSG)
+    good = _ok_response("hello")
+    client._post_chat = MagicMock(side_effect=[bad, good])
+
+    assert client.generate(prompt="hi", model="gpt-5.5", num_predict=2048) == "hello"
+
+    first, second = [c.args[0] for c in client._post_chat.call_args_list]
+    assert first["max_tokens"] == 2048
+    assert second["max_completion_tokens"] == 2048
+    assert "max_tokens" not in second
+
+
+def test_unsupported_max_tokens_rename_works_without_param_field():
+    """Fallback for providers whose 400 body lacks error.param (e.g. Azure variants):
+    the message text alone must trigger the rename."""
+    client = _make_client()
+    bad = _bad_response(_UNSUPPORTED_MAX_TOKENS_MSG)
+    good = _ok_response("hello")
+    client._post_chat = MagicMock(side_effect=[bad, good])
+
+    assert client.generate(prompt="hi", model="my-deployment", num_predict=1024) == "hello"
+
+    second = client._post_chat.call_args_list[1].args[0]
+    assert second["max_completion_tokens"] == 1024
+    assert "max_tokens" not in second
+
+
+def test_unsupported_param_fixup_is_memoized_per_model():
+    """Only the first request per model pays the learning 400; other models on the
+    same client are unaffected."""
+    client = _make_client()
+    bad = _unsupported_param_response("max_tokens", _UNSUPPORTED_MAX_TOKENS_MSG)
+    client._post_chat = MagicMock(side_effect=[bad, _ok_response("a"), _ok_response("b")])
+
+    client.generate(prompt="hi", model="gpt-5.5", num_predict=2048)
+    client.generate(prompt="again", model="gpt-5.5", num_predict=2048)
+
+    third = client._post_chat.call_args_list[2].args[0]
+    assert client._post_chat.call_count == 3  # 400 + retry, then single memoized call
+    assert third["max_completion_tokens"] == 2048
+    assert "max_tokens" not in third
+
+    client._post_chat = MagicMock(return_value=_ok_response("c"))
+    client.generate(prompt="hi", model="gpt-4.1", num_predict=2048)
+    other = client._post_chat.call_args.args[0]
+    assert other["max_tokens"] == 2048
+    assert "max_completion_tokens" not in other
+
+
+def test_unsupported_temperature_is_dropped_and_memoized():
+    """o-series models reject non-default temperature; synto's ingest sends
+    temperature=0 by default, so the drop must be automatic."""
+    client = _make_client()
+    bad = _unsupported_param_response("temperature", _UNSUPPORTED_TEMPERATURE_MSG)
+    client._post_chat = MagicMock(side_effect=[bad, _ok_response("a"), _ok_response("b")])
+
+    assert client.generate(prompt="hi", model="o3", num_predict=512, temperature=0) == "a"
+    retry = client._post_chat.call_args_list[1].args[0]
+    assert "temperature" not in retry
+
+    client.generate(prompt="again", model="o3", num_predict=512, temperature=0)
+    assert client._post_chat.call_count == 3
+    assert "temperature" not in client._post_chat.call_args_list[2].args[0]
+
+
+def test_model_rejecting_both_params_learns_both():
+    """A model can reject max_tokens and temperature in successive 400s (OpenAI
+    reports one offending param at a time)."""
+    client = _make_client()
+    bad_tokens = _unsupported_param_response("max_tokens", _UNSUPPORTED_MAX_TOKENS_MSG)
+    bad_temp = _unsupported_param_response("temperature", _UNSUPPORTED_TEMPERATURE_MSG)
+    client._post_chat = MagicMock(side_effect=[bad_tokens, bad_temp, _ok_response("a")])
+
+    assert client.generate(prompt="hi", model="o3", num_predict=512, temperature=0) == "a"
+
+    final = client._post_chat.call_args_list[2].args[0]
+    assert final["max_completion_tokens"] == 512
+    assert "max_tokens" not in final
+    assert "temperature" not in final
+
+    client._post_chat = MagicMock(return_value=_ok_response("b"))
+    client.generate(prompt="again", model="o3", num_predict=512, temperature=0)
+    memoized = client._post_chat.call_args.args[0]
+    assert client._post_chat.call_count == 1
+    assert memoized["max_completion_tokens"] == 512
+    assert "max_tokens" not in memoized
+    assert "temperature" not in memoized
+
+
+def test_json_mode_survives_max_tokens_rename():
+    """The unsupported-param fixup must run BEFORE the response_format downgrade
+    (which fires on any 400), or GPT-5 JSON-mode calls silently lose json mode."""
+    client = _make_client()
+    bad = _unsupported_param_response("max_tokens", _UNSUPPORTED_MAX_TOKENS_MSG)
+    good = _ok_response('{"ok": true}')
+    client._post_chat = MagicMock(side_effect=[bad, good])
+
+    result = client.generate(prompt="hi", model="gpt-5.5", num_predict=2048, format="json")
+
+    assert result == '{"ok": true}'
+    second = client._post_chat.call_args_list[1].args[0]
+    assert second["response_format"] == {"type": "json_object"}
+    assert second["max_completion_tokens"] == 2048
+
+
+def test_options_max_tokens_override_survives_memoized_rename():
+    """options is merged last to override; the rename must carry the user's value,
+    not silently revert to num_predict."""
+    client = _make_client()
+    bad = _unsupported_param_response("max_tokens", _UNSUPPORTED_MAX_TOKENS_MSG)
+    client._post_chat = MagicMock(side_effect=[bad, _ok_response("a"), _ok_response("b")])
+    client.generate(prompt="hi", model="gpt-5.5", num_predict=2048)
+
+    client.generate(prompt="again", model="gpt-5.5", num_predict=2048, options={"max_tokens": 8192})
+
+    memoized = client._post_chat.call_args_list[2].args[0]
+    assert memoized["max_completion_tokens"] == 8192
+    assert "max_tokens" not in memoized
+
+
+def test_explicit_max_completion_tokens_option_is_never_overwritten():
+    """A user who already configured options={'max_completion_tokens': N} must win
+    over the num_predict-derived value on the learning retry."""
+    client = _make_client()
+    bad = _unsupported_param_response("max_tokens", _UNSUPPORTED_MAX_TOKENS_MSG)
+    good = _ok_response("a")
+    client._post_chat = MagicMock(side_effect=[bad, good])
+
+    client.generate(
+        prompt="hi",
+        model="gpt-5.5",
+        num_predict=2048,
+        options={"max_completion_tokens": 1234},
+    )
+
+    retry = client._post_chat.call_args_list[1].args[0]
+    assert retry["max_completion_tokens"] == 1234
+    assert "max_tokens" not in retry
+
+
+def test_unrelated_unsupported_400_does_not_trigger_fixups():
+    """An 'unsupported' 400 about some other parameter must not rename or drop
+    anything — it raises like any other bad request."""
+    client = _make_client()
+    bad = _unsupported_param_response(
+        "logit_bias", "Unsupported parameter: 'logit_bias' is not supported with this model."
+    )
+    client._post_chat = MagicMock(return_value=bad)
+
+    with pytest.raises(LLMBadRequestError):
+        client.generate(prompt="hi", model="gpt-5.5", num_predict=2048, temperature=0)
+
+    assert client._post_chat.call_count == 1
+
+
+def test_rename_then_cap_halving_cascade():
+    """After the rename retry, a 'too large' 400 must still reach the cap-halving
+    downgrade — it operates on max_completion_tokens now."""
+    client = _make_client()
+    bad_unsupported = _unsupported_param_response("max_tokens", _UNSUPPORTED_MAX_TOKENS_MSG)
+    bad_cap = _bad_response(
+        '{"error": {"message": "max_completion_tokens exceeds the maximum for this model"}}'
+    )
+    good = _ok_response("a")
+    client._post_chat = MagicMock(side_effect=[bad_unsupported, bad_cap, good])
+
+    assert client.generate(prompt="hi", model="gpt-5.5", num_predict=16384) == "a"
+
+    third = client._post_chat.call_args_list[2].args[0]
+    assert third["max_completion_tokens"] == 8192
+    assert "max_tokens" not in third
+
+
+def test_n_keep_downgrade_strips_max_completion_tokens():
+    """The n_keep 400 recovery must work regardless of which output-cap field the
+    payload carries."""
+    client = _make_client()
+    bad_unsupported = _unsupported_param_response("max_tokens", _UNSUPPORTED_MAX_TOKENS_MSG)
+    bad_n_keep = _bad_response(
+        '{"error": {"message": "tokens to keep from initial prompt exceeds n_ctx"}}'
+    )
+    good = _ok_response("a")
+    client._post_chat = MagicMock(side_effect=[bad_unsupported, bad_n_keep, good])
+
+    assert client.generate(prompt="hi", model="m", num_predict=4096) == "a"
+
+    second = client._post_chat.call_args_list[1].args[0]
+    assert second["max_completion_tokens"] == 4096
+    third = client._post_chat.call_args_list[2].args[0]
+    assert "max_completion_tokens" not in third
+    assert "max_tokens" not in third
+
+
+def test_truncation_cap_reported_from_max_completion_tokens():
+    """LLMTruncatedError must surface the configured cap for either field spelling."""
+    client = _make_client()
+    bad = _unsupported_param_response("max_tokens", _UNSUPPORTED_MAX_TOKENS_MSG)
+    truncated = _ok_response("partial...", finish_reason="length")
+    client._post_chat = MagicMock(side_effect=[bad, truncated])
+
+    with pytest.raises(LLMTruncatedError) as exc_info:
+        client.generate(prompt="hi", model="gpt-5.5", num_predict=4096)
+
+    assert exc_info.value.max_tokens == 4096
 
 
 # ── HTTP-2xx error envelope (issue #25: OpenRouter returns errors with 200) ─────
