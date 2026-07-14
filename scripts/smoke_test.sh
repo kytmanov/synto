@@ -2041,7 +2041,9 @@ if [[ -n "$_TRACE_WIKI" ]]; then
     echo "$TR_OUT"
     check "trace article exits 0" "test $_TR_RC -eq 0"
     _TMP=$(mktemp); echo "$TR_OUT" > "$_TMP"
-    soft_check "trace article output contains compile history or title or model" \
+    # Hard check: every draft writer (concept, stub, legacy) records lineage, so a
+    # published article without a compile history is a regression, not model variance.
+    check "trace article output contains compile history" \
         "grep -qiE 'Compile history|model' \"$_TMP\""
     rm -f "$_TMP"
 else

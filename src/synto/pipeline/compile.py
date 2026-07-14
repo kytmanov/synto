@@ -926,6 +926,17 @@ def _build_concept_write_prompt(
     return write_prompt, resolved_paths, confidence, lang
 
 
+def _new_run_ulid() -> str:
+    try:
+        import ulid as _ulid_mod
+
+        return str(_ulid_mod.ULID())
+    except ImportError:
+        import uuid
+
+        return uuid.uuid4().hex.upper()
+
+
 def compile_concepts(
     config: Config,
     router: ModelRouter,
@@ -976,14 +987,7 @@ def compile_concepts(
     heavy = router.endpoint("heavy")
 
     # Start compile run tracking
-    try:
-        import ulid as _ulid_mod
-
-        run_ulid = str(_ulid_mod.ULID())
-    except ImportError:
-        import uuid
-
-        run_ulid = uuid.uuid4().hex.upper()
+    run_ulid = _new_run_ulid()
     pipeline = PipelineVersion(
         fast_model=config.model_name("fast"), heavy_model=config.model_name("heavy")
     )
@@ -1126,8 +1130,13 @@ def compile_concepts(
                 canonical_title=name,
                 concept_aliases=db.get_aliases(name),
                 alias_map=alias_map,
+                run_ulid=run_ulid,
+                pipeline=pipeline,
             )
             draft_paths.append(draft_path)
+            if not dry_run and db._has_table("compile_runs"):
+                rel = str(draft_path.relative_to(config.vault))
+                db.update_article_compile_run(rel, run_ulid)
             db.delete_stub(name)
             db.mark_concept_compile_state(name, source_paths, "compiled")
             elapsed = time.monotonic() - _t_concept
@@ -1495,6 +1504,20 @@ def compile_notes(
         return [], []
 
     # ── Step 2: Write each article ────────────────────────────────────────────
+    # Start run tracking only once the plan is committed, so the early returns
+    # above never leave an unfinished compile_runs row behind.
+    run_ulid = _new_run_ulid()
+    pipeline = PipelineVersion(
+        fast_model=config.model_name("fast"), heavy_model=config.model_name("heavy")
+    )
+    if db._has_table("compile_runs"):
+        db.start_compile_run(
+            run_ulid,
+            pipeline.model_dump_json(),
+            config.model_name("fast"),
+            config.model_name("heavy"),
+        )
+
     draft_paths: list[Path] = []
     failed: list[str] = []
     failure_categories: dict[str, list[str]] = {}
@@ -1565,8 +1588,13 @@ def compile_notes(
             confidence=confidence,
             existing_meta=existing_meta,
             resolvable_titles=existing_titles,
+            run_ulid=run_ulid,
+            pipeline=pipeline,
         )
         draft_paths.append(draft_path)
+        if db._has_table("compile_runs"):
+            rel = str(draft_path.relative_to(config.vault))
+            db.update_article_compile_run(rel, run_ulid)
         log.info("Draft written: %s", draft_path.name)
 
     # Mark source notes as compiled
@@ -1578,6 +1606,9 @@ def compile_notes(
     if failure_categories:
         summary = ", ".join(f"{len(v)} {k}" for k, v in sorted(failure_categories.items()))
         log.warning("Compile failures by category: %s", summary)
+
+    if db._has_table("compile_runs"):
+        db.finish_compile_run(run_ulid, article_count=len(draft_paths))
 
     return draft_paths, failed
 
