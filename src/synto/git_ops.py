@@ -12,7 +12,18 @@ log = logging.getLogger(__name__)
 
 
 def _run(args: list[str], cwd: Path, check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(args, cwd=cwd, capture_output=True, text=True, check=check)
+    # text=True alone decodes git output with the Windows locale codepage; git emits
+    # UTF-8, so pin it. errors="replace" keeps a stray byte from crashing undo/status
+    # (the [synto] subject matching is ASCII and unaffected by replacement chars).
+    return subprocess.run(
+        args,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=check,
+        encoding="utf-8",
+        errors="replace",
+    )
 
 
 def _is_auto_commit_subject(subject: str) -> bool:

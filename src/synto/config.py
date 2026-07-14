@@ -814,8 +814,19 @@ class Config(BaseModel):
             )
         file_config: dict = {}
         if config_file.exists():
-            with open(config_file, "rb") as f:
-                file_config = tomllib.load(f)
+            try:
+                with open(config_file, "rb") as f:
+                    file_config = tomllib.load(f)
+            except UnicodeDecodeError as exc:
+                # synto <= 0.6.2 on Windows wrote this file in the locale codepage
+                # (e.g. cp1251), so the em dash in generated comments breaks strict-UTF-8
+                # tomllib on every later command. Name the file and the way out (#91).
+                raise ValueError(
+                    f"{config_file} is not valid UTF-8. It was likely written with a "
+                    "Windows locale codepage by synto 0.6.2 or earlier. Re-save the file "
+                    "as UTF-8 in your editor, or delete it and re-run "
+                    "`synto init <vault> --existing`."
+                ) from exc
         if "telemetry" in file_config:
             raise ValueError(
                 f"Legacy [telemetry] config found in {config_file}; "

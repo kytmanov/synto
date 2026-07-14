@@ -58,7 +58,7 @@ def _acquire_windows_lock(lock_path: Path) -> bool:
             return True
         except FileExistsError:
             try:
-                pid = int(lock_path.read_text().strip())
+                pid = int(lock_path.read_text(encoding="utf-8").strip())
             except Exception:
                 lock_path.unlink(missing_ok=True)
                 continue  # broken file cleaned up, retry
@@ -119,7 +119,7 @@ def pipeline_lock(vault: Path, block: bool = False):
     # Open with "a+" (create if absent, no truncation) so a competing process
     # that fails to acquire the lock does not clear the incumbent's PID.
     # We truncate and write the PID ourselves only after the lock is held.
-    with open(lock_path, "a+") as f:
+    with open(lock_path, "a+", encoding="utf-8") as f:
         import os
 
         try:
@@ -149,7 +149,7 @@ def lock_holder_pid(vault: Path) -> int | None:
     if not lock_path.exists():
         return None
     try:
-        pid = int(lock_path.read_text().strip())
+        pid = int(lock_path.read_text(encoding="utf-8").strip())
     except Exception:
         return None
     if not _IS_POSIX:
@@ -168,7 +168,7 @@ def lock_holder_pid(vault: Path) -> int | None:
         # readable above), so this works on NFS — where flock() is emulated as
         # fcntl() locks and an exclusive lock on a read-only fd returns EBADF —
         # and on read-only mounts / mode-0444 stale lock files.
-        with open(lock_path) as f:
+        with open(lock_path, encoding="utf-8") as f:
             fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
             fcntl.flock(f, fcntl.LOCK_UN)
         return None  # acquired → nobody holding it
@@ -189,7 +189,7 @@ def has_invalid_lock_file(vault: Path) -> bool:
     if not lock_path.exists():
         return False
     try:
-        int(lock_path.read_text().strip())
+        int(lock_path.read_text(encoding="utf-8").strip())
     except Exception:
         return True
     return False

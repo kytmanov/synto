@@ -158,7 +158,7 @@ def _index_json_validity(config: Config) -> tuple[float | None, dict[str, object
         import jsonschema
 
         schema_path = files("synto.schemas").joinpath("index-v1.json")
-        schema = json.loads(schema_path.read_text())
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
         jsonschema.validate(payload, schema)
     except jsonschema.ValidationError as exc:
         return 0.0, {"reason": "schema_invalid", "detail": exc.message}

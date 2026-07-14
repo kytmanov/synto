@@ -518,7 +518,8 @@ def init(vault_path: str, existing: bool, non_interactive: bool, set_default: bo
                     providers,
                     models,
                     inline_source_citations=bool(gcfg.experimental_inline_source_citations),
-                )
+                ),
+                encoding="utf-8",
             )
         else:
             from .vault import atomic_write
@@ -579,7 +580,8 @@ def init(vault_path: str, existing: bool, non_interactive: bool, set_default: bo
                     inline_source_citations=(
                         bool(gcfg.experimental_inline_source_citations) if gcfg else False
                     ),
-                )
+                ),
+                encoding="utf-8",
             )
         else:
             # Existing vault with a matching provider: patch model/URL fields from global config so
@@ -607,7 +609,8 @@ def init(vault_path: str, existing: bool, non_interactive: bool, set_default: bo
             ".synto/pipeline.lock\n"
             ".synto/exports/\n"
             ".obsidian/workspace.json\n"
-            "*.log\n"
+            "*.log\n",
+            encoding="utf-8",
         )
 
     if set_default:
@@ -844,7 +847,8 @@ def _write_vault_schema(vault: Path) -> None:
             "Every wiki note has YAML frontmatter with: title, tags, sources, "
             "confidence, status, created, updated.\n\n"
             "## Links\n"
-            "Use `[[Article Title]]` wikilinks between notes.\n"
+            "Use `[[Article Title]]` wikilinks between notes.\n",
+            encoding="utf-8",
         )
 
 
@@ -858,7 +862,7 @@ def _write_index(vault: Path) -> None:
     index = vault / "wiki" / "index.md"
     if not index.exists():
         index.parent.mkdir(parents=True, exist_ok=True)
-        index.write_text(_INDEX_STUB)
+        index.write_text(_INDEX_STUB, encoding="utf-8")
 
 
 @cli.command("migrate-olw")
@@ -4004,10 +4008,10 @@ def compare(
 
     run_dir = out / report.run_id / "results"
     if report_format in ("md", "both"):
-        (run_dir / "report.md").write_text(render_markdown(report))
+        (run_dir / "report.md").write_text(render_markdown(report), encoding="utf-8")
     if report_format in ("json", "both"):
-        (run_dir / "report.json").write_text(render_json(report))
-    (run_dir / "summary.json").write_text(render_summary_json(report))
+        (run_dir / "report.json").write_text(render_json(report), encoding="utf-8")
+    (run_dir / "summary.json").write_text(render_summary_json(report), encoding="utf-8")
 
     from .compare.models import AdvisorVerdict
 
@@ -4102,6 +4106,17 @@ def _make_source_id(path: Path) -> str:
     raw = path.read_bytes()
     content_hash = hashlib.sha256(raw).hexdigest()
     return f"{_source_slug(path.stem)}-{content_hash[:8]}"
+
+
+def _decode_import_text(data: bytes) -> str:
+    """UTF-8 first, then the host locale codec — so legacy locale-encoded notes
+    (e.g. cp1251 on a Russian Windows) import readably instead of as mojibake (#91)."""
+    import locale
+
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode(locale.getpreferredencoding(False), errors="replace")
 
 
 @cli.command("add")
@@ -4252,7 +4267,7 @@ def add(
             )
         else:
             note_title = src_path.stem
-            note_body = dest_path.read_text(errors="replace")
+            note_body = _decode_import_text(dest_path.read_bytes())
             if ext == ".md":
                 note_meta, note_body = parse_note(dest_path)
                 raw_title = note_meta.get("title")

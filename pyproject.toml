@@ -60,7 +60,12 @@ target-version = "py311"
 line-length = 100
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP"]
+# PLW1514: text-mode open() without encoding= follows the Windows locale codepage (#91).
+# read_text/write_text and subprocess decoding are covered by tests/test_io_encoding_guard.py.
+# The rule is preview-gated; explicit-preview-rules keeps every other rule at stable behavior.
+preview = true
+explicit-preview-rules = true
+select = ["E", "F", "I", "UP", "PLW1514"]
 
 [tool.ruff.lint.per-file-ignores]
 "src/synto/providers.py" = ["E501"]  # tabular registry data

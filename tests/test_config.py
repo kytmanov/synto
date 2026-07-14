@@ -274,3 +274,17 @@ heavy = "orig"
     )
     cfg = Config.from_vault(tmp_path, models=None)
     assert cfg.models.fast == "orig"
+
+
+def test_from_vault_non_utf8_config_raises_actionable_error(tmp_path):
+    """#91: a synto.toml written in a Windows locale codepage (synto <= 0.6.2 wrote the
+    em-dash comment as cp1251 byte 0x97) must produce a named, actionable error — not a
+    bare UnicodeDecodeError traceback on every command."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "synto.toml").write_bytes(
+        '# Параметры — см. README\n[models]\nfast = "gemma4:e4b"\n'.encode("cp1251")
+    )
+    with pytest.raises(ValueError, match=r"not valid UTF-8") as excinfo:
+        Config.from_vault(tmp_path)
+    assert "synto.toml" in str(excinfo.value)
+    assert "UTF-8" in str(excinfo.value)
