@@ -1296,3 +1296,80 @@ def test_disambiguation_stub_not_flagged_missing_or_stale(vault, config, db):
     assert ("wiki/Mercury.md", "stale") not in flagged
     assert ("wiki/Normal.md", "missing_frontmatter") in flagged
     assert ("wiki/Normal.md", "stale") in flagged
+
+
+# ── Code fences and inline code must not trigger content scanners (#93) ───────
+
+
+def test_json_in_fenced_code_block_not_malformed_link(vault, config, db):
+    # The #93 repro: a valid package.json example inside a ```json fence. Following
+    # the [[...]] suggestion would corrupt the code sample.
+    _write_page(
+        config,
+        "Alpha",
+        'Example:\n\n```json\n{\n  "workspaces": ["apps/*", "packages/*"]\n}\n```\n',
+    )
+
+    result = run_lint(config, db)
+
+    malformed = [i for i in result.issues if i.issue_type == "malformed_link"]
+    assert not malformed
+
+
+def test_brackets_in_inline_code_not_malformed_link(vault, config, db):
+    _write_page(config, "Alpha", "Set the `[config]` section header first.")
+
+    result = run_lint(config, db)
+
+    malformed = [i for i in result.issues if i.issue_type == "malformed_link"]
+    assert not malformed
+
+
+def test_malformed_link_outside_fence_still_detected(vault, config, db):
+    # Positive control against over-masking: the fence is skipped, prose is not.
+    _write_page(
+        config,
+        "Alpha",
+        'Mentions [astronomy] in prose.\n\n```json\n["apps/*", "packages/*"]\n```\n',
+    )
+
+    result = run_lint(config, db)
+
+    malformed = [i for i in result.issues if i.issue_type == "malformed_link"]
+    assert len(malformed) == 1
+    assert "[astronomy]" in malformed[0].description
+
+
+def test_embed_like_token_in_fence_not_flagged_or_rewritten(vault, config, db):
+    page = _write_page(config, "Alpha", "Shell example:\n\n```\n!diagram.png\n```\n")
+
+    result = run_lint(config, db, fix=True)
+
+    embeds = [i for i in result.issues if i.issue_type == "malformed_embed"]
+    assert not embeds
+    _, body = parse_note(page)
+    assert "!diagram.png" in body
+    assert "![[" not in body
+
+
+def test_citation_in_fence_not_rewritten_by_fix(vault, config, db):
+    page = _write_page(
+        config,
+        "Alpha",
+        "Claim [S9].\n\n```\ncite [S1] here\n```\n\n## Sources\n- S9: somewhere\n",
+    )
+
+    run_lint(config, db, fix=True)
+
+    _, body = parse_note(page)
+    assert "cite [S1] here" in body  # fence byte-identical
+    assert "[S9](#Sources)" in body  # prose citation still repaired
+
+
+def test_latex_like_line_in_fence_not_malformed_latex(vault, config, db):
+    _write_page(config, "Alpha", "LaTeX source example:\n\n```latex\n\\[\na=b\n\\]\n```\n")
+
+    result = run_lint(config, db)
+
+    malformed = [i for i in result.issues if i.issue_type == "malformed_latex"]
+    assert not malformed

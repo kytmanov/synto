@@ -21,7 +21,11 @@ import re
 from pathlib import Path
 
 from ..config import Config
-from ..markdown_math import sanitize_obsidian_math
+from ..markdown_math import (
+    mask_markdown_regions,
+    restore_markdown_regions,
+    sanitize_obsidian_math,
+)
 from ..models import LintIssue, LintResult
 from ..sanitize import sanitize_tag, sanitize_tags
 from ..state import StateDB
@@ -124,8 +128,12 @@ def _body_hash(body: str) -> str:
 
 
 def _check_malformed_links(rel_path: str, body: str, issues: list[LintIssue]) -> None:
-    # Strip math spans so $H_i \in [0, 1]$ does not trigger a false positive.
-    clean = _DISPLAY_MATH_DOLLAR_RE.sub(" ", body)
+    # Mask code fences/inline code (and math/links) so code samples like
+    # ["apps/*", "packages/*"] in a ```json fence are never flagged (#93), then
+    # strip the remaining math forms the mask doesn't cover so $H_i \in [0, 1]$
+    # and \[...\] display math do not trigger false positives.
+    masked, _ = mask_markdown_regions(body)
+    clean = _DISPLAY_MATH_DOLLAR_RE.sub(" ", masked)
     clean = _INLINE_MATH_RE.sub(" ", clean)
     clean = _DISPLAY_LATEX_RE.sub(" ", clean)
 
@@ -151,7 +159,7 @@ def _check_malformed_links(rel_path: str, body: str, issues: list[LintIssue]) ->
             )
         )
 
-    for line in body.splitlines():
+    for line in masked.splitlines():
         stripped = line.rstrip()
         if not stripped.endswith("[") or stripped.endswith(("[[", "![", "![[")):
             continue
@@ -209,8 +217,9 @@ def _check_broken_wikilinks(
 
 
 def _check_malformed_embeds(rel_path: str, body: str, issues: list[LintIssue]) -> None:
+    masked, _ = mask_markdown_regions(body)
     seen: set[str] = set()
-    for match in _MALFORMED_EMBED_RE.finditer(body):
+    for match in _MALFORMED_EMBED_RE.finditer(masked):
         target = match.group(1).strip()
         if not target or target in seen:
             continue
@@ -227,11 +236,16 @@ def _check_malformed_embeds(rel_path: str, body: str, issues: list[LintIssue]) -
 
 
 def _repair_malformed_embeds(body: str) -> str:
-    return _MALFORMED_EMBED_RE.sub(lambda m: f"![[{m.group(1).strip()}]]", body)
+    masked, replacements = mask_markdown_regions(body)
+    fixed = _MALFORMED_EMBED_RE.sub(lambda m: f"![[{m.group(1).strip()}]]", masked)
+    return restore_markdown_regions(fixed, replacements)
 
 
 def _check_malformed_latex(rel_path: str, body: str, issues: list[LintIssue]) -> None:
-    if not (_DISPLAY_LATEX_RE.search(body) or _BARE_LATEX_LINE_RE.search(body)):
+    # Mask code regions so LaTeX *source examples* in fences aren't flagged; the fix
+    # path (sanitize_obsidian_math) masks the same regions, keeping check and fix agreed.
+    masked, _ = mask_markdown_regions(body)
+    if not (_DISPLAY_LATEX_RE.search(masked) or _BARE_LATEX_LINE_RE.search(masked)):
         return
     issues.append(
         LintIssue(
@@ -320,14 +334,17 @@ def _check_missing_media(rel_path: str, body: str, vault: Path, issues: list[Lin
 
 
 def _repair_plain_citations(body: str) -> str:
-    if "## Sources" not in body:
+    # mask_links=False: the Sources-section cleanup below must still see
+    # [S1](#Sources) links; code fences/inline code stay protected (#93).
+    masked, replacements = mask_markdown_regions(body, mask_links=False)
+    if "## Sources" not in masked:
         return body
-    before_sources, sources = body.split("## Sources", 1)
+    before_sources, sources = masked.split("## Sources", 1)
     before_sources = _PLAIN_CITATION_RE.sub(
         lambda match: f"[{match.group(1)}](#Sources)", before_sources
     )
     sources = re.sub(r"\[(S\d+(?:\s*,\s*S\d+)*)\]\(#Sources\)", r"[\1]", sources)
-    return before_sources + "## Sources" + sources
+    return restore_markdown_regions(before_sources + "## Sources" + sources, replacements)
 
 
 def _mask_markdown_links(body: str) -> tuple[str, list[tuple[str, str]]]:

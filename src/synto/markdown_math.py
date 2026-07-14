@@ -10,8 +10,8 @@ _BASE_MASK_PARTS = [
     _INLINE_MATH_RE,
     r"\\\([\s\S]*?\\\)",
     r"!\[[^\]]*\]\([^)]*\)",
-    r"\[[^\]\n]+\]\([^)]*\)",
 ]
+_MARKDOWN_LINK_RE = r"\[[^\]\n]+\]\([^)]*\)"
 _OBSIDIAN_EMBED_RE = r"!\[\[[\s\S]*?\]\]"
 _WIKILINK_RE = r"\[\[[^\]]+\]\]"
 _DISPLAY_MATH_RE = re.compile(r"\\{1,2}\[(.*?)\\{1,2}\]", re.DOTALL)
@@ -23,11 +23,21 @@ _MATH_SIGNAL_RE = re.compile(r"[{}_^=]|\\(?:[A-Za-z]+|[,;! ])")
 
 
 def mask_markdown_regions(
-    content: str, *, mask_wikilinks: bool = True, mask_embeds: bool = True
+    content: str,
+    *,
+    mask_wikilinks: bool = True,
+    mask_embeds: bool = True,
+    mask_links: bool = True,
 ) -> tuple[str, list[tuple[str, str]]]:
-    """Protect markdown regions that should not be rewritten."""
+    """Protect markdown regions that should not be rewritten.
+
+    mask_links=False keeps [text](url) links visible for rewriters that must still
+    match them (e.g. the citation repair's [S1](#Sources) reverse-cleanup).
+    """
     replacements: list[tuple[str, str]] = []
     parts = list(_BASE_MASK_PARTS)
+    if mask_links:
+        parts.append(_MARKDOWN_LINK_RE)
     if mask_embeds:
         parts.append(_OBSIDIAN_EMBED_RE)
     if mask_wikilinks:
