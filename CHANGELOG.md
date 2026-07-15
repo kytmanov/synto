@@ -1,10 +1,15 @@
 # Changelog
 
-## [Unreleased]
+## [0.6.3] - 2026-07-15
+
+Five fixes: two Windows bugs (editor launch, non-UTF-8 locales), lint false positives
+inside code fences, OpenAI GPT-5/o-series HTTP 400s, and missing compile lineage on
+stub/legacy paths. Thanks to @VibeSan7 (#91, #92, #93) and @junghoon-vans (#88) for
+the reports.
 
 ### Fixed
 
-- **Stub and legacy compiles now record compile lineage.** Articles born from a stub
+- **Stub and legacy compiles now record compile lineage (#98).** Articles born from a stub
   compile (`maintain --fix`) or `compile --legacy` were published without a `lineage`
   frontmatter block, so `synto trace article` reported "No lineage recorded" for them.
   Both paths now thread the compile-run id like the default concept path, and legacy
