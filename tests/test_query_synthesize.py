@@ -355,7 +355,12 @@ def test_run_query_synthesize_race_duplicate_can_save_with_suffix(tmp_path, monk
     def race_insert(record):
         if first_call["value"]:
             first_call["value"] = False
-            db.upsert_article(
+            # Plant the competing row through a second connection: a real racer is
+            # another process whose commit survives this caller's rollback. Writing
+            # through `db` would put the row inside the caller's own transaction,
+            # where the duplicate-triggered rollback would erase it.
+            racer = StateDB(config.state_db_path)
+            racer.upsert_article(
                 WikiArticleRecord(
                     path="wiki/synthesis/Existing Topic.md",
                     title="Existing Topic",
@@ -366,6 +371,7 @@ def test_run_query_synthesize_race_duplicate_can_save_with_suffix(tmp_path, monk
                     question_hash=record.question_hash,
                 )
             )
+            racer.close()
         return original_insert(record)
 
     monkeypatch.setattr(db, "insert_synthesis_atomic", race_insert)
@@ -500,7 +506,10 @@ def test_run_query_synthesize_race_duplicate_can_update_in_place(tmp_path, monke
                 "Original answer.\n\n## Sources\n\n- [[Topic]]",
             )
             _, existing_body = parse_note(raced_path)
-            db.upsert_article(
+            # Second connection: a real racer's commit must survive this caller's
+            # duplicate-triggered rollback (see save_with_suffix race test above).
+            racer = StateDB(config.state_db_path)
+            racer.upsert_article(
                 WikiArticleRecord(
                     path=str(raced_path.relative_to(config.vault)),
                     title="Existing Topic",
@@ -511,6 +520,7 @@ def test_run_query_synthesize_race_duplicate_can_update_in_place(tmp_path, monke
                     question_hash=record.question_hash,
                 )
             )
+            racer.close()
         return original_insert(record)
 
     monkeypatch.setattr(db, "insert_synthesis_atomic", race_insert)
