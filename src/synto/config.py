@@ -7,10 +7,11 @@ import tomllib
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .models import LintIssue
 from .paths import APP_DIR_NAME, LEGACY_CONFIG_FILE_NAME, effective_config_path
 from .providers import get_provider
 
@@ -163,6 +164,14 @@ def _vault_toml_tail(inline_source_citations: bool) -> str:
         f"#\n"
         f"# [pipeline.source_overrides.paper]\n"
         f"# max_concepts_per_source = 15  # built-in default: 15\n"
+        f"#\n"
+        f"# Known-and-accepted lint advisories to collapse in `synto maintain` output.\n"
+        f'# Entry is "<check>" (matches every path) or "<check>:<vault-relative-path>"\n'
+        f"# (matches only that path). Display-only — health score and advisory count\n"
+        f"# are unaffected; acked issues just print as a single collapsed line.\n"
+        f"#\n"
+        f"# [maintain]\n"
+        f'# ack = ["graph_noise", "stale_lock:wiki/Old Draft.md"]\n'
     )
 
 
@@ -600,6 +609,30 @@ class CacheConfig(BaseModel):
     enabled: bool = False
 
 
+# Known lint check names, derived from LintIssue.issue_type so this list can't drift from the
+# checks lint.py actually emits.
+_LINT_ISSUE_TYPE_ANNOTATION = LintIssue.model_fields["issue_type"].annotation
+_KNOWN_LINT_CHECKS: frozenset[str] = frozenset(get_args(_LINT_ISSUE_TYPE_ANNOTATION))
+
+
+class MaintainConfig(BaseModel):
+    """Known-and-accepted lint advisories (#94). Display-only: never changes health_score or
+    advisory_issue_count — see partition_acked in pipeline/lint.py."""
+
+    ack: list[str] = Field(default_factory=list)
+
+    @field_validator("ack")
+    @classmethod
+    def warn_unknown_checks(cls, value: list[str]) -> list[str]:
+        for entry in value:
+            check = entry.split(":", 1)[0]
+            if check not in _KNOWN_LINT_CHECKS:
+                logging.getLogger(__name__).warning(
+                    "[maintain].ack: unknown check name %r — entry will never match", check
+                )
+        return value
+
+
 class Config(BaseModel):
     vault: Path
     models: ModelsConfig = ModelsConfig()
@@ -616,6 +649,7 @@ class Config(BaseModel):
     metrics: MetricsConfig = MetricsConfig()
     mcp: McpConfig = McpConfig()
     cache: CacheConfig = CacheConfig()
+    maintain: MaintainConfig = Field(default_factory=MaintainConfig)
 
     @field_validator("vault", mode="before")
     @classmethod

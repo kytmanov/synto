@@ -748,6 +748,37 @@ def _check_manual_relabel(config: Config, db: StateDB, issues: list[LintIssue], 
 # ── Public API ────────────────────────────────────────────────────────────────
 
 
+def partition_acked(
+    issues: list[LintIssue], ack_entries: list[str]
+) -> tuple[list[LintIssue], list[LintIssue]]:
+    """Split issues into (active, acked) per [maintain].ack entries (#94).
+
+    An entry is "<issue_type>" (matches every path) or "<issue_type>:<path>" (matches only
+    that vault-relative path), split on the first colon. Paths are compared with posix
+    separators on both sides — ack entries may be hand-written with backslashes on Windows,
+    while LintIssue.path is always vault-relative posix (see _vault_rel_path). Display-only:
+    callers must keep using the unpartitioned `issues` list for health score / auto-fix passes.
+    """
+    bare_checks: set[str] = set()
+    scoped_checks: set[tuple[str, str]] = set()
+    for entry in ack_entries:
+        check, sep, path = entry.partition(":")
+        if sep:
+            scoped_checks.add((check, path.replace("\\", "/")))
+        else:
+            bare_checks.add(check)
+
+    active: list[LintIssue] = []
+    acked: list[LintIssue] = []
+    for issue in issues:
+        norm_path = issue.path.replace("\\", "/")
+        if issue.issue_type in bare_checks or (issue.issue_type, norm_path) in scoped_checks:
+            acked.append(issue)
+        else:
+            active.append(issue)
+    return active, acked
+
+
 def run_lint(config: Config, db: StateDB, fix: bool = False) -> LintResult:
     issues: list[LintIssue] = []
 

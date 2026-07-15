@@ -1,5 +1,16 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- **`synto maintain` can acknowledge known lint advisories.** Long-running vaults often
+  carry advisories that are true by construction (e.g. `graph_noise`) and permanently
+  clutter `maintain` output, hiding new issues. Set `[maintain] ack = ["graph_noise"]` (or
+  `"check:vault/relative/path.md"` for a single file) in `synto.toml` to collapse acked
+  issues into a one-line count. Acks are display-only — the health score and advisory
+  count are unaffected.
+
 ## [0.6.3] - 2026-07-15
 
 Five fixes: two Windows bugs (editor launch, non-UTF-8 locales), lint false positives
