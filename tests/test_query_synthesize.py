@@ -12,7 +12,12 @@ from conftest import as_router
 from synto.config import Config
 from synto.metrics import app_event_sink
 from synto.models import WikiArticleRecord
-from synto.pipeline.query import _body_hash, _derive_synthesis_title, run_query
+from synto.pipeline.query import (
+    _body_hash,
+    _derive_synthesis_title,
+    find_existing_synthesis,
+    run_query,
+)
 from synto.state import StateDB
 from synto.vault import parse_note, write_note
 
@@ -571,3 +576,31 @@ def test_run_query_synthesize_rejects_synthesis_source_chain(tmp_path):
     assert events[0].payload["resolution"] == "rejected_synthesis_chain"
     assert events[0].payload["file_written"] is False
     assert events[0].payload["error"] == "Synthesis sources cannot include another synthesis page"
+
+
+def test_synthesize_write_failure_leaves_no_phantom_row(tmp_path, monkeypatch):
+    """A failed synthesis file write must not leave a committed DB row.
+
+    The row and the file are persisted in one _tx() frame; if atomic_write
+    raises, the insert must roll back — a surviving phantom row would block
+    re-synthesizing the question forever (dedup by question_hash).
+    """
+    _, config, db = _make_vault(tmp_path)
+    _write_index(config, "# Wiki Index\n\n## Concepts\n- [[Topic]]\n")
+    _write_concept_page(config, "Topic")
+
+    selection_json = json.dumps({"pages": ["Topic"]})
+    answer_json = json.dumps({"answer": "Answer.", "title": "Topic Overview"})
+    client = _make_client(selection_json, answer_json)
+
+    def boom(path, text):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("synto.pipeline.query.atomic_write", boom)
+
+    with app_event_sink():
+        with pytest.raises(OSError, match="disk full"):
+            run_query(config, client, db, "What is Topic?", synthesize=True)
+
+    assert find_existing_synthesis(db, "What is Topic?") is None
+    assert list(config.synthesis_dir.glob("*.md")) == []
