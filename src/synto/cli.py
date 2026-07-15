@@ -2341,7 +2341,9 @@ def eval_cmd(vault_str, queries_path, live, json_out):
 
 # Identity ops mutate the gitignored state.db; git revert restores the working tree
 # but never the DB, so reverting one of these commits silently diverges DB from disk.
-_IDENTITY_OP_RE = re.compile(r"concept (merge|split|unmerge|rename):")
+_IDENTITY_OP_RE = re.compile(
+    r"concept (merge|split|unmerge|rename|alias add|alias remove|alias move):"
+)
 
 
 def _is_identity_op_subject(message: str) -> bool:
@@ -2351,9 +2353,10 @@ def _is_identity_op_subject(message: str) -> bool:
 def _identity_op_reversal_hint(message: str) -> str:
     """Return the DB-aware reversal instruction for an identity-op commit subject.
 
-    Names are parsed off the stable ``L → W`` / ``L ← W`` subject tail; a subject that
-    does not split cleanly (a name containing the arrow — near-impossible) falls back to
-    a generic instruction rather than crashing.
+    Names are parsed off the stable ``L → W`` / ``L ← W`` subject tail (alias ops use
+    ``entity :: alias`` / ``alias :: from → to``); a subject that does not split cleanly
+    (a name containing the separator — near-impossible) falls back to a generic
+    instruction rather than crashing.
     """
     m = _IDENTITY_OP_RE.search(message)
     op = m.group(1) if m else ""
@@ -2369,6 +2372,19 @@ def _identity_op_reversal_hint(message: str) -> str:
         return f'reverse with: synto concept rename "{new.strip()}" "{old.strip()}"'
     if op == "split":
         return "reverse by re-merging the senses with `synto concept merge` (no single inverse)"
+    if op == "alias add" and " :: " in tail:
+        entity, alias = tail.split(" :: ", 1)
+        return f'reverse with: synto concept alias remove "{entity.strip()}" "{alias.strip()}"'
+    if op == "alias remove" and " :: " in tail:
+        entity, alias = tail.split(" :: ", 1)
+        return f'reverse with: synto concept alias add "{entity.strip()}" "{alias.strip()}"'
+    if op == "alias move" and " :: " in tail and " → " in tail:
+        alias, rest = tail.split(" :: ", 1)
+        from_entity, to_entity = rest.split(" → ", 1)
+        return (
+            f'reverse with: synto concept alias move "{to_entity.strip()}" '
+            f'"{from_entity.strip()}" "{alias.strip()}"'
+        )
     return (
         "reverse with the matching `synto concept …` op, not undo — "
         "state.db is gitignored and will not roll back"
@@ -4624,6 +4640,149 @@ def concept_unmerge(name: str, vault_str: str | None) -> None:
             )
 
 
+@concept.group("alias")
+def concept_alias() -> None:
+    """Add, remove, or move a single alias (surface) on a concept entity.
+
+    Unlike merge/split/rename, these ops target one alias surface — e.g. detaching an
+    extraction mistake (an npm package name attached as a project alias) without touching
+    the rest of the entity. `alias remove` records a denial tombstone so the next ingest
+    can't silently re-attach the surface (discussion #94).
+    """
+
+
+def _alias_op_commit(config, db, log_line: str, commit_subject: str) -> None:
+    """Shared post-op ritual for alias add/remove/move — mirrors rename/merge/split/unmerge."""
+    from .git_ops import git_commit
+    from .indexer import append_log, generate_index, generate_index_json
+
+    generate_index(config, db)
+    generate_index_json(config, db)  # refresh the committed identity seed (decision 13)
+    append_log(config, log_line)
+
+    if config.pipeline.auto_commit:
+        outcome = git_commit(config.vault, commit_subject, paths=["wiki/", ".synto/"])
+        if outcome == "committed":
+            console.print("[dim]Git commit created.[/dim]")
+        elif outcome == "failed":
+            console.print("[yellow]⚠ Git commit failed — run 'git status' in your vault.[/yellow]")
+        elif outcome == "blocked":
+            console.print(
+                "[yellow]⚠ Auto-commit skipped — you have staged changes. "
+                "Commit or stash them first.[/yellow]"
+            )
+
+
+@concept_alias.command("add")
+@click.argument("entity_name")
+@click.argument("alias")
+@click.option("--vault", "vault_str", envvar=VAULT_ENV_VAR, default=None)
+def concept_alias_add(entity_name: str, alias: str, vault_str: str | None) -> None:
+    """Add ALIAS as a blessed alias of ENTITY_NAME (clears a prior denial, if any)."""
+    config = _load_config(vault_str)
+    db = _load_db(config)
+
+    try:
+        db.add_alias(entity_name, alias)
+    except ValueError as exc:
+        click.echo(str(exc), err=True)
+        sys.exit(1)
+
+    console.print(f"[green]Added alias:[/green] '{alias}' → {entity_name}")
+    # Ambiguous aliases are excluded from link rewriting (list_alias_map), so this is a
+    # heads-up, not a failure — just surface it so the user isn't surprised later.
+    if db.resolve_label(alias).ambiguous:
+        console.print(
+            f"[yellow]⚠[/yellow] '{alias}' is now claimed by more than one active entity — "
+            "it will resolve ambiguously and won't be used to rewrite wiki links."
+        )
+
+    _alias_op_commit(
+        config,
+        db,
+        f"concept alias add | '{alias}' → '{entity_name}'",
+        f"concept alias add: {entity_name} :: {alias}",
+    )
+
+
+@concept_alias.command("remove")
+@click.argument("entity_name")
+@click.argument("alias")
+@click.option("--vault", "vault_str", envvar=VAULT_ENV_VAR, default=None)
+def concept_alias_remove(entity_name: str, alias: str, vault_str: str | None) -> None:
+    """Remove ALIAS from ENTITY_NAME and deny it from being re-attached by ingest."""
+    from .pipeline.maintain import unlink_alias_links
+
+    config = _load_config(vault_str)
+    db = _load_db(config)
+
+    entity_id = db.entity_id_for_name(entity_name)
+    if entity_id is None:
+        click.echo(f"Concept not found: {entity_name!r}", err=True)
+        sys.exit(1)
+    canonical_title = db.preferred_label_for_entity(entity_id) or entity_name
+
+    try:
+        db.remove_alias(entity_name, alias)
+    except ValueError as exc:
+        click.echo(str(exc), err=True)
+        sys.exit(1)
+
+    cleaned = unlink_alias_links(config, alias, canonical_title)
+
+    console.print(f"[green]Removed alias:[/green] '{alias}' from {entity_name}")
+    console.print(f"  Wiki links cleaned: {cleaned}")
+
+    _alias_op_commit(
+        config,
+        db,
+        f"concept alias remove | '{alias}' from '{entity_name}'",
+        f"concept alias remove: {entity_name} :: {alias}",
+    )
+
+
+@concept_alias.command("move")
+@click.argument("from_entity")
+@click.argument("to_entity")
+@click.argument("alias")
+@click.option("--vault", "vault_str", envvar=VAULT_ENV_VAR, default=None)
+def concept_alias_move(from_entity: str, to_entity: str, alias: str, vault_str: str | None) -> None:
+    """Move ALIAS from FROM_ENTITY to TO_ENTITY (deny-on-source + bless-on-target)."""
+    from .pipeline.maintain import unlink_alias_links
+
+    config = _load_config(vault_str)
+    db = _load_db(config)
+
+    from_id = db.entity_id_for_name(from_entity)
+    if from_id is None:
+        click.echo(f"Concept not found: {from_entity!r}", err=True)
+        sys.exit(1)
+    to_id = db.entity_id_for_name(to_entity)
+    if to_id is None:
+        click.echo(f"Concept not found: {to_entity!r}", err=True)
+        sys.exit(1)
+    from_title = db.preferred_label_for_entity(from_id) or from_entity
+    to_title = db.preferred_label_for_entity(to_id) or to_entity
+
+    try:
+        db.move_alias(alias, from_entity, to_entity)
+    except ValueError as exc:
+        click.echo(str(exc), err=True)
+        sys.exit(1)
+
+    cleaned = unlink_alias_links(config, alias, from_title, retarget_title=to_title)
+
+    console.print(f"[green]Moved alias:[/green] '{alias}'  {from_entity} → {to_entity}")
+    console.print(f"  Wiki links re-pointed: {cleaned}")
+
+    _alias_op_commit(
+        config,
+        db,
+        f"concept alias move | '{alias}' {from_entity} → {to_entity}",
+        f"concept alias move: {alias} :: {from_entity} → {to_entity}",
+    )
+
+
 @concept.command("inspect")
 @click.argument("name")
 @click.option("--vault", "vault_str", envvar=VAULT_ENV_VAR, default=None)
@@ -4647,6 +4806,9 @@ def concept_inspect(name: str, vault_str: str | None) -> None:
     console.print(f"[bold]{pref}[/bold]  [dim](entity_id: {eid})[/dim]")
     if aliases:
         console.print(f"  Aliases: {', '.join(aliases)}")
+    denied = [d["label"] for d in db.list_alias_denials() if d["entity_id"] == eid]
+    if denied:
+        console.print(f"  [dim]Denied aliases: {', '.join(denied)}[/dim]")
     console.print(f"  Sources: {len(sources)}")
     for src in sources:
         console.print(f"    [dim]{src}[/dim]")

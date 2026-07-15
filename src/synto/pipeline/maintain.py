@@ -249,6 +249,62 @@ def normalize_published_alias_links(
     return modified
 
 
+def unlink_alias_links(
+    config: Config,
+    alias: str,
+    canonical_title: str,
+    *,
+    retarget_title: str | None = None,
+) -> int:
+    """Inverse of normalize_published_alias_links: un-rewrite piped alias links.
+
+    `normalize_published_alias_links` already rewrote bare ``[[Alias]]`` mentions in
+    published articles to ``[[Canonical|Alias]]``. Once ``concept alias remove`` denies
+    that alias, those piped links are stale — no lint check can ever flag them (the
+    canonical target still exists) — so they must be un-rewritten here: to plain
+    ``Alias`` text when the alias is removed, or to ``[[RetargetTitle|Alias]]`` when it is
+    moved to another entity. The display text is preserved verbatim; only the target
+    changes. Returns the number of files modified.
+    """
+    alias_key = _ck(alias)
+    canonical_lower = canonical_title.lower()
+    modified = 0
+
+    for _title, path in list_wiki_articles(config.wiki_dir):
+        try:
+            meta, body = parse_note(path)
+        except Exception as exc:
+            log.warning("unlink_alias_links: skipping %s — %s", path.name, exc)
+            continue
+
+        masked, spans = _mask_code_blocks(body)
+
+        def _rewrite(m: re.Match) -> str:
+            target = m.group(1).strip()
+            display = m.group(3)
+            # Only piped links (explicit display) pointing at the canonical title, whose
+            # display text is this exact alias, are ours to touch — a bare [[Canonical]]
+            # link or a piped link with unrelated display text is left alone.
+            if target.lower() != canonical_lower or display is None or _ck(display) != alias_key:
+                return m.group(0)
+            if retarget_title:
+                fragment = m.group(2)
+                frag_part = f"#{fragment}" if fragment else ""
+                return f"[[{retarget_title}{frag_part}|{display}]]"
+            return display
+
+        new_masked = _WIKILINK_REPAIR_RE.sub(_rewrite, masked)
+        if new_masked == masked:
+            continue
+        new_body = _restore_code_blocks(new_masked, spans)
+
+        write_note(path, meta, new_body)
+        log.info("Un-rewrote alias links for %r in %s", alias, path.name)
+        modified += 1
+
+    return modified
+
+
 class ConceptRenameError(Exception):
     """Raised when a concept rename cannot proceed (not found, name taken, etc.)."""
 

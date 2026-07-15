@@ -129,7 +129,7 @@ def _fts5_available(conn: sqlite3.Connection) -> bool:
         return False
 
 
-_CURRENT_SCHEMA_VERSION = 26
+_CURRENT_SCHEMA_VERSION = 27
 
 
 @dataclass
@@ -461,6 +461,21 @@ CREATE TABLE IF NOT EXISTS concept_merge_candidates (
     reason     TEXT,
     created_at TEXT NOT NULL,
     PRIMARY KEY (entity_a, entity_b, surface)
+);
+
+-- `synto concept alias remove` tombstone (v27, discussion #94): extraction is
+-- LLM-non-deterministic and upsert_aliases(source='extracted') runs on every ingest, so a
+-- plain DELETE of a wrong alias gets silently re-attached by the next ingest. Every live
+-- alias-insert path checks this table (via _is_alias_denied) before writing a role='alias'
+-- row. Separate table, not a concept_labels.role value — the role CHECK is locked and a
+-- separate table keeps the >=2-entities ambiguity counting in list_alias_map/
+-- load_concept_alias_map untouched.
+CREATE TABLE IF NOT EXISTS concept_alias_denials (
+    entity_id  TEXT NOT NULL,
+    label      TEXT NOT NULL,
+    label_key  TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (entity_id, label_key)
 );
 """
 
@@ -872,6 +887,10 @@ _VERSIONED_MIGRATIONS: dict[int, list[str]] = {
             PRIMARY KEY (entity_a, entity_b, surface)
         )"""
     ],
+    # Empty is correct here: _SCHEMA runs in full on every open, before _migrate — so
+    # concept_alias_denials already exists by the time this version's migration step would
+    # run, on both a fresh DB and an upgrading one. Established pattern (see v22/v23/v25).
+    27: [],
 }
 
 
@@ -2107,6 +2126,23 @@ class StateDB:
         ).fetchone()
         return row is not None
 
+    def _is_alias_denied(self, entity_id: str, label_key: str) -> bool:
+        """True if (entity_id, label_key) carries a denial tombstone.
+
+        Every live alias-insert path (extraction, merge absorption, blessed restore) must
+        consult this before writing a role='alias' row, or `concept alias remove` gets
+        silently undone by the next ingest / rebuild.
+        """
+        if not self._has_table("concept_alias_denials"):
+            return False
+        return (
+            self._conn.execute(
+                "SELECT 1 FROM concept_alias_denials WHERE entity_id = ? AND label_key = ?",
+                (entity_id, label_key),
+            ).fetchone()
+            is not None
+        )
+
     # ── Raw Notes ─────────────────────────────────────────────────────────────
 
     def upsert_raw(self, record: RawNoteRecord) -> None:
@@ -2980,6 +3016,10 @@ class StateDB:
                 lk = _ck(lbl)
                 if not lk or lk == winner_lk:
                     continue
+                # The winner may have explicitly denied this exact surface (`concept alias
+                # remove`) — an explicit human decision outranks resurrecting it via merge.
+                if self._is_alias_denied(winner_id, lk):
+                    continue
                 self._conn.execute(
                     "INSERT INTO concept_labels"
                     " (entity_id, label, label_key, match_key, role, source, created_at)"
@@ -3174,7 +3214,7 @@ class StateDB:
                     raise ValueError(f"Cannot mint entity for sense name: {new_name!r}")
                 # Add bare label as a shared alias on the new entity.
                 new_lk = _ck(new_name)
-                if bare_lk and bare_lk != new_lk:
+                if bare_lk and bare_lk != new_lk and not self._is_alias_denied(new_id, bare_lk):
                     self._conn.execute(
                         "INSERT INTO concept_labels"
                         " (entity_id, label, label_key, match_key, role, source, created_at)"
@@ -3547,6 +3587,10 @@ class StateDB:
                     "SELECT 1 FROM concept_entities WHERE id=?", (eid,)
                 ).fetchone():
                     continue
+                # A denial recorded after this alias was blessed must win — the caller
+                # (rebuild) restores denials first, so this catches a since-denied alias.
+                if self._is_alias_denied(eid, lk):
+                    continue
                 cur = self._conn.execute(
                     "INSERT OR IGNORE INTO concept_labels"
                     " (entity_id, label, label_key, match_key, role, source, created_at)"
@@ -3555,6 +3599,144 @@ class StateDB:
                 )
                 restored += cur.rowcount
         return restored
+
+    def list_alias_denials(self) -> list[dict]:
+        """Return alias denial tombstones (`concept alias remove`) for the INDEX.json seed.
+
+        Mirrors list_blessed_aliases: a denial is a curation decision a re-ingest cannot
+        reproduce, so it must survive a state.db rebuild — else the next ingest silently
+        re-attaches the surface the human explicitly rejected.
+        """
+        if not self._has_table("concept_alias_denials"):
+            return []
+        rows = self._conn.execute(
+            "SELECT entity_id, label FROM concept_alias_denials ORDER BY entity_id, label"
+        ).fetchall()
+        return [{"entity_id": r[0], "label": r[1]} for r in rows]
+
+    def restore_alias_denials(self, entries: list[dict]) -> int:
+        """Re-insert denial tombstones on a fresh-DB rebuild. Returns the count restored.
+
+        Must run BEFORE restore_blessed_aliases in the rebuild sequence — restoring a
+        blessed alias that was later denied would otherwise resurrect it (restore_blessed_
+        aliases re-checks denials itself as defense in depth, but ordering is still load-
+        bearing: a denial written after this call could not be seen by that check).
+        """
+        if not self._has_table("concept_alias_denials") or not entries:
+            return 0
+        now = datetime.now().isoformat()
+        restored = 0
+        with self._tx():
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                eid = entry.get("entity_id")
+                label = entry.get("label")
+                if not eid or not label:
+                    continue
+                lk = _ck(label)
+                if not lk:
+                    continue
+                if not self._conn.execute(
+                    "SELECT 1 FROM concept_entities WHERE id=?", (eid,)
+                ).fetchone():
+                    continue
+                cur = self._conn.execute(
+                    "INSERT OR IGNORE INTO concept_alias_denials"
+                    " (entity_id, label, label_key, created_at) VALUES (?, ?, ?, ?)",
+                    (eid, label, lk, now),
+                )
+                restored += cur.rowcount
+        return restored
+
+    def remove_alias(self, concept_name: str, alias: str) -> bool:
+        """Detach ALIAS from concept_name and record a denial so re-ingest can't reattach it.
+
+        Strict lookup (entity_id_for_name) — unlike upsert_aliases this must NEVER mint an
+        entity for an unknown concept_name. Works on blessed (user/rename) aliases too: an
+        explicit `concept alias remove` outranks a past blessing.
+
+        Raises ValueError if the concept is unknown, the label is the entity's preferred
+        label (point the caller at `concept rename` instead), or the alias isn't attached
+        (a denial with nothing to deny would silently mask a typo).
+        """
+        entity_id = self.entity_id_for_name(concept_name)
+        if entity_id is None:
+            raise ValueError(f"Concept not found: {concept_name!r}")
+        lk = _ck(alias)
+        if not lk:
+            raise ValueError(f"Empty alias: {alias!r}")
+        preferred = self.preferred_label_for_entity(entity_id)
+        if preferred is not None and _ck(preferred) == lk:
+            raise ValueError(
+                f"{alias!r} is the preferred label of {concept_name!r}, not an alias — "
+                "use `synto concept rename` instead."
+            )
+        now = datetime.now().isoformat()
+        with self._tx():
+            row = self._conn.execute(
+                "SELECT label FROM concept_labels"
+                " WHERE entity_id = ? AND label_key = ? AND role = 'alias'",
+                (entity_id, lk),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"{alias!r} is not attached to {concept_name!r}")
+            self._conn.execute(
+                "DELETE FROM concept_labels"
+                " WHERE entity_id = ? AND label_key = ? AND role = 'alias'",
+                (entity_id, lk),
+            )
+            self._conn.execute(
+                "INSERT INTO concept_alias_denials (entity_id, label, label_key, created_at)"
+                " VALUES (?, ?, ?, ?)"
+                " ON CONFLICT(entity_id, label_key) DO UPDATE SET label=excluded.label,"
+                " created_at=excluded.created_at",
+                (entity_id, alias, lk, now),
+            )
+        return True
+
+    def add_alias(self, concept_name: str, alias: str) -> None:
+        """Bless ALIAS onto concept_name, clearing any prior denial first (re-adding un-denies).
+
+        Delegates to upsert_aliases(source='user') so the alias is durable (survives a
+        state.db rebuild) and protected from auto-demotion, exactly like a rename/merge
+        blessing.
+        """
+        entity_id = self.entity_id_for_name(concept_name)
+        if entity_id is None:
+            raise ValueError(f"Concept not found: {concept_name!r}")
+        lk = _ck(alias)
+        if lk:
+            with self._tx():
+                self._conn.execute(
+                    "DELETE FROM concept_alias_denials WHERE entity_id = ? AND label_key = ?",
+                    (entity_id, lk),
+                )
+        self.upsert_aliases(concept_name, [alias], source="user")
+
+    def move_alias(self, alias: str, from_name: str, to_name: str) -> None:
+        """Move ALIAS from from_name to to_name (remove-from + add-to in one transaction).
+
+        The denial recorded on from_name is load-bearing: it stops the next re-ingest from
+        re-attaching the surface to the wrong entity, which is exactly the bug this feature
+        exists to fix (a wrong extracted alias keeps coming back).
+        """
+        # A single outer transaction: remove_alias/add_alias each nest into it via SAVEPOINT
+        # (_tx supports reentrant nesting), so a failure in add_alias (e.g. unknown to_name)
+        # rolls back the remove too — the alias never ends up detached from both entities.
+        #
+        # The explicit BEGIN is load-bearing, not decorative: Python's sqlite3 module only
+        # auto-opens a transaction before it sees a recognized DML statement (INSERT/UPDATE/
+        # DELETE), not before a raw "SAVEPOINT" we issue ourselves. Without a real transaction
+        # already open, the nested calls' first SAVEPOINT is itself the outermost one, and
+        # RELEASEing it — even on success — commits for real instead of staying pending on
+        # this outer _tx(). A later exception's self._conn.rollback() would then have nothing
+        # left to undo, silently defeating the "one transaction" guarantee above.
+        with self._tx():
+            if not self._conn.in_transaction:
+                self._conn.execute("BEGIN")
+            self.remove_alias(from_name, alias)
+            self.add_alias(to_name, alias)
 
     def restore_entities_from_seed(self, entries: list[tuple[str, str]]) -> int:
         """Recreate entities with their ORIGINAL ids + preferred labels from a rebuild seed.
@@ -3722,7 +3904,11 @@ class StateDB:
                 # Primary write: concept_labels.
                 if entity_id is not None:
                     alias_lk = _ck(alias)
-                    if alias_lk and alias_lk != canonical_key:
+                    if (
+                        alias_lk
+                        and alias_lk != canonical_key
+                        and not self._is_alias_denied(entity_id, alias_lk)
+                    ):
                         self._conn.execute(
                             "INSERT INTO concept_labels"
                             " (entity_id, label, label_key, match_key, role, source, created_at)"
