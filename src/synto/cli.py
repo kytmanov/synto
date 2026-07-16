@@ -4683,12 +4683,16 @@ def concept_alias_add(entity_name: str, alias: str, vault_str: str | None) -> No
     db = _load_db(config)
 
     try:
-        db.add_alias(entity_name, alias)
+        cleared_denial = db.add_alias(entity_name, alias)
     except ValueError as exc:
         click.echo(str(exc), err=True)
         sys.exit(1)
 
     console.print(f"[green]Added alias:[/green] '{alias}' → {entity_name}")
+    if cleared_denial:
+        console.print(
+            f"[dim]Cleared the denial a previous 'alias remove' recorded for '{alias}'.[/dim]"
+        )
     # Ambiguous aliases are excluded from link rewriting (list_alias_map), so this is a
     # heads-up, not a failure — just surface it so the user isn't surprised later.
     if db.resolve_label(alias).ambiguous:
@@ -4728,7 +4732,7 @@ def concept_alias_remove(entity_name: str, alias: str, vault_str: str | None) ->
         click.echo(str(exc), err=True)
         sys.exit(1)
 
-    cleaned = unlink_alias_links(config, alias, canonical_title)
+    cleaned = unlink_alias_links(config, db, alias, canonical_title)
 
     console.print(f"[green]Removed alias:[/green] '{alias}' from {entity_name}")
     console.print(f"  Wiki links cleaned: {cleaned}")
@@ -4770,7 +4774,7 @@ def concept_alias_move(from_entity: str, to_entity: str, alias: str, vault_str: 
         click.echo(str(exc), err=True)
         sys.exit(1)
 
-    cleaned = unlink_alias_links(config, alias, from_title, retarget_title=to_title)
+    cleaned = unlink_alias_links(config, db, alias, from_title, retarget_title=to_title)
 
     console.print(f"[green]Moved alias:[/green] '{alias}'  {from_entity} → {to_entity}")
     console.print(f"  Wiki links re-pointed: {cleaned}")

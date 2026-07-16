@@ -87,7 +87,7 @@ def test_unlink_alias_links_remove_un_rewrites_piped_links(config, db):
         "See [[Mocha Project|@mocha/engine]] for details. Plain [[@mocha/engine]] stays.",
     )
 
-    modified = unlink_alias_links(config, "@mocha/engine", "Mocha Project")
+    modified = unlink_alias_links(config, db, "@mocha/engine", "Mocha Project")
     assert modified == 1
 
     _, body = parse_note(linker)
@@ -103,7 +103,7 @@ def test_unlink_alias_links_move_repoints_piped_links(config, db):
     linker = _write_article(config, "Overview", "See [[Mocha Project|@mocha/engine]] for details.")
 
     modified = unlink_alias_links(
-        config, "@mocha/engine", "Mocha Project", retarget_title="Mocha Engine"
+        config, db, "@mocha/engine", "Mocha Project", retarget_title="Mocha Engine"
     )
     assert modified == 1
 
@@ -115,7 +115,7 @@ def test_unlink_alias_links_leaves_unrelated_display_text_alone(config, db):
     _write_article(config, "Mocha Project", "## About\n\nThe project.")
     linker = _write_article(config, "Overview", "See [[Mocha Project|the framework]] for details.")
 
-    modified = unlink_alias_links(config, "@mocha/engine", "Mocha Project")
+    modified = unlink_alias_links(config, db, "@mocha/engine", "Mocha Project")
     assert modified == 0
 
     _, body = parse_note(linker)
@@ -131,7 +131,7 @@ def test_remove_end_to_end_cyrillic_alias(config, db):
     linker = _write_article(config, "Обзор", f"См. [[{canonical}|{alias}]] для деталей.")
 
     db.remove_alias(canonical, alias)
-    modified = unlink_alias_links(config, alias, canonical)
+    modified = unlink_alias_links(config, db, alias, canonical)
 
     assert modified == 1
     _, body = parse_note(linker)
@@ -305,3 +305,220 @@ def test_undo_refuses_alias_op(vault: Path) -> None:
 
     assert result.exit_code == 1, result.output
     assert "concept alias add" in result.output
+
+
+# ── review follow-ups: content_hash sync, blessed upgrade, fail-loud add ─────────
+
+
+def test_unlink_alias_links_syncs_db_content_hash(config, db):
+    """(#83 class) The un-rewrite must refresh the stored content_hash, or lint flags the
+    article stale and compile's manual-edit protection skips it forever after."""
+    import hashlib
+
+    from synto.models import WikiArticleRecord
+
+    _write_article(config, "Mocha Project", "## About\n\nThe project.")
+    linker = _write_article(config, "Overview", "See [[Mocha Project|@mocha/engine]] for details.")
+    rel = linker.relative_to(config.vault).as_posix()
+    _, body_before = parse_note(linker)
+    db.upsert_article(
+        WikiArticleRecord(
+            path=rel,
+            title="Overview",
+            sources=[],
+            content_hash=hashlib.sha256(body_before.encode()).hexdigest(),
+            status="published",
+        )
+    )
+
+    modified = unlink_alias_links(config, db, "@mocha/engine", "Mocha Project")
+    assert modified == 1
+
+    _, body_after = parse_note(linker)
+    assert body_after != body_before
+    stored = db.get_article(rel).content_hash
+    assert stored == hashlib.sha256(body_after.encode()).hexdigest()
+
+
+def test_add_alias_upgrades_extracted_alias_to_blessed(config, db):
+    """`concept alias add` on an already-extracted surface must not silently leave it weak —
+    a weak row is excluded from the durability seed and the blessed-alias map."""
+    db.upsert_aliases("Mocha Project", ["@mocha/engine"])  # source='extracted'
+    eid = db.entity_id_for_name("Mocha Project")
+
+    db.add_alias("Mocha Project", "@mocha/engine")
+
+    row = db._conn.execute(
+        "SELECT source FROM concept_labels WHERE entity_id=? AND label='@mocha/engine'"
+        " AND role='alias'",
+        (eid,),
+    ).fetchone()
+    assert row[0] == "user"
+    assert any(b["label"] == "@mocha/engine" for b in db.list_blessed_aliases())
+
+
+def test_blessed_upsert_never_downgrades_or_touches_preferred(config, db):
+    from synto.state import _ck
+
+    db.upsert_concepts("raw/a.md", ["Mocha Project"])
+    eid = db.entity_id_for_name("Mocha Project")
+    db.upsert_aliases("Mocha Project", ["@mocha/engine"], source="rename")
+
+    # A second blessed upsert must not rewrite the existing blessed source ...
+    db.upsert_aliases("Mocha Project", ["@mocha/engine"], source="user")
+    row = db._conn.execute(
+        "SELECT source FROM concept_labels WHERE entity_id=? AND label_key=? AND role='alias'",
+        (eid, _ck("@mocha/engine")),
+    ).fetchone()
+    assert row[0] == "rename"
+
+    # ... and the preferred-label row keeps its source untouched.
+    pref = db._conn.execute(
+        "SELECT source FROM concept_labels WHERE entity_id=? AND role='preferred'", (eid,)
+    ).fetchone()
+    assert pref[0] == "extracted"
+
+
+def test_add_alias_empty_raises(config, db):
+    db.upsert_concepts("raw/a.md", ["Mocha Project"])
+    with pytest.raises(ValueError, match="Empty alias"):
+        db.add_alias("Mocha Project", "")
+    with pytest.raises(ValueError, match="Empty alias"):
+        db.add_alias("Mocha Project", "   ")
+
+
+def test_add_alias_preferred_label_refused(config, db):
+    db.upsert_concepts("raw/a.md", ["Mocha Project"])
+    with pytest.raises(ValueError, match="concept rename"):
+        db.add_alias("Mocha Project", "Mocha Project")
+
+
+def test_add_alias_reports_cleared_denial(config, db):
+    db.upsert_aliases("Mocha Project", ["@mocha/engine"])
+    db.remove_alias("Mocha Project", "@mocha/engine")
+
+    assert db.add_alias("Mocha Project", "@mocha/engine") is True
+    assert db.add_alias("Mocha Project", "@mocha/other") is False
+
+
+def test_add_alias_failed_bless_keeps_denial(config, db, monkeypatch):
+    """Denial-clear and bless must commit together: if the bless fails, the denial from the
+    earlier remove must survive, not be dropped in a separate committed transaction."""
+    db.upsert_aliases("Mocha Project", ["@mocha/engine"])
+    db.remove_alias("Mocha Project", "@mocha/engine")
+    eid = db.entity_id_for_name("Mocha Project")
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("bless failed")
+
+    monkeypatch.setattr(db, "upsert_aliases", boom)
+    with pytest.raises(RuntimeError, match="bless failed"):
+        db.add_alias("Mocha Project", "@mocha/engine")
+
+    assert db._conn.execute(
+        "SELECT 1 FROM concept_alias_denials WHERE entity_id=? AND label='@mocha/engine'",
+        (eid,),
+    ).fetchone()
+
+
+# ── review follow-ups: denial transfer across merge / split ─────────────────────
+
+
+def test_merge_transfers_loser_denial_to_winner(config, db):
+    db.upsert_concepts("raw/a.md", ["Winner Concept"])
+    db.upsert_concepts("raw/b.md", ["Loser Concept"])
+    db.upsert_aliases("Loser Concept", ["badalias"])
+    db.remove_alias("Loser Concept", "badalias")
+
+    db.merge_entities("Winner Concept", "Loser Concept")
+
+    # The next ingest of the loser's sources resolves to the winner — the human's
+    # "this surface is not this concept" decision must still hold there.
+    db.upsert_aliases("Winner Concept", ["badalias"], source="extracted")
+    assert "badalias" not in db.get_aliases("Winner Concept")
+
+
+def test_merge_denial_transfer_skips_live_winner_label(config, db):
+    db.upsert_concepts("raw/a.md", ["Winner Concept"])
+    db.upsert_concepts("raw/b.md", ["Loser Concept"])
+    db.upsert_aliases("Winner Concept", ["sharedname"])
+    db.upsert_aliases("Loser Concept", ["sharedname"])
+    db.remove_alias("Loser Concept", "sharedname")
+
+    db.merge_entities("Winner Concept", "Loser Concept")
+
+    # The winner's live alias is standing state — it wins over the loser's denial.
+    assert "sharedname" in db.get_aliases("Winner Concept")
+
+
+def test_unmerge_strips_transferred_denial_and_keeps_losers_own(config, db):
+    db.upsert_concepts("raw/a.md", ["Winner Concept"])
+    db.upsert_concepts("raw/b.md", ["Loser Concept"])
+    db.upsert_aliases("Loser Concept", ["badalias"])
+    db.remove_alias("Loser Concept", "badalias")
+    loser_id = db.entity_id_for_name("Loser Concept")
+
+    db.merge_entities("Winner Concept", "Loser Concept")
+    db.unmerge_entities(loser_id)
+
+    # Winner is clean again: the surface may attach to it.
+    db.upsert_aliases("Winner Concept", ["badalias"], source="extracted")
+    assert "badalias" in db.get_aliases("Winner Concept")
+    # The restored loser still refuses it.
+    db.upsert_aliases("Loser Concept", ["badalias"], source="extracted")
+    assert "badalias" not in db.get_aliases("Loser Concept")
+
+
+def test_unmerge_keeps_denial_still_owed_by_other_merge(config, db):
+    """A→W and B→W both denied the same surface; unmerging A must keep the winner's denial
+    because still-merged B owes it too."""
+    db.upsert_concepts("raw/w.md", ["Winner Concept"])
+    db.upsert_concepts("raw/a.md", ["Loser Alpha"])
+    db.upsert_concepts("raw/b.md", ["Loser Beta"])
+    for loser in ("Loser Alpha", "Loser Beta"):
+        db.upsert_aliases(loser, ["badalias"])
+        db.remove_alias(loser, "badalias")
+    alpha_id = db.entity_id_for_name("Loser Alpha")
+
+    db.merge_entities("Winner Concept", "Loser Alpha")
+    db.merge_entities("Winner Concept", "Loser Beta")
+    db.unmerge_entities(alpha_id)
+
+    db.upsert_aliases("Winner Concept", ["badalias"], source="extracted")
+    assert "badalias" not in db.get_aliases("Winner Concept")
+
+
+def test_unmerge_never_strips_winners_own_denial(config, db):
+    """The winner denied the surface itself before the merge — no unmerge may undo that."""
+    db.upsert_concepts("raw/a.md", ["Winner Concept"])
+    db.upsert_concepts("raw/b.md", ["Loser Concept"])
+    db.upsert_aliases("Winner Concept", ["badalias"])
+    db.remove_alias("Winner Concept", "badalias")
+    db.upsert_aliases("Loser Concept", ["badalias"])
+    db.remove_alias("Loser Concept", "badalias")
+    loser_id = db.entity_id_for_name("Loser Concept")
+
+    db.merge_entities("Winner Concept", "Loser Concept")
+    db.unmerge_entities(loser_id)
+
+    db.upsert_aliases("Winner Concept", ["badalias"], source="extracted")
+    assert "badalias" not in db.get_aliases("Winner Concept")
+
+
+def test_split_copies_denials_to_senses(config, db):
+    db.upsert_concepts("raw/a.md", ["Mercury"])
+    db.upsert_concepts("raw/b.md", ["Mercury"])
+    db.upsert_aliases("Mercury", ["badalias"])
+    db.remove_alias("Mercury", "badalias")
+
+    db.split_entity(
+        "Mercury",
+        [
+            {"name": "Mercury (element)", "sources": ["raw/a.md"]},
+            {"name": "Mercury (planet)", "sources": ["raw/b.md"]},
+        ],
+    )
+
+    for sense in ("Mercury (element)", "Mercury (planet)"):
+        db.upsert_aliases(sense, ["badalias"], source="extracted")
+        assert "badalias" not in db.get_aliases(sense)

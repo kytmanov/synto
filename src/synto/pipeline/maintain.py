@@ -251,6 +251,7 @@ def normalize_published_alias_links(
 
 def unlink_alias_links(
     config: Config,
+    db: StateDB,
     alias: str,
     canonical_title: str,
     *,
@@ -266,6 +267,8 @@ def unlink_alias_links(
     moved to another entity. The display text is preserved verbatim; only the target
     changes. Returns the number of files modified.
     """
+    from .lint import _write_fixed_note
+
     alias_key = _ck(alias)
     canonical_lower = canonical_title.lower()
     modified = 0
@@ -298,7 +301,9 @@ def unlink_alias_links(
             continue
         new_body = _restore_code_blocks(new_masked, spans)
 
-        write_note(path, meta, new_body)
+        # Keep the DB content_hash in sync with the rewritten body (#83), so a later
+        # compile doesn't read this un-rewrite as a manual edit and lint doesn't flag stale.
+        _write_fixed_note(path, str(path.relative_to(config.vault)), meta, new_body, db)
         log.info("Un-rewrote alias links for %r in %s", alias, path.name)
         modified += 1
 
