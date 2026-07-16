@@ -129,7 +129,7 @@ def _fts5_available(conn: sqlite3.Connection) -> bool:
         return False
 
 
-_CURRENT_SCHEMA_VERSION = 26
+_CURRENT_SCHEMA_VERSION = 27
 
 
 @dataclass
@@ -461,6 +461,21 @@ CREATE TABLE IF NOT EXISTS concept_merge_candidates (
     reason     TEXT,
     created_at TEXT NOT NULL,
     PRIMARY KEY (entity_a, entity_b, surface)
+);
+
+-- `synto concept alias remove` tombstone (v27, discussion #94): extraction is
+-- LLM-non-deterministic and upsert_aliases(source='extracted') runs on every ingest, so a
+-- plain DELETE of a wrong alias gets silently re-attached by the next ingest. Every live
+-- alias-insert path checks this table (via _is_alias_denied) before writing a role='alias'
+-- row. Separate table, not a concept_labels.role value — the role CHECK is locked and a
+-- separate table keeps the >=2-entities ambiguity counting in list_alias_map/
+-- load_concept_alias_map untouched.
+CREATE TABLE IF NOT EXISTS concept_alias_denials (
+    entity_id  TEXT NOT NULL,
+    label      TEXT NOT NULL,
+    label_key  TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (entity_id, label_key)
 );
 """
 
@@ -872,6 +887,10 @@ _VERSIONED_MIGRATIONS: dict[int, list[str]] = {
             PRIMARY KEY (entity_a, entity_b, surface)
         )"""
     ],
+    # Empty is correct here: _SCHEMA runs in full on every open, before _migrate — so
+    # concept_alias_denials already exists by the time this version's migration step would
+    # run, on both a fresh DB and an upgrading one. Established pattern (see v22/v23/v25).
+    27: [],
 }
 
 
@@ -2121,6 +2140,23 @@ class StateDB:
         ).fetchone()
         return row is not None
 
+    def _is_alias_denied(self, entity_id: str, label_key: str) -> bool:
+        """True if (entity_id, label_key) carries a denial tombstone.
+
+        Every live alias-insert path (extraction, merge absorption, blessed restore) must
+        consult this before writing a role='alias' row, or `concept alias remove` gets
+        silently undone by the next ingest / rebuild.
+        """
+        if not self._has_table("concept_alias_denials"):
+            return False
+        return (
+            self._conn.execute(
+                "SELECT 1 FROM concept_alias_denials WHERE entity_id = ? AND label_key = ?",
+                (entity_id, label_key),
+            ).fetchone()
+            is not None
+        )
+
     # ── Raw Notes ─────────────────────────────────────────────────────────────
 
     def upsert_raw(self, record: RawNoteRecord) -> None:
@@ -2994,6 +3030,10 @@ class StateDB:
                 lk = _ck(lbl)
                 if not lk or lk == winner_lk:
                     continue
+                # The winner may have explicitly denied this exact surface (`concept alias
+                # remove`) — an explicit human decision outranks resurrecting it via merge.
+                if self._is_alias_denied(winner_id, lk):
+                    continue
                 self._conn.execute(
                     "INSERT INTO concept_labels"
                     " (entity_id, label, label_key, match_key, role, source, created_at)"
@@ -3002,6 +3042,46 @@ class StateDB:
                     (winner_id, lbl, lk, _mk(lbl), now),
                 )
                 labels_absorbed.append(lbl)
+
+            # Transfer the loser's denial tombstones onto the winner: the denial said "this
+            # surface is not this concept", and after the merge the loser IS the winner — the
+            # next ingest of the loser's sources would otherwise re-attach the denied surface
+            # to the winner. Skip any surface the winner carries live (alias or preferred):
+            # the winner's existing label is itself standing state and must win. Loser rows
+            # stay in place (the loser is retired, not deleted), so unmerge restores the
+            # loser's own denials for free; the transferred ones are recorded in meta so
+            # unmerge can strip exactly those from the winner.
+            denials_transferred: list[str] = []
+            if self._has_table("concept_alias_denials"):
+                loser_denials = self._conn.execute(
+                    "SELECT label, label_key FROM concept_alias_denials WHERE entity_id=?",
+                    (loser_id,),
+                ).fetchall()
+                for d_label, d_lk in loser_denials:
+                    if self._conn.execute(
+                        "SELECT 1 FROM concept_labels WHERE entity_id=? AND label_key=?",
+                        (winner_id, d_lk),
+                    ).fetchone():
+                        continue
+                    row_exists = self._conn.execute(
+                        "SELECT 1 FROM concept_alias_denials WHERE entity_id=? AND label_key=?",
+                        (winner_id, d_lk),
+                    ).fetchone()
+                    if not row_exists:
+                        self._conn.execute(
+                            "INSERT INTO concept_alias_denials"
+                            " (entity_id, label, label_key, created_at) VALUES (?, ?, ?, ?)",
+                            (winner_id, d_label, d_lk, now),
+                        )
+                        denials_transferred.append(d_label)
+                    elif self._alias_owed_by_other_merge(
+                        winner_id, loser_id, d_lk, meta_key="denials_transferred"
+                    ):
+                        # The existing winner row came from another still-merged loser's
+                        # transfer — record shared ownership so unmerging either loser keeps
+                        # the denial while the other still owes it. A row the winner denied
+                        # itself stays unrecorded, so no unmerge can strip it.
+                        denials_transferred.append(d_label)
 
             # Move compile state onto the winner entity (UPDATE OR IGNORE + delete the
             # leftover collides exactly like the concepts edge-move), refreshing the cache.
@@ -3126,6 +3206,7 @@ class StateDB:
                     "sources_moved": loser_sources,
                     "labels_absorbed": labels_absorbed,
                     "articles_repointed": articles_repointed,
+                    "denials_transferred": denials_transferred,
                 },
             )
 
@@ -3188,7 +3269,7 @@ class StateDB:
                     raise ValueError(f"Cannot mint entity for sense name: {new_name!r}")
                 # Add bare label as a shared alias on the new entity.
                 new_lk = _ck(new_name)
-                if bare_lk and bare_lk != new_lk:
+                if bare_lk and bare_lk != new_lk and not self._is_alias_denied(new_id, bare_lk):
                     self._conn.execute(
                         "INSERT INTO concept_labels"
                         " (entity_id, label, label_key, match_key, role, source, created_at)"
@@ -3214,6 +3295,27 @@ class StateDB:
                                    status='pending', updated_at=excluded.updated_at""",
                         (new_id, src, new_name, now),
                     )
+                # Copy the original's denial tombstones onto the sense: the human said "this
+                # surface is not this concept", and each sense inherits a partition of that
+                # concept's sources — without the copy, the next ingest of those sources could
+                # re-attach the denied surface to the sense. Conservative across all senses; if
+                # wrong for one, `concept alias add <sense> <surface>` clears it. Skip surfaces
+                # the sense already carries live (its preferred label / the shared bare alias).
+                if self._has_table("concept_alias_denials"):
+                    for d_label, d_lk in self._conn.execute(
+                        "SELECT label, label_key FROM concept_alias_denials WHERE entity_id=?",
+                        (original_id,),
+                    ).fetchall():
+                        if self._conn.execute(
+                            "SELECT 1 FROM concept_labels WHERE entity_id=? AND label_key=?",
+                            (new_id, d_lk),
+                        ).fetchone():
+                            continue
+                        self._conn.execute(
+                            "INSERT OR IGNORE INTO concept_alias_denials"
+                            " (entity_id, label, label_key, created_at) VALUES (?, ?, ?, ?)",
+                            (new_id, d_label, d_lk, now),
+                        )
                 result_senses.append({"name": new_name, "entity_id": new_id, "sources": sources})
 
             # Retire original entity.
@@ -3275,11 +3377,16 @@ class StateDB:
         return row[0] if row else None
 
     def _alias_owed_by_other_merge(
-        self, winner_id: str, excluding_loser_id: str, label_key: str
+        self,
+        winner_id: str,
+        excluding_loser_id: str,
+        label_key: str,
+        meta_key: str = "labels_absorbed",
     ) -> bool:
         """True if a still-merged loser other than excluding_loser_id contributed label_key.
 
-        Used by unmerge to avoid stripping an absorbed alias that another active merge still owes
+        Used by unmerge to avoid stripping an absorbed alias (meta_key='labels_absorbed') or a
+        transferred denial (meta_key='denials_transferred') that another active merge still owes
         to the winner. Scans ALL merge rows for this winner (no row cap): a deep curation history
         must not let an older still-active merge's claim fall outside a fixed scan window, or
         unmerge would drop the still-owed alias — the exact bug this guard exists to prevent.
@@ -3300,7 +3407,7 @@ class StateDB:
             if row is None or row[0] != "merged" or row[1] != winner_id:
                 continue
             meta = json.loads(meta_json) if meta_json else {}
-            if any(_ck(a) == label_key for a in (meta.get("labels_absorbed") or [])):
+            if any(_ck(a) == label_key for a in (meta.get(meta_key) or [])):
                 return True
         return False
 
@@ -3365,6 +3472,8 @@ class StateDB:
         sources_moved = list(meta.get("sources_moved") or [])
         labels_absorbed = list(meta.get("labels_absorbed") or [])
         articles_repointed = list(meta.get("articles_repointed") or [])
+        # Pre-transfer merge rows lack this key — nothing was moved, so nothing to strip.
+        denials_transferred = list(meta.get("denials_transferred") or [])
 
         # The loser must still be merged into this winner.
         row = self._conn.execute(
@@ -3433,6 +3542,23 @@ class StateDB:
                     "DELETE FROM concept_labels WHERE entity_id=? AND role='alias' AND label_key=?",
                     (winner_id, lk),
                 )
+            # Strip the denial tombstones this merge transferred onto the winner (recorded in
+            # meta). The loser kept its own denial rows through the merge, so reactivating it
+            # restored them for free. Same still-owed guard as absorbed aliases: another
+            # still-merged loser may have transferred the same denial.
+            if denials_transferred and self._has_table("concept_alias_denials"):
+                for lbl in denials_transferred:
+                    lk = _ck(lbl)
+                    if not lk:
+                        continue
+                    if self._alias_owed_by_other_merge(
+                        winner_id, loser_id, lk, meta_key="denials_transferred"
+                    ):
+                        continue
+                    self._conn.execute(
+                        "DELETE FROM concept_alias_denials WHERE entity_id=? AND label_key=?",
+                        (winner_id, lk),
+                    )
 
             # Drop candidates touching either entity — the graph changed; valid pairs re-derive
             # on the next ingest.
@@ -3561,6 +3687,10 @@ class StateDB:
                     "SELECT 1 FROM concept_entities WHERE id=?", (eid,)
                 ).fetchone():
                     continue
+                # A denial recorded after this alias was blessed must win — the caller
+                # (rebuild) restores denials first, so this catches a since-denied alias.
+                if self._is_alias_denied(eid, lk):
+                    continue
                 cur = self._conn.execute(
                     "INSERT OR IGNORE INTO concept_labels"
                     " (entity_id, label, label_key, match_key, role, source, created_at)"
@@ -3569,6 +3699,166 @@ class StateDB:
                 )
                 restored += cur.rowcount
         return restored
+
+    def list_alias_denials(self) -> list[dict]:
+        """Return alias denial tombstones (`concept alias remove`) for the INDEX.json seed.
+
+        Mirrors list_blessed_aliases: a denial is a curation decision a re-ingest cannot
+        reproduce, so it must survive a state.db rebuild — else the next ingest silently
+        re-attaches the surface the human explicitly rejected.
+        """
+        if not self._has_table("concept_alias_denials"):
+            return []
+        rows = self._conn.execute(
+            "SELECT entity_id, label FROM concept_alias_denials ORDER BY entity_id, label"
+        ).fetchall()
+        return [{"entity_id": r[0], "label": r[1]} for r in rows]
+
+    def restore_alias_denials(self, entries: list[dict]) -> int:
+        """Re-insert denial tombstones on a fresh-DB rebuild. Returns the count restored.
+
+        Must run BEFORE restore_blessed_aliases in the rebuild sequence — restoring a
+        blessed alias that was later denied would otherwise resurrect it (restore_blessed_
+        aliases re-checks denials itself as defense in depth, but ordering is still load-
+        bearing: a denial written after this call could not be seen by that check).
+        """
+        if not self._has_table("concept_alias_denials") or not entries:
+            return 0
+        now = datetime.now().isoformat()
+        restored = 0
+        with self._tx():
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                eid = entry.get("entity_id")
+                label = entry.get("label")
+                if not eid or not label:
+                    continue
+                lk = _ck(label)
+                if not lk:
+                    continue
+                if not self._conn.execute(
+                    "SELECT 1 FROM concept_entities WHERE id=?", (eid,)
+                ).fetchone():
+                    continue
+                cur = self._conn.execute(
+                    "INSERT OR IGNORE INTO concept_alias_denials"
+                    " (entity_id, label, label_key, created_at) VALUES (?, ?, ?, ?)",
+                    (eid, label, lk, now),
+                )
+                restored += cur.rowcount
+        return restored
+
+    def remove_alias(self, concept_name: str, alias: str) -> bool:
+        """Detach ALIAS from concept_name and record a denial so re-ingest can't reattach it.
+
+        Strict lookup (entity_id_for_name) — unlike upsert_aliases this must NEVER mint an
+        entity for an unknown concept_name. Works on blessed (user/rename) aliases too: an
+        explicit `concept alias remove` outranks a past blessing.
+
+        Raises ValueError if the concept is unknown, the label is the entity's preferred
+        label (point the caller at `concept rename` instead), or the alias isn't attached
+        (a denial with nothing to deny would silently mask a typo).
+        """
+        entity_id = self.entity_id_for_name(concept_name)
+        if entity_id is None:
+            raise ValueError(f"Concept not found: {concept_name!r}")
+        lk = _ck(alias)
+        if not lk:
+            raise ValueError(f"Empty alias: {alias!r}")
+        preferred = self.preferred_label_for_entity(entity_id)
+        if preferred is not None and _ck(preferred) == lk:
+            raise ValueError(
+                f"{alias!r} is the preferred label of {concept_name!r}, not an alias — "
+                "use `synto concept rename` instead."
+            )
+        now = datetime.now().isoformat()
+        with self._tx():
+            row = self._conn.execute(
+                "SELECT label FROM concept_labels"
+                " WHERE entity_id = ? AND label_key = ? AND role = 'alias'",
+                (entity_id, lk),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"{alias!r} is not attached to {concept_name!r}")
+            self._conn.execute(
+                "DELETE FROM concept_labels"
+                " WHERE entity_id = ? AND label_key = ? AND role = 'alias'",
+                (entity_id, lk),
+            )
+            self._conn.execute(
+                "INSERT INTO concept_alias_denials (entity_id, label, label_key, created_at)"
+                " VALUES (?, ?, ?, ?)"
+                " ON CONFLICT(entity_id, label_key) DO UPDATE SET label=excluded.label,"
+                " created_at=excluded.created_at",
+                (entity_id, alias, lk, now),
+            )
+        return True
+
+    def add_alias(self, concept_name: str, alias: str) -> bool:
+        """Bless ALIAS onto concept_name, clearing any prior denial first (re-adding un-denies).
+
+        Delegates to upsert_aliases(source='user') so the alias is durable (survives a
+        state.db rebuild) and protected from auto-demotion, exactly like a rename/merge
+        blessing. Returns True if a prior denial was cleared (an un-deny is otherwise an
+        invisible state change the CLI should surface).
+
+        Raises ValueError if the concept is unknown, the alias is empty, or the alias is the
+        entity's preferred label — upsert_aliases would silently skip both no-op cases and the
+        CLI would report success for a command that stored nothing.
+        """
+        entity_id = self.entity_id_for_name(concept_name)
+        if entity_id is None:
+            raise ValueError(f"Concept not found: {concept_name!r}")
+        lk = _ck(alias)
+        if not lk:
+            raise ValueError(f"Empty alias: {alias!r}")
+        preferred = self.preferred_label_for_entity(entity_id)
+        if preferred is not None and _ck(preferred) == lk:
+            raise ValueError(
+                f"{alias!r} is the preferred label of {concept_name!r}, not an alias — "
+                "use `synto concept rename` instead."
+            )
+        # Same explicit-BEGIN guard as move_alias: without a real transaction open, the nested
+        # upsert_aliases _tx() would RELEASE its own outermost SAVEPOINT and commit for real,
+        # leaving the denial-clear below to commit separately from the bless.
+        with self._tx():
+            if not self._conn.in_transaction:
+                self._conn.execute("BEGIN")
+            cur = self._conn.execute(
+                "DELETE FROM concept_alias_denials WHERE entity_id = ? AND label_key = ?",
+                (entity_id, lk),
+            )
+            # Bless via the PREFERRED label, not the caller-supplied name: entity_id_for_name
+            # resolves any label, but upsert's _ensure_entity_for_name matches preferred rows
+            # only — addressing the entity by one of its aliases would miss, demote that alias
+            # row, and mint a phantom entity that receives the bless.
+            self.upsert_aliases(preferred or concept_name, [alias], source="user")
+        return cur.rowcount > 0
+
+    def move_alias(self, alias: str, from_name: str, to_name: str) -> None:
+        """Move ALIAS from from_name to to_name (remove-from + add-to in one transaction).
+
+        The denial recorded on from_name is load-bearing: it stops the next re-ingest from
+        re-attaching the surface to the wrong entity, which is exactly the bug this feature
+        exists to fix (a wrong extracted alias keeps coming back).
+        """
+        # A single outer transaction: remove_alias/add_alias each nest into it via SAVEPOINT
+        # (_tx supports reentrant nesting), so a failure in add_alias (e.g. unknown to_name)
+        # rolls back the remove too — the alias never ends up detached from both entities.
+        #
+        # The explicit BEGIN is load-bearing, not decorative: Python's sqlite3 module only
+        # auto-opens a transaction before it sees a recognized DML statement (INSERT/UPDATE/
+        # DELETE), not before a raw "SAVEPOINT" we issue ourselves. Without a real transaction
+        # already open, the nested calls' first SAVEPOINT is itself the outermost one, and
+        # RELEASEing it — even on success — commits for real instead of staying pending on
+        # this outer _tx(). A later exception's self._conn.rollback() would then have nothing
+        # left to undo, silently defeating the "one transaction" guarantee above.
+        with self._tx():
+            if not self._conn.in_transaction:
+                self._conn.execute("BEGIN")
+            self.remove_alias(from_name, alias)
+            self.add_alias(to_name, alias)
 
     def restore_entities_from_seed(self, entries: list[tuple[str, str]]) -> int:
         """Recreate entities with their ORIGINAL ids + preferred labels from a rebuild seed.
@@ -3721,11 +4011,25 @@ class StateDB:
 
         ``source`` defaults to 'extracted' (a weak LLM-guessed alias). Curation paths that record a
         human decision (e.g. rename keeping the old name) pass a blessed source ('rename'/'user')
-        so the order-independent ingest rule links the surface instead of re-minting it.
+        so the order-independent ingest rule links the surface instead of re-minting it. A blessed
+        source also upgrades an existing weak (extracted) alias row in place — otherwise
+        `concept alias add` on an already-extracted surface would report success while leaving the
+        alias excluded from the durability seed and the blessed-alias map. Existing blessed rows
+        and role='preferred' conflict rows are never touched.
         """
         canonical_lower = concept_name.lower()
         canonical_key = _ck(concept_name)
         now = datetime.now().isoformat()
+        if source in ("user", "rename"):
+            # Weak = extracted OR legacy_backfill — the same pair _ensure_entity_for_name
+            # demotes. Upgrading only 'extracted' would leave migrated aliases un-blessable.
+            on_conflict = (
+                " ON CONFLICT(entity_id, label_key) DO UPDATE SET source=excluded.source"
+                " WHERE concept_labels.role='alias'"
+                " AND concept_labels.source IN ('extracted', 'legacy_backfill')"
+            )
+        else:
+            on_conflict = " ON CONFLICT(entity_id, label_key) DO NOTHING"
         with self._tx():
             # Ensure the entity exists (creates if missing — upsert_aliases asserts ownership).
             entity_id = self._ensure_entity_for_name(concept_name, now)
@@ -3736,12 +4040,15 @@ class StateDB:
                 # Primary write: concept_labels.
                 if entity_id is not None:
                     alias_lk = _ck(alias)
-                    if alias_lk and alias_lk != canonical_key:
+                    if (
+                        alias_lk
+                        and alias_lk != canonical_key
+                        and not self._is_alias_denied(entity_id, alias_lk)
+                    ):
                         self._conn.execute(
                             "INSERT INTO concept_labels"
                             " (entity_id, label, label_key, match_key, role, source, created_at)"
-                            " VALUES (?, ?, ?, ?, 'alias', ?, ?)"
-                            " ON CONFLICT(entity_id, label_key) DO NOTHING",
+                            " VALUES (?, ?, ?, ?, 'alias', ?, ?)" + on_conflict,
                             (entity_id, alias, alias_lk, _mk(alias), source, now),
                         )
 

@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### Added
+
+- **`synto concept alias add/remove/move` for fixing a wrong extracted alias.** The fast
+  model sometimes attaches a surface to the wrong entity (e.g. an npm package name
+  attached as a project alias) with no CLI remedy. `remove` now detaches the alias and
+  records a denial tombstone so the next ingest can't silently re-attach it; `move`
+  re-points it to the correct entity in one step. Both un-rewrite any `[[Canonical|Alias]]`
+  wiki links the wrong alias had produced, and denials survive a `state.db` rebuild via
+  the `.synto/INDEX.json` seed like blessed aliases already do.
+- **`synto maintain` can acknowledge known lint advisories.** Long-running vaults often
+  carry advisories that are true by construction (e.g. `graph_noise`) and permanently
+  clutter `maintain` output, hiding new issues. Set `[maintain] ack = ["graph_noise"]` (or
+  `"check:vault/relative/path.md"` for a single file) in `synto.toml` to collapse acked
+  issues into a one-line count. Acks are display-only — the health score and advisory
+  count are unaffected.
+
 ### Fixed
 
 - **`StateDB._tx()` now opens a real transaction at depth 0.** sqlite3's legacy isolation
