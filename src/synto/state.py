@@ -3815,7 +3815,11 @@ class StateDB:
                 "DELETE FROM concept_alias_denials WHERE entity_id = ? AND label_key = ?",
                 (entity_id, lk),
             )
-            self.upsert_aliases(concept_name, [alias], source="user")
+            # Bless via the PREFERRED label, not the caller-supplied name: entity_id_for_name
+            # resolves any label, but upsert's _ensure_entity_for_name matches preferred rows
+            # only — addressing the entity by one of its aliases would miss, demote that alias
+            # row, and mint a phantom entity that receives the bless.
+            self.upsert_aliases(preferred or concept_name, [alias], source="user")
         return cur.rowcount > 0
 
     def move_alias(self, alias: str, from_name: str, to_name: str) -> None:
@@ -4003,9 +4007,12 @@ class StateDB:
         canonical_key = _ck(concept_name)
         now = datetime.now().isoformat()
         if source in ("user", "rename"):
+            # Weak = extracted OR legacy_backfill — the same pair _ensure_entity_for_name
+            # demotes. Upgrading only 'extracted' would leave migrated aliases un-blessable.
             on_conflict = (
                 " ON CONFLICT(entity_id, label_key) DO UPDATE SET source=excluded.source"
-                " WHERE concept_labels.role='alias' AND concept_labels.source='extracted'"
+                " WHERE concept_labels.role='alias'"
+                " AND concept_labels.source IN ('extracted', 'legacy_backfill')"
             )
         else:
             on_conflict = " ON CONFLICT(entity_id, label_key) DO NOTHING"

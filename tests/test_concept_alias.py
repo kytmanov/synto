@@ -522,3 +522,58 @@ def test_split_copies_denials_to_senses(config, db):
     for sense in ("Mercury (element)", "Mercury (planet)"):
         db.upsert_aliases(sense, ["badalias"], source="extracted")
         assert "badalias" not in db.get_aliases(sense)
+
+
+# ── round-2 review follow-ups: alias-addressed bless, legacy_backfill upgrade ────
+
+
+def test_add_alias_addressed_by_alias_does_not_mint_phantom_entity(config, db):
+    """entity_id_for_name resolves any label, but upsert's _ensure_entity_for_name matches
+    preferred rows only — blessing through an alias name must not fall into the mint path,
+    demote the addressing alias, and hand the bless to a phantom entity."""
+    db.upsert_concepts("raw/a.md", ["Mocha Project"])
+    db.upsert_aliases("Mocha Project", ["@mocha/engine"])
+    eid = db.entity_id_for_name("Mocha Project")
+    entities_before = db._conn.execute("SELECT COUNT(*) FROM concept_entities").fetchone()[0]
+
+    db.add_alias("@mocha/engine", "mocha-rt")
+
+    entities_after = db._conn.execute("SELECT COUNT(*) FROM concept_entities").fetchone()[0]
+    assert entities_after == entities_before
+    assert "mocha-rt" in db.get_aliases("Mocha Project")
+    # The addressing alias row survived untouched.
+    assert "@mocha/engine" in db.get_aliases("Mocha Project")
+    assert db.entity_id_for_name("@mocha/engine") == eid
+
+
+def test_move_alias_target_addressed_by_alias_lands_on_real_entity(config, db):
+    db.upsert_concepts("raw/a.md", ["Mocha Project"])
+    db.upsert_concepts("raw/b.md", ["Mocha Toolkit"])
+    db.upsert_aliases("Mocha Toolkit", ["toolkit-alias"])
+    db.upsert_aliases("Mocha Project", ["@mocha/engine"])
+    entities_before = db._conn.execute("SELECT COUNT(*) FROM concept_entities").fetchone()[0]
+
+    db.move_alias("@mocha/engine", "Mocha Project", "toolkit-alias")
+
+    entities_after = db._conn.execute("SELECT COUNT(*) FROM concept_entities").fetchone()[0]
+    assert entities_after == entities_before
+    assert "@mocha/engine" in db.get_aliases("Mocha Toolkit")
+    assert "@mocha/engine" not in db.get_aliases("Mocha Project")
+
+
+def test_add_alias_upgrades_legacy_backfill_alias_to_blessed(config, db):
+    """legacy_backfill is the other WEAK source (see _ensure_entity_for_name's demote pair) —
+    blessing a migrated alias must upgrade it, not silently leave it out of the seed."""
+    db.upsert_concepts("raw/a.md", ["Mocha Project"])
+    db.upsert_aliases("Mocha Project", ["@mocha/engine"], source="legacy_backfill")
+    eid = db.entity_id_for_name("Mocha Project")
+
+    db.add_alias("Mocha Project", "@mocha/engine")
+
+    row = db._conn.execute(
+        "SELECT source FROM concept_labels WHERE entity_id=? AND label='@mocha/engine'"
+        " AND role='alias'",
+        (eid,),
+    ).fetchone()
+    assert row[0] == "user"
+    assert any(b["label"] == "@mocha/engine" for b in db.list_blessed_aliases())
