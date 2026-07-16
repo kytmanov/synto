@@ -4,6 +4,13 @@
 
 ### Added
 
+- **`synto concept alias add/remove/move` for fixing a wrong extracted alias.** The fast
+  model sometimes attaches a surface to the wrong entity (e.g. an npm package name
+  attached as a project alias) with no CLI remedy. `remove` now detaches the alias and
+  records a denial tombstone so the next ingest can't silently re-attach it; `move`
+  re-points it to the correct entity in one step. Both un-rewrite any `[[Canonical|Alias]]`
+  wiki links the wrong alias had produced, and denials survive a `state.db` rebuild via
+  the `.synto/INDEX.json` seed like blessed aliases already do.
 - **`synto maintain` can acknowledge known lint advisories.** Long-running vaults often
   carry advisories that are true by construction (e.g. `graph_noise`) and permanently
   clutter `maintain` output, hiding new issues. Set `[maintain] ack = ["graph_noise"]` (or
