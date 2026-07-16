@@ -51,6 +51,10 @@ class PipelineReport:
     published: int = 0
     held_back: int = 0
     lint_issues: int = 0
+    # Subset of lint_issues covered by [maintain].ack — display-only. lint_issues stays raw
+    # (compare metrics feed on it and must not vary with a user's ack preferences); the CLI
+    # subtracts this for the summary row and the "Fix issues" tip.
+    lint_issues_acked: int = 0
     stubs_created: int = 0
     rounds: int = 0
     timings: dict[str, float] = field(default_factory=dict)
@@ -95,7 +99,7 @@ class PipelineOrchestrator:
         from ..indexer import append_log, generate_index
         from ..pipeline.compile import approve_drafts
         from ..pipeline.ingest import ingest_note
-        from ..pipeline.lint import run_lint
+        from ..pipeline.lint import partition_acked, run_lint
         from ..pipeline.maintain import create_stubs
 
         config = self.config
@@ -168,6 +172,9 @@ class PipelineOrchestrator:
         if not dry_run:
             lint_result = run_lint(config, db)
             report.lint_issues = len(lint_result.issues)
+            report.lint_issues_acked = len(
+                partition_acked(lint_result.issues, config.maintain.ack)[1]
+            )
             broken_links = [i for i in lint_result.issues if i.issue_type == "broken_link"]
 
             if fix and broken_links:
@@ -230,6 +237,9 @@ class PipelineOrchestrator:
             append_log(config, f"run | {report.published} articles published")
             lint_result = run_lint(config, db)
             report.lint_issues = len(lint_result.issues)
+            report.lint_issues_acked = len(
+                partition_acked(lint_result.issues, config.maintain.ack)[1]
+            )
 
         # ── Commit ─────────────────────────────────────────────────────────────
         if config.pipeline.auto_commit and not dry_run and (report.compiled or report.published):

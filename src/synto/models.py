@@ -209,6 +209,26 @@ class LintIssue(BaseModel):
     auto_fixable: bool = False
 
 
+# Advisory = never affects LintResult.health_score (the score is structural wiki health).
+# Lives here next to LintIssue so config.py can validate [maintain].ack entries against it
+# without importing pipeline.lint (which imports Config — a cycle).
+_ADVISORY_ISSUE_TYPES = frozenset(
+    {
+        "graph_noise",
+        "graph_connectivity",
+        "synthesis_chain",
+        "stale_lock",
+        "missing_media",
+        "label_collision",
+        "orphan_entity",
+        "ambiguous_label_needs_disambiguation",
+        "stale_legacy_backfill_alias",
+        "homonym_filename_collision",
+        "manual_relabel_adopted",
+    }
+)
+
+
 class LintResult(BaseModel):
     issues: list[LintIssue]
     health_score: float = Field(ge=0, le=100)

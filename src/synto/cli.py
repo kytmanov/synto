@@ -3236,7 +3236,11 @@ def run(
     table.add_row("Published", str(report.published), "")
     if report.held_back > 0:
         table.add_row("Held back", str(report.held_back), "")
-    table.add_row("Lint issues", str(report.lint_issues), "")
+    active_lint = report.lint_issues - report.lint_issues_acked
+    if report.lint_issues_acked:
+        table.add_row("Lint issues", f"{active_lint} ({report.lint_issues_acked} acked)", "")
+    else:
+        table.add_row("Lint issues", str(report.lint_issues), "")
     table.add_row("Stubs created", str(report.stubs_created), "")
     if report.rounds > 1:
         table.add_row("Compile rounds", str(report.rounds), "")
@@ -3287,7 +3291,8 @@ def run(
         if report.published > 0:
             tips.append(f"Export pack:    [bold]{CLI_NAME} pack export --target agents[/bold]")
             tips.append(f'Query wiki:     [bold]{CLI_NAME} query "..."[/bold]')
-        if report.lint_issues > 0:
+        # Acked advisories are known-and-accepted — they must not keep this nag alive.
+        if report.lint_issues - report.lint_issues_acked > 0:
             tips.append(f"Fix issues:     [bold]{CLI_NAME} maintain --fix[/bold]")
         if not tips and report.ingested == 0 and report.compiled == 0:
             tips.append("Add notes to [bold]raw/[/bold] and run again.")

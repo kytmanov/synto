@@ -145,3 +145,104 @@ def test_unknown_check_name_in_toml_still_loads_vault(vault: Path, caplog):
 
     assert result.exit_code == 0, result.output
     assert "Structural health" in result.output
+    # The validator must actually run on the TOML load path, not just direct construction.
+    assert any("unknown check name" in r.message for r in caplog.records)
+
+
+# ── Advisory-only scope ───────────────────────────────────────────────────────
+
+
+def test_structural_check_cannot_be_acked():
+    """Acking a score-affecting issue would hide it while the score stays dinged —
+    partition_acked must refuse, keeping "(N advisory, M acked)" a true subset."""
+    issues = [_issue("orphan", "wiki/A.md"), _issue("broken_link", "wiki/B.md")]
+
+    active, acked = partition_acked(issues, ["orphan", "broken_link:wiki/B.md"])
+
+    assert active == issues
+    assert acked == []
+
+
+def test_structural_check_in_ack_warns_at_config_load(caplog):
+    with caplog.at_level(logging.WARNING):
+        config = Config(vault="/tmp/v", maintain={"ack": ["orphan"]})
+
+    assert config.maintain.ack == ["orphan"]
+    assert any("structural check, not an advisory" in r.message for r in caplog.records)
+
+
+# ── Whitespace tolerance ──────────────────────────────────────────────────────
+
+
+def test_ack_entries_tolerate_natural_toml_spacing():
+    issues = [_issue("graph_noise", "Welcome.md"), _issue("stale_lock", "wiki/X.md")]
+
+    active, acked = partition_acked(issues, [" graph_noise ", "stale_lock: wiki/X.md"])
+
+    assert active == []
+    assert acked == issues
+
+
+def test_ack_whitespace_check_name_does_not_warn(caplog):
+    with caplog.at_level(logging.WARNING):
+        Config(vault="/tmp/v", maintain={"ack": [" graph_noise"]})
+
+    assert not any("unknown check name" in r.message for r in caplog.records)
+
+
+# ── `synto run` summary is ack-aware ──────────────────────────────────────────
+
+
+def _invoke_run_with_report(vault: Path, monkeypatch, report):
+    from unittest.mock import MagicMock
+
+    monkeypatch.setattr("synto.cli._load_deps", lambda config: (MagicMock(), MagicMock()))
+    monkeypatch.setattr(
+        "synto.pipeline.orchestrator.PipelineOrchestrator.run",
+        lambda self, **kwargs: report,
+    )
+    return CliRunner().invoke(cli, ["run", "--vault", str(vault)])
+
+
+def test_run_summary_collapses_acked_and_drops_fix_tip(vault: Path, monkeypatch):
+    """The run summary is the lint surface users see most — an acked advisory must not
+    keep the "Fix issues: synto maintain --fix" nag alive forever."""
+    from synto.pipeline.orchestrator import PipelineReport
+
+    result = _invoke_run_with_report(
+        vault, monkeypatch, PipelineReport(lint_issues=1, lint_issues_acked=1)
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "(1 acked)" in result.output
+    assert "maintain --fix" not in result.output
+
+
+def test_run_summary_without_ack_keeps_fix_tip(vault: Path, monkeypatch):
+    from synto.pipeline.orchestrator import PipelineReport
+
+    result = _invoke_run_with_report(vault, monkeypatch, PipelineReport(lint_issues=1))
+
+    assert result.exit_code == 0, result.output
+    assert "acked" not in result.output
+    assert "maintain --fix" in result.output
+
+
+def test_orchestrator_computes_acked_count_from_config(vault: Path):
+    """report.lint_issues stays raw (compare metrics feed on it); the acked subset is
+    reported separately for the CLI to subtract."""
+    from unittest.mock import MagicMock, patch
+
+    from synto.pipeline.orchestrator import PipelineOrchestrator
+
+    config = Config(vault=vault, maintain={"ack": ["graph_noise"]})
+    from synto.state import StateDB
+
+    db = StateDB(config.state_db_path)
+    with patch("synto.pipeline.orchestrator._run_compile") as mock_compile:
+        mock_compile.return_value = ([], [], {})
+        report = PipelineOrchestrator(config, MagicMock(), db).run(paths=[])
+
+    assert report.lint_issues >= 1  # the Welcome.md graph_noise advisory
+    assert report.lint_issues_acked == 1
+    assert report.lint_issues_acked <= report.lint_issues

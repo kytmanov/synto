@@ -11,7 +11,7 @@ from typing import Any, Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .models import LintIssue
+from .models import _ADVISORY_ISSUE_TYPES, LintIssue
 from .paths import APP_DIR_NAME, LEGACY_CONFIG_FILE_NAME, effective_config_path
 from .providers import get_provider
 
@@ -167,11 +167,13 @@ def _vault_toml_tail(inline_source_citations: bool) -> str:
         f"#\n"
         f"# Known-and-accepted lint advisories to collapse in `synto maintain` output.\n"
         f'# Entry is "<check>" (matches every path) or "<check>:<vault-relative-path>"\n'
-        f"# (matches only that path). Display-only — health score and advisory count\n"
-        f"# are unaffected; acked issues just print as a single collapsed line.\n"
+        f"# (matches only that path). Advisory checks only — structural issues (orphans,\n"
+        f"# broken links, ...) affect the health score and cannot be acked. Display-only —\n"
+        f"# health score and advisory count are unaffected; acked issues just print as a\n"
+        f"# single collapsed line.\n"
         f"#\n"
         f"# [maintain]\n"
-        f'# ack = ["graph_noise", "stale_lock:wiki/Old Draft.md"]\n'
+        f'# ack = ["stale_lock", "graph_noise:wiki/Imported Note.md"]\n'
     )
 
 
@@ -625,10 +627,16 @@ class MaintainConfig(BaseModel):
     @classmethod
     def warn_unknown_checks(cls, value: list[str]) -> list[str]:
         for entry in value:
-            check = entry.split(":", 1)[0]
+            check = entry.split(":", 1)[0].strip()
             if check not in _KNOWN_LINT_CHECKS:
                 logging.getLogger(__name__).warning(
                     "[maintain].ack: unknown check name %r — entry will never match", check
+                )
+            elif check not in _ADVISORY_ISSUE_TYPES:
+                logging.getLogger(__name__).warning(
+                    "[maintain].ack: %r is a structural check, not an advisory — it affects "
+                    "the health score and cannot be acked; entry will never match",
+                    check,
                 )
         return value
 
