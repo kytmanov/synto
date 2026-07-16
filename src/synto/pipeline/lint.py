@@ -26,7 +26,7 @@ from ..markdown_math import (
     restore_markdown_regions,
     sanitize_obsidian_math,
 )
-from ..models import LintIssue, LintResult
+from ..models import _ADVISORY_ISSUE_TYPES, LintIssue, LintResult
 from ..sanitize import sanitize_tag, sanitize_tags
 from ..state import StateDB
 from ..vault import _MEDIA_EXTENSIONS, extract_wikilinks, parse_note, sanitize_filename, write_note
@@ -58,23 +58,6 @@ _BARE_LATEX_LINE_RE = re.compile(
 
 # Vault-internal directory names that LLMs sometimes write as wikilinks
 _VAULT_DIRS = frozenset({"wiki", "raw", "source", "sources", "queries", ".drafts", ".olw"})
-
-_ADVISORY_ISSUE_TYPES = frozenset(
-    {
-        "graph_noise",
-        "graph_connectivity",
-        "synthesis_chain",
-        "stale_lock",
-        "missing_media",
-        "label_collision",
-        "orphan_entity",
-        "ambiguous_label_needs_disambiguation",
-        "stale_legacy_backfill_alias",
-        "homonym_filename_collision",
-        "manual_relabel_adopted",
-    }
-)
-
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -746,6 +729,44 @@ def _check_manual_relabel(config: Config, db: StateDB, issues: list[LintIssue], 
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
+
+
+def partition_acked(
+    issues: list[LintIssue], ack_entries: list[str]
+) -> tuple[list[LintIssue], list[LintIssue]]:
+    """Split issues into (active, acked) per [maintain].ack entries (#94).
+
+    An entry is "<issue_type>" (matches every path) or "<issue_type>:<path>" (matches only
+    that vault-relative path), split on the first colon; check and path are stripped so
+    natural TOML spacing ("stale_lock: wiki/X.md") doesn't silently never match. Paths are
+    compared with posix separators on both sides — ack entries may be hand-written with
+    backslashes on Windows, while LintIssue.path is always vault-relative posix (see
+    _vault_rel_path). Only ADVISORY issue types can be acked — an acked structural issue
+    would keep lowering the health score while hidden from the list, so it stays active
+    (config warns about such entries at load). Display-only: callers must keep using the
+    unpartitioned `issues` list for health score / auto-fix passes.
+    """
+    bare_checks: set[str] = set()
+    scoped_checks: set[tuple[str, str]] = set()
+    for entry in ack_entries:
+        check, sep, path = entry.partition(":")
+        check = check.strip()
+        if check not in _ADVISORY_ISSUE_TYPES:
+            continue
+        if sep:
+            scoped_checks.add((check, path.strip().replace("\\", "/")))
+        else:
+            bare_checks.add(check)
+
+    active: list[LintIssue] = []
+    acked: list[LintIssue] = []
+    for issue in issues:
+        norm_path = issue.path.replace("\\", "/")
+        if issue.issue_type in bare_checks or (issue.issue_type, norm_path) in scoped_checks:
+            acked.append(issue)
+        else:
+            active.append(issue)
+    return active, acked
 
 
 def run_lint(config: Config, db: StateDB, fix: bool = False) -> LintResult:

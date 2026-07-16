@@ -11,6 +11,12 @@
   re-points it to the correct entity in one step. Both un-rewrite any `[[Canonical|Alias]]`
   wiki links the wrong alias had produced, and denials survive a `state.db` rebuild via
   the `.synto/INDEX.json` seed like blessed aliases already do.
+- **`synto maintain` can acknowledge known lint advisories.** Long-running vaults often
+  carry advisories that are true by construction (e.g. `graph_noise`) and permanently
+  clutter `maintain` output, hiding new issues. Set `[maintain] ack = ["graph_noise"]` (or
+  `"check:vault/relative/path.md"` for a single file) in `synto.toml` to collapse acked
+  issues into a one-line count. Acks are display-only — the health score and advisory
+  count are unaffected.
 
 ## [0.6.3] - 2026-07-15
 

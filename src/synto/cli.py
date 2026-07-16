@@ -3252,7 +3252,11 @@ def run(
     table.add_row("Published", str(report.published), "")
     if report.held_back > 0:
         table.add_row("Held back", str(report.held_back), "")
-    table.add_row("Lint issues", str(report.lint_issues), "")
+    active_lint = report.lint_issues - report.lint_issues_acked
+    if report.lint_issues_acked:
+        table.add_row("Lint issues", f"{active_lint} ({report.lint_issues_acked} acked)", "")
+    else:
+        table.add_row("Lint issues", str(report.lint_issues), "")
     table.add_row("Stubs created", str(report.stubs_created), "")
     if report.rounds > 1:
         table.add_row("Compile rounds", str(report.rounds), "")
@@ -3303,7 +3307,8 @@ def run(
         if report.published > 0:
             tips.append(f"Export pack:    [bold]{CLI_NAME} pack export --target agents[/bold]")
             tips.append(f'Query wiki:     [bold]{CLI_NAME} query "..."[/bold]')
-        if report.lint_issues > 0:
+        # Acked advisories are known-and-accepted — they must not keep this nag alive.
+        if report.lint_issues - report.lint_issues_acked > 0:
             tips.append(f"Fix issues:     [bold]{CLI_NAME} maintain --fix[/bold]")
         if not tips and report.ingested == 0 and report.compiled == 0:
             tips.append("Add notes to [bold]raw/[/bold] and run again.")
@@ -3614,7 +3619,7 @@ def maintain(vault_str, fix, stubs_only, dry_run, clear_cache, older_than_days):
     Use --dry-run for a read-only health check.
     """
     from .cache import LLMCache
-    from .pipeline.lint import run_lint
+    from .pipeline.lint import partition_acked, run_lint
     from .pipeline.lock import pipeline_lock
     from .pipeline.maintain import (
         create_stubs,
@@ -3676,14 +3681,24 @@ def maintain(vault_str, fix, stubs_only, dry_run, clear_cache, older_than_days):
 
         # Full lint
         result = run_lint(config, db, fix=fix and not dry_run)
+        # Acks are display-only: health score / advisory_issue_count come from the full
+        # result.issues, and every later pass (alias normalization, broken-link repair,
+        # stub creation) must keep reading result.issues unfiltered.
+        active_issues, acked_issues = partition_acked(result.issues, config.maintain.ack)
         score = result.health_score
         colour = "green" if score >= 80 else "yellow" if score >= 50 else "red"
         headline = f"[bold {colour}]Structural health: {score}/100[/bold {colour}]"
         if result.advisory_issue_count:
-            headline += f"  [dim]({result.advisory_issue_count} advisory issue(s))[/dim]"
+            if acked_issues:
+                headline += (
+                    f"  [dim]({result.advisory_issue_count} advisory, "
+                    f"{len(acked_issues)} acked)[/dim]"
+                )
+            else:
+                headline += f"  [dim]({result.advisory_issue_count} advisory issue(s))[/dim]"
         console.print(f"\n{headline}  {result.summary}")
 
-        if result.issues:
+        if active_issues:
             console.print()
             _TYPE_ICON = {
                 "orphan": "○",
@@ -3695,7 +3710,7 @@ def maintain(vault_str, fix, stubs_only, dry_run, clear_cache, older_than_days):
             }
             from rich.markup import escape
 
-            for iss in result.issues:
+            for iss in active_issues:
                 icon = _TYPE_ICON.get(iss.issue_type, "!")
                 fix_tag = " [dim][auto-fixable][/dim]" if iss.auto_fixable else ""
                 console.print(
@@ -3703,6 +3718,14 @@ def maintain(vault_str, fix, stubs_only, dry_run, clear_cache, older_than_days):
                 )
                 console.print(f"     {escape(iss.description)}")
                 console.print(f"     [dim]→ {escape(iss.suggestion)}[/dim]")
+
+        if acked_issues:
+            # \[maintain] escapes the bracket so rich markup doesn't swallow the literal
+            # config-section name.
+            console.print(
+                f"\n[dim]{len(acked_issues)} acked issue(s) hidden "
+                f"(\\[maintain].ack in synto.toml)[/dim]"
+            )
 
         # Alias link normalization in published articles (fix [[Alias]] → [[Canonical|Alias]])
         # Runs independently of broken-link detection: lint resolves aliases so they never
