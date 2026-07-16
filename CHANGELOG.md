@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- **`synto concept alias add/remove/move` for fixing a wrong extracted alias.** The fast
+  model sometimes attaches a surface to the wrong entity (e.g. an npm package name
+  attached as a project alias) with no CLI remedy. `remove` now detaches the alias and
+  records a denial tombstone so the next ingest can't silently re-attach it; `move`
+  re-points it to the correct entity in one step. Both un-rewrite any `[[Canonical|Alias]]`
+  wiki links the wrong alias had produced, and denials survive a `state.db` rebuild via
+  the `.synto/INDEX.json` seed like blessed aliases already do.
+
 ## [0.6.3] - 2026-07-15
 
 Five fixes: two Windows bugs (editor launch, non-UTF-8 locales), lint false positives
