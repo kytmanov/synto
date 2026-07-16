@@ -18,6 +18,15 @@
   issues into a one-line count. Acks are display-only — the health score and advisory
   count are unaffected.
 
+### Fixed
+
+- **`StateDB._tx()` now opens a real transaction at depth 0.** sqlite3's legacy isolation
+  mode only implicit-BEGINs before DML, so a nested `_tx()`'s SAVEPOINT issued before any
+  outer write silently became the outermost transaction and committed early — a failed
+  `query --synthesize` file write could leave a phantom DB row that blocked re-synthesizing
+  that question, and migration hooks documented as atomic were not. Depth-0 frames now
+  BEGIN explicitly, making nesting and DDL frames atomic as documented.
+
 ## [0.6.3] - 2026-07-15
 
 Five fixes: two Windows bugs (editor launch, non-UTF-8 locales), lint false positives

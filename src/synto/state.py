@@ -968,6 +968,11 @@ class StateDB:
     - ``_tx()`` and ``_read()`` hold ``_lock`` for the whole yielded block, so callers must not do
       expensive work or blocking I/O while inside one — it stalls every other thread (including
       parallel-ingest workers). Keep the block to its DB statements.
+
+    Transaction contract: a depth-0 ``_tx()`` frame opens a real transaction with an explicit
+    BEGIN, so the whole frame — including SELECTs, DDL, and any nested ``_tx()`` frames
+    (SAVEPOINTs) — commits or rolls back as one unit. StateDB methods may therefore freely call
+    other ``_tx()`` methods; the nested frame's RELEASE never commits the outer one.
     """
 
     def __init__(self, db_path: Path) -> None:
@@ -2092,6 +2097,15 @@ class StateDB:
             try:
                 if nested:
                     self._conn.execute(f"SAVEPOINT {savepoint_name}")
+                else:
+                    # Explicit BEGIN: sqlite3's legacy isolation mode only implicit-BEGINs before
+                    # DML — not SAVEPOINT/DDL/SELECT. Without it, a nested _tx()'s SAVEPOINT
+                    # issued before any outer DML becomes the outermost transaction and its
+                    # RELEASE commits early, defeating the outer frame's rollback. The
+                    # in_transaction guard keeps today's adopt-behavior for a (contract-
+                    # violating) stray open transaction.
+                    if not self._conn.in_transaction:
+                        self._conn.execute("BEGIN")
                 yield self._conn
                 if nested:
                     self._conn.execute(f"RELEASE SAVEPOINT {savepoint_name}")
