@@ -100,21 +100,27 @@ def test_pack_export_writes_graph_json_with_relations(vault: Path, config: Confi
     assert by_name["Vector Clocks"]["article_id"] is not None
     assert by_name["Causal Consistency"]["article_id"] is not None
 
-    edges = {(e["from_id"], e["to_id"], e["predicate"], e["confidence"]) for e in payload["edges"]}
-    assert (
-        concept_key("Vector Clocks"),
-        concept_key("Causal Consistency"),
-        "implemented_by",
-        0.9,
-    ) in edges
-    # "Network Partitions" is not a known concept — edge exports anyway, no filtering.
-    assert (
-        concept_key("Causal Consistency"),
-        concept_key("Network Partitions"),
-        "depends_on",
-        0.5,
-    ) in edges
-    assert len(payload["edges"]) == 2
+    # Seed order above is (Vector Clocks, ...) then (Causal Consistency, ...) — the reverse
+    # of sorted-by-subject order — so this only passes if the export sorts edges rather than
+    # relying on insertion/rowid order.
+    edge_tuples = [
+        (e["from_id"], e["to_id"], e["predicate"], e["confidence"]) for e in payload["edges"]
+    ]
+    assert edge_tuples == [
+        (
+            concept_key("Causal Consistency"),
+            concept_key("Network Partitions"),
+            "depends_on",
+            0.5,
+        ),
+        # "Network Partitions" is not a known concept — edge exports anyway, no filtering.
+        (
+            concept_key("Vector Clocks"),
+            concept_key("Causal Consistency"),
+            "implemented_by",
+            0.9,
+        ),
+    ]
 
 
 def test_pack_export_omits_graph_json_without_relations(vault: Path, config: Config, db: StateDB):

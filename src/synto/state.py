@@ -5395,6 +5395,7 @@ class StateDB:
             params.append(object_)
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY subject, predicate, object"
         return [dict(row) for row in self._conn.execute(query, params).fetchall()]
 
     def list_relations_for_concept(self, name: str, limit: int = 10) -> list[dict]:
