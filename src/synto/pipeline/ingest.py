@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, get_args
 
 from pydantic import BaseModel as _BaseModel
@@ -364,6 +365,39 @@ def _persist_concept_occurrences(
     occ = namedtuple("occ", ["name", "confidence"])
     for sid, concepts in seg_to_concepts.items():
         db.upsert_concept_occurrences([occ(name=c, confidence=1.0) for c in sorted(concepts)], sid)
+
+
+def _extract_and_persist_relations(
+    db: StateDB,
+    segments: list,
+    canonical_names: list[str],
+    fast: RoleEndpoint,
+    config: Config,
+) -> int:
+    """Run the Stage-3 relation-extraction pass over each segment and persist results.
+
+    `segments` may be sqlite3.Row (bracket-only access, e.g. from get_segments_for_source) or
+    any .id/.text-bearing object (e.g. a pseudo-segment); normalize both to a uniform shim so
+    extract_relations's duck-typed segment arg is satisfied. Returns the number of relations
+    upserted (for logging) — candidates that dedup to the same relation each still count.
+    """
+    persisted = 0
+    for seg in segments:
+        seg_id, seg_text = (seg["id"], seg["text"]) if hasattr(seg, "keys") else (seg.id, seg.text)
+        shim = SimpleNamespace(id=seg_id, text=seg_text)
+        result = extract_relations(shim, canonical_names, fast, config)
+        for candidate in result.relations:
+            db.upsert_relation(
+                candidate.subject,
+                candidate.predicate,
+                candidate.object,
+                candidate.confidence,
+                seg_id,
+                candidate.evidence,
+            )
+            persisted += 1
+        db.insert_relation_candidates(result.relations, seg_id)
+    return persisted
 
 
 def _analyze_body(
@@ -1682,6 +1716,26 @@ def ingest_note(
             )
         except Exception as e:  # noqa: BLE001
             log.warning("concept_occurrences attribution failed for %s: %s", path.name, e)
+
+    # Relation extraction (feature 26, opt-in): a third fast-model pass per segment linking
+    # concept pairs. Non-fatal: an extraction failure must not fail the ingest.
+    if config.pipeline.relation_extraction:
+        try:
+            if source_segments:
+                rel_segments = source_segments
+            else:
+                # Plain notes have no source_segments row — re-derive the same fixed-size
+                # chunking the main analysis pass uses (see _analyze_body_with_checkpoints)
+                # so relation evidence stays traceable to a note+chunk id.
+                rel_chunk_size = config.resolve_role("fast").ctx // 2
+                rel_segments = [
+                    SimpleNamespace(id=f"note:{path.stem}:{i}", text=body[i : i + rel_chunk_size])
+                    for i in range(0, len(body), rel_chunk_size)
+                ]
+            n = _extract_and_persist_relations(db, rel_segments, canonical_names, fast, config)
+            log.info("relation extraction: %d relations from %d segments", n, len(rel_segments))
+        except Exception:
+            log.warning("relation extraction failed for %s", path.name, exc_info=True)
 
     title_for_items = str(meta.get("title") or path.stem.replace("-", " ").strip())
     item_candidates = [

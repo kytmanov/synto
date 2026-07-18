@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
-from conftest import as_endpoint, make_mock_client
+from conftest import as_endpoint, as_router, make_mock_client
 
 from synto.models import RelationCandidate, RelationExtractionResult
 from synto.state import StateDB
@@ -381,3 +383,123 @@ def test_extract_relations_empty_concepts_skips_llm_call(config) -> None:
     assert result.source_segment_id == segment.id
     assert result.model == config.model_name("fast")
     client.generate.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Stage 4: config flag + persistence + ingest wiring
+# ---------------------------------------------------------------------------
+
+
+def _analysis_response(concepts: list[str]) -> str:
+    return json.dumps(
+        {
+            "summary": "A summary.",
+            "concepts": [{"name": c, "aliases": []} for c in concepts],
+            "suggested_topics": [],
+            "named_references": [],
+            "quality": "high",
+        }
+    )
+
+
+def test_extract_and_persist_relations_dedups_across_segments(tmp_path: Path, config) -> None:
+    """Two segments restating the same relation must collapse to one relations row (upsert_relation
+    dedup), while both raw LLM candidates and both evidence rows are still kept for provenance."""
+    from synto.pipeline.ingest import _extract_and_persist_relations
+
+    db = StateDB(tmp_path / "state.db")
+    segments = [
+        SimpleNamespace(id="seg-1", text="Vector clocks implement causal consistency."),
+        SimpleNamespace(id="seg-2", text="Restated: vector clocks implement causal consistency."),
+    ]
+    response_1 = json.dumps(
+        {
+            "relations": [
+                {
+                    "subject": "Vector Clocks",
+                    "predicate": "implemented_by",
+                    "object": "Causal Consistency",
+                    "evidence": "Vector clocks implement causal consistency.",
+                    "confidence": 0.6,
+                }
+            ]
+        }
+    )
+    response_2 = json.dumps(
+        {
+            "relations": [
+                {
+                    "subject": "vector clocks",
+                    "predicate": "implemented_by",
+                    "object": "causal consistency",
+                    "evidence": "Restated relation.",
+                    "confidence": 0.9,
+                }
+            ]
+        }
+    )
+    client = make_mock_client()
+    client.generate.side_effect = [response_1, response_2]
+    fast = as_endpoint(client, model=config.model_name("fast"))
+
+    n = _extract_and_persist_relations(
+        db, segments, ["Vector Clocks", "Causal Consistency"], fast, config
+    )
+
+    assert n == 2  # two relations upserted (one per segment call), even though they dedup
+    relations = db.list_relations()
+    assert len(relations) == 1
+    assert relations[0]["confidence"] == 0.9  # max of 0.6 and 0.9
+
+    evidence = db.list_relation_evidence(relations[0]["id"])
+    assert len(evidence) == 2
+
+    raw_rows = db._conn.execute("SELECT * FROM relation_candidates").fetchall()
+    assert len(raw_rows) == 2
+
+
+def test_ingest_note_relation_extraction_off_by_default(vault, config, db) -> None:
+    """The flag guard in ingest_note must skip the whole relation-extraction pass when
+    pipeline.relation_extraction is False (its default) — no relations rows, regardless of
+    whether the main analysis pass ran."""
+    from synto.pipeline.ingest import ingest_note
+
+    assert config.pipeline.relation_extraction is False
+    path = vault / "raw" / "note.md"
+    path.write_text("# Note\n\nAlpha depends on Beta.", encoding="utf-8")
+    client = as_router(make_mock_client(_analysis_response(["Alpha", "Beta"])), config)
+
+    ingest_note(path, config, client, db)
+
+    assert db.count_relations() == 0
+
+
+def test_ingest_note_relation_extraction_pseudo_segment_for_plain_note(vault, config, db) -> None:
+    """Plain notes (no tracked source_segments) must still get relation extraction with a
+    traceable pseudo-segment id, so `trace relation` can point back at note+chunk."""
+    from synto.pipeline.ingest import ingest_note
+
+    config.pipeline.relation_extraction = True
+    path = vault / "raw" / "note.md"
+    path.write_text("# Note\n\nAlpha depends on Beta.", encoding="utf-8")
+    relation_response = json.dumps(
+        {
+            "relations": [
+                {
+                    "subject": "Alpha",
+                    "predicate": "depends_on",
+                    "object": "Beta",
+                    "evidence": "Alpha depends on Beta.",
+                    "confidence": 0.8,
+                }
+            ]
+        }
+    )
+    client = as_router(MagicMock())
+    client.generate.side_effect = [_analysis_response(["Alpha", "Beta"]), relation_response]
+
+    ingest_note(path, config, client, db)
+
+    assert db.count_relations() == 1
+    relation = db.list_relations()[0]
+    assert relation["source_segment_id"].startswith("note:")
