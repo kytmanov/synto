@@ -20,6 +20,16 @@
 
 ### Fixed
 
+- **Tags in any script survive sanitization and `maintain --fix` (#105).** Tag rules
+  stripped every non-ASCII character, so on non-English vaults LLM-proposed tags were
+  silently dropped and `--fix` deleted valid Unicode tags (`каталог`, `日本語`, `café`)
+  from frontmatter. Rules are now script-agnostic; ASCII tags behave exactly as before.
+
+- **Name matching folds non-ASCII case (#105).** SQLite's `lower()` folds ASCII only, so
+  the rename collision check and the concept-lookup substring fallback missed non-ASCII
+  case variants (e.g. `Привет` vs `привет`). Both now compare via Python `casefold()`;
+  remaining legacy `lower()` sites are tracked in #104.
+
 - **`StateDB._tx()` now opens a real transaction at depth 0.** sqlite3's legacy isolation
   mode only implicit-BEGINs before DML, so a nested `_tx()`'s SAVEPOINT issued before any
   outer write silently became the outermost transaction and committed early — a failed
