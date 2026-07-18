@@ -20,6 +20,12 @@
 
 ### Fixed
 
+- **`missing_media`, `inline_tag`, and orphan-mention scans skip code regions (#106).**
+  Example embeds, `#include`-style directives, and titles inside code fences or inline
+  code were reported as advisories on code-heavy vaults. All three now mask code first
+  (like the #96 scanners), and the inline-tag regex accepts any-script letters so real
+  non-Latin tags are finally reported.
+
 - **`StateDB._tx()` now opens a real transaction at depth 0.** sqlite3's legacy isolation
   mode only implicit-BEGINs before DML, so a nested `_tx()`'s SAVEPOINT issued before any
   outer write silently became the outermost transaction and committed early — a failed
