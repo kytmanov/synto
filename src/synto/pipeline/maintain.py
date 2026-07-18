@@ -21,6 +21,7 @@ import frontmatter as fm_lib
 
 from ..concept_text import concept_key as _ck
 from ..config import Config
+from ..markdown_math import mask_markdown_regions
 from ..models import LintIssue, WikiArticleRecord
 from ..sanitize import clean_display_name
 from ..state import StateDB
@@ -595,6 +596,12 @@ def _extract_link_target(description: str) -> str | None:
     return match.group(1) if match else None
 
 
+def _wiki_page_key(path: Path, vault: Path) -> str:
+    """Vault-relative forward-slash key. Must match lint's LintIssue.path format
+    (as_posix) or the self-skip comparison below silently fails on Windows."""
+    return path.relative_to(vault).as_posix()
+
+
 def suggest_orphan_links(config: Config, db: StateDB) -> list[tuple[str, list[str]]]:
     """
     For each orphan article, find other articles that mention its title unlinked.
@@ -608,7 +615,8 @@ def suggest_orphan_links(config: Config, db: StateDB) -> list[tuple[str, list[st
     if not orphan_issues:
         return []
 
-    # Load all published article bodies
+    # Load all published article bodies, masked once: a title inside a code fence,
+    # inline code, or an existing [[wikilink]] is not an unlinked prose mention.
     wiki_pages: dict[str, str] = {}
     if config.wiki_dir.exists():
         for p in config.wiki_dir.rglob("*.md"):
@@ -616,7 +624,8 @@ def suggest_orphan_links(config: Config, db: StateDB) -> list[tuple[str, list[st
                 continue
             try:
                 meta, body = parse_note(p)
-                wiki_pages[str(p.relative_to(config.vault))] = body
+                masked, _ = mask_markdown_regions(body)
+                wiki_pages[_wiki_page_key(p, config.vault)] = masked
             except Exception:
                 pass
 

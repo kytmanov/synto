@@ -40,7 +40,8 @@ _LOW_CONFIDENCE_THRESHOLD = 0.3
 _SYSTEM_STEMS = frozenset({"index", "log"})
 
 # Inline hashtag pattern — Obsidian indexes these as tags
-_INLINE_TAG_RE = re.compile(r"(?<![/\w])#([a-zA-Z][^\s#\]]*)")
+# First char after # must be a letter in any script (\w minus digits/underscore).
+_INLINE_TAG_RE = re.compile(r"(?<![/\w])#([^\W\d_][^\s#\]]*)")
 
 # Common LLM markdown slip: reference-style link syntax with no URL, e.g.
 # [astronomy] or [Zodiac] (text), which Obsidian will not resolve as a link.
@@ -292,8 +293,14 @@ def _check_stale_lock(config: Config, issues: list[LintIssue]) -> None:
 
 
 def _check_missing_media(rel_path: str, body: str, vault: Path, issues: list[LintIssue]) -> None:
+    # Mask code fences/inline code so example embeds aren't flagged, but keep embeds and
+    # wikilinks visible — the wikilink pattern would otherwise eat the [[...]] inside
+    # ![[...]] and blind the scan entirely.
+    masked, _ = mask_markdown_regions(
+        body, mask_wikilinks=False, mask_embeds=False, mask_links=False
+    )
     seen: set[str] = set()
-    for match in _EMBED_TARGET_RE.finditer(body):
+    for match in _EMBED_TARGET_RE.finditer(masked):
         target = match.group(1).strip().split("#")[0].strip()
         if not target or target in seen:
             continue
@@ -328,23 +335,6 @@ def _repair_plain_citations(body: str) -> str:
     )
     sources = re.sub(r"\[(S\d+(?:\s*,\s*S\d+)*)\]\(#Sources\)", r"[\1]", sources)
     return restore_markdown_regions(before_sources + "## Sources" + sources, replacements)
-
-
-def _mask_markdown_links(body: str) -> tuple[str, list[tuple[str, str]]]:
-    replacements: list[tuple[str, str]] = []
-
-    def repl(match: re.Match[str]) -> str:
-        token = f"@@SYNTO_LINK_{len(replacements)}@@"
-        replacements.append((token, match.group(0)))
-        return token
-
-    return re.sub(r"\[[^\]\n]+\]\([^)]*\)", repl, body), replacements
-
-
-def _restore_markdown_links(body: str, replacements: list[tuple[str, str]]) -> str:
-    for token, original in replacements:
-        body = body.replace(token, original)
-    return body
 
 
 def _update_article_hash(db: StateDB, rel_path: str, new_hash: str) -> None:
@@ -910,9 +900,11 @@ def run_lint(config: Config, db: StateDB, fix: bool = False) -> LintResult:
                 _write_fixed_note(page, rel_path, meta, body, db)
 
         # ── Inline hashtags ───────────────────────────────────────────────────
-        masked_body, markdown_links = _mask_markdown_links(body)
+        # Full mask: code fences/inline code (a #include in a code example is not a
+        # tag), plus links/wikilinks/embeds as before. Scan the masked copy; body
+        # itself is untouched.
+        masked_body, _ = mask_markdown_regions(body)
         inline_tags = _INLINE_TAG_RE.findall(masked_body)
-        body = _restore_markdown_links(masked_body, markdown_links)
         if inline_tags:
             issues.append(
                 LintIssue(

@@ -20,6 +20,12 @@
 
 ### Fixed
 
+- **`missing_media`, `inline_tag`, and orphan-mention scans skip code regions (#106).**
+  Example embeds, `#include`-style directives, and titles inside code fences or inline
+  code were reported as advisories on code-heavy vaults. All three now mask code first
+  (like the #96 scanners), and the inline-tag regex accepts any-script letters so real
+  non-Latin tags are finally reported.
+
 - **Tags in any script survive sanitization and `maintain --fix` (#105).** Tag rules
   stripped every non-ASCII character, so on non-English vaults LLM-proposed tags were
   silently dropped and `--fix` deleted valid Unicode tags (`каталог`, `日本語`, `café`)
