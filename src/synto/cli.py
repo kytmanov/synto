@@ -4154,6 +4154,77 @@ def trace_article(name: str, vault_str: str | None) -> None:
     console.print(table)
 
 
+# ── synto find ────────────────────────────────────────────────────────────────
+
+
+def _find_body_matches(query_lower: str, config, articles: list) -> list:
+    """Published articles (already filtered to non-matched-yet) whose first
+    paragraph contains query_lower. Missing files are skipped silently — a
+    read-only lookup shouldn't fail because a draft outran its file."""
+    from .readers import _extract_first_paragraph
+    from .vault import parse_note
+
+    matches = []
+    for article in articles:
+        path = config.vault / article.path
+        if not path.exists():
+            continue
+        _, body = parse_note(path)
+        paragraph = _extract_first_paragraph(body)
+        if paragraph and query_lower in paragraph.casefold():
+            matches.append(article)
+    return matches
+
+
+@cli.command("find")
+@click.argument("query")
+@click.option("--vault", "vault_str", envvar=VAULT_ENV_VAR, default=None)
+def find(query: str, vault_str: str | None) -> None:
+    """Reverse-lookup: find published articles matching QUERY by concept, title, or body."""
+    config = _load_config(vault_str)
+    db = _load_db(config)
+
+    query_lower = query.casefold()
+    published = [a for a in db.list_articles() if a.status == "published"]
+
+    seen: set[str] = set()
+    rows: list[tuple[str, str, str]] = []
+
+    resolved = db.find_concept_by_name_or_alias(query)
+    if resolved is not None:
+        concept_name, _aliases = resolved
+        for article in db.find_article_candidates(concept_name):
+            if article.status != "published" or article.path in seen:
+                continue
+            seen.add(article.path)
+            rows.append((article.title, "concept", article.path))
+
+    for article in published:
+        if article.path in seen:
+            continue
+        stem_lower = Path(article.path).stem.casefold()
+        if query_lower in stem_lower or query_lower in article.title.casefold():
+            seen.add(article.path)
+            rows.append((article.title, "title", article.path))
+
+    remaining = [a for a in published if a.path not in seen]
+    for article in _find_body_matches(query_lower, config, remaining):
+        seen.add(article.path)
+        rows.append((article.title, "body", article.path))
+
+    if not rows:
+        console.print(f"No articles found for '{query}'")
+        return
+
+    table = Table(title=f"Find: {query}", show_header=True, header_style="bold")
+    table.add_column("Article", style="cyan", no_wrap=True)
+    table.add_column("Match")
+    table.add_column("Path")
+    for title, match_type, path in rows:
+        table.add_row(title, match_type, path)
+    console.print(table)
+
+
 # ── synto add ─────────────────────────────────────────────────────────────────
 
 _SOURCE_TYPES = [

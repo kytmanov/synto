@@ -194,3 +194,102 @@ def test_pack_reader_graph_returns_parsed_payload_or_none(vault: Path, config: C
     )
     export_pack(config2, target="agents", out=without_graph)
     assert PackReader(without_graph).graph() is None
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: synto find reverse-lookup CLI command
+# ---------------------------------------------------------------------------
+
+
+def _seed_find_fixtures(config: Config, db: StateDB) -> None:
+    """Seed three published articles exercising the concept/title/body tiers.
+
+    Only the first is registered as a concept — the title and body matches must
+    come purely from article metadata/content, not from concept resolution, so
+    the test can't accidentally pass via the wrong tier.
+    """
+    _write_wiki_toml(config.vault)
+    write_note(
+        config.wiki_dir / "Raft.md",
+        {"title": "Raft"},
+        "Raft is a consensus algorithm for managing replicated logs.",
+    )
+    db.upsert_concepts("raw/a.md", ["Raft"])
+    db.upsert_article(
+        WikiArticleRecord(
+            path="wiki/Raft.md",
+            title="Raft",
+            sources=["raw/a.md"],
+            content_hash="h1",
+            status="published",
+        )
+    )
+
+    write_note(
+        config.wiki_dir / "Raft-Variants.md",
+        {"title": "Raft Variants Overview"},
+        "This page surveys leader-election strategies in replicated systems.",
+    )
+    db.upsert_article(
+        WikiArticleRecord(
+            path="wiki/Raft-Variants.md",
+            title="Raft Variants Overview",
+            sources=["raw/b.md"],
+            content_hash="h2",
+            status="published",
+        )
+    )
+
+    write_note(
+        config.wiki_dir / "Distributed-Systems-Notes.md",
+        {"title": "Distributed Systems Notes"},
+        "This note explains how Raft achieves consensus in distributed logs.",
+    )
+    db.upsert_article(
+        WikiArticleRecord(
+            path="wiki/Distributed-Systems-Notes.md",
+            title="Distributed Systems Notes",
+            sources=["raw/c.md"],
+            content_hash="h3",
+            status="published",
+        )
+    )
+
+
+def test_find_ranks_concept_title_body_and_dedupes(config: Config, db: StateDB) -> None:
+    from click.testing import CliRunner
+
+    from synto.cli import cli
+
+    _seed_find_fixtures(config, db)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["find", "--vault", str(config.vault), "raft"])
+
+    assert result.exit_code == 0, result.output
+    assert "wiki/Raft.md" in result.output
+    assert "wiki/Raft-Variants.md" in result.output
+    assert "wiki/Distributed-Systems-Notes.md" in result.output
+
+    # Tier order preserved: concept match, then title match, then body match.
+    concept_pos = result.output.index("wiki/Raft.md")
+    title_pos = result.output.index("wiki/Raft-Variants.md")
+    body_pos = result.output.index("wiki/Distributed-Systems-Notes.md")
+    assert concept_pos < title_pos < body_pos
+
+    # The concept's own article must not also appear as a title-tier duplicate.
+    assert result.output.count("wiki/Raft.md") == 1
+
+
+def test_find_no_matches_exits_cleanly(config: Config, db: StateDB) -> None:
+    from click.testing import CliRunner
+
+    from synto.cli import cli
+
+    _seed_find_fixtures(config, db)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["find", "--vault", str(config.vault), "zzz-nonexistent"])
+
+    assert result.exit_code == 0, result.output
+    assert "No articles found" in result.output
