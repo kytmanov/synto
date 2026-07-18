@@ -784,6 +784,49 @@ def test_fix_mode_sanitizes_tags(vault, config, db):
     assert "bad tag" not in post.metadata["tags"]
 
 
+def test_unicode_tags_no_issue(vault, config, db):
+    # Obsidian allows Unicode tags; a non-English vault must not have every tag flagged.
+    _write_page(
+        config,
+        "UnicodeTags",
+        meta_override={"tags": ["каталог", "日本語", "café"], "status": "published"},
+    )
+    result = run_lint(config, db)
+    tag_issues = [i for i in result.issues if i.issue_type == "invalid_tag"]
+    assert not tag_issues
+
+
+def test_fix_converges_in_one_pass_for_dotted_capital_tag(vault, config, db):
+    # Regression (review finding): non-idempotent sanitization made lint re-flag the
+    # tag --fix had just written (İ → i + combining dot on pass 1, stripped on pass 2).
+    _write_page(
+        config,
+        "TurkishTag",
+        meta_override={"tags": ["İstanbul"], "status": "published"},
+    )
+    run_lint(config, db, fix=True)
+
+    result = run_lint(config, db)
+
+    tag_issues = [i for i in result.issues if i.issue_type == "invalid_tag"]
+    assert not tag_issues
+
+
+def test_fix_mode_preserves_unicode_tags(vault, config, db):
+    # Data-loss regression: --fix used to rewrite frontmatter with non-ASCII tags removed.
+    import frontmatter as fm
+
+    path = _write_page(
+        config,
+        "UnicodeFixTags",
+        meta_override={"tags": ["каталог", "bad tag"], "status": "published"},
+    )
+    run_lint(config, db, fix=True)
+    post = fm.load(str(path))
+    assert "каталог" in post.metadata["tags"]
+    assert "bad-tag" in post.metadata["tags"]
+
+
 def test_lint_checks_source_pages(vault, config, db):
     """Tags in wiki/sources/ pages are also checked."""
     sources_dir = config.wiki_dir / "sources"
