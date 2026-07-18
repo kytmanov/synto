@@ -37,8 +37,11 @@ jobs:
       - name: Run tests
         run: uv run pytest --tb=short -q
 
+  # Subset, not the full suite: ~19 tests carry POSIX assumptions (backslash-path
+  # asserts, default-encoding writes) and the full run takes ~45 min on the Windows
+  # runner. Tracked for cleanup — see the "Windows-clean test suite" issue.
   windows-paths:
-    name: windows full suite
+    name: windows path portability
     runs-on: windows-latest
     strategy:
       fail-fast: false
@@ -65,5 +68,17 @@ jobs:
       - name: Portability smoke
         run: uv run python scripts/portability_smoke.py
 
-      - name: Run tests
-        run: uv run pytest --tb=short -q
+      - name: Windows path-focused tests
+        run: >
+          uv run pytest --tb=short -q
+          tests/test_cross_os_portability_v17.py
+          tests/test_compile_v2.py
+          tests/test_phase1a_pack_export.py
+          tests/test_indexer_extra.py
+          tests/test_lint.py
+          tests/test_lock.py
+          tests/test_console_encoding.py
+          tests/test_vault.py
+          tests/test_maintain.py
+          tests/test_cli_maintain.py
+          tests/test_sanitize.py

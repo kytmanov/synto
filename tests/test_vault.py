@@ -272,6 +272,21 @@ def test_sanitize_filename_strips_control_chars():
     assert sanitize_filename("Foo\x07Bar\x1f") == "FooBar"
 
 
+def test_parse_note_body_identical_for_crlf_and_lf_bytes(tmp_path):
+    # Content hashes are computed on parse_note bodies, so CRLF (Windows-authored) and
+    # LF bytes of the same note must parse to the identical body — otherwise a git
+    # line-ending rewrite flips every note to "manually edited" on the next compile.
+    lf = tmp_path / "lf.md"
+    crlf = tmp_path / "crlf.md"
+    lf.write_bytes(b"---\ntitle: T\n---\nHello\nWorld\n")
+    crlf.write_bytes(b"---\r\ntitle: T\r\n---\r\nHello\r\nWorld\r\n")
+
+    _, lf_body = parse_note(lf)
+    _, crlf_body = parse_note(crlf)
+
+    assert lf_body == crlf_body
+
+
 def test_sanitize_filename_nonlatin_unchanged():
     assert sanitize_filename("Каталог шаблонов") == "Каталог шаблонов"
     assert sanitize_filename("日本語ノート") == "日本語ノート"

@@ -26,7 +26,9 @@ def parse_note(path: Path) -> tuple[dict[str, Any], str]:
     """Return (frontmatter_dict, body_text). Safe against --- in body."""
     # Explicit utf-8 handle: frontmatter.load's own default is utf-8 today, but a path
     # string would leave the decoding to the library on a codebase that pins utf-8 I/O.
-    with open(path, encoding="utf-8") as fh:
+    # newline="" mirrors the library's own codecs.open decode (no newline translation);
+    # the frontmatter handler normalizes CRLF→LF in post.content either way.
+    with open(path, encoding="utf-8", newline="") as fh:
         post = frontmatter.load(fh)
     return dict(post.metadata), post.content
 
