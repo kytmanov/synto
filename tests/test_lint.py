@@ -534,6 +534,32 @@ def test_markdown_anchor_links_not_inline_tags(vault, config, db):
     assert not inline
 
 
+def test_fenced_and_inline_code_hashtags_not_inline_tags(vault, config, db):
+    # docs-from-code vaults: preprocessor directives / comments in code are not tags.
+    _write_page(
+        config,
+        "Alpha",
+        "Example:\n\n```c\n#include <stdio.h>\n#define MAX 10\n```\n\nUse `#pragma` sparingly.",
+    )
+
+    result = run_lint(config, db)
+
+    inline = [i for i in result.issues if i.issue_type == "inline_tag"]
+    assert not inline
+
+
+def test_nonlatin_inline_tags_detected(vault, config, db):
+    # The tag scan must be script-agnostic — a real inline tag in any script is flagged.
+    _write_page(config, "Alpha", "Текст про решения #каталог и ещё #日本語 в прозе.")
+
+    result = run_lint(config, db)
+
+    inline = [i for i in result.issues if i.issue_type == "inline_tag"]
+    assert inline
+    assert "#каталог" in inline[0].description
+    assert "#日本語" in inline[0].description
+
+
 def test_lint_fix_updates_article_hash(vault, config, db):
     body = "Claim [S1].\n\n## Sources\n- [S1] [[sources/Alpha Source|Alpha Source]]"
     page = _write_page(config, "Alpha", body)
@@ -854,6 +880,49 @@ def test_fix_mode_sanitizes_tags(vault, config, db):
     assert "bad tag" not in post.metadata["tags"]
 
 
+def test_unicode_tags_no_issue(vault, config, db):
+    # Obsidian allows Unicode tags; a non-English vault must not have every tag flagged.
+    _write_page(
+        config,
+        "UnicodeTags",
+        meta_override={"tags": ["каталог", "日本語", "café"], "status": "published"},
+    )
+    result = run_lint(config, db)
+    tag_issues = [i for i in result.issues if i.issue_type == "invalid_tag"]
+    assert not tag_issues
+
+
+def test_fix_converges_in_one_pass_for_dotted_capital_tag(vault, config, db):
+    # Regression (review finding): non-idempotent sanitization made lint re-flag the
+    # tag --fix had just written (İ → i + combining dot on pass 1, stripped on pass 2).
+    _write_page(
+        config,
+        "TurkishTag",
+        meta_override={"tags": ["İstanbul"], "status": "published"},
+    )
+    run_lint(config, db, fix=True)
+
+    result = run_lint(config, db)
+
+    tag_issues = [i for i in result.issues if i.issue_type == "invalid_tag"]
+    assert not tag_issues
+
+
+def test_fix_mode_preserves_unicode_tags(vault, config, db):
+    # Data-loss regression: --fix used to rewrite frontmatter with non-ASCII tags removed.
+    import frontmatter as fm
+
+    path = _write_page(
+        config,
+        "UnicodeFixTags",
+        meta_override={"tags": ["каталог", "bad tag"], "status": "published"},
+    )
+    run_lint(config, db, fix=True)
+    post = fm.load(str(path))
+    assert "каталог" in post.metadata["tags"]
+    assert "bad-tag" in post.metadata["tags"]
+
+
 def test_lint_checks_source_pages(vault, config, db):
     """Tags in wiki/sources/ pages are also checked."""
     sources_dir = config.wiki_dir / "sources"
@@ -1172,6 +1241,29 @@ def test_note_transclusion_not_flagged_as_missing_media(config, db):
     _write_page(config, "Article", "See ![[Other Note]] for details.")
     result = run_lint(config, db)
     assert not any(i.issue_type == "missing_media" for i in result.issues)
+
+
+def test_fenced_embed_not_flagged_as_missing_media(config, db):
+    # An ![[...]] shown as an example inside a code fence or inline code is not a real embed.
+    _write_page(
+        config,
+        "Article",
+        "Embed syntax:\n\n```\n![[fenced.png]]\n```\n\nOr inline: `![[inline.png]]`.",
+    )
+    result = run_lint(config, db)
+    assert not any(i.issue_type == "missing_media" for i in result.issues)
+
+
+def test_fenced_embed_does_not_hide_real_missing_media(config, db):
+    _write_page(
+        config,
+        "Article",
+        "Example:\n\n```\n![[fenced.png]]\n```\n\nReal one: ![[really-missing.png]].",
+    )
+    result = run_lint(config, db)
+    missing = [i for i in result.issues if i.issue_type == "missing_media"]
+    assert len(missing) == 1
+    assert "really-missing.png" in missing[0].description
 
 
 def test_missing_media_detected_in_raw_note(config, db):
