@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import re
 
-# Valid Obsidian tag: [a-zA-Z0-9][a-zA-Z0-9_/-]*
-# We enforce lowercase by convention (consistent with hardcoded tags: source, meta, index, query).
-_INVALID_CHARS = re.compile(r"[^a-zA-Z0-9_/\-]")
-_LEADING_NON_ALNUM = re.compile(r"^[^a-zA-Z0-9]+")
+# Valid Obsidian tag: letters/digits of any script, plus _ - and / for nesting.
+# Obsidian allows Unicode tags, and non-English vaults depend on them — character rules
+# are \w-based (script-agnostic), never per-language lists.
+# We enforce lowercase by convention (consistent with hardcoded tags: source, meta, index,
+# query); str.lower() is script-aware and a no-op for caseless scripts (e.g. CJK).
+_INVALID_CHARS = re.compile(r"[^\w/\-]")
+_LEADING_NON_ALNUM = re.compile(r"^[\W_]+")
 
 
 def sanitize_tag(raw: str) -> str:
@@ -20,7 +23,7 @@ def sanitize_tag(raw: str) -> str:
     Steps:
       1. Strip whitespace
       2. Replace spaces with hyphens
-      3. Remove chars not in [a-zA-Z0-9_/-]
+      3. Remove chars that are not word chars (any script) or / -
       4. Strip leading non-alphanumeric chars
       5. Lowercase
       6. Return "" if nothing remains

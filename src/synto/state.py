@@ -4233,7 +4233,6 @@ class StateDB:
     def find_concept_by_name_or_alias(self, query: str) -> tuple[str, list[str]] | None:
         q = query.strip()
         q_lower = q.casefold()
-        q_escaped = q_lower.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
         # Exact match via entity layer first.
         result = self.resolve_label(q)
@@ -4243,13 +4242,12 @@ class StateDB:
                 return preferred, self.aliases_for_concept(preferred)
 
         # Substring fallback on canonical concept names (covers prefix/infix queries).
-        row = self._conn.execute(
-            "SELECT DISTINCT name FROM concepts WHERE lower(name) LIKE ? ESCAPE '\\' LIMIT 1",
-            (f"%{q_escaped}%",),
-        ).fetchone()
-        if row:
-            name = row["name"]
-            return name, self.aliases_for_concept(name)
+        # Compared in Python: SQLite's lower() folds ASCII only, so a SQL LIKE against a
+        # casefolded needle misses non-ASCII case variants (and needs no LIKE escaping).
+        for row in self._conn.execute("SELECT DISTINCT name FROM concepts ORDER BY name"):
+            if q_lower in row["name"].casefold():
+                name = row["name"]
+                return name, self.aliases_for_concept(name)
 
         return None
 
@@ -4521,13 +4519,13 @@ class StateDB:
         n = name.casefold()
         ex = exclude_concept.casefold() if exclude_concept else None
         # A concept/knowledge-item literally named `name` (other than the excluded one).
+        # Folded in Python: SQLite's lower() is ASCII-only, and knowledge_items have no
+        # entity-label backstop to catch non-ASCII case variants.
         if n != ex:
-            for sql in (
-                "SELECT 1 FROM concepts WHERE lower(name) = ? LIMIT 1",
-                "SELECT 1 FROM knowledge_items WHERE lower(name) = ? LIMIT 1",
-            ):
-                if self._conn.execute(sql, (n,)).fetchone():
-                    return True
+            for sql in ("SELECT name FROM concepts", "SELECT name FROM knowledge_items"):
+                for row in self._conn.execute(sql):
+                    if row["name"].casefold() == n:
+                        return True
         # An alias label_key claimed by a *different* entity.
         key = _ck(name)
         ex_key = _ck(exclude_concept) if exclude_concept else None

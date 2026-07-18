@@ -73,12 +73,48 @@ def test_empty_string_returns_empty():
     assert sanitize_tag("") == ""
 
 
-def test_unicode_special_chars_removed():
-    assert sanitize_tag("café") == "caf"
-
-
 def test_at_symbol_removed():
     assert sanitize_tag("tag@user") == "taguser"
+
+
+# ── sanitize_tag: language-agnostic (any script survives, Obsidian allows Unicode tags) ──
+
+
+def test_accented_latin_preserved():
+    assert sanitize_tag("café") == "café"
+
+
+def test_cyrillic_preserved():
+    assert sanitize_tag("каталог") == "каталог"
+
+
+def test_cyrillic_lowercased():
+    assert sanitize_tag("Каталог") == "каталог"
+
+
+def test_cyrillic_nested_path_preserved():
+    assert sanitize_tag("код/архитектура") == "код/архитектура"
+
+
+def test_cjk_preserved():
+    # Caseless script — lowercasing must be a no-op, not a mangle.
+    assert sanitize_tag("日本語") == "日本語"
+
+
+def test_cyrillic_spaces_to_hyphens():
+    assert sanitize_tag("машинное обучение") == "машинное-обучение"
+
+
+def test_leading_punctuation_stripped_before_cyrillic():
+    assert sanitize_tag("#каталог") == "каталог"
+
+
+def test_punctuation_removed_from_unicode_tag():
+    assert sanitize_tag("каталог!") == "каталог"
+
+
+def test_garbage_still_empty_with_unicode_rules():
+    assert sanitize_tag("!!!@@@###") == ""
 
 
 # ── sanitize_tags ─────────────────────────────────────────────────────────────
