@@ -382,6 +382,33 @@ def test_suggest_orphan_links_finds_unlinked_mention(config, db):
     assert isinstance(result, list)
 
 
+def test_suggest_orphan_links_ignores_fenced_mentions(config, db):
+    # A title appearing only inside code fences / inline code is not an unlinked mention.
+    _write_article(config, "Orphan Topic", body="## Body\n\nAbout orphan.")
+    _write_article(
+        config,
+        "Main Article",
+        body="## Body\n\nCode:\n\n```\nOrphan Topic\n```\n\nAnd `Orphan Topic` inline.",
+    )
+
+    result = suggest_orphan_links(config, db)
+
+    assert all(title != "Orphan Topic" for title, _ in result)
+
+
+def test_suggest_orphan_links_finds_prose_mention_next_to_fenced_one(config, db):
+    _write_article(config, "Orphan Topic", body="## Body\n\nAbout orphan.")
+    _write_article(
+        config,
+        "Main Article",
+        body="## Body\n\nThis discusses Orphan Topic.\n\n```\nOrphan Topic\n```\n",
+    )
+
+    result = suggest_orphan_links(config, db)
+
+    assert ("Orphan Topic", ["wiki/Main Article.md"]) in result
+
+
 # ── suggest_concept_merges ────────────────────────────────────────────────────
 
 
