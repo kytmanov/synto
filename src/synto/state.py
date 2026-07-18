@@ -25,6 +25,8 @@ Schema versioning: schema_version table tracks migration level.
          concepts + concept_aliases; resolve_label seam; INDEX.json seed extended)
   v19 — concept_occurrences extended (entity_id, surface, resolution_status, source_path,
          nullable source_segment_id); concept_occurrence_candidates child table
+  v28 — relations, relation_evidence, relation_candidates tables for concept-to-concept
+         relation extraction (feature 26)
 """
 
 from __future__ import annotations
@@ -46,7 +48,13 @@ from pathlib import Path
 
 from .concept_text import concept_key as _ck
 from .concept_text import match_key as _mk
-from .models import ItemMentionRecord, KnowledgeItemRecord, RawNoteRecord, WikiArticleRecord
+from .models import (
+    ItemMentionRecord,
+    KnowledgeItemRecord,
+    RawNoteRecord,
+    RelationCandidate,
+    WikiArticleRecord,
+)
 from .paths import rel_posix, to_posix
 
 log = logging.getLogger(__name__)
@@ -129,7 +137,7 @@ def _fts5_available(conn: sqlite3.Connection) -> bool:
         return False
 
 
-_CURRENT_SCHEMA_VERSION = 27
+_CURRENT_SCHEMA_VERSION = 28
 
 
 @dataclass
@@ -477,6 +485,38 @@ CREATE TABLE IF NOT EXISTS concept_alias_denials (
     created_at TEXT NOT NULL,
     PRIMARY KEY (entity_id, label_key)
 );
+
+-- Concept-to-concept relations (feature 26, v28). `relation_candidates` is the raw
+-- append-only LLM output log; `relations` is the approved/deduplicated set keyed by
+-- concept_key(subject):predicate:concept_key(object) so casing drift across extraction
+-- runs can't fork identity. source_segment_id columns are TEXT with no foreign key:
+-- pseudo-segment ids like `note:<stem>:<idx>` are written by a later task.
+CREATE TABLE IF NOT EXISTS relations (
+    id TEXT PRIMARY KEY,
+    subject TEXT NOT NULL,
+    predicate TEXT NOT NULL,
+    object TEXT NOT NULL,
+    confidence REAL NOT NULL DEFAULT 0.0,
+    source_segment_id TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS relation_evidence (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    relation_id TEXT NOT NULL REFERENCES relations(id),
+    evidence_text TEXT NOT NULL,
+    source_segment_id TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS relation_candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    subject TEXT NOT NULL,
+    predicate TEXT NOT NULL,
+    object TEXT NOT NULL,
+    evidence TEXT NOT NULL DEFAULT '',
+    source_segment_id TEXT NOT NULL,
+    confidence REAL NOT NULL DEFAULT 0.0,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_relations_subject ON relations(subject);
+CREATE INDEX IF NOT EXISTS idx_relations_object ON relations(object);
 """
 
 # v17 separator-collision tables resolved by recency, not "POSIX wins" (issue #55 follow-up).
@@ -891,6 +931,10 @@ _VERSIONED_MIGRATIONS: dict[int, list[str]] = {
     # concept_alias_denials already exists by the time this version's migration step would
     # run, on both a fresh DB and an upgrading one. Established pattern (see v22/v23/v25).
     27: [],
+    # Empty is correct here: relations/relation_evidence/relation_candidates are pure new
+    # tables with no backfill, so _SCHEMA (which runs in full before _migrate) already
+    # creates them on both a fresh DB and an upgrading one. Same pattern as v22/v23/v25/v27.
+    28: [],
 }
 
 
@@ -5297,6 +5341,126 @@ class StateDB:
                LIMIT ?""",
             (canonical_name, max_passages),
         ).fetchall()
+
+    # ── Relations (feature 26) ──────────────────────────────────────────────
+
+    def upsert_relation(
+        self,
+        subject: str,
+        predicate: str,
+        object_: str,
+        confidence: float,
+        source_segment_id: str,
+        evidence_text: str,
+    ) -> str:
+        """Insert or strengthen an approved relation; always records evidence.
+
+        The id is derived from case-folded (subject, predicate, object) so LLM casing
+        drift across extraction runs ("Vector Clocks" vs "vector clocks") can't fork
+        the same relation into two rows.
+        """
+        if not self._has_table("relations"):
+            return ""
+        relation_id = hashlib.sha256(
+            f"{_ck(subject)}:{predicate}:{_ck(object_)}".encode()
+        ).hexdigest()[:16]
+        with self._tx():
+            self._conn.execute(
+                """INSERT INTO relations
+                       (id, subject, predicate, object, confidence, source_segment_id)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE
+                       SET confidence = max(confidence, excluded.confidence)""",
+                (relation_id, subject, predicate, object_, confidence, source_segment_id),
+            )
+            self._conn.execute(
+                """INSERT INTO relation_evidence
+                       (relation_id, evidence_text, source_segment_id)
+                   VALUES (?, ?, ?)""",
+                (relation_id, evidence_text, source_segment_id),
+            )
+        return relation_id
+
+    def list_relations(self, subject: str | None = None, object_: str | None = None) -> list[dict]:
+        if not self._has_table("relations"):
+            return []
+        query = "SELECT * FROM relations"
+        clauses = []
+        params: list[str] = []
+        if subject is not None:
+            clauses.append("subject = ?")
+            params.append(subject)
+        if object_ is not None:
+            clauses.append("object = ?")
+            params.append(object_)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        return [dict(row) for row in self._conn.execute(query, params).fetchall()]
+
+    def list_relations_for_concept(self, name: str, limit: int = 10) -> list[dict]:
+        if not self._has_table("relations"):
+            return []
+        rows = self._conn.execute(
+            """SELECT * FROM relations WHERE subject = ? OR object = ?
+               ORDER BY confidence DESC LIMIT ?""",
+            (name, name, limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_relation(self, relation_id: str) -> dict | None:
+        if not self._has_table("relations"):
+            return None
+        row = self._conn.execute("SELECT * FROM relations WHERE id = ?", (relation_id,)).fetchone()
+        return dict(row) if row else None
+
+    def list_relation_evidence(self, relation_id: str) -> list[dict]:
+        if not self._has_table("relation_evidence"):
+            return []
+        rows = self._conn.execute(
+            "SELECT * FROM relation_evidence WHERE relation_id = ?", (relation_id,)
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def insert_relation_candidates(
+        self, candidates: list[RelationCandidate], source_segment_id: str
+    ) -> None:
+        """Append raw LLM relation candidates verbatim (no dedup, no approval gate)."""
+        if not self._has_table("relation_candidates"):
+            return
+        now = datetime.now().isoformat()
+        with self._tx():
+            for candidate in candidates:
+                self._conn.execute(
+                    """INSERT INTO relation_candidates
+                           (subject, predicate, object, evidence, source_segment_id,
+                            confidence, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        candidate.subject,
+                        candidate.predicate,
+                        candidate.object,
+                        candidate.evidence,
+                        source_segment_id,
+                        candidate.confidence,
+                        now,
+                    ),
+                )
+
+    def count_relations(self) -> int:
+        if not self._has_table("relations"):
+            return 0
+        return int(self._conn.execute("SELECT COUNT(*) FROM relations").fetchone()[0])
+
+    def list_relation_neighbors(self, name: str, min_confidence: float) -> list[str]:
+        if not self._has_table("relations"):
+            return []
+        rows = self._conn.execute(
+            """SELECT object FROM relations WHERE subject = ? AND confidence > ?
+               UNION
+               SELECT subject FROM relations WHERE object = ? AND confidence > ?""",
+            (name, min_confidence, name, min_confidence),
+        ).fetchall()
+        return [row[0] for row in rows]
 
     def fts5_available(self) -> bool:
         """True if this SQLite build supports FTS5 (verbatim search index)."""

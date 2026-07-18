@@ -90,7 +90,7 @@ def test_v17_migration_rewrites_separators_on_a_windows_built_db(tmp_path: Path)
 
     db = StateDB(db_path)  # reopen → runs the v17 migration
 
-    assert db._conn.execute("SELECT version FROM schema_version").fetchone()[0] == 27
+    assert db._conn.execute("SELECT version FROM schema_version").fetchone()[0] == 28
     assert db._conn.execute("SELECT path FROM raw_notes").fetchone()[0] == "raw/qubit.md"
     assert db._conn.execute("SELECT source_path FROM concepts").fetchone()[0] == "raw/qubit.md"
     assert (
@@ -137,7 +137,7 @@ def test_v17_migration_leaves_absolute_master_path_untouched(tmp_path: Path) -> 
 
     db = StateDB(db_path)  # runs v17 then v18
 
-    assert db._conn.execute("SELECT version FROM schema_version").fetchone()[0] == 27
+    assert db._conn.execute("SELECT version FROM schema_version").fetchone()[0] == 28
     path, master = db._conn.execute("SELECT path, master_path FROM generated_assets").fetchone()
     assert master == abs_master  # absolute external path preserved byte-for-byte
     assert path == "assets/doc/img.png"  # vault-relative key untouched (already POSIX)
