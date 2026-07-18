@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 import synto.vault as vault
 from synto.vault import (
     atomic_write,
@@ -236,6 +238,43 @@ def test_sanitize_filename_empty_becomes_untitled():
 
 def test_sanitize_filename_normal():
     assert sanitize_filename("Quantum Computing") == "Quantum Computing"
+
+
+# ── sanitize_filename: Windows-safe output ────────────────────────────────────
+# Vaults are cross-platform; a name that cannot be created on Windows is a bug on
+# every OS, because the vault stops syncing/cloning there.
+
+
+@pytest.mark.parametrize("title", ["CON", "nul", "Nul", "COM7", "lpt3", "AUX", "PRN"])
+def test_sanitize_filename_deserves_reserved_device_names(title):
+    result = sanitize_filename(title)
+    assert result.casefold() != title.casefold()
+    assert result  # never empty
+
+
+def test_sanitize_filename_reserved_name_stays_link_consistent():
+    # Same derivation for filename and link target — must hold for the de-reserved form.
+    assert sanitize_wikilink_target("NUL") == sanitize_filename("NUL")
+
+
+def test_sanitize_filename_strips_trailing_dots():
+    # Windows silently drops trailing dots, so "Foo..md" can't round-trip.
+    assert sanitize_filename("Foo.") == "Foo"
+    assert sanitize_filename("etc..") == "etc"
+
+
+def test_sanitize_filename_keeps_interior_dots():
+    assert sanitize_filename("Node.js") == "Node.js"
+    assert sanitize_filename(".NET") == ".NET"
+
+
+def test_sanitize_filename_strips_control_chars():
+    assert sanitize_filename("Foo\x07Bar\x1f") == "FooBar"
+
+
+def test_sanitize_filename_nonlatin_unchanged():
+    assert sanitize_filename("Каталог шаблонов") == "Каталог шаблонов"
+    assert sanitize_filename("日本語ノート") == "日本語ノート"
 
 
 # ── atomic_write ──────────────────────────────────────────────────────────────

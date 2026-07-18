@@ -25,6 +25,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import click
 import frontmatter as fm_lib
 
 from ..config import Config
@@ -1042,7 +1043,7 @@ def compile_concepts(
 
         if draft_path.exists() and not force:
             if dry_run:
-                print(f"  [skip] {name} — draft already pending review")
+                click.echo(f"  [skip] {name} — draft already pending review")
                 continue
             log.info(
                 "Skipping '%s' — draft already pending review (use --force to overwrite)", name
@@ -1065,7 +1066,7 @@ def compile_concepts(
                         and art_rec.content_hash != _content_hash(existing_body)
                     ):
                         if dry_run:
-                            print(f"  [skip] {name} — published article manually edited")
+                            click.echo(f"  [skip] {name} — published article manually edited")
                             continue
                         log.info("Skipping '%s' — manually edited (use --force to override)", name)
                         db.mark_concept_compile_state(name, source_paths, "deferred_manual_edit")
@@ -1080,7 +1081,7 @@ def compile_concepts(
 
         if dry_run:
             stub_tag = " [stub]" if is_stub else ""
-            print(
+            click.echo(
                 f"  [concept{stub_tag}] {name} — {len(source_paths)} source(s): "
                 f"{', '.join(Path(s).name for s in source_paths)}"
             )
@@ -1499,8 +1500,8 @@ def compile_notes(
 
     if dry_run:
         for a in plan.articles:
-            print(f"  [{a.action}] {a.path} — {a.title}")
-            print(f"    sources: {', '.join(a.source_paths)}")
+            click.echo(f"  [{a.action}] {a.path} — {a.title}")
+            click.echo(f"    sources: {', '.join(a.source_paths)}")
         return [], []
 
     # ── Step 2: Write each article ────────────────────────────────────────────

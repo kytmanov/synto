@@ -291,6 +291,48 @@ def _check_stale_lock(config: Config, issues: list[LintIssue]) -> None:
         )
 
 
+def find_filename_drift(config: Config, db: StateDB) -> list[tuple[str, str, str, str, str]]:
+    """Tracked articles whose on-disk stem re-sanitizes to a different canonical stem.
+
+    Wikilink targets derive from ``sanitize_filename(title)``, so when its rules get
+    stricter (Windows reserved names, trailing dots) a file the OLD sanitizer produced
+    stops matching newly written links. Drift is only claimed when the existing stem
+    itself re-sanitizes to the canonical form — a stem that doesn't (e.g. after a manual
+    frontmatter retitle) is a deliberate user state, not a sanitizer-rule change.
+
+    Returns (old_rel, new_rel, old_stem, new_stem, title) per drifted article.
+    """
+    drifts: list[tuple[str, str, str, str, str]] = []
+    for art in db.list_articles():
+        path = config.vault / art.path
+        if not path.exists():
+            continue
+        old_stem = path.stem
+        new_stem = sanitize_filename(art.title)
+        if old_stem == new_stem or sanitize_filename(old_stem) != new_stem:
+            continue
+        parent, _, _ = art.path.rpartition("/")
+        new_rel = f"{parent}/{new_stem}.md" if parent else f"{new_stem}.md"
+        drifts.append((art.path, new_rel, old_stem, new_stem, art.title))
+    return drifts
+
+
+def _check_filename_drift(config: Config, db: StateDB, issues: list[LintIssue]) -> None:
+    for old_rel, _new_rel, old_stem, new_stem, _title in find_filename_drift(config, db):
+        issues.append(
+            LintIssue(
+                path=old_rel,
+                issue_type="filename_drift",
+                description=(
+                    f"Filename stem {old_stem!r} no longer matches its canonical form "
+                    f"{new_stem!r}; new [[{new_stem}]] links will not resolve to this file."
+                ),
+                suggestion="Run `synto maintain --fix` to rename it and repoint inbound links.",
+                auto_fixable=False,
+            )
+        )
+
+
 def _check_missing_media(rel_path: str, body: str, vault: Path, issues: list[LintIssue]) -> None:
     seen: set[str] = set()
     for match in _EMBED_TARGET_RE.finditer(body):
@@ -795,6 +837,7 @@ def run_lint(config: Config, db: StateDB, fix: bool = False) -> LintResult:
         )
 
     _check_stale_lock(config, issues)
+    _check_filename_drift(config, db, issues)
 
     title_index = _build_title_index(config, db=db)
     inbound_index = _build_inbound_index(config)

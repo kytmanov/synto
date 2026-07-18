@@ -88,6 +88,34 @@ def test_fix_normalizes_alias_link_on_disk(config, tmp_path):
     assert "[[Machine Learning|ML]]" in parse_note(ref)[1]
 
 
+def test_fix_renames_drifted_filename_and_repoints_links(config, tmp_path):
+    """--fix renames a legacy-sanitizer filename (here: kept trailing dot) to the
+    canonical stem, repoints inbound links, and creates no stub for the target."""
+    from synto.models import WikiArticleRecord
+
+    db = StateDB(config.state_db_path)
+    old = config.wiki_dir / "Foo..md"
+    atomic_write(
+        old, fm_lib.dumps(fm_lib.Post("## Body\n\nContent.", title="Foo.", status="published"))
+    )
+    db.upsert_article(
+        WikiArticleRecord(
+            path="wiki/Foo..md", title="Foo.", sources=[], content_hash="h", status="published"
+        )
+    )
+    ref = _write_article(config, "Ref", "See [[Foo.]] here.")
+    db.close()
+
+    result = CliRunner().invoke(cli, ["maintain", "--fix", "--vault", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    assert "Renamed 1 file(s)" in result.output
+    assert not old.exists()
+    assert (config.wiki_dir / "Foo.md").exists()
+    assert "[[Foo|Foo.]]" in parse_note(ref)[1]
+    assert not (config.drafts_dir / "Foo.md").exists()
+
+
 def test_fix_creates_stub_for_unresolvable_link(config, tmp_path):
     """A link to a name with no article and no alias is genuinely broken; --fix creates a
     stub draft for it so the link resolves."""

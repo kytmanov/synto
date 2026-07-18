@@ -744,6 +744,52 @@ def test_write_fixed_note_does_not_mutate_caller_meta(vault, config, db):
     assert "content_hash" not in caller_meta
 
 
+# ── Filename drift ────────────────────────────────────────────────────────────
+
+
+def test_filename_drift_detected_for_legacy_stem(vault, config, db):
+    # A file created by the old sanitizer ("Foo." kept its trailing dot) no longer
+    # matches what new wikilinks will point at — lint must surface it.
+    path = config.wiki_dir / "Foo..md"
+    write_note(path, {"title": "Foo.", "tags": [], "status": "published"}, "Body.")
+    db.upsert_article(
+        WikiArticleRecord(
+            path="wiki/Foo..md", title="Foo.", sources=[], content_hash="h", status="published"
+        )
+    )
+
+    result = run_lint(config, db)
+
+    drift = [i for i in result.issues if i.issue_type == "filename_drift"]
+    assert drift
+    assert "wiki/Foo..md" in drift[0].path
+
+
+def test_no_filename_drift_for_canonical_or_retitled(vault, config, db):
+    _write_page(config, "Alpha", "Body.")
+    db.upsert_article(
+        WikiArticleRecord(
+            path="wiki/Alpha.md", title="Alpha", sources=[], content_hash="h", status="published"
+        )
+    )
+    # Manual retitle in frontmatter/DB (stem doesn't re-sanitize to the title's form) is
+    # not drift — that's a deliberate user edit, not a sanitizer-rule change.
+    _write_page(config, "Beta", "Body.", meta_override={"title": "Renamed Concept"})
+    db.upsert_article(
+        WikiArticleRecord(
+            path="wiki/Beta.md",
+            title="Renamed Concept",
+            sources=[],
+            content_hash="h2",
+            status="published",
+        )
+    )
+
+    result = run_lint(config, db)
+
+    assert not [i for i in result.issues if i.issue_type == "filename_drift"]
+
+
 # ── Invalid tags ─────────────────────────────────────────────────────────────
 
 

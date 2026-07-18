@@ -595,6 +595,39 @@ def _extract_link_target(description: str) -> str | None:
     return match.group(1) if match else None
 
 
+def fix_filename_drift(
+    config: Config, db: StateDB, *, dry_run: bool = False
+) -> list[tuple[str, str]]:
+    """Rename drifted article files to their canonical stem and repoint inbound links.
+
+    See ``lint.find_filename_drift`` for what counts as drift. Reuses the concept-rename
+    machinery: file move, DB row repoint (title unchanged), inbound wikilink rewrite.
+    A target collision (file or tracked row already at the canonical path) skips that
+    article — the lint issue stays visible for manual resolution.
+
+    Returns (old_rel, new_rel) per renamed article.
+    """
+    from .lint import find_filename_drift
+
+    moved: list[tuple[str, str]] = []
+    for old_rel, new_rel, old_stem, new_stem, title in find_filename_drift(config, db):
+        old_path = config.vault / old_rel
+        new_path = config.vault / new_rel
+        if new_path.exists() or db.get_article(new_rel) is not None:
+            log.warning(
+                "filename drift: target %s already exists; leaving %s in place",
+                new_rel,
+                old_rel,
+            )
+            continue
+        if not dry_run:
+            _move_file(old_path, new_path)
+            db.update_article_identity(old_rel, new_rel, title)
+            _rewrite_inbound_links(config, db, old_stem, new_stem, title, dry_run=False)
+        moved.append((old_rel, new_rel))
+    return moved
+
+
 def suggest_orphan_links(config: Config, db: StateDB) -> list[tuple[str, list[str]]]:
     """
     For each orphan article, find other articles that mention its title unlinked.

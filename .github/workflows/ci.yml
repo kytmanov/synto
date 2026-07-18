@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.11", "3.12", "3.14"]
 
     steps:
       - uses: actions/checkout@v4
@@ -38,12 +38,12 @@ jobs:
         run: uv run pytest --tb=short -q
 
   windows-paths:
-    name: windows path portability
+    name: windows full suite
     runs-on: windows-latest
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11"]
+        python-version: ["3.11", "3.14"]
 
     steps:
       - uses: actions/checkout@v4
@@ -65,13 +65,5 @@ jobs:
       - name: Portability smoke
         run: uv run python scripts/portability_smoke.py
 
-      - name: Windows path-focused tests
-        run: >
-          uv run pytest --tb=short -q
-          tests/test_cross_os_portability_v17.py
-          tests/test_compile_v2.py
-          tests/test_phase1a_pack_export.py
-          tests/test_indexer_extra.py
-          tests/test_lint.py
-          tests/test_lock.py
-          tests/test_console_encoding.py
+      - name: Run tests
+        run: uv run pytest --tb=short -q

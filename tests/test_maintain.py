@@ -382,6 +382,89 @@ def test_suggest_orphan_links_finds_unlinked_mention(config, db):
     assert isinstance(result, list)
 
 
+# ── fix_filename_drift ────────────────────────────────────────────────────────
+# sanitize_filename() got stricter (Windows reserved names, trailing dots, control
+# chars). Wikilinks derive from the same function, so a vault holding a file the OLD
+# sanitizer produced would get new links pointing at the NEW stem → broken links and a
+# duplicate stub on the next compile. Reconciliation renames the file to the canonical
+# stem and repoints inbound links, keeping old vaults working.
+
+
+def _write_tracked_article(config, db, *, on_disk_stem: str, title: str) -> Path:
+    from synto.models import WikiArticleRecord
+
+    path = config.wiki_dir / f"{on_disk_stem}.md"
+    post = fm_lib.Post("## Body\n\nContent.", title=title, status="published", tags=[], sources=[])
+    atomic_write(path, fm_lib.dumps(post))
+    db.upsert_article(
+        WikiArticleRecord(
+            path=f"wiki/{on_disk_stem}.md",
+            title=title,
+            sources=[],
+            content_hash="h",
+            status="published",
+        )
+    )
+    return path
+
+
+def test_fix_filename_drift_renames_file_and_rewrites_links(config, db):
+    from synto.pipeline.lint import run_lint
+    from synto.pipeline.maintain import fix_filename_drift
+
+    old_path = _write_tracked_article(config, db, on_disk_stem="Foo.", title="Foo.")
+    linker = _write_article(config, "Linker", body="See [[Foo.]] for details.")
+
+    moved = fix_filename_drift(config, db)
+
+    assert moved == [("wiki/Foo..md", "wiki/Foo.md")]
+    assert not old_path.exists()
+    assert (config.wiki_dir / "Foo.md").exists()
+    assert db.get_article("wiki/Foo.md") is not None
+    assert db.get_article("wiki/Foo..md") is None
+    assert "[[Foo.]]" not in linker.read_text()
+    # The reconciled vault must resolve: no broken links left behind.
+    broken = [i for i in run_lint(config, db).issues if i.issue_type == "broken_link"]
+    assert not broken
+
+
+def test_fix_filename_drift_skips_on_target_collision(config, db):
+    from synto.pipeline.maintain import fix_filename_drift
+
+    old_path = _write_tracked_article(config, db, on_disk_stem="Foo.", title="Foo.")
+    other = _write_tracked_article(config, db, on_disk_stem="Foo", title="Foo")
+
+    moved = fix_filename_drift(config, db)
+
+    assert moved == []
+    assert old_path.exists()
+    assert other.exists()
+
+
+def test_fix_filename_drift_ignores_manual_retitle(config, db):
+    # A frontmatter title edited by hand (stem doesn't re-sanitize to the new title's
+    # form) is NOT drift — renaming would adopt a retitle the user never asked for.
+    from synto.pipeline.maintain import fix_filename_drift
+
+    path = _write_tracked_article(config, db, on_disk_stem="Foo", title="Bar")
+
+    moved = fix_filename_drift(config, db)
+
+    assert moved == []
+    assert path.exists()
+
+
+def test_fix_filename_drift_dereserves_windows_names(config, db):
+    from synto.pipeline.maintain import fix_filename_drift
+
+    _write_tracked_article(config, db, on_disk_stem="NUL", title="NUL")
+
+    moved = fix_filename_drift(config, db)
+
+    assert moved == [("wiki/NUL.md", "wiki/NUL_.md")]
+    assert (config.wiki_dir / "NUL_.md").exists()
+
+
 # ── suggest_concept_merges ────────────────────────────────────────────────────
 
 
