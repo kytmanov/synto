@@ -20,6 +20,16 @@
 
 ### Fixed
 
+- **Article filenames are Windows-safe, with automatic drift repair (#107).** A title
+  like `NUL` or `Foo.` produced a file Windows cannot create or round-trip, breaking
+  vault sync. `sanitize_filename` now de-reserves device names and strips trailing
+  dots/control chars; files named by the old rules are reported as `filename_drift`
+  and `maintain --fix` renames them and repoints inbound links.
+
+- **CI now tests Python 3.14 and runs the full suite on Windows (#107).** The Windows
+  job covered a 7-file subset on 3.11 only; the reporter's Windows + Python 3.14
+  environment was untested.
+
 - **`StateDB._tx()` now opens a real transaction at depth 0.** sqlite3's legacy isolation
   mode only implicit-BEGINs before DML, so a nested `_tx()`'s SAVEPOINT issued before any
   outer write silently became the outermost transaction and committed early — a failed
