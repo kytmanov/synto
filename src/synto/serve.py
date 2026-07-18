@@ -11,6 +11,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import click
+
 from .config import Config, McpConfig, McpSourceAccessConfig
 from .readers import (
     Article,
@@ -1085,13 +1087,12 @@ def run_server(
         # which looks like a hang to anyone who runs it by hand (see issue #30). Emit
         # a startup line on stderr so the wait is legible. Real clients ignore/capture
         # stderr; stdout stays reserved for the protocol.
-        print(
+        click.echo(
             f"synto MCP server ready (stdio) — vault: {vault}\n"
             "Waiting for an MCP client to connect; this terminal will stay idle until then.\n"
             "Launch it from your MCP client config (Claude Code / Cursor / etc.), not by hand.\n"
             "Press Ctrl-C to stop.",
-            file=sys.stderr,
-            flush=True,
+            err=True,
         )
     else:
         allowed = ", ".join(transport_security.allowed_hosts) if transport_security else ""
@@ -1101,7 +1102,7 @@ def run_server(
             if host == "::"
             else ""
         )
-        print(
+        click.echo(
             f"synto MCP server ready (streamable-http) — vault: {vault}\n"
             f"Listening at http://{host}:{port}/mcp as {server_name!r}.\n"
             "No authentication is enabled; expose this only on a trusted network "
@@ -1110,8 +1111,7 @@ def run_server(
             "Add public/proxy hostnames with --allowed-host if connections are rejected.\n"
             f"{ipv6_wildcard_note}"
             "Press Ctrl-C to stop.",
-            file=sys.stderr,
-            flush=True,
+            err=True,
         )
 
     try:

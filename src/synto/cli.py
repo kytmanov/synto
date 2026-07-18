@@ -3624,6 +3624,7 @@ def maintain(vault_str, fix, stubs_only, dry_run, clear_cache, older_than_days):
     from .pipeline.maintain import (
         create_stubs,
         fix_broken_links,
+        fix_filename_drift,
         normalize_published_alias_links,
         suggest_concept_merges,
         suggest_orphan_links,
@@ -3681,6 +3682,36 @@ def maintain(vault_str, fix, stubs_only, dry_run, clear_cache, older_than_days):
 
         # Full lint
         result = run_lint(config, db, fix=fix and not dry_run)
+        # Filename drift repair runs before the issue display and the broken-link pass:
+        # renames change link resolution, so a stale issue list would create stubs for
+        # targets the rename just satisfied.
+        renamed_files: list[tuple[str, str]] = []
+        if fix and not stubs_only:
+            renamed_files = fix_filename_drift(config, db, dry_run=dry_run)
+            if renamed_files:
+                verb = "Would rename" if dry_run else "Renamed"
+                console.print(
+                    f"[green]{verb} {len(renamed_files)} file(s) to their canonical "
+                    f"filename form.[/green]"
+                )
+                if dry_run:
+                    # The issue list below can't be recomputed against pretend-renames.
+                    console.print(
+                        "[dim](issue counts below assume these renames have not been applied)[/dim]"
+                    )
+                else:
+                    # Renames change what index links must point at — refresh like every
+                    # other mutating op. generate_index only: the .synto/INDEX.json seed
+                    # is written solely by the identity ops that also commit .synto/,
+                    # else an uncommitted seed breaks `synto undo`.
+                    from .indexer import append_log, generate_index
+
+                    generate_index(config, db)
+                    append_log(
+                        config,
+                        f"maintain --fix | renamed {len(renamed_files)} drifted filename(s)",
+                    )
+                    result = run_lint(config, db)
         # Acks are display-only: health score / advisory_issue_count come from the full
         # result.issues, and every later pass (alias normalization, broken-link repair,
         # stub creation) must keep reading result.issues unfiltered.

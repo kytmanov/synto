@@ -88,6 +88,89 @@ def test_fix_normalizes_alias_link_on_disk(config, tmp_path):
     assert "[[Machine Learning|ML]]" in parse_note(ref)[1]
 
 
+def test_fix_renames_drifted_filename_and_repoints_links(config, tmp_path):
+    """--fix renames a legacy-sanitizer filename (here: kept trailing dot) to the
+    canonical stem, repoints inbound links, and creates no stub for the target."""
+    from synto.models import WikiArticleRecord
+
+    db = StateDB(config.state_db_path)
+    old = config.wiki_dir / "Foo..md"
+    atomic_write(
+        old, fm_lib.dumps(fm_lib.Post("## Body\n\nContent.", title="Foo.", status="published"))
+    )
+    db.upsert_article(
+        WikiArticleRecord(
+            path="wiki/Foo..md", title="Foo.", sources=[], content_hash="h", status="published"
+        )
+    )
+    ref = _write_article(config, "Ref", "See [[Foo.]] here.")
+    db.close()
+
+    result = CliRunner().invoke(cli, ["maintain", "--fix", "--vault", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    assert "Renamed 1 file(s)" in result.output
+    assert not old.exists()
+    assert (config.wiki_dir / "Foo.md").exists()
+    assert "[[Foo|Foo.]]" in parse_note(ref)[1]
+    assert not (config.drafts_dir / "Foo.md").exists()
+
+
+def test_fix_drift_rename_regenerates_index(config, tmp_path):
+    """A drift rename changes what index links must point at — maintain --fix must
+    refresh wiki/index.md like every other mutating operation does."""
+    from synto.models import WikiArticleRecord
+    from synto.vault import extract_wikilinks
+
+    db = StateDB(config.state_db_path)
+    atomic_write(
+        config.wiki_dir / "Foo..md",
+        fm_lib.dumps(fm_lib.Post("## Body\n\nContent.", title="Foo.", status="published")),
+    )
+    db.upsert_article(
+        WikiArticleRecord(
+            path="wiki/Foo..md", title="Foo.", sources=[], content_hash="h", status="published"
+        )
+    )
+    db.close()
+
+    result = CliRunner().invoke(cli, ["maintain", "--fix", "--vault", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    index = config.wiki_dir / "index.md"
+    assert index.exists()
+    targets = extract_wikilinks(index.read_text(encoding="utf-8"))
+    assert "Foo" in targets
+    assert "Foo." not in targets
+
+
+def test_dry_run_drift_note_qualifies_issue_counts(config, tmp_path):
+    """Dry-run cannot refresh the issue list after pretend-renames, so the output must
+    say the counts assume the renames have not been applied — and write nothing."""
+    from synto.models import WikiArticleRecord
+
+    db = StateDB(config.state_db_path)
+    old = config.wiki_dir / "Foo..md"
+    atomic_write(
+        old,
+        fm_lib.dumps(fm_lib.Post("## Body\n\nContent.", title="Foo.", status="published")),
+    )
+    db.upsert_article(
+        WikiArticleRecord(
+            path="wiki/Foo..md", title="Foo.", sources=[], content_hash="h", status="published"
+        )
+    )
+    db.close()
+
+    result = CliRunner().invoke(cli, ["maintain", "--fix", "--dry-run", "--vault", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    assert "Would rename 1 file(s)" in result.output
+    assert "renames have not been applied" in result.output
+    assert old.exists()
+    assert not (config.wiki_dir / "Foo.md").exists()
+
+
 def test_fix_creates_stub_for_unresolvable_link(config, tmp_path):
     """A link to a name with no article and no alias is genuinely broken; --fix creates a
     stub draft for it so the link resolves."""

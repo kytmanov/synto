@@ -203,6 +203,7 @@ class LintIssue(BaseModel):
         "stale_legacy_backfill_alias",
         "homonym_filename_collision",
         "manual_relabel_adopted",
+        "filename_drift",
     ]
     description: str
     suggestion: str

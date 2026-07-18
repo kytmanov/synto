@@ -20,6 +20,17 @@
 
 ### Fixed
 
+- **Article filenames are Windows-safe, with automatic drift repair (#107).** A title
+  like `NUL` or `Foo.` produced a file Windows cannot create or round-trip, breaking
+  vault sync. `sanitize_filename` now de-reserves device names and strips trailing
+  dots/control chars; files named by the old rules are reported as `filename_drift`
+  and `maintain --fix` renames them and repoints inbound links.
+
+- **CI now tests Python 3.14 (#107).** Ubuntu runs the full suite on 3.11/3.12/3.14;
+  the Windows job runs the path-portability subset — widened to cover these changes —
+  on 3.11 and 3.14. The reporter's Windows + Python 3.14 environment was previously
+  untested anywhere; making the full suite Windows-clean is tracked in #108.
+
 - **`missing_media`, `inline_tag`, and orphan-mention scans skip code regions (#106).**
   Example embeds, `#include`-style directives, and titles inside code fences or inline
   code were reported as advisories on code-heavy vaults. All three now mask code first

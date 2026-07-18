@@ -24,7 +24,12 @@ from .sanitize import sanitize_tags
 
 def parse_note(path: Path) -> tuple[dict[str, Any], str]:
     """Return (frontmatter_dict, body_text). Safe against --- in body."""
-    post = frontmatter.load(str(path))
+    # Explicit utf-8 handle: frontmatter.load's own default is utf-8 today, but a path
+    # string would leave the decoding to the library on a codebase that pins utf-8 I/O.
+    # newline="" mirrors the library's own codecs.open decode (no newline translation);
+    # the frontmatter handler normalizes CRLF→LF in post.content either way.
+    with open(path, encoding="utf-8", newline="") as fh:
+        post = frontmatter.load(fh)
     return dict(post.metadata), post.content
 
 
@@ -233,14 +238,28 @@ def sanitize_wikilink_target(name: str) -> str:
 # ── Filename safety ───────────────────────────────────────────────────────────
 
 _FORBIDDEN_CHARS = re.compile(r'[*"\\/<>:|?#^\[\]]')
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+# Windows refuses to create these as filename stems regardless of extension; vaults are
+# cross-platform, so an LLM-generated title like "NUL" must be de-reserved on every OS
+# or the vault stops cloning/syncing to Windows.
+_WINDOWS_RESERVED_STEMS = frozenset(
+    ["con", "prn", "aux", "nul"]
+    + [f"com{i}" for i in range(1, 10)]
+    + [f"lpt{i}" for i in range(1, 10)]
+)
 
 
 def sanitize_filename(title: str, max_len: int = 100) -> str:
-    """Strip Obsidian-forbidden chars and truncate to max_len. Never returns empty string."""
-    name = _FORBIDDEN_CHARS.sub("", title).strip()
+    """Strip chars Obsidian/Windows can't take and truncate. Never returns empty string."""
+    name = _FORBIDDEN_CHARS.sub("", title)
+    name = _CONTROL_CHARS.sub("", name).strip()
     if len(name) > max_len:
         # Truncate at word boundary
         name = name[:max_len].rsplit(" ", 1)[0]
+    # Windows silently drops trailing dots/spaces, so "Foo." could never round-trip.
+    name = name.rstrip(". ")
+    if name.casefold() in _WINDOWS_RESERVED_STEMS:
+        name += "_"
     return name or "untitled"
 
 
@@ -416,7 +435,11 @@ def rename_wikilink_targets(body: str, old_stem: str, new_stem: str, new_name: s
 
     def _rewrite(m: re.Match) -> str:
         target = m.group(1).strip()
-        if sanitize_filename(target).casefold() != old_key:
+        # A link resolves to the old file if its raw target equals the on-disk stem, or
+        # if synto's derived stem does. The raw compare matters for filename-drift
+        # repair, where the old stem is one today's sanitize_filename no longer produces
+        # (e.g. "Foo." → derived stem "Foo") and the sanitized compare alone would miss it.
+        if target.casefold() != old_key and sanitize_filename(target).casefold() != old_key:
             return m.group(0)
         fragment = m.group(2)  # may be None
         display = m.group(3)  # may be None
@@ -425,7 +448,9 @@ def rename_wikilink_targets(body: str, old_stem: str, new_stem: str, new_name: s
         # Drop a display that only echoed the old name/stem so the rename actually
         # corrects the visible text; keep a deliberate, different display as-is. The
         # display "Quantm Computing" echoes stem "QuantmComputing", so compare on stems.
-        echoes_old = display is not None and sanitize_filename(display).casefold() == old_key
+        echoes_old = display is not None and (
+            display.casefold() == old_key or sanitize_filename(display).casefold() == old_key
+        )
         if display is None or echoes_old:
             if new_stem == new_name:
                 return f"[[{new_stem}{frag_part}]]"

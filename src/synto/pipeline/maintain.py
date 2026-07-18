@@ -596,6 +596,41 @@ def _extract_link_target(description: str) -> str | None:
     return match.group(1) if match else None
 
 
+def fix_filename_drift(
+    config: Config, db: StateDB, *, dry_run: bool = False
+) -> list[tuple[str, str]]:
+    """Rename drifted article files to their canonical stem and repoint inbound links.
+
+    See ``lint.find_filename_drift`` for what counts as drift. Reuses the concept-rename
+    machinery: file move, DB row repoint (title unchanged), inbound wikilink rewrite.
+    A target collision (file or tracked row already at the canonical path) skips that
+    article — the lint issue stays visible for manual resolution.
+
+    Returns (old_rel, new_rel) per renamed article.
+    """
+    from .lint import find_filename_drift
+
+    moved: list[tuple[str, str]] = []
+    for drift in find_filename_drift(config, db):
+        if drift.collides:
+            # Collision detection lives in find_filename_drift (single source of truth
+            # with the lint check, which points the user at `concept rename`).
+            log.warning(
+                "filename drift: target %s already exists; leaving %s in place",
+                drift.new_rel,
+                drift.old_rel,
+            )
+            continue
+        if not dry_run:
+            _move_file(config.vault / drift.old_rel, config.vault / drift.new_rel)
+            db.update_article_identity(drift.old_rel, drift.new_rel, drift.title)
+            _rewrite_inbound_links(
+                config, db, drift.old_stem, drift.new_stem, drift.title, dry_run=False
+            )
+        moved.append((drift.old_rel, drift.new_rel))
+    return moved
+
+
 def _wiki_page_key(path: Path, vault: Path) -> str:
     """Vault-relative forward-slash key. Must match lint's LintIssue.path format
     (as_posix) or the self-skip comparison below silently fails on Windows."""
