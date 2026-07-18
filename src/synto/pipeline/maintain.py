@@ -596,6 +596,12 @@ def _extract_link_target(description: str) -> str | None:
     return match.group(1) if match else None
 
 
+def _wiki_page_key(path: Path, vault: Path) -> str:
+    """Vault-relative forward-slash key. Must match lint's LintIssue.path format
+    (as_posix) or the self-skip comparison below silently fails on Windows."""
+    return path.relative_to(vault).as_posix()
+
+
 def suggest_orphan_links(config: Config, db: StateDB) -> list[tuple[str, list[str]]]:
     """
     For each orphan article, find other articles that mention its title unlinked.
@@ -619,7 +625,7 @@ def suggest_orphan_links(config: Config, db: StateDB) -> list[tuple[str, list[st
             try:
                 meta, body = parse_note(p)
                 masked, _ = mask_markdown_regions(body)
-                wiki_pages[str(p.relative_to(config.vault))] = masked
+                wiki_pages[_wiki_page_key(p, config.vault)] = masked
             except Exception:
                 pass
 

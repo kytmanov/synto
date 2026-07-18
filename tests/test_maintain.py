@@ -382,6 +382,33 @@ def test_suggest_orphan_links_finds_unlinked_mention(config, db):
     assert isinstance(result, list)
 
 
+def test_wiki_page_key_forward_slash_on_windows_paths():
+    # Review finding: wiki_pages was keyed with str(relative_to()) — backslashes on
+    # Windows — while lint's issue.path is always as_posix(), so the self-skip
+    # comparison silently never matched there. Same test shape as lint's
+    # test_wiki_rel_key_forward_slash_on_windows_paths.
+    from pathlib import PureWindowsPath
+
+    from synto.pipeline.maintain import _wiki_page_key
+
+    key = _wiki_page_key(
+        PureWindowsPath(r"C:\v\wiki\Main Article.md"),
+        PureWindowsPath(r"C:\v"),
+    )
+    assert key == "wiki/Main Article.md"
+
+
+def test_suggest_orphan_links_does_not_suggest_self(config, db):
+    # An orphan article naming its own title in its own body is not an inbound mention.
+    # (On POSIX the key formats coincide; the Windows-shaped guarantee is pinned by
+    # test_wiki_page_key_forward_slash_on_windows_paths above.)
+    _write_article(config, "Orphan Topic", body="## Body\n\nOrphan Topic is described here.")
+
+    result = suggest_orphan_links(config, db)
+
+    assert all(title != "Orphan Topic" or not mentions for title, mentions in result)
+
+
 def test_suggest_orphan_links_ignores_fenced_mentions(config, db):
     # A title appearing only inside code fences / inline code is not an unlinked mention.
     _write_article(config, "Orphan Topic", body="## Body\n\nAbout orphan.")

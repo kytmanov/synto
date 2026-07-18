@@ -901,10 +901,10 @@ def run_lint(config: Config, db: StateDB, fix: bool = False) -> LintResult:
 
         # ── Inline hashtags ───────────────────────────────────────────────────
         # Full mask: code fences/inline code (a #include in a code example is not a
-        # tag), plus links/wikilinks/embeds as before.
-        masked_body, masked_regions = mask_markdown_regions(body)
+        # tag), plus links/wikilinks/embeds as before. Scan the masked copy; body
+        # itself is untouched.
+        masked_body, _ = mask_markdown_regions(body)
         inline_tags = _INLINE_TAG_RE.findall(masked_body)
-        body = restore_markdown_regions(masked_body, masked_regions)
         if inline_tags:
             issues.append(
                 LintIssue(
