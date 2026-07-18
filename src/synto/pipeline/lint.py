@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 from ..config import Config
@@ -291,7 +292,19 @@ def _check_stale_lock(config: Config, issues: list[LintIssue]) -> None:
         )
 
 
-def find_filename_drift(config: Config, db: StateDB) -> list[tuple[str, str, str, str, str]]:
+@dataclass(frozen=True)
+class FilenameDrift:
+    old_rel: str
+    new_rel: str
+    old_stem: str
+    new_stem: str
+    title: str
+    # Canonical target already taken (file on disk or tracked DB row) — the fixer must
+    # skip; the remedy is a concept rename, not --fix.
+    collides: bool
+
+
+def find_filename_drift(config: Config, db: StateDB) -> list[FilenameDrift]:
     """Tracked articles whose on-disk stem re-sanitizes to a different canonical stem.
 
     Wikilink targets derive from ``sanitize_filename(title)``, so when its rules get
@@ -300,9 +313,9 @@ def find_filename_drift(config: Config, db: StateDB) -> list[tuple[str, str, str
     itself re-sanitizes to the canonical form — a stem that doesn't (e.g. after a manual
     frontmatter retitle) is a deliberate user state, not a sanitizer-rule change.
 
-    Returns (old_rel, new_rel, old_stem, new_stem, title) per drifted article.
+    Collision detection lives here — single source of truth for the check and the fixer.
     """
-    drifts: list[tuple[str, str, str, str, str]] = []
+    drifts: list[FilenameDrift] = []
     for art in db.list_articles():
         path = config.vault / art.path
         if not path.exists():
@@ -313,21 +326,30 @@ def find_filename_drift(config: Config, db: StateDB) -> list[tuple[str, str, str
             continue
         parent, _, _ = art.path.rpartition("/")
         new_rel = f"{parent}/{new_stem}.md" if parent else f"{new_stem}.md"
-        drifts.append((art.path, new_rel, old_stem, new_stem, art.title))
+        collides = (config.vault / new_rel).exists() or db.get_article(new_rel) is not None
+        drifts.append(FilenameDrift(art.path, new_rel, old_stem, new_stem, art.title, collides))
     return drifts
 
 
 def _check_filename_drift(config: Config, db: StateDB, issues: list[LintIssue]) -> None:
-    for old_rel, _new_rel, old_stem, new_stem, _title in find_filename_drift(config, db):
+    for drift in find_filename_drift(config, db):
+        if drift.collides:
+            suggestion = (
+                f"Target '{drift.new_stem}.md' is taken by another article; `maintain "
+                f"--fix` will skip this — rename one concept with `synto concept rename`."
+            )
+        else:
+            suggestion = "Run `synto maintain --fix` to rename it and repoint inbound links."
         issues.append(
             LintIssue(
-                path=old_rel,
+                path=drift.old_rel,
                 issue_type="filename_drift",
                 description=(
-                    f"Filename stem {old_stem!r} no longer matches its canonical form "
-                    f"{new_stem!r}; new [[{new_stem}]] links will not resolve to this file."
+                    f"Filename stem {drift.old_stem!r} no longer matches its canonical form "
+                    f"{drift.new_stem!r}; new [[{drift.new_stem}]] links will not resolve "
+                    f"to this file."
                 ),
-                suggestion="Run `synto maintain --fix` to rename it and repoint inbound links.",
+                suggestion=suggestion,
                 auto_fixable=False,
             )
         )

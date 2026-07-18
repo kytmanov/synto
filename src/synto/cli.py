@@ -3694,7 +3694,23 @@ def maintain(vault_str, fix, stubs_only, dry_run, clear_cache, older_than_days):
                     f"[green]{verb} {len(renamed_files)} file(s) to their canonical "
                     f"filename form.[/green]"
                 )
-                if not dry_run:
+                if dry_run:
+                    # The issue list below can't be recomputed against pretend-renames.
+                    console.print(
+                        "[dim](issue counts below assume these renames have not been applied)[/dim]"
+                    )
+                else:
+                    # Renames change what index links must point at — refresh like every
+                    # other mutating op. generate_index only: the .synto/INDEX.json seed
+                    # is written solely by the identity ops that also commit .synto/,
+                    # else an uncommitted seed breaks `synto undo`.
+                    from .indexer import append_log, generate_index
+
+                    generate_index(config, db)
+                    append_log(
+                        config,
+                        f"maintain --fix | renamed {len(renamed_files)} drifted filename(s)",
+                    )
                     result = run_lint(config, db)
         # Acks are display-only: health score / advisory_issue_count come from the full
         # result.issues, and every later pass (alias normalization, broken-link repair,

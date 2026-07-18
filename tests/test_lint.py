@@ -765,6 +765,30 @@ def test_filename_drift_detected_for_legacy_stem(vault, config, db):
     assert "wiki/Foo..md" in drift[0].path
 
 
+def test_filename_drift_collision_suggests_concept_rename(vault, config, db):
+    # Two titles collapsing to one canonical stem ("Foo" + "Foo.") can never be fixed by
+    # maintain --fix (it correctly skips); the issue must say so and point at the real
+    # remedy instead of sending the user in a --fix loop.
+    for stem, title in (("Foo", "Foo"), ("Foo.", "Foo.")):
+        path = config.wiki_dir / f"{stem}.md"
+        write_note(path, {"title": title, "tags": [], "status": "published"}, "Body.")
+        db.upsert_article(
+            WikiArticleRecord(
+                path=f"wiki/{stem}.md",
+                title=title,
+                sources=[],
+                content_hash="h",
+                status="published",
+            )
+        )
+
+    result = run_lint(config, db)
+
+    drift = [i for i in result.issues if i.issue_type == "filename_drift"]
+    assert drift
+    assert "concept rename" in drift[0].suggestion
+
+
 def test_no_filename_drift_for_canonical_or_retitled(vault, config, db):
     _write_page(config, "Alpha", "Body.")
     db.upsert_article(

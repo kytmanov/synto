@@ -26,9 +26,10 @@
   dots/control chars; files named by the old rules are reported as `filename_drift`
   and `maintain --fix` renames them and repoints inbound links.
 
-- **CI now tests Python 3.14 and runs the full suite on Windows (#107).** The Windows
-  job covered a 7-file subset on 3.11 only; the reporter's Windows + Python 3.14
-  environment was untested.
+- **CI now tests Python 3.14 (#107).** Ubuntu runs the full suite on 3.11/3.12/3.14;
+  the Windows job runs the path-portability subset — widened to cover these changes —
+  on 3.11 and 3.14. The reporter's Windows + Python 3.14 environment was previously
+  untested anywhere; making the full suite Windows-clean is tracked in #108.
 
 - **`StateDB._tx()` now opens a real transaction at depth 0.** sqlite3's legacy isolation
   mode only implicit-BEGINs before DML, so a nested `_tx()`'s SAVEPOINT issued before any

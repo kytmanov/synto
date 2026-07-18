@@ -610,21 +610,23 @@ def fix_filename_drift(
     from .lint import find_filename_drift
 
     moved: list[tuple[str, str]] = []
-    for old_rel, new_rel, old_stem, new_stem, title in find_filename_drift(config, db):
-        old_path = config.vault / old_rel
-        new_path = config.vault / new_rel
-        if new_path.exists() or db.get_article(new_rel) is not None:
+    for drift in find_filename_drift(config, db):
+        if drift.collides:
+            # Collision detection lives in find_filename_drift (single source of truth
+            # with the lint check, which points the user at `concept rename`).
             log.warning(
                 "filename drift: target %s already exists; leaving %s in place",
-                new_rel,
-                old_rel,
+                drift.new_rel,
+                drift.old_rel,
             )
             continue
         if not dry_run:
-            _move_file(old_path, new_path)
-            db.update_article_identity(old_rel, new_rel, title)
-            _rewrite_inbound_links(config, db, old_stem, new_stem, title, dry_run=False)
-        moved.append((old_rel, new_rel))
+            _move_file(config.vault / drift.old_rel, config.vault / drift.new_rel)
+            db.update_article_identity(drift.old_rel, drift.new_rel, drift.title)
+            _rewrite_inbound_links(
+                config, db, drift.old_stem, drift.new_stem, drift.title, dry_run=False
+            )
+        moved.append((drift.old_rel, drift.new_rel))
     return moved
 
 

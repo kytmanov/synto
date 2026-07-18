@@ -292,6 +292,26 @@ def test_sanitize_filename_nonlatin_unchanged():
     assert sanitize_filename("日本語ノート") == "日本語ノート"
 
 
+@pytest.mark.parametrize(
+    "title",
+    [
+        "NUL",
+        "Foo.",
+        "CON.",
+        "Foo\x07Bar",
+        "word " * 30,
+        "Каталог шаблонов",
+        "日本語ノート",
+        "***///",
+    ],
+)
+def test_sanitize_filename_idempotent(title):
+    # filename_drift detection treats sanitize_filename(stem) == sanitize_filename(title)
+    # as "converged" — that only holds if the function is a fixpoint of itself.
+    once = sanitize_filename(title.strip())
+    assert sanitize_filename(once) == once
+
+
 # ── atomic_write ──────────────────────────────────────────────────────────────
 
 
