@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import unicodedata
+
 import pytest
 
 from synto.sanitize import clean_display_name, sanitize_tag, sanitize_tags
@@ -115,6 +117,45 @@ def test_punctuation_removed_from_unicode_tag():
 
 def test_garbage_still_empty_with_unicode_rules():
     assert sanitize_tag("!!!@@@###") == ""
+
+
+# ── sanitize_tag: idempotence and normalization ───────────────────────────────
+# lint's invalid_tag check is `t != sanitize_tag(t)`, so any input where a second pass
+# differs from the first makes lint re-flag the tag --fix just wrote (review finding on
+# Turkish İ: filter-before-lower let the combining dot of lower("İ") survive one pass).
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "İstanbul",  # lower() emits U+0307 combining dot — the reported case
+        unicodedata.normalize("NFD", "café"),  # decomposed input (macOS-style)
+        unicodedata.normalize("NFD", "Ёлка"),
+        "ẞ",  # capital sharp s → ß
+        "ǅungla",  # titlecase digraph
+        "каталог",
+        "日本語",
+        "quantum computing",
+        "C++ programming",
+        "#my-tag",
+        "2024",
+        "!!!",
+    ],
+)
+def test_sanitize_tag_idempotent(raw):
+    once = sanitize_tag(raw)
+    assert sanitize_tag(once) == once
+
+
+def test_turkish_dotted_capital_folds_cleanly():
+    assert sanitize_tag("İstanbul") == "istanbul"
+
+
+def test_nfd_input_normalized_to_nfc():
+    # Decomposed "café" (e + combining acute) must keep its accent, as NFC.
+    nfd = unicodedata.normalize("NFD", "café")
+    assert sanitize_tag(nfd) == "café"
+    assert unicodedata.is_normalized("NFC", sanitize_tag(nfd))
 
 
 # ── sanitize_tags ─────────────────────────────────────────────────────────────

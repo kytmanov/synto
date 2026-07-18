@@ -7,6 +7,7 @@ Leaf module — no project imports, safe to import from models.py and vault.py.
 from __future__ import annotations
 
 import re
+import unicodedata
 
 # Valid Obsidian tag: letters/digits of any script, plus _ - and / for nesting.
 # Obsidian allows Unicode tags, and non-English vaults depend on them — character rules
@@ -21,18 +22,23 @@ def sanitize_tag(raw: str) -> str:
     """Convert arbitrary string to a valid Obsidian tag (lowercase convention).
 
     Steps:
-      1. Strip whitespace
+      1. Strip whitespace, NFC-normalize, lowercase
       2. Replace spaces with hyphens
       3. Remove chars that are not word chars (any script) or / -
       4. Strip leading non-alphanumeric chars
-      5. Lowercase
-      6. Return "" if nothing remains
+      5. Return "" if nothing remains
+
+    NFC + lowercase run BEFORE the character filter so the result is idempotent —
+    lint flags any tag where t != sanitize_tag(t), so a second pass must be a no-op.
+    Filtering first broke that for İ (lower("İ") emits a combining dot the filter
+    then strips) and silently dropped diacritics from decomposed (NFD, macOS-style)
+    input. NFC, not NFKC: tags are display text — compatibility folding (①→1) would
+    surprise; identity matching uses concept_key's NFKC separately.
     """
-    tag = raw.strip()
+    tag = unicodedata.normalize("NFC", raw.strip()).lower()
     tag = tag.replace(" ", "-")
     tag = _INVALID_CHARS.sub("", tag)
     tag = _LEADING_NON_ALNUM.sub("", tag)
-    tag = tag.lower()
     return tag
 
 

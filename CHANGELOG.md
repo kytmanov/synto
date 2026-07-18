@@ -23,7 +23,10 @@
 - **Tags in any script survive sanitization and `maintain --fix` (#105).** Tag rules
   stripped every non-ASCII character, so on non-English vaults LLM-proposed tags were
   silently dropped and `--fix` deleted valid Unicode tags (`каталог`, `日本語`, `café`)
-  from frontmatter. Rules are now script-agnostic; ASCII tags behave exactly as before.
+  from frontmatter. Rules are now script-agnostic and idempotent (NFC + lowercase
+  before filtering); ASCII tags behave exactly as before. Decomposed (NFD, macOS-style)
+  tags are normalized to NFC — a one-time frontmatter rewrite under `--fix` that then
+  converges.
 
 - **Name matching folds non-ASCII case (#105).** SQLite's `lower()` folds ASCII only, so
   the rename collision check and the concept-lookup substring fallback missed non-ASCII

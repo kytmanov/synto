@@ -796,6 +796,22 @@ def test_unicode_tags_no_issue(vault, config, db):
     assert not tag_issues
 
 
+def test_fix_converges_in_one_pass_for_dotted_capital_tag(vault, config, db):
+    # Regression (review finding): non-idempotent sanitization made lint re-flag the
+    # tag --fix had just written (İ → i + combining dot on pass 1, stripped on pass 2).
+    _write_page(
+        config,
+        "TurkishTag",
+        meta_override={"tags": ["İstanbul"], "status": "published"},
+    )
+    run_lint(config, db, fix=True)
+
+    result = run_lint(config, db)
+
+    tag_issues = [i for i in result.issues if i.issue_type == "invalid_tag"]
+    assert not tag_issues
+
+
 def test_fix_mode_preserves_unicode_tags(vault, config, db):
     # Data-loss regression: --fix used to rewrite frontmatter with non-ASCII tags removed.
     import frontmatter as fm
