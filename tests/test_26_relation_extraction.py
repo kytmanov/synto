@@ -458,10 +458,50 @@ def test_extract_and_persist_relations_dedups_across_segments(tmp_path: Path, co
     assert len(raw_rows) == 2
 
 
+def test_extract_and_persist_relations_isolates_segment_failures(tmp_path: Path, config) -> None:
+    """A StructuredOutputError on one segment's relation call must not skip the remaining
+    segments — best-effort per segment, matching the "log + continue" convention used
+    elsewhere in ingest for non-fatal LLM failures."""
+    from synto.pipeline.ingest import _extract_and_persist_relations
+    from synto.structured_output import StructuredOutputError
+
+    db = StateDB(tmp_path / "state.db")
+    segments = [
+        SimpleNamespace(id="seg-1", text="Alpha depends on Beta."),
+        SimpleNamespace(id="seg-2", text="Gamma depends on Delta."),
+    ]
+    response_2 = json.dumps(
+        {
+            "relations": [
+                {
+                    "subject": "Gamma",
+                    "predicate": "depends_on",
+                    "object": "Delta",
+                    "evidence": "Gamma depends on Delta.",
+                    "confidence": 0.7,
+                }
+            ]
+        }
+    )
+    client = make_mock_client()
+    client.generate.side_effect = [StructuredOutputError("boom"), response_2]
+    fast = as_endpoint(client, model=config.model_name("fast"))
+
+    n = _extract_and_persist_relations(db, segments, ["Gamma", "Delta"], fast, config)
+
+    assert n == 1  # seg-1 failed and was skipped; seg-2 still persisted
+    relations = db.list_relations()
+    assert len(relations) == 1
+    assert relations[0]["subject"] == "Gamma"
+    assert relations[0]["source_segment_id"] == "seg-2"
+
+
 def test_ingest_note_relation_extraction_off_by_default(vault, config, db) -> None:
     """The flag guard in ingest_note must skip the whole relation-extraction pass when
-    pipeline.relation_extraction is False (its default) — no relations rows, regardless of
-    whether the main analysis pass ran."""
+    pipeline.relation_extraction is False (its default): no relations rows AND no extra
+    LLM call beyond the analysis pass. (Asserting count_relations()==0 alone would also
+    pass if the guard were deleted, since the broad except around the extraction pass
+    would swallow the resulting failure on the analysis-shaped mock response.)"""
     from synto.pipeline.ingest import ingest_note
 
     assert config.pipeline.relation_extraction is False
@@ -471,6 +511,7 @@ def test_ingest_note_relation_extraction_off_by_default(vault, config, db) -> No
 
     ingest_note(path, config, client, db)
 
+    assert client.generate.call_count == 1  # analysis pass only, no relation-extraction call
     assert db.count_relations() == 0
 
 

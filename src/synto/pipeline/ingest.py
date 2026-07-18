@@ -380,23 +380,29 @@ def _extract_and_persist_relations(
     any .id/.text-bearing object (e.g. a pseudo-segment); normalize both to a uniform shim so
     extract_relations's duck-typed segment arg is satisfied. Returns the number of relations
     upserted (for logging) — candidates that dedup to the same relation each still count.
+
+    Each segment is isolated with its own try/except: a failure on one segment (e.g. a
+    StructuredOutputError from the fast model) must not skip the remaining segments.
     """
     persisted = 0
     for seg in segments:
         seg_id, seg_text = (seg["id"], seg["text"]) if hasattr(seg, "keys") else (seg.id, seg.text)
-        shim = SimpleNamespace(id=seg_id, text=seg_text)
-        result = extract_relations(shim, canonical_names, fast, config)
-        for candidate in result.relations:
-            db.upsert_relation(
-                candidate.subject,
-                candidate.predicate,
-                candidate.object,
-                candidate.confidence,
-                seg_id,
-                candidate.evidence,
-            )
-            persisted += 1
-        db.insert_relation_candidates(result.relations, seg_id)
+        try:
+            shim = SimpleNamespace(id=seg_id, text=seg_text)
+            result = extract_relations(shim, canonical_names, fast, config)
+            for candidate in result.relations:
+                db.upsert_relation(
+                    candidate.subject,
+                    candidate.predicate,
+                    candidate.object,
+                    candidate.confidence,
+                    seg_id,
+                    candidate.evidence,
+                )
+                persisted += 1
+            db.insert_relation_candidates(result.relations, seg_id)
+        except Exception:
+            log.warning("relation extraction failed for segment %s", seg_id, exc_info=True)
     return persisted
 
 
