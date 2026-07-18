@@ -346,6 +346,7 @@ def build_wiki_frontmatter(
     source_count: int | None = None,
     single_source: bool | None = None,
     source_quality: str | None = None,
+    relations: list[dict] | None = None,
 ) -> dict[str, Any]:
     now = datetime.now().strftime("%Y-%m-%d")
     sanitized_tags = sanitize_tags(tags)
@@ -369,6 +370,8 @@ def build_wiki_frontmatter(
         meta["source_quality"] = source_quality
     if aliases:
         meta["aliases"] = aliases
+    if relations:
+        meta["relations"] = relations
     if existing_meta and "created" in existing_meta:
         meta["created"] = existing_meta["created"]
     else:

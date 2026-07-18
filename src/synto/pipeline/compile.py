@@ -802,6 +802,17 @@ def _write_draft(
         single_source = False
         source_quality = None
 
+    relation_rows = db.list_relations_for_concept(article_title, limit=10)
+    relations = [
+        {
+            "subject": r["subject"],
+            "predicate": r["predicate"],
+            "object": r["object"],
+            "confidence": round(float(r["confidence"]), 2),
+        }
+        for r in relation_rows
+    ]
+
     meta = build_wiki_frontmatter(
         title=article_title,
         tags=content_result.tags,
@@ -814,6 +825,7 @@ def _write_draft(
         source_count=source_count,
         single_source=single_source,
         source_quality=source_quality,
+        relations=relations,
     )
 
     post = fm_lib.Post(body, **meta)

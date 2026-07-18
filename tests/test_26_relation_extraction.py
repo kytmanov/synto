@@ -544,3 +544,82 @@ def test_ingest_note_relation_extraction_pseudo_segment_for_plain_note(vault, co
     assert db.count_relations() == 1
     relation = db.list_relations()[0]
     assert relation["source_segment_id"].startswith("note:")
+
+
+# ---------------------------------------------------------------------------
+# Stage 5: relations block in article frontmatter
+# ---------------------------------------------------------------------------
+
+
+def test_compile_concepts_draft_frontmatter_has_relations_block(
+    vault, config, db, fixtures_dir
+) -> None:
+    """Compiling a concept with >10 stored relations must surface the top 10
+    (by confidence) in the draft frontmatter, so a reader can see the concept's
+    graph neighborhood without opening the DB."""
+    from synto.models import RawNoteRecord
+    from synto.pipeline.compile import compile_concepts
+
+    raw_note = vault / "raw" / "note.md"
+    raw_note.write_text("---\ntitle: Note\n---\n\nQuantum entanglement content.")
+    db.upsert_raw(RawNoteRecord(path="raw/note.md", content_hash="abc", status="ingested"))
+    db.upsert_concepts("raw/note.md", ["Quantum Entanglement"])
+
+    for i in range(12):
+        db.upsert_relation(
+            subject="Quantum Entanglement",
+            predicate="related_to",
+            object_=f"Concept {i}",
+            confidence=round(0.5 + i * 0.03, 2),
+            source_segment_id=f"note.md:0-0:seg{i}",
+            evidence_text=f"Quantum Entanglement relates to Concept {i}.",
+        )
+
+    article_json = (fixtures_dir / "single_article_valid.json").read_text()
+    client = MagicMock()
+    client.generate.return_value = article_json
+    client = as_router(client)
+
+    drafts, failed, _ = compile_concepts(config=config, router=client, db=db)
+
+    assert len(drafts) == 1
+    assert failed == []
+
+    from synto.vault import parse_note
+
+    meta, _ = parse_note(drafts[0])
+    relations = meta["relations"]
+    assert len(relations) == 10
+    confidences = [r["confidence"] for r in relations]
+    assert confidences == sorted(confidences, reverse=True)
+    for r in relations:
+        assert set(r.keys()) == {"subject", "predicate", "object", "confidence"}
+
+
+def test_compile_concepts_draft_frontmatter_omits_relations_when_none(
+    vault, config, db, fixtures_dir
+) -> None:
+    """A concept with no stored relations must not get a `relations` frontmatter key at
+    all — an empty list would be misleading noise vs. simply absent."""
+    from synto.models import RawNoteRecord
+    from synto.pipeline.compile import compile_concepts
+
+    raw_note = vault / "raw" / "note.md"
+    raw_note.write_text("---\ntitle: Note\n---\n\nQuantum entanglement content.")
+    db.upsert_raw(RawNoteRecord(path="raw/note.md", content_hash="abc", status="ingested"))
+    db.upsert_concepts("raw/note.md", ["Quantum Entanglement"])
+
+    article_json = (fixtures_dir / "single_article_valid.json").read_text()
+    client = MagicMock()
+    client.generate.return_value = article_json
+    client = as_router(client)
+
+    drafts, failed, _ = compile_concepts(config=config, router=client, db=db)
+
+    assert len(drafts) == 1
+    assert failed == []
+
+    from synto.vault import parse_note
+
+    meta, _ = parse_note(drafts[0])
+    assert "relations" not in meta
