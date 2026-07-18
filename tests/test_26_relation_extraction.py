@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+
+from conftest import as_endpoint, make_mock_client
 
 from synto.models import RelationCandidate, RelationExtractionResult
 from synto.state import StateDB
@@ -222,3 +225,159 @@ def test_insert_relation_candidates_round_trip(tmp_path: Path) -> None:
     assert row["source_segment_id"] == "doc:0-0:abc123"
     assert row["confidence"] == 0.85
     assert row["created_at"]
+
+
+# ---------------------------------------------------------------------------
+# Stage 3: extract_relations() function
+# ---------------------------------------------------------------------------
+
+
+def _segment(text: str = "Vector clocks implement causal consistency."):
+    from synto.models import SourceSegment
+
+    return SourceSegment(
+        id="doc:0-0:abc123",
+        identity="doc:0-0",
+        ordinal=0,
+        source_id="doc",
+        structural_locator="0-0",
+        content_hash="abc123",
+        text=text,
+    )
+
+
+def test_extract_relations_empty_response(config) -> None:
+    from synto.pipeline.ingest import extract_relations
+
+    segment = _segment()
+    client = make_mock_client('{"relations": []}')
+    result = extract_relations(
+        segment,
+        ["Vector Clocks", "Causal Consistency"],
+        as_endpoint(client, model=config.model_name("fast")),
+        config,
+    )
+    assert isinstance(result, RelationExtractionResult)
+    assert result.relations == []
+    assert result.source_segment_id == segment.id
+    assert result.model == config.model_name("fast")
+
+
+def test_extract_relations_two_valid(config) -> None:
+    from synto.pipeline.ingest import extract_relations
+
+    segment = _segment()
+    response = json.dumps(
+        {
+            "relations": [
+                {
+                    "subject": "Vector Clocks",
+                    "predicate": "implemented_by",
+                    "object": "Causal Consistency",
+                    "evidence": "Vector clocks implement causal consistency.",
+                    "confidence": 0.9,
+                },
+                {
+                    "subject": "Causal Consistency",
+                    "predicate": "depends_on",
+                    "object": "Vector Clocks",
+                    "evidence": "Causal consistency depends on vector clocks.",
+                    "confidence": 0.7,
+                },
+            ]
+        }
+    )
+    client = make_mock_client(response)
+    result = extract_relations(
+        segment,
+        ["Vector Clocks", "Causal Consistency"],
+        as_endpoint(client, model=config.model_name("fast")),
+        config,
+    )
+    assert len(result.relations) == 2
+    first = result.relations[0]
+    assert isinstance(first, RelationCandidate)
+    assert first.subject == "Vector Clocks"
+    assert first.predicate == "implemented_by"
+    assert first.object == "Causal Consistency"
+    assert first.source_segment_id == segment.id
+    assert result.relations[1].predicate == "depends_on"
+
+
+def test_extract_relations_drops_invalid_predicate(config) -> None:
+    from synto.pipeline.ingest import extract_relations
+
+    segment = _segment()
+    response = json.dumps(
+        {
+            "relations": [
+                {
+                    "subject": "Vector Clocks",
+                    "predicate": "implemented_by",
+                    "object": "Causal Consistency",
+                    "evidence": "valid one",
+                    "confidence": 0.8,
+                },
+                {
+                    "subject": "Vector Clocks",
+                    "predicate": "related_to_somehow",
+                    "object": "Causal Consistency",
+                    "evidence": "bad predicate",
+                    "confidence": 0.5,
+                },
+            ]
+        }
+    )
+    client = make_mock_client(response)
+    result = extract_relations(
+        segment,
+        ["Vector Clocks", "Causal Consistency"],
+        as_endpoint(client, model=config.model_name("fast")),
+        config,
+    )
+    assert len(result.relations) == 1
+    assert result.relations[0].predicate == "implemented_by"
+
+
+def test_extract_relations_clamps_confidence(config) -> None:
+    from synto.pipeline.ingest import extract_relations
+
+    segment = _segment()
+    response = json.dumps(
+        {
+            "relations": [
+                {
+                    "subject": "Vector Clocks",
+                    "predicate": "implemented_by",
+                    "object": "Causal Consistency",
+                    "evidence": "overconfident",
+                    "confidence": 1.7,
+                }
+            ]
+        }
+    )
+    client = make_mock_client(response)
+    result = extract_relations(
+        segment,
+        ["Vector Clocks", "Causal Consistency"],
+        as_endpoint(client, model=config.model_name("fast")),
+        config,
+    )
+    assert result.relations[0].confidence == 1.0
+
+
+def test_extract_relations_empty_concepts_skips_llm_call(config) -> None:
+    from synto.pipeline.ingest import extract_relations
+
+    segment = _segment()
+    client = make_mock_client('{"relations": []}')
+    result = extract_relations(
+        segment,
+        [],
+        as_endpoint(client, model=config.model_name("fast")),
+        config,
+    )
+    assert result.relations == []
+    assert result.source_segment_id == segment.id
+    assert result.model == config.model_name("fast")
+    client.generate.assert_not_called()

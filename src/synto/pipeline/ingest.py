@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, get_args
 
 from pydantic import BaseModel as _BaseModel
 
@@ -26,7 +26,15 @@ from ..concept_text import concept_key as _concept_key
 from ..concept_text import match_key as _match_key
 from ..config import Config
 from ..indexer import append_log
-from ..models import AnalysisResult, Concept, RawNoteRecord, SourceSegment, TermExtractionResult
+from ..models import (
+    AnalysisResult,
+    Concept,
+    RawNoteRecord,
+    RelationCandidate,
+    RelationExtractionResult,
+    SourceSegment,
+    TermExtractionResult,
+)
 from ..paths import rel_posix
 from ..state import StateDB
 from ..structured_output import request_structured
@@ -1827,6 +1835,88 @@ def extract_terms(
     ]
     return TermExtractionResult(
         terms=terms,
+        source_segment_id=segment.id,
+        model=fast.model,
+    )
+
+
+_RELATION_PREDICATES = get_args(RelationCandidate.model_fields["predicate"].annotation)
+_RELATION_PREDICATE_SET = frozenset(_RELATION_PREDICATES)
+
+_RELATION_EXTRACTION_SYSTEM = (
+    "You are a relation extractor. Given a list of known concepts and a text passage, "
+    "extract directed relationships between those concepts only — do not invent concepts. "
+    f"predicate must be exactly one of: {', '.join(_RELATION_PREDICATES)}. "
+    "Include a short verbatim evidence quote from the passage and a confidence 0.0-1.0. "
+    "Return JSON only, no explanation."
+)
+
+
+class _RelationLLMItem(_BaseModel):
+    subject: str
+    predicate: str
+    object: str
+    evidence: str = ""
+    confidence: float = 0.8
+
+
+class _RelationLLMResponse(_BaseModel):
+    relations: list[_RelationLLMItem] = []
+
+
+def extract_relations(
+    segment: SourceSegment,
+    concepts: list[str],
+    fast: RoleEndpoint,
+    config: Config,
+) -> RelationExtractionResult:
+    """Third LLM pass: extract directed concept-to-concept relations from a source segment."""
+    if not concepts:
+        return RelationExtractionResult(
+            relations=[], source_segment_id=segment.id, model=fast.model
+        )
+
+    prompt = (
+        f"Known concepts: {', '.join(concepts)}\n\n"
+        "Extract directed relations between these concepts from the following text.\n"
+        'Return JSON: {"relations": [{"subject": "...", "predicate": "...", "object": "...", '
+        '"evidence": "...", "confidence": 0.8}]}\n\n'
+        f"{segment.text[:4000]}"
+    )
+    llm_result = request_structured(
+        client=fast.client,
+        prompt=prompt,
+        model_class=_RelationLLMResponse,
+        model=fast.model,
+        system=_RELATION_EXTRACTION_SYSTEM,
+        num_ctx=fast.ctx,
+        temperature=fast.temperature if fast.temperature is not None else 0,
+        stage="relation_extraction",
+        model_role="fast",
+        think=fast.think,
+        options=fast.options,
+    )
+    relations = []
+    for r in llm_result.relations:
+        if r.predicate not in _RELATION_PREDICATE_SET:
+            log.debug("dropping relation with invalid predicate: %r", r.predicate)
+            continue
+        if not r.subject or not r.object:
+            log.debug("dropping relation with empty subject/object")
+            continue
+        relations.append(
+            RelationCandidate(
+                subject=r.subject,
+                predicate=r.predicate,  # type: ignore[arg-type]
+                object=r.object,
+                evidence=r.evidence,
+                source_segment_id=segment.id,
+                provenance="extracted",
+                confidence=min(max(r.confidence, 0.0), 1.0),
+            )
+        )
+    return RelationExtractionResult(
+        relations=relations,
         source_segment_id=segment.id,
         model=fast.model,
     )
