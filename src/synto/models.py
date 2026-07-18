@@ -436,6 +436,14 @@ class RelationCandidate(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
 
 
+class RelationExtractionResult(BaseModel):
+    """Result of the relation-extraction LLM pass over a source segment."""
+
+    relations: list[RelationCandidate]
+    source_segment_id: str
+    model: str
+
+
 class Paper(BaseModel):
     """Paper-specific metadata (V6 §13)."""
 
