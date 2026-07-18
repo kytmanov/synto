@@ -464,6 +464,18 @@ class PackReader:
             )
         return segments
 
+    def graph(self) -> dict | None:
+        if not self.has_capability("graph"):
+            return None
+
+        graph_path = self.pack_root / "graph" / "graph.json"
+        if not graph_path.exists():
+            return None
+        try:
+            return json.loads(graph_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise MalformedPackError(f"Invalid JSON in {graph_path}") from exc
+
     def has_capability(self, name: str) -> bool:
         return name in self.capabilities
 
@@ -627,6 +639,8 @@ class VaultReader:
         db = self._state()
         if db is not None and db.count_source_segments() > 0:
             caps.update({"segments", "lifecycle"})
+        if db is not None and db.count_relations() > 0:
+            caps.add("graph")
         return frozenset(caps)
 
     def _ensure_article_cache(self) -> None:

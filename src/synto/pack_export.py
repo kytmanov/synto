@@ -58,14 +58,19 @@ def export_pack(config: Config, target: ExportTarget, out: Path | None = None) -
         )
         source_refs = _export_source_refs(config, db, article_refs)
 
+        concepts_payload = _concepts_payload(db)
+
         _write_pack_toml(out_dir / "pack.toml", reader)
         _write_json(out_dir / "agent" / "manifest.json", _manifest_payload(reader, source_refs))
-        _write_json(out_dir / "agent" / "concepts.json", _concepts_payload(db))
+        _write_json(out_dir / "agent" / "concepts.json", concepts_payload)
         _write_json(out_dir / "agent" / "sources.json", _sources_payload(source_refs))
         _write_json(out_dir / "agent" / "routes.json", _routes_payload(db, source_refs))
 
         if reader.has_capability("segments"):
             _write_json(out_dir / "agent" / "segments.json", _segments_payload(db))
+
+        if reader.has_capability("graph"):
+            _write_json(out_dir / "graph" / "graph.json", _graph_payload(concepts_payload, db))
 
         _write_json(
             out_dir / "index" / "INDEX.json",
@@ -103,6 +108,7 @@ def _reset_managed_dirs(out_dir: Path) -> None:
         "agent",
         "articles",
         "drafts",
+        "graph",
         "index",
         "queries",
         "raw",
@@ -281,6 +287,30 @@ def _segments_payload(db: StateDB) -> dict[str, object]:
             "articles": [],
         }
     return {"schema_version": 1, "segments": segments}
+
+
+def _graph_payload(concepts_payload: dict[str, object], db: StateDB) -> dict[str, object]:
+    # Reuses concepts_payload's already-resolved canonical_article_id (see _concepts_payload)
+    # instead of re-querying find_article_candidates, so node identity stays consistent with
+    # concepts.json without a second lookup.
+    nodes = [
+        {
+            "id": _ck(str(concept["name"])),
+            "label": concept["name"],
+            "article_id": concept.get("canonical_article_id"),
+        }
+        for concept in concepts_payload.get("concepts", [])
+    ]
+    edges = [
+        {
+            "from_id": _ck(str(relation["subject"])),
+            "to_id": _ck(str(relation["object"])),
+            "predicate": relation["predicate"],
+            "confidence": relation["confidence"],
+        }
+        for relation in db.list_relations()
+    ]
+    return {"schema_version": 1, "nodes": nodes, "edges": edges}
 
 
 def _pack_index_payload(
