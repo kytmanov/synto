@@ -4,6 +4,26 @@
 
 ### Added
 
+- **Concept relation extraction (opt-in `pipeline.relation_extraction`).** A third
+  fast-model pass during ingest extracts directed relations between known concepts
+  ("Raft depends_on Consensus") into new `relations`/`relation_evidence` tables (schema
+  v28), with a verbatim evidence quote per source segment. Off by default — it adds one
+  LLM call per chunk; enable with `relation_extraction = true` under `[pipeline]`.
+  Plain hand-written notes work too (chunk-level provenance ids `note:<name>:<offset>`).
+  Compiled articles surface their top-10 relations in a `relations:` frontmatter block.
+  Known limitation: relations from a removed source are not garbage-collected yet
+  (re-ingest itself is idempotent via confidence-max dedup).
+- **Concept graph in pack export + graph-aware queries.** Packs now include
+  `graph/graph.json` (nodes = concepts, edges = relations, `graph` capability in the
+  manifest) whenever relations exist. `synto query` and MCP `ask` automatically pull in
+  up to 2 related articles via 1-hop graph expansion (confidence > 0.7) — a no-op for
+  vaults without relations.
+- **`synto find <query>` reverse lookup.** Ranked search over the wiki: concept
+  name/alias match first, then title match, then first-paragraph body match.
+- **`synto trace term|relation|citation`.** Trace where a term occurs, the verbatim
+  evidence behind an extracted relation, or which articles consumed a source segment.
+  Extends the existing `trace article` group.
+
 - **`synto concept alias add/remove/move` for fixing a wrong extracted alias.** The fast
   model sometimes attaches a surface to the wrong entity (e.g. an npm package name
   attached as a project alias) with no CLI remedy. `remove` now detaches the alias and
