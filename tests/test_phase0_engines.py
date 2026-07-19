@@ -22,7 +22,7 @@ from synto.readers import VaultReader
 def test_query_config_defaults() -> None:
     cfg = QueryConfig()
     assert cfg.max_pages == 5
-    assert cfg.graph_expand_hops == 1
+    assert cfg.graph_expand is True
 
 
 def test_search_config_defaults() -> None:

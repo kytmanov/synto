@@ -306,6 +306,15 @@ def _merge_chunk_results(results: list[AnalysisResult]) -> AnalysisResult:
     )
 
 
+def _unit_char_target(ctx: int) -> int:
+    """Char budget for one packed LLM unit: ~1.5x ctx CHARS (~0.4x ctx tokens of input).
+
+    Shared by analysis unit packing and relation extraction so both passes see the
+    same unit text — a smaller cap in one of them would silently truncate the unit.
+    """
+    return max(ctx * 3 // 2, 4096)
+
+
 def _build_segment_units(segments: list, chunk_size: int) -> list[tuple[str, list[str]]]:
     """Pack whole segments (in `ordinal` order) into analysis units up to chunk_size chars.
 
@@ -385,20 +394,35 @@ def _extract_and_persist_relations(
     StructuredOutputError from the fast model) must not skip the remaining segments.
     """
     persisted = 0
-    # Rewrite candidate endpoints to the canonical article casing before persisting to
-    # `relations`, since list_relations_for_concept/list_relation_neighbors match by exact
-    # title string. Unmatched names are left as-is on purpose (export deliberately keeps
-    # unknown-endpoint edges); a qualified homonym title like "Mercury (planet)" still
-    # won't match a bare "Mercury" relation. relation_candidates keeps the raw LLM text.
-    canon_by_key = {_concept_key(n): n for n in canonical_names}
+    # Resolve candidate endpoints to canonical concept names before persisting to
+    # `relations`, so the graph stays closed over known concepts: the fast model is told
+    # "do not invent concepts" but 4B-class models cannot be trusted to comply. Layered
+    # map (later wins): alias surfaces -> canonical, DB-wide canonical names, this note's
+    # canonical names. Folding through the FULL alias map is safe here — unlike concept
+    # normalization's blessed-only pre-fold, endpoint resolution never mints a concept, so
+    # there is no ordering side-effect. Candidates with an unresolvable endpoint are NOT
+    # upserted; relation_candidates keeps every raw LLM row as the hallucination audit
+    # trail. A qualified homonym like "Mercury (planet)" still won't match a bare
+    # "Mercury" relation — falling back to the base name would cross-link homonyms.
+    # list_alias_map keys are already concept_key(surface) (label_key), no re-keying needed.
+    canon_by_key: dict[str, str] = dict(db.list_alias_map())
+    for name in (*db.list_all_concept_names(), *canonical_names):
+        canon_by_key[_concept_key(name)] = name
     for seg in segments:
         seg_id, seg_text = (seg["id"], seg["text"]) if hasattr(seg, "keys") else (seg.id, seg.text)
         try:
             shim = SimpleNamespace(id=seg_id, text=seg_text)
             result = extract_relations(shim, canonical_names, fast, config)
             for candidate in result.relations:
-                subject = canon_by_key.get(_concept_key(candidate.subject), candidate.subject)
-                object_ = canon_by_key.get(_concept_key(candidate.object), candidate.object)
+                subject = canon_by_key.get(_concept_key(candidate.subject))
+                object_ = canon_by_key.get(_concept_key(candidate.object))
+                if subject is None or object_ is None:
+                    log.debug(
+                        "dropping relation with unknown endpoint: %r -> %r",
+                        candidate.subject,
+                        candidate.object,
+                    )
+                    continue
                 db.upsert_relation(
                     subject,
                     candidate.predicate,
@@ -1606,13 +1630,12 @@ def ingest_note(
     chunk_units: list[tuple[str, list[str]]] | None = None
     chunk_attribution: dict[int, list[str]] | None = None
     if source_segments:
-        # Pack segments into chapter-sized analysis units. fast_ctx is in TOKENS; a target of
-        # ~1.5x fast_ctx CHARS (~0.4x fast_ctx tokens of input) keeps each call well within
-        # context while grouping whole sections, so thin/peripheral segments (title page,
-        # references) aren't analyzed in isolation — which would rate medium/low and, via the
-        # min-quality aggregation + quality cap, halve the extracted concept count.
-        unit_target = max(fast.ctx * 3 // 2, 4096)
-        chunk_units = _build_segment_units(source_segments, unit_target)
+        # Pack segments into chapter-sized analysis units (~1.5x fast ctx chars, see
+        # _unit_char_target) so each call stays well within context while grouping whole
+        # sections — thin/peripheral segments (title page, references) analyzed in
+        # isolation would rate medium/low and, via the min-quality aggregation +
+        # quality cap, halve the extracted concept count.
+        chunk_units = _build_segment_units(source_segments, _unit_char_target(fast.ctx))
         chunk_attribution = {}
     try:
         result: AnalysisResult = _analyze_body_with_checkpoints(
@@ -1731,12 +1754,24 @@ def ingest_note(
         except Exception as e:  # noqa: BLE001
             log.warning("concept_occurrences attribution failed for %s: %s", path.name, e)
 
-    # Relation extraction (feature 26, opt-in): a third fast-model pass per segment linking
-    # concept pairs. Non-fatal: an extraction failure must not fail the ingest.
+    # Relation extraction (feature 26, opt-in): a third fast-model pass per packed unit
+    # linking concept pairs. Non-fatal: an extraction failure must not fail the ingest.
     if config.pipeline.relation_extraction:
         try:
-            if source_segments:
-                rel_segments = source_segments
+            # Re-ingest = replace: drop this source's evidence/candidate rows before
+            # re-extracting (mirrors clear_concept_occurrences_for_source). Safe as a
+            # single clear — _extract_and_persist_relations runs once per note.
+            db.clear_relation_artifacts_for_source(path.stem)
+            if chunk_units:
+                # Reuse the packed analysis units (one LLM call per unit, matching the
+                # documented cost), not one call per fine structural segment. Evidence
+                # is attributed to the unit's first segment id: it is a provenance
+                # pointer to where the unit starts, not a recall index — fanning the
+                # quote out to every member segment would fabricate attributions.
+                rel_segments = [
+                    SimpleNamespace(id=seg_ids[0], text=unit_text)
+                    for unit_text, seg_ids in chunk_units
+                ]
             else:
                 # Plain notes have no source_segments row — re-derive the same fixed-size
                 # chunking the main analysis pass uses (see _analyze_body_with_checkpoints)
@@ -1925,7 +1960,11 @@ class _RelationLLMItem(_BaseModel):
     predicate: str
     object: str
     evidence: str = ""
-    confidence: float = 0.8
+    # An omitted confidence must sit BELOW the 0.7 graph-expansion gate (query.py):
+    # silence from the model is not evidence of certainty. The prompt example stays
+    # 0.8 on purpose — small models anchor on example values, and a 0.5 example
+    # would bias all scored output under the gate.
+    confidence: float = 0.5
 
 
 class _RelationLLMResponse(_BaseModel):
@@ -1949,7 +1988,7 @@ def extract_relations(
         "Extract directed relations between these concepts from the following text.\n"
         'Return JSON: {"relations": [{"subject": "...", "predicate": "...", "object": "...", '
         '"evidence": "...", "confidence": 0.8}]}\n\n'
-        f"{segment.text[:4000]}"
+        f"{segment.text[: _unit_char_target(fast.ctx)]}"
     )
     llm_result = request_structured(
         client=fast.client,

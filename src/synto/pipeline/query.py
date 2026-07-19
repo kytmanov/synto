@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING
 
 import frontmatter
 
+from ..concept_text import concept_key
 from ..config import Config
 from ..engines import QueryConfig, QueryEngine
 from ..indexer import append_log, generate_index
@@ -53,7 +54,8 @@ MAX_PAGES = 5
 MAX_CHARS_PER_PAGE = 8_000
 _MIN_ALIAS_LEN = 3  # filters stop-noise ("in", "of", "to")
 _MAX_BRIDGE_MATCHES = 10  # caps routing-hint token cost
-_GRAPH_EXPANSION_MIN_CONFIDENCE = 0.7  # relations below this are too noisy to widen context
+# Inclusive minimum: relations below this are too noisy to widen context.
+_GRAPH_EXPANSION_MIN_CONFIDENCE = 0.7
 _GRAPH_EXPANSION_MAX_EXTRAS = 2  # total extra pages across all selected pages, not per page
 
 log = logging.getLogger(__name__)
@@ -675,7 +677,7 @@ def _query_core(
     question: str,
     *,
     max_pages: int = MAX_PAGES,
-    graph_hops: int = 0,
+    graph_expand: bool = False,
 ) -> _QueryCoreResult:
     index_content = _load_index(config)
     if not index_content:
@@ -729,11 +731,13 @@ def _query_core(
     )
 
     extras: list[str] = []
-    if graph_hops > 0 and db is not None and db.count_relations() > 0:
+    if graph_expand and db is not None and db.count_relations() > 0:
         # Neighbors are concept names; resolve against actual article titles (not the
         # 80-capped known_title_list) so a match is guaranteed loadable by _find_page.
-        title_by_casefold = {title.casefold(): title for title, _ in all_articles}
-        selected_casefold = {page.casefold() for page in selection.pages}
+        # Keyed by concept_key, not casefold: punctuation/unicode title variants must
+        # resolve the same way the relation endpoints themselves are matched.
+        title_by_key = {concept_key(title): title for title, _ in all_articles}
+        selected_keys = {concept_key(page) for page in selection.pages}
         for page in selection.pages:
             if len(extras) >= _GRAPH_EXPANSION_MAX_EXTRAS:
                 break
@@ -742,14 +746,14 @@ def _query_core(
             ):
                 if len(extras) >= _GRAPH_EXPANSION_MAX_EXTRAS:
                     break
-                neighbor_casefold = neighbor.casefold()
-                if neighbor_casefold in selected_casefold:
+                neighbor_key = concept_key(neighbor)
+                if neighbor_key in selected_keys:
                     continue
-                resolved_title = title_by_casefold.get(neighbor_casefold)
+                resolved_title = title_by_key.get(neighbor_key)
                 if resolved_title is None:
                     continue
                 extras.append(resolved_title)
-                selected_casefold.add(neighbor_casefold)
+                selected_keys.add(neighbor_key)
 
     pages = [*selection.pages, *extras]
     context = _load_pages(config, pages, db=db, max_pages=max_pages + len(extras))

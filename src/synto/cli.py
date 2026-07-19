@@ -4381,7 +4381,9 @@ def find(query: str, vault_str: str | None) -> None:
     table.add_column("Match")
     table.add_column("Path")
     for title, match_type, path in rows:
-        table.add_row(title, match_type, path)
+        # Text() wraps LLM-derived title/path so Rich can't mangle emoji shortcodes
+        # (":a:" -> 🅰) — same invariant as the trace tables. match_type is a code literal.
+        table.add_row(Text(title), match_type, Text(path))
     console.print(table)
 
 

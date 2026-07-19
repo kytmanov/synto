@@ -301,15 +301,25 @@ def _graph_payload(concepts_payload: dict[str, object], db: StateDB) -> dict[str
         }
         for concept in concepts_payload.get("concepts", [])
     ]
-    edges = [
-        {
-            "from_id": _ck(str(relation["subject"])),
-            "to_id": _ck(str(relation["object"])),
-            "predicate": relation["predicate"],
-            "confidence": relation["confidence"],
-        }
-        for relation in db.list_relations()
-    ]
+    # Closed-graph invariant: every edge endpoint is a node. Nodes cover ALL known
+    # concepts (article_id may be null), so this only drops edges whose endpoint never
+    # was a concept — rows persisted before write-time endpoint filtering existed, or
+    # whose concept was since removed.
+    node_ids = {node["id"] for node in nodes}
+    edges = []
+    for relation in db.list_relations():
+        from_id = _ck(str(relation["subject"]))
+        to_id = _ck(str(relation["object"]))
+        if from_id not in node_ids or to_id not in node_ids:
+            continue
+        edges.append(
+            {
+                "from_id": from_id,
+                "to_id": to_id,
+                "predicate": relation["predicate"],
+                "confidence": relation["confidence"],
+            }
+        )
     return {"schema_version": 1, "nodes": nodes, "edges": edges}
 
 

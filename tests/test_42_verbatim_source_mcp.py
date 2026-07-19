@@ -183,7 +183,7 @@ def test_fts5_migration_skipped_when_unavailable(tmp_path: Path, monkeypatch) ->
     db = StateDB(tmp_path / "state.db")
 
     version = db._conn.execute("SELECT version FROM schema_version WHERE id = 1").fetchone()[0]
-    assert version == 28, "schema must still advance even when FTS5 is unavailable"
+    assert version == 29, "schema must still advance even when FTS5 is unavailable"
     assert not db.source_segments_fts_exists(), "FTS table must not be created without FTS5"
     trigger_count = db._conn.execute(
         "SELECT count(*) FROM sqlite_master"

@@ -104,20 +104,12 @@ def test_pack_export_writes_graph_json_with_relations(vault: Path, config: Confi
     assert by_name["Vector Clocks"]["article_id"] is not None
     assert by_name["Causal Consistency"]["article_id"] is not None
 
-    # Seed order above is (Vector Clocks, ...) then (Causal Consistency, ...) — the reverse
-    # of sorted-by-subject order — so this only passes if the export sorts edges rather than
-    # relying on insertion/rowid order.
+    # Closed-graph invariant: "Network Partitions" is not a known concept, so its edge
+    # must NOT export — a consumer may assume every edge endpoint resolves to a node.
     edge_tuples = [
         (e["from_id"], e["to_id"], e["predicate"], e["confidence"]) for e in payload["edges"]
     ]
     assert edge_tuples == [
-        (
-            concept_key("Causal Consistency"),
-            concept_key("Network Partitions"),
-            "depends_on",
-            0.5,
-        ),
-        # "Network Partitions" is not a known concept — edge exports anyway, no filtering.
         (
             concept_key("Vector Clocks"),
             concept_key("Causal Consistency"),
@@ -125,6 +117,7 @@ def test_pack_export_writes_graph_json_with_relations(vault: Path, config: Confi
             0.9,
         ),
     ]
+    assert concept_key("Network Partitions") not in {t[1] for t in edge_tuples}
 
 
 def test_pack_export_omits_graph_json_without_relations(vault: Path, config: Config, db: StateDB):
@@ -299,6 +292,40 @@ def test_find_no_matches_exits_cleanly(config: Config, db: StateDB) -> None:
     assert "No articles found" in result.output
 
 
+def test_find_article_title_verbatim(config: Config, db: StateDB) -> None:
+    """A published article title is LLM-synthesized and can contain a colon-enclosed
+    token; the find table must render it verbatim, not mangled by rich's
+    emoji-shortcode parsing (":a:" -> "🅰") — same invariant the trace tables carry."""
+    from click.testing import CliRunner
+
+    from synto.cli import cli
+
+    concept_name = "Raft :a: Consensus"
+    _write_wiki_toml(config.vault)
+    write_note(
+        config.wiki_dir / "Raft-Consensus.md",
+        {"title": concept_name},
+        "Raft is a consensus algorithm.",
+    )
+    db.upsert_concepts("raw/a.md", [concept_name])
+    db.upsert_article(
+        WikiArticleRecord(
+            path="wiki/Raft-Consensus.md",
+            title=concept_name,
+            sources=["raw/a.md"],
+            content_hash="h1",
+            status="published",
+        )
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["find", "--vault", str(config.vault), "raft"])
+
+    assert result.exit_code == 0, result.output
+    assert ":a:" in result.output
+    assert "🅰" not in result.output
+
+
 # ---------------------------------------------------------------------------
 # Stage 3: 1-hop graph expansion in QueryEngine
 # ---------------------------------------------------------------------------
@@ -431,7 +458,7 @@ def test_graph_expansion_skips_below_confidence_threshold(
 
 def test_graph_expansion_noop_without_relations(vault: Path, config: Config, db: StateDB) -> None:
     """No relations recorded yet (e.g. relation extraction never ran) must behave
-    exactly like today: no crash, no extras, despite graph_expand_hops defaulting to 1."""
+    exactly like today: no crash, no extras, despite graph_expand defaulting to True."""
     _seed_query_graph_fixtures(vault, config, db)
     fast_client, heavy_client = _make_query_clients(["Raft"])
 

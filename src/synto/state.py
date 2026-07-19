@@ -137,7 +137,7 @@ def _fts5_available(conn: sqlite3.Connection) -> bool:
         return False
 
 
-_CURRENT_SCHEMA_VERSION = 28
+_CURRENT_SCHEMA_VERSION = 29
 
 
 @dataclass
@@ -486,18 +486,24 @@ CREATE TABLE IF NOT EXISTS concept_alias_denials (
     PRIMARY KEY (entity_id, label_key)
 );
 
--- Concept-to-concept relations (feature 26, v28). `relation_candidates` is the raw
--- append-only LLM output log; `relations` is the approved/deduplicated set keyed by
--- concept_key(subject):predicate:concept_key(object) so casing drift across extraction
--- runs can't fork identity. source_segment_id columns are TEXT with no foreign key:
--- pseudo-segment ids like `note:<stem>:<idx>` are written by a later task.
+-- Concept-to-concept relations (feature 26, v28/v29). `relation_candidates` is the raw
+-- LLM output log (cleared per source on re-ingest); `relations` is the approved set keyed
+-- by concept_key(subject):predicate:concept_key(object) so casing drift across extraction
+-- runs can't fork identity. subject_key/object_key (v29) store concept_key(...) so reads
+-- match by normalized key, not display string. Their indexes are created in the v29
+-- post-hook, NOT here: _SCHEMA runs on every open BEFORE migrations, and a pre-v29 vault
+-- lacks the columns (same trap as idx_concepts_entity / v22). source_segment_id columns
+-- are TEXT with no foreign key: pseudo-segment ids like `note:<stem>:<idx>` are written
+-- for plain notes.
 CREATE TABLE IF NOT EXISTS relations (
     id TEXT PRIMARY KEY,
     subject TEXT NOT NULL,
     predicate TEXT NOT NULL,
     object TEXT NOT NULL,
     confidence REAL NOT NULL DEFAULT 0.0,
-    source_segment_id TEXT NOT NULL
+    source_segment_id TEXT NOT NULL,
+    subject_key TEXT NOT NULL DEFAULT '',
+    object_key TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS relation_evidence (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -935,6 +941,7 @@ _VERSIONED_MIGRATIONS: dict[int, list[str]] = {
     # tables with no backfill, so _SCHEMA (which runs in full before _migrate) already
     # creates them on both a fresh DB and an upgrading one. Same pattern as v22/v23/v25/v27.
     28: [],
+    29: [],  # relations key columns + backfill + indexes in the post-hook for atomicity
 }
 
 
@@ -1173,6 +1180,8 @@ class StateDB:
                 self._backfill_article_entities_v24()
             if version == 25:
                 self._expand_identity_log_ops_v25()
+            if version == 29:
+                self._add_relation_keys_v29()
             with self._tx():
                 self._conn.execute(
                     "INSERT OR REPLACE INTO schema_version (id, version) VALUES (1, ?)",
@@ -1232,6 +1241,38 @@ class StateDB:
         with self._tx():
             for col in to_drop:
                 self._conn.execute(f"ALTER TABLE raw_notes DROP COLUMN {col}")
+
+    def _add_relation_keys_v29(self) -> None:
+        """Add relations.subject_key/object_key, backfill via concept_key, index them.
+
+        Fresh DBs already have the columns from _SCHEMA (they get stamped v3 and run
+        this hook anyway), so the ALTER/backfill is probe-guarded; the indexes are
+        created unconditionally here because they must NOT live in _SCHEMA — _SCHEMA
+        runs on every open before migrations and would crash a pre-v29 vault that
+        lacks the columns (same trap as idx_concepts_entity in the v22 hook).
+        Atomic via _tx(); idempotent via the probe + IF NOT EXISTS.
+        """
+        existing = {r[1] for r in self._conn.execute("PRAGMA table_info(relations)").fetchall()}
+        with self._tx():
+            if "subject_key" not in existing:
+                for col in ("subject_key", "object_key"):
+                    self._conn.execute(
+                        f"ALTER TABLE relations ADD COLUMN {col} TEXT NOT NULL DEFAULT ''"
+                    )
+            rows = self._conn.execute(
+                "SELECT id, subject, object FROM relations WHERE subject_key = ''"
+            ).fetchall()
+            for row in rows:
+                self._conn.execute(
+                    "UPDATE relations SET subject_key = ?, object_key = ? WHERE id = ?",
+                    (_ck(row["subject"]), _ck(row["object"]), row["id"]),
+                )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_relations_subject_key ON relations(subject_key)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_relations_object_key ON relations(object_key)"
+            )
 
     def _apply_status_column_v15(self) -> None:
         """Add wiki_articles.status, backfill from is_draft, drop is_draft.
@@ -5335,6 +5376,28 @@ class StateDB:
                 (source_id,),
             )
 
+    def clear_relation_artifacts_for_source(self, stem: str) -> None:
+        """Delete a source's relation evidence + raw candidates (re-ingest = replace).
+
+        Covers both tracked segment ids (via source_segments) and the `note:<stem>:<idx>`
+        pseudo ids plain notes use. `relations` rows are intentionally left alone: their
+        confidence-max upsert dedups identical re-extractions, and GC of relations from
+        removed/changed sources is a documented deferred limitation.
+        """
+        if not self._has_table("relation_evidence"):
+            return
+        # LIKE-escape the stem — it is a user filename and may contain %, _ or \.
+        escaped = stem.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"note:{escaped}:%"
+        with self._tx():
+            for table in ("relation_evidence", "relation_candidates"):
+                self._conn.execute(
+                    f"""DELETE FROM {table} WHERE source_segment_id IN
+                           (SELECT id FROM source_segments WHERE source_id = ?)
+                        OR source_segment_id LIKE ? ESCAPE '\\'""",
+                    (stem, pattern),
+                )
+
     def concept_occurrence_count(self) -> int:
         """Total concept→segment links — used by `synto doctor` for coverage reporting."""
         if not self._has_table("concept_occurrences"):
@@ -5386,11 +5449,21 @@ class StateDB:
         with self._tx():
             self._conn.execute(
                 """INSERT INTO relations
-                       (id, subject, predicate, object, confidence, source_segment_id)
-                   VALUES (?, ?, ?, ?, ?, ?)
+                       (id, subject, predicate, object, confidence, source_segment_id,
+                        subject_key, object_key)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE
                        SET confidence = max(confidence, excluded.confidence)""",
-                (relation_id, subject, predicate, object_, confidence, source_segment_id),
+                (
+                    relation_id,
+                    subject,
+                    predicate,
+                    object_,
+                    confidence,
+                    source_segment_id,
+                    _ck(subject),
+                    _ck(object_),
+                ),
             )
             self._conn.execute(
                 """INSERT INTO relation_evidence
@@ -5418,12 +5491,14 @@ class StateDB:
         return [dict(row) for row in self._conn.execute(query, params).fetchall()]
 
     def list_relations_for_concept(self, name: str, limit: int = 10) -> list[dict]:
+        """Match by concept_key so a title/casing variant of an endpoint still resolves."""
         if not self._has_table("relations"):
             return []
+        key = _ck(name)
         rows = self._conn.execute(
-            """SELECT * FROM relations WHERE subject = ? OR object = ?
+            """SELECT * FROM relations WHERE subject_key = ? OR object_key = ?
                ORDER BY confidence DESC LIMIT ?""",
-            (name, name, limit),
+            (key, key, limit),
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -5474,20 +5549,25 @@ class StateDB:
     def list_relation_neighbors(self, name: str, min_confidence: float) -> list[str]:
         """Neighbors ordered by strongest relation confidence first — callers that cap
         how many neighbors they take (e.g. query graph expansion) must get the strongest
-        links, not whatever order UNION happened to return them in."""
+        links, not whatever order UNION happened to return them in.
+
+        Endpoints match by concept_key (casing/punctuation variants resolve) and
+        min_confidence is an inclusive minimum: a relation at exactly the threshold
+        qualifies."""
         if not self._has_table("relations"):
             return []
+        key = _ck(name)
         rows = self._conn.execute(
             """SELECT neighbor FROM (
                    SELECT object AS neighbor, confidence FROM relations
-                       WHERE subject = ? AND confidence > ?
+                       WHERE subject_key = ? AND confidence >= ?
                    UNION ALL
                    SELECT subject AS neighbor, confidence FROM relations
-                       WHERE object = ? AND confidence > ?
+                       WHERE object_key = ? AND confidence >= ?
                )
                GROUP BY neighbor
                ORDER BY MAX(confidence) DESC""",
-            (name, min_confidence, name, min_confidence),
+            (key, min_confidence, key, min_confidence),
         ).fetchall()
         return [row[0] for row in rows]
 
