@@ -10,6 +10,10 @@
 # outcome-agnostic: discover names from the DB rather than hardcoding them (see CLAUDE.md).
 set -uo pipefail
 
+# Rich wraps CLI output at 80 cols when stdout is not a tty, which can split
+# phrases that checks grep for. Pin a wide width so greps are deterministic.
+export COLUMNS=200
+
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # ── colours ───────────────────────────────────────────────────────────────────

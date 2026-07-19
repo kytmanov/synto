@@ -15,6 +15,10 @@
 
 set -euo pipefail
 
+# Rich wraps CLI output at 80 cols when stdout is not a tty, which can split
+# phrases that checks grep for. Pin a wide width so greps are deterministic.
+export COLUMNS=200
+
 # ── Config ────────────────────────────────────────────────────────────────────
 PROVIDER="${PROVIDER:-ollama}"
 
