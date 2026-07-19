@@ -8,6 +8,10 @@
 
 set -euo pipefail
 
+# Rich wraps CLI output at 80 cols when stdout is not a tty, which can split
+# phrases that checks grep for. Pin a wide width so greps are deterministic.
+export COLUMNS=200
+
 FAST_MODEL="${FAST_MODEL:-gemma4:e4b}"
 HEAVY_MODEL="${HEAVY_MODEL:-$FAST_MODEL}"
 CHALLENGER_HEAVY_MODEL="${CHALLENGER_HEAVY_MODEL:-}"
