@@ -28,6 +28,11 @@
 - **`synto trace term|relation|citation`.** Trace where a term occurs, the verbatim
   evidence behind an extracted relation, or which articles consumed a source segment.
   Extends the existing `trace article` group.
+- **Smoke coverage for relations + graph.** `scripts/smoke_feature_relation_graph.sh`
+  runs the opt-in extraction end to end against a live model (DB invariants, frontmatter
+  block, find/trace, closed graph.json, query expansion, replace-on-reingest); the main
+  smoke now also guards the relation-less default path (no `graph` capability, find and
+  trace degrade gracefully).
 
 - **`synto concept alias add/remove/move` for fixing a wrong extracted alias.** The fast
   model sometimes attaches a surface to the wrong entity (e.g. an npm package name
