@@ -47,7 +47,7 @@ class Hit:
 @dataclass
 class QueryConfig:
     max_pages: int = 5
-    graph_expand_hops: int = 0
+    graph_expand_hops: int = 1
 
 
 @dataclass
@@ -90,6 +90,7 @@ class QueryEngine:
             self.db,
             question,
             max_pages=self.query_config.max_pages,
+            graph_hops=self.query_config.graph_expand_hops,
         )
         self.last_selected_pages = tuple(result.selected_pages)
         self.last_index_found = result.index_found

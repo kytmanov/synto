@@ -53,6 +53,8 @@ MAX_PAGES = 5
 MAX_CHARS_PER_PAGE = 8_000
 _MIN_ALIAS_LEN = 3  # filters stop-noise ("in", "of", "to")
 _MAX_BRIDGE_MATCHES = 10  # caps routing-hint token cost
+_GRAPH_EXPANSION_MIN_CONFIDENCE = 0.7  # relations below this are too noisy to widen context
+_GRAPH_EXPANSION_MAX_EXTRAS = 2  # total extra pages across all selected pages, not per page
 
 log = logging.getLogger(__name__)
 
@@ -673,6 +675,7 @@ def _query_core(
     question: str,
     *,
     max_pages: int = MAX_PAGES,
+    graph_hops: int = 0,
 ) -> _QueryCoreResult:
     index_content = _load_index(config)
     if not index_content:
@@ -725,7 +728,31 @@ def _query_core(
         temperature=fast_ep.temperature,
     )
 
-    context = _load_pages(config, selection.pages, db=db, max_pages=max_pages)
+    extras: list[str] = []
+    if graph_hops > 0 and db is not None and db.count_relations() > 0:
+        # Neighbors are concept names; resolve against actual article titles (not the
+        # 80-capped known_title_list) so a match is guaranteed loadable by _find_page.
+        title_by_casefold = {title.casefold(): title for title, _ in all_articles}
+        selected_casefold = {page.casefold() for page in selection.pages}
+        for page in selection.pages:
+            if len(extras) >= _GRAPH_EXPANSION_MAX_EXTRAS:
+                break
+            for neighbor in db.list_relation_neighbors(
+                page, min_confidence=_GRAPH_EXPANSION_MIN_CONFIDENCE
+            ):
+                if len(extras) >= _GRAPH_EXPANSION_MAX_EXTRAS:
+                    break
+                neighbor_casefold = neighbor.casefold()
+                if neighbor_casefold in selected_casefold:
+                    continue
+                resolved_title = title_by_casefold.get(neighbor_casefold)
+                if resolved_title is None:
+                    continue
+                extras.append(resolved_title)
+                selected_casefold.add(neighbor_casefold)
+
+    pages = [*selection.pages, *extras]
+    context = _load_pages(config, pages, db=db, max_pages=max_pages + len(extras))
     if not context:
         context = "(No matching wiki pages found.)"
     answer_prompt = (
@@ -753,10 +780,10 @@ def _query_core(
         temperature=heavy_ep.temperature,
     )
 
-    sanitized_answer = _sanitize_query_answer(result.answer, selection.pages, known_title_list)
+    sanitized_answer = _sanitize_query_answer(result.answer, pages, known_title_list)
     return _QueryCoreResult(
         answer=sanitized_answer,
-        selected_pages=selection.pages,
+        selected_pages=pages,
         title=result.title,
     )
 

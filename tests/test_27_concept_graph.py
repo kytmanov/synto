@@ -9,9 +9,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import MagicMock
+
+from conftest import as_endpoint
 
 from synto.concept_text import concept_key
 from synto.config import Config
+from synto.engines import QueryEngine
 from synto.models import WikiArticleRecord
 from synto.pack_export import export_pack
 from synto.readers import PackReader, VaultReader
@@ -293,3 +297,146 @@ def test_find_no_matches_exits_cleanly(config: Config, db: StateDB) -> None:
 
     assert result.exit_code == 0, result.output
     assert "No articles found" in result.output
+
+
+# ---------------------------------------------------------------------------
+# Stage 3: 1-hop graph expansion in QueryEngine
+# ---------------------------------------------------------------------------
+
+
+def _write_query_article(config: Config, title: str, body: str) -> None:
+    write_note(
+        config.wiki_dir / f"{title.replace(' ', '-')}.md",
+        {"title": title, "tags": [], "status": "published"},
+        body,
+    )
+
+
+def _seed_query_graph_fixtures(vault: Path, config: Config, db: StateDB) -> None:
+    """Two published articles, no relations yet — callers add relations as needed."""
+    _write_wiki_toml(vault)
+    (config.wiki_dir / "index.md").write_text(
+        "# Wiki Index\n\n## Concepts\n- [[Raft]]\n- [[Consensus]]\n", encoding="utf-8"
+    )
+    _write_query_article(config, "Raft", "Raft is a consensus algorithm for replicated logs.")
+    _write_query_article(config, "Consensus", "Consensus content: agreement across replicas.")
+
+
+def _make_query_clients(pages: list[str]) -> tuple[MagicMock, MagicMock]:
+    fast_client = MagicMock()
+    heavy_client = MagicMock()
+    fast_client.generate.return_value = json.dumps({"pages": pages})
+    heavy_client.generate.return_value = json.dumps({"answer": "Raft answer.", "title": "Raft"})
+    return fast_client, heavy_client
+
+
+def test_graph_expansion_adds_high_confidence_neighbor(
+    vault: Path, config: Config, db: StateDB
+) -> None:
+    """A high-confidence relation should widen context to the neighbor's page
+
+    so the heavy model can use it, even though the fast model only selected the
+    subject page.
+    """
+    _seed_query_graph_fixtures(vault, config, db)
+    db.upsert_relation(
+        subject="Raft",
+        predicate="depends_on",
+        object_="Consensus",
+        confidence=0.9,
+        source_segment_id="note:a:0",
+        evidence_text="Raft depends on consensus.",
+    )
+    fast_client, heavy_client = _make_query_clients(["Raft"])
+
+    engine = QueryEngine(
+        VaultReader(config.vault),
+        as_endpoint(fast_client),
+        as_endpoint(heavy_client),
+        config,
+        db=db,
+    )
+    engine.query("How does Raft achieve agreement?")
+
+    heavy_prompt = heavy_client.generate.call_args.kwargs["prompt"]
+    assert "Consensus content" in heavy_prompt
+    assert "Consensus" in engine.last_selected_pages
+
+
+def test_graph_expansion_caps_at_two_extras(vault: Path, config: Config, db: StateDB) -> None:
+    """The cap is 2 extras total, not 2 per selected page — three eligible neighbors
+    of a single selected page must not all be pulled in."""
+    _write_wiki_toml(vault)
+    (config.wiki_dir / "index.md").write_text(
+        "# Wiki Index\n\n## Concepts\n- [[Raft]]\n", encoding="utf-8"
+    )
+    _write_query_article(config, "Raft", "Raft is a consensus algorithm.")
+    for name in ["Consensus", "Replication", "Leader Election"]:
+        _write_query_article(config, name, f"Content about {name}.")
+        db.upsert_relation(
+            subject="Raft",
+            predicate="depends_on",
+            object_=name,
+            confidence=0.9,
+            source_segment_id=f"note:a:{name}",
+            evidence_text=f"Raft depends on {name}.",
+        )
+    fast_client, heavy_client = _make_query_clients(["Raft"])
+
+    engine = QueryEngine(
+        VaultReader(config.vault),
+        as_endpoint(fast_client),
+        as_endpoint(heavy_client),
+        config,
+        db=db,
+    )
+    engine.query("Tell me about Raft")
+
+    assert len(engine.last_selected_pages) == 3
+
+
+def test_graph_expansion_skips_below_confidence_threshold(
+    vault: Path, config: Config, db: StateDB
+) -> None:
+    """A relation below the noise threshold must not widen context — otherwise
+    low-confidence extraction errors would leak unrelated pages into every answer."""
+    _seed_query_graph_fixtures(vault, config, db)
+    db.upsert_relation(
+        subject="Raft",
+        predicate="depends_on",
+        object_="Consensus",
+        confidence=0.5,
+        source_segment_id="note:a:0",
+        evidence_text="weak link",
+    )
+    fast_client, heavy_client = _make_query_clients(["Raft"])
+
+    engine = QueryEngine(
+        VaultReader(config.vault),
+        as_endpoint(fast_client),
+        as_endpoint(heavy_client),
+        config,
+        db=db,
+    )
+    engine.query("Tell me about Raft")
+
+    assert engine.last_selected_pages == ("Raft",)
+
+
+def test_graph_expansion_noop_without_relations(vault: Path, config: Config, db: StateDB) -> None:
+    """No relations recorded yet (e.g. relation extraction never ran) must behave
+    exactly like today: no crash, no extras, despite graph_expand_hops defaulting to 1."""
+    _seed_query_graph_fixtures(vault, config, db)
+    fast_client, heavy_client = _make_query_clients(["Raft"])
+
+    engine = QueryEngine(
+        VaultReader(config.vault),
+        as_endpoint(fast_client),
+        as_endpoint(heavy_client),
+        config,
+        db=db,
+    )
+    answer = engine.query("Tell me about Raft")
+
+    assert answer.text == "Raft answer."
+    assert engine.last_selected_pages == ("Raft",)
