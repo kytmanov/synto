@@ -4217,7 +4217,9 @@ def trace_term(name: str, vault_str: str | None) -> None:
         art_table.add_column("Article", style="cyan", no_wrap=True)
         art_table.add_column("Path")
         for article in articles:
-            art_table.add_row(article.title, article.path)
+            # Article titles are LLM-synthesized and can contain the same kind of
+            # colon-enclosed tokens as segment ids — wrap for the same reason as above.
+            art_table.add_row(Text(article.title), Text(article.path))
         console.print(art_table)
 
 
@@ -4289,7 +4291,9 @@ def trace_citation(segment_id: str, vault_str: str | None) -> None:
     table.add_column("Compile run")
     table.add_column("Timestamp")
     for title, run_id, timestamp in rows:
-        table.add_row(title, run_id, timestamp)
+        # Article titles are LLM-synthesized data, not markup — wrap for the same
+        # reason as the other trace tables above.
+        table.add_row(Text(title), Text(run_id), Text(timestamp))
     console.print(table)
 
 

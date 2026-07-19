@@ -488,6 +488,55 @@ def test_trace_term_command(config: Config, db: StateDB) -> None:
     assert "Vector Clocks" in result.output
 
 
+def test_trace_term_covering_article_title_verbatim(config: Config, db: StateDB) -> None:
+    """A published article title is LLM-synthesized and can contain a colon-enclosed
+    token (e.g. from a quoted phrase); it must render verbatim in the covering-articles
+    table, not get mangled by rich's emoji-shortcode parsing (":a:" -> "🅰"). The
+    filename is sanitized separately from the title (vault.sanitize_filename), so a
+    real published article can carry this token in its title while its path stays clean.
+    """
+    from click.testing import CliRunner
+
+    from synto.cli import cli
+    from synto.models import TermRecord
+
+    concept_name = "Raft :a: Consensus"
+    _write_wiki_toml(config.vault)
+    db.upsert_concepts("raw/a.md", [concept_name])
+    db.upsert_concept_occurrences(
+        [
+            TermRecord(
+                name=concept_name,
+                definition="A consensus algorithm.",
+                source_segment_id="note:b:0",
+                provenance="extracted",
+                confidence=0.9,
+            )
+        ],
+        source_segment_id="note:b:0",
+    )
+    db.upsert_article(
+        WikiArticleRecord(
+            path="wiki/Raft-Consensus.md",
+            title=concept_name,
+            sources=["raw/a.md"],
+            content_hash="h1",
+            status="published",
+        )
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["trace", "term", "--vault", str(config.vault), concept_name])
+
+    assert result.exit_code == 0, result.output
+    assert concept_name in result.output
+    # The table title also happens to embed concept_name (already Text-safe), so a bare
+    # substring check alone can't tell the two tables apart — assert the emoji-shortcode
+    # corruption doesn't appear anywhere, which only the (also unwrapped) article-row cell
+    # in the covering-articles table can introduce.
+    assert "🅰" not in result.output
+
+
 def test_trace_term_unknown(config: Config) -> None:
     """An unknown term must not crash trace — it should degrade to a friendly message."""
     from click.testing import CliRunner
@@ -590,6 +639,52 @@ def test_trace_citation_command(config: Config, db: StateDB) -> None:
     # Segment id must render verbatim, not get mangled by rich's emoji-shortcode
     # parsing (":a:" between colons is a real shortcode, "🅰").
     assert "note:a:0" in result.output
+
+
+def test_trace_citation_article_title_verbatim(config: Config, db: StateDB) -> None:
+    """A published article title is LLM-synthesized and can contain a colon-enclosed
+    token; it must render verbatim in the citation table, not get mangled by rich's
+    emoji-shortcode parsing (":a:" -> "🅰"). The filename is sanitized separately from
+    the title (vault.sanitize_filename), so a real published article can carry this
+    token in its title while its path stays clean.
+    """
+    from click.testing import CliRunner
+
+    from synto.cli import cli
+    from synto.models import TermRecord
+
+    concept_name = "Raft :a: Consensus"
+    _write_wiki_toml(config.vault)
+    db.upsert_concepts("raw/a.md", [concept_name])
+    db.upsert_concept_occurrences(
+        [
+            TermRecord(
+                name=concept_name,
+                definition="A consensus algorithm.",
+                source_segment_id="note:b:0",
+                provenance="extracted",
+                confidence=0.9,
+            )
+        ],
+        source_segment_id="note:b:0",
+    )
+    db.upsert_article(
+        WikiArticleRecord(
+            path="wiki/Raft-Consensus.md",
+            title=concept_name,
+            sources=["raw/a.md"],
+            content_hash="h1",
+            status="published",
+        )
+    )
+    db.start_compile_run("run123", "{}", "test-fast", "test-heavy")
+    db.update_article_compile_run("wiki/Raft-Consensus.md", "run123")
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["trace", "citation", "--vault", str(config.vault), "note:b:0"])
+
+    assert result.exit_code == 0, result.output
+    assert concept_name in result.output
 
 
 def test_trace_citation_unknown(config: Config) -> None:
