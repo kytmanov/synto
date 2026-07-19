@@ -496,6 +496,45 @@ def test_extract_and_persist_relations_isolates_segment_failures(tmp_path: Path,
     assert relations[0]["source_segment_id"] == "seg-2"
 
 
+def test_extract_and_persist_relations_normalizes_to_canonical_casing(
+    tmp_path: Path, config
+) -> None:
+    """The fast model can return a concept in different casing than the canonical article
+    title ("vector clocks" vs "Vector Clocks"). Persisted relation endpoints must be
+    rewritten to canonical casing, or list_relations_for_concept/list_relation_neighbors
+    (which match by exact title string) silently never find the row."""
+    from synto.pipeline.ingest import _extract_and_persist_relations
+
+    db = StateDB(tmp_path / "state.db")
+    segments = [SimpleNamespace(id="seg-1", text="vector clocks implement causal consistency.")]
+    response = json.dumps(
+        {
+            "relations": [
+                {
+                    "subject": "vector clocks",
+                    "predicate": "implemented_by",
+                    "object": "causal consistency",
+                    "evidence": "vector clocks implement causal consistency.",
+                    "confidence": 0.8,
+                }
+            ]
+        }
+    )
+    client = make_mock_client()
+    client.generate.side_effect = [response]
+    fast = as_endpoint(client, model=config.model_name("fast"))
+
+    n = _extract_and_persist_relations(
+        db, segments, ["Vector Clocks", "Causal Consistency"], fast, config
+    )
+
+    assert n == 1
+    relations = db.list_relations()
+    assert relations[0]["subject"] == "Vector Clocks"
+    assert relations[0]["object"] == "Causal Consistency"
+    assert db.list_relations_for_concept("Vector Clocks")
+
+
 def test_ingest_note_relation_extraction_off_by_default(vault, config, db) -> None:
     """The flag guard in ingest_note must skip the whole relation-extraction pass when
     pipeline.relation_extraction is False (its default): no relations rows AND no extra

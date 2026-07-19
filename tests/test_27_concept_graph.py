@@ -365,19 +365,24 @@ def test_graph_expansion_adds_high_confidence_neighbor(
 
 def test_graph_expansion_caps_at_two_extras(vault: Path, config: Config, db: StateDB) -> None:
     """The cap is 2 extras total, not 2 per selected page — three eligible neighbors
-    of a single selected page must not all be pulled in."""
+    of a single selected page must not all be pulled in. Confidences are distinct, and
+    deliberately out of alphabetical order, so the cap must keep the two STRONGEST
+    neighbors (Zab Protocol, Consensus) rather than falling back to SQLite's implicit
+    UNION-dedup ordering (alphabetical), which would keep Availability instead of the
+    strongest link, Zab Protocol."""
     _write_wiki_toml(vault)
     (config.wiki_dir / "index.md").write_text(
         "# Wiki Index\n\n## Concepts\n- [[Raft]]\n", encoding="utf-8"
     )
     _write_query_article(config, "Raft", "Raft is a consensus algorithm.")
-    for name in ["Consensus", "Replication", "Leader Election"]:
+    confidences = {"Availability": 0.71, "Consensus": 0.72, "Zab Protocol": 0.99}
+    for name, confidence in confidences.items():
         _write_query_article(config, name, f"Content about {name}.")
         db.upsert_relation(
             subject="Raft",
             predicate="depends_on",
             object_=name,
-            confidence=0.9,
+            confidence=confidence,
             source_segment_id=f"note:a:{name}",
             evidence_text=f"Raft depends on {name}.",
         )
@@ -393,6 +398,7 @@ def test_graph_expansion_caps_at_two_extras(vault: Path, config: Config, db: Sta
     engine.query("Tell me about Raft")
 
     assert len(engine.last_selected_pages) == 3
+    assert set(engine.last_selected_pages) == {"Raft", "Zab Protocol", "Consensus"}
 
 
 def test_graph_expansion_skips_below_confidence_threshold(
@@ -688,7 +694,10 @@ def test_trace_citation_article_title_verbatim(config: Config, db: StateDB) -> N
 
 
 def test_trace_citation_unknown(config: Config) -> None:
-    """An unknown segment id must not crash trace — it should degrade to a friendly message."""
+    """An unknown 'note:' segment id must not crash trace — it should degrade to a friendly
+    message that also explains WHY: plain notes are never chunked into source_segments, so
+    they never get concept_occurrences rows. Without that sentence, a user has no way to
+    tell "wrong id" apart from "this kind of id never has data"."""
     from click.testing import CliRunner
 
     from synto.cli import cli
@@ -699,3 +708,5 @@ def test_trace_citation_unknown(config: Config) -> None:
 
     assert result.exit_code == 0
     assert "note:none:0" in result.output
+    normalized = " ".join(result.output.casefold().split())
+    assert "plain-note segments have no occurrence records" in normalized

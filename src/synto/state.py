@@ -5472,12 +5472,21 @@ class StateDB:
         return int(self._conn.execute("SELECT COUNT(*) FROM relations").fetchone()[0])
 
     def list_relation_neighbors(self, name: str, min_confidence: float) -> list[str]:
+        """Neighbors ordered by strongest relation confidence first — callers that cap
+        how many neighbors they take (e.g. query graph expansion) must get the strongest
+        links, not whatever order UNION happened to return them in."""
         if not self._has_table("relations"):
             return []
         rows = self._conn.execute(
-            """SELECT object FROM relations WHERE subject = ? AND confidence > ?
-               UNION
-               SELECT subject FROM relations WHERE object = ? AND confidence > ?""",
+            """SELECT neighbor FROM (
+                   SELECT object AS neighbor, confidence FROM relations
+                       WHERE subject = ? AND confidence > ?
+                   UNION ALL
+                   SELECT subject AS neighbor, confidence FROM relations
+                       WHERE object = ? AND confidence > ?
+               )
+               GROUP BY neighbor
+               ORDER BY MAX(confidence) DESC""",
             (name, min_confidence, name, min_confidence),
         ).fetchall()
         return [row[0] for row in rows]

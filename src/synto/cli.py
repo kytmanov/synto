@@ -22,6 +22,7 @@ import sys
 import tomllib
 from contextlib import contextmanager
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import click
 from rich.console import Console
@@ -44,6 +45,10 @@ from .paths import (
     legacy_config_path,
     migration_message,
 )
+
+if TYPE_CHECKING:
+    from .config import Config
+    from .models import WikiArticleRecord
 
 
 def _ensure_utf8_streams() -> None:
@@ -4265,7 +4270,17 @@ def trace_citation(segment_id: str, vault_str: str | None) -> None:
 
     occurrences = db.list_occurrences_for_segment(segment_id)
     if not occurrences:
-        console.print(Text("No concepts found for segment:", style="yellow"), Text(segment_id))
+        parts = [Text("No concepts found for segment:", style="yellow"), Text(segment_id)]
+        if segment_id.startswith("note:"):
+            # Plain notes are never chunked into source_segments, so they never get
+            # concept_occurrences rows — this is expected, not a lookup failure.
+            parts.append(
+                Text(
+                    " Plain-note segments have no occurrence records — only tracked sources do.",
+                    style="yellow",
+                )
+            )
+        console.print(*parts)
         return
 
     seen_paths: set[str] = set()
@@ -4300,7 +4315,9 @@ def trace_citation(segment_id: str, vault_str: str | None) -> None:
 # ── synto find ────────────────────────────────────────────────────────────────
 
 
-def _find_body_matches(query_lower: str, config, articles: list) -> list:
+def _find_body_matches(
+    query_lower: str, config: Config, articles: list[WikiArticleRecord]
+) -> list[WikiArticleRecord]:
     """Published articles (already filtered to non-matched-yet) whose first
     paragraph contains query_lower. Missing files are skipped silently — a
     read-only lookup shouldn't fail because a draft outran its file."""

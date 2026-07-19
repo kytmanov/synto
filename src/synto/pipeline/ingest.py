@@ -385,16 +385,24 @@ def _extract_and_persist_relations(
     StructuredOutputError from the fast model) must not skip the remaining segments.
     """
     persisted = 0
+    # Rewrite candidate endpoints to the canonical article casing before persisting to
+    # `relations`, since list_relations_for_concept/list_relation_neighbors match by exact
+    # title string. Unmatched names are left as-is on purpose (export deliberately keeps
+    # unknown-endpoint edges); a qualified homonym title like "Mercury (planet)" still
+    # won't match a bare "Mercury" relation. relation_candidates keeps the raw LLM text.
+    canon_by_key = {_concept_key(n): n for n in canonical_names}
     for seg in segments:
         seg_id, seg_text = (seg["id"], seg["text"]) if hasattr(seg, "keys") else (seg.id, seg.text)
         try:
             shim = SimpleNamespace(id=seg_id, text=seg_text)
             result = extract_relations(shim, canonical_names, fast, config)
             for candidate in result.relations:
+                subject = canon_by_key.get(_concept_key(candidate.subject), candidate.subject)
+                object_ = canon_by_key.get(_concept_key(candidate.object), candidate.object)
                 db.upsert_relation(
-                    candidate.subject,
+                    subject,
                     candidate.predicate,
-                    candidate.object,
+                    object_,
                     candidate.confidence,
                     seg_id,
                     candidate.evidence,
