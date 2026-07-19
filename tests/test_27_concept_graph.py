@@ -440,3 +440,167 @@ def test_graph_expansion_noop_without_relations(vault: Path, config: Config, db:
 
     assert answer.text == "Raft answer."
     assert engine.last_selected_pages == ("Raft",)
+
+
+# ---------------------------------------------------------------------------
+# Stage 4: synto trace term/relation/citation CLI commands
+# ---------------------------------------------------------------------------
+
+
+def test_trace_term_command(config: Config, db: StateDB) -> None:
+    """Occurrences (with confidence) and the concept's published articles must be
+    discoverable by canonical name, so a user can audit where a term came from."""
+    from click.testing import CliRunner
+
+    from synto.cli import cli
+    from synto.models import TermRecord
+
+    _write_wiki_toml(config.vault)
+    db.upsert_concepts("raw/a.md", ["Vector Clocks"])
+    db.upsert_concept_occurrences(
+        [
+            TermRecord(
+                name="Vector Clocks",
+                definition="A logical clock scheme.",
+                source_segment_id="note:a:0",
+                provenance="extracted",
+                confidence=0.87,
+            )
+        ],
+        source_segment_id="note:a:0",
+    )
+    db.upsert_article(
+        WikiArticleRecord(
+            path="wiki/Vector-Clocks.md",
+            title="Vector Clocks",
+            sources=["raw/a.md"],
+            content_hash="h1",
+            status="published",
+        )
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["trace", "term", "--vault", str(config.vault), "Vector Clocks"])
+
+    assert result.exit_code == 0, result.output
+    assert "note:a:0" in result.output
+    assert "0.87" in result.output
+    assert "Vector Clocks" in result.output
+
+
+def test_trace_term_unknown(config: Config) -> None:
+    """An unknown term must not crash trace — it should degrade to a friendly message."""
+    from click.testing import CliRunner
+
+    from synto.cli import cli
+
+    _write_wiki_toml(config.vault)
+    runner = CliRunner()
+    result = runner.invoke(cli, ["trace", "term", "--vault", str(config.vault), "Nonexistent Term"])
+
+    assert result.exit_code == 0
+    assert "Nonexistent Term" in result.output
+
+
+def test_trace_relation_command(config: Config, db: StateDB) -> None:
+    """Looking up a relation id must surface subject/predicate/object, confidence,
+    and the evidence text it was extracted from — the audit trail for feature 26."""
+    from click.testing import CliRunner
+
+    from synto.cli import cli
+
+    _write_wiki_toml(config.vault)
+    relation_id = db.upsert_relation(
+        subject="Raft",
+        predicate="depends_on",
+        object_="Consensus",
+        confidence=0.92,
+        source_segment_id="note:a:0",
+        evidence_text="Raft depends on consensus.",
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["trace", "relation", "--vault", str(config.vault), relation_id])
+
+    assert result.exit_code == 0, result.output
+    assert "Raft" in result.output
+    assert "depends_on" in result.output
+    assert "Consensus" in result.output
+    assert "0.92" in result.output
+    assert "Raft depends on consensus." in result.output
+    assert "note:a:0" in result.output
+
+
+def test_trace_relation_unknown(config: Config) -> None:
+    """A bogus relation id must not crash trace — it should degrade to a friendly message."""
+    from click.testing import CliRunner
+
+    from synto.cli import cli
+
+    _write_wiki_toml(config.vault)
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["trace", "relation", "--vault", str(config.vault), "deadbeefdeadbeef"]
+    )
+
+    assert result.exit_code == 0
+    assert "deadbeefdeadbeef" in result.output
+
+
+def test_trace_citation_command(config: Config, db: StateDB) -> None:
+    """A segment id must resolve to the concepts occurring in it and the published
+    articles that cite them, with the compile run that produced each article."""
+    from click.testing import CliRunner
+
+    from synto.cli import cli
+    from synto.models import TermRecord
+
+    _write_wiki_toml(config.vault)
+    db.upsert_concepts("raw/a.md", ["Vector Clocks"])
+    db.upsert_concept_occurrences(
+        [
+            TermRecord(
+                name="Vector Clocks",
+                definition="A logical clock scheme.",
+                source_segment_id="note:a:0",
+                provenance="extracted",
+                confidence=0.9,
+            )
+        ],
+        source_segment_id="note:a:0",
+    )
+    db.upsert_article(
+        WikiArticleRecord(
+            path="wiki/Vector-Clocks.md",
+            title="Vector Clocks",
+            sources=["raw/a.md"],
+            content_hash="h1",
+            status="published",
+        )
+    )
+    db.start_compile_run("run123", "{}", "test-fast", "test-heavy")
+    db.update_article_compile_run("wiki/Vector-Clocks.md", "run123")
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["trace", "citation", "--vault", str(config.vault), "note:a:0"])
+
+    assert result.exit_code == 0, result.output
+    assert "Vector Clocks" in result.output
+    assert "run123"[:16] in result.output
+    # Segment id must render verbatim, not get mangled by rich's emoji-shortcode
+    # parsing (":a:" between colons is a real shortcode, "🅰").
+    assert "note:a:0" in result.output
+
+
+def test_trace_citation_unknown(config: Config) -> None:
+    """An unknown segment id must not crash trace — it should degrade to a friendly message."""
+    from click.testing import CliRunner
+
+    from synto.cli import cli
+
+    _write_wiki_toml(config.vault)
+    runner = CliRunner()
+    result = runner.invoke(cli, ["trace", "citation", "--vault", str(config.vault), "note:none:0"])
+
+    assert result.exit_code == 0
+    assert "note:none:0" in result.output

@@ -5291,6 +5291,25 @@ class StateDB:
             "SELECT * FROM concept_occurrences ORDER BY concept_name, source_segment_id"
         ).fetchall()
 
+    def list_occurrences_for_concept(self, concept_name: str) -> list[sqlite3.Row]:
+        """Occurrence rows for one concept, without joining source_segments — evidence
+        segment ids may be pseudo ids (`note:<stem>:<idx>`) with no matching row there."""
+        if not self._has_table("concept_occurrences"):
+            return []
+        return self._conn.execute(
+            """SELECT * FROM concept_occurrences WHERE concept_name = ?
+               ORDER BY confidence DESC, ordinal ASC""",
+            (concept_name,),
+        ).fetchall()
+
+    def list_occurrences_for_segment(self, segment_id: str) -> list[sqlite3.Row]:
+        if not self._has_table("concept_occurrences"):
+            return []
+        return self._conn.execute(
+            "SELECT * FROM concept_occurrences WHERE source_segment_id = ? ORDER BY concept_name",
+            (segment_id,),
+        ).fetchall()
+
     def get_segments_for_source(self, source_id: str) -> list[sqlite3.Row]:
         """Return a source's segments (id, ordinal, structural_locator, text) in reading order.
 

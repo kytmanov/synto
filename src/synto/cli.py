@@ -17,6 +17,7 @@ Commands:
 from __future__ import annotations
 
 import re
+import sqlite3
 import sys
 import tomllib
 from contextlib import contextmanager
@@ -28,6 +29,7 @@ from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.prompt import Prompt
 from rich.table import Table
+from rich.text import Text
 
 from .paths import (
     APP_DIR_NAME,
@@ -4151,6 +4153,143 @@ def trace_article(name: str, vault_str: str | None) -> None:
         ts = str(entry.get("timestamp", "—"))[:19]
         table.add_row(run_id[:16] or "—", fast, heavy, ts)
 
+    console.print(table)
+
+
+def _occurrence_source(row: sqlite3.Row) -> str:
+    """Best-effort source label for a concept_occurrences row.
+
+    Prefers the explicit source_path column; falls back to the note stem embedded in
+    `note:<stem>:<idx>` pseudo segment ids (written when a source has no real
+    source_segments row); otherwise shows the raw segment id.
+    """
+    source_path = row["source_path"]
+    if source_path:
+        return source_path
+    segment_id = row["source_segment_id"]
+    if segment_id and segment_id.startswith("note:"):
+        parts = segment_id.split(":")
+        if len(parts) >= 2:
+            return parts[1]
+    return segment_id or "—"
+
+
+@trace.command("term")
+@click.argument("name")
+@click.option("--vault", "vault_str", envvar=VAULT_ENV_VAR, default=None)
+def trace_term(name: str, vault_str: str | None) -> None:
+    """Print occurrences and covering published articles for concept NAME."""
+    config = _load_config(vault_str)
+    db = _load_db(config)
+
+    resolved = db.find_concept_by_name_or_alias(name)
+    concept_name = resolved[0] if resolved else name
+
+    occurrences = db.list_occurrences_for_concept(concept_name)
+    if not occurrences:
+        console.print(Text("No occurrences found for:", style="yellow"), Text(name))
+        return
+
+    # Segment ids and note-derived source labels are display-only data, never markup — a
+    # pseudo id like "note:a:0" would otherwise be mangled into an emoji (rich reads
+    # `:a:` as a shortcode) if passed through console's default markup/emoji parsing.
+    table = Table(
+        title=Text.assemble("Term: ", concept_name), show_header=True, header_style="bold"
+    )
+    table.add_column("Source", style="cyan", no_wrap=True)
+    table.add_column("Segment")
+    table.add_column("Confidence")
+    for occ in occurrences:
+        table.add_row(
+            Text(_occurrence_source(occ)),
+            Text(occ["source_segment_id"] or "—"),
+            f"{occ['confidence']:.2f}",
+        )
+    console.print(table)
+
+    articles = [a for a in db.find_article_candidates(concept_name) if a.status == "published"]
+    if articles:
+        art_table = Table(
+            title=Text.assemble("Covering articles: ", concept_name),
+            show_header=True,
+            header_style="bold",
+        )
+        art_table.add_column("Article", style="cyan", no_wrap=True)
+        art_table.add_column("Path")
+        for article in articles:
+            art_table.add_row(article.title, article.path)
+        console.print(art_table)
+
+
+@trace.command("relation")
+@click.argument("relation_id")
+@click.option("--vault", "vault_str", envvar=VAULT_ENV_VAR, default=None)
+def trace_relation(relation_id: str, vault_str: str | None) -> None:
+    """Print subject/predicate/object and evidence for RELATION_ID."""
+    config = _load_config(vault_str)
+    db = _load_db(config)
+
+    relation = db.get_relation(relation_id)
+    if relation is None:
+        console.print(Text("No relation found for:", style="yellow"), Text(relation_id))
+        return
+
+    console.print(
+        Text.assemble(
+            relation["subject"],
+            " → ",
+            relation["predicate"],
+            " → ",
+            relation["object"],
+            f"  (confidence {relation['confidence']:.2f})",
+        )
+    )
+
+    table = Table(title="Evidence", show_header=True, header_style="bold")
+    table.add_column("Evidence", style="cyan")
+    table.add_column("Segment")
+    for evidence in db.list_relation_evidence(relation_id):
+        table.add_row(Text(evidence["evidence_text"]), Text(evidence["source_segment_id"] or "—"))
+    console.print(table)
+
+
+@trace.command("citation")
+@click.argument("segment_id")
+@click.option("--vault", "vault_str", envvar=VAULT_ENV_VAR, default=None)
+def trace_citation(segment_id: str, vault_str: str | None) -> None:
+    """Print concepts occurring in SEGMENT_ID and the published articles that cite them."""
+    config = _load_config(vault_str)
+    db = _load_db(config)
+
+    occurrences = db.list_occurrences_for_segment(segment_id)
+    if not occurrences:
+        console.print(Text("No concepts found for segment:", style="yellow"), Text(segment_id))
+        return
+
+    seen_paths: set[str] = set()
+    rows: list[tuple[str, str, str]] = []
+    for occ in occurrences:
+        for article in db.find_article_candidates(occ["concept_name"]):
+            if article.status != "published" or article.path in seen_paths:
+                continue
+            seen_paths.add(article.path)
+            run_ulid = article.last_compile_pipeline
+            run_row = db.get_compile_run(run_ulid) if run_ulid else None
+            timestamp = str(run_row["started_at"])[:19] if run_row else "—"
+            rows.append((article.title, (run_ulid or "—")[:16], timestamp))
+
+    if not rows:
+        console.print(Text("No published articles cite segment:", style="yellow"), Text(segment_id))
+        return
+
+    table = Table(
+        title=Text.assemble("Citation: ", segment_id), show_header=True, header_style="bold"
+    )
+    table.add_column("Article", style="cyan", no_wrap=True)
+    table.add_column("Compile run")
+    table.add_column("Timestamp")
+    for title, run_id, timestamp in rows:
+        table.add_row(title, run_id, timestamp)
     console.print(table)
 
 
