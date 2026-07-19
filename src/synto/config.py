@@ -141,6 +141,8 @@ def _vault_toml_tail(inline_source_citations: bool) -> str:
         f"watch_debounce = 3.0\n"
         f"max_concepts_per_source = 8\n"
         f"ingest_parallel = false   # true = parallel chunks\n"
+        f"# relation_extraction = false  # opt-in: adds a fast-model pass per ingest that "
+        f"extracts concept-to-concept relations\n"
         f"article_max_tokens = 16384 # soft cap on generated tokens per article; "
         f"auto-reduced to fit context\n"
         f"concept_draft_soft_cap = 2400 # concept-driven compile only; set to "
@@ -465,6 +467,7 @@ class PipelineConfig(BaseModel):
     source_overrides: dict[str, SourceTypeOverride] = Field(default_factory=dict)
     auto_maintain: bool = False
     ingest_parallel: bool = False  # parallel chunk analysis (needs OLLAMA_NUM_PARALLEL≥4)
+    relation_extraction: bool = False  # extra fast-model pass extracting concept relations
     article_max_tokens: int = 16384
     concept_draft_soft_cap: int | str = 2400
     inline_source_citations: bool = False

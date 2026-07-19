@@ -4,6 +4,36 @@
 
 ### Added
 
+- **Concept relation extraction (opt-in `pipeline.relation_extraction`).** A third
+  fast-model pass during ingest extracts directed relations between known concepts
+  ("Raft depends_on Consensus") into new `relations`/`relation_evidence` tables (schema
+  v29), with a verbatim evidence quote per extraction unit. Off by default — it adds one
+  LLM call per chunk (the same packed chapter-sized units the analysis pass uses);
+  enable with `relation_extraction = true` under `[pipeline]`.
+  Plain hand-written notes work too (chunk-level provenance ids `note:<name>:<offset>`).
+  Relations are only recorded between known concepts or their aliases — endpoints the
+  model invented never enter the graph, but every raw candidate is kept in
+  `relation_candidates` as an audit trail. Re-ingest replaces a source's
+  evidence/candidate rows and dedups relations by confidence-max; relations from a
+  removed source are not garbage-collected yet.
+  Compiled articles surface their top-10 relations in a `relations:` frontmatter block.
+- **Concept graph in pack export + graph-aware queries.** Packs now include
+  `graph/graph.json` (nodes = concepts, edges = relations, `graph` capability in the
+  manifest) whenever relations exist; every edge endpoint resolves to a node, so
+  consumers can assume a closed graph. `synto query` and MCP `ask` automatically pull
+  in up to 2 related articles via 1-hop graph expansion (confidence ≥ 0.7) — a no-op
+  for vaults without relations.
+- **`synto find <query>` reverse lookup.** Ranked search over the wiki: concept
+  name/alias match first, then title match, then first-paragraph body match.
+- **`synto trace term|relation|citation`.** Trace where a term occurs, the verbatim
+  evidence behind an extracted relation, or which articles consumed a source segment.
+  Extends the existing `trace article` group.
+- **Smoke coverage for relations + graph.** `scripts/smoke_feature_relation_graph.sh`
+  runs the opt-in extraction end to end against a live model (DB invariants, frontmatter
+  block, find/trace, closed graph.json, query expansion, replace-on-reingest); the main
+  smoke now also guards the relation-less default path (no `graph` capability, find and
+  trace degrade gracefully).
+
 - **`synto concept alias add/remove/move` for fixing a wrong extracted alias.** The fast
   model sometimes attaches a surface to the wrong entity (e.g. an npm package name
   attached as a project alias) with no CLI remedy. `remove` now detaches the alias and

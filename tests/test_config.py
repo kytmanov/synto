@@ -190,6 +190,17 @@ def test_pipeline_config_accepts_explicit_language():
     assert cfg.language == "de"
 
 
+def test_pipeline_config_relation_extraction_default_false():
+    cfg = PipelineConfig()
+    assert cfg.relation_extraction is False
+
+
+def test_default_wiki_toml_contains_relation_extraction_comment():
+    toml = default_wiki_toml()
+    assert "relation_extraction" in toml
+    assert "fast-model pass" in toml
+
+
 # ── from_vault deep-merge ──────────────────────────────────────────────────────
 
 

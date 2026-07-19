@@ -47,7 +47,8 @@ class Hit:
 @dataclass
 class QueryConfig:
     max_pages: int = 5
-    graph_expand_hops: int = 0
+    # 1-hop expansion only; agent-driven multi-hop traversal is Feature 38's MCP graph walk.
+    graph_expand: bool = True
 
 
 @dataclass
@@ -90,6 +91,7 @@ class QueryEngine:
             self.db,
             question,
             max_pages=self.query_config.max_pages,
+            graph_expand=self.query_config.graph_expand,
         )
         self.last_selected_pages = tuple(result.selected_pages)
         self.last_index_found = result.index_found

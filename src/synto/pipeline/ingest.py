@@ -15,7 +15,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, get_args
 
 from pydantic import BaseModel as _BaseModel
 
@@ -26,7 +27,15 @@ from ..concept_text import concept_key as _concept_key
 from ..concept_text import match_key as _match_key
 from ..config import Config
 from ..indexer import append_log
-from ..models import AnalysisResult, Concept, RawNoteRecord, SourceSegment, TermExtractionResult
+from ..models import (
+    AnalysisResult,
+    Concept,
+    RawNoteRecord,
+    RelationCandidate,
+    RelationExtractionResult,
+    SourceSegment,
+    TermExtractionResult,
+)
 from ..paths import rel_posix
 from ..state import StateDB
 from ..structured_output import request_structured
@@ -297,6 +306,15 @@ def _merge_chunk_results(results: list[AnalysisResult]) -> AnalysisResult:
     )
 
 
+def _unit_char_target(ctx: int) -> int:
+    """Char budget for one packed LLM unit: ~1.5x ctx CHARS (~0.4x ctx tokens of input).
+
+    Shared by analysis unit packing and relation extraction so both passes see the
+    same unit text — a smaller cap in one of them would silently truncate the unit.
+    """
+    return max(ctx * 3 // 2, 4096)
+
+
 def _build_segment_units(segments: list, chunk_size: int) -> list[tuple[str, list[str]]]:
     """Pack whole segments (in `ordinal` order) into analysis units up to chunk_size chars.
 
@@ -356,6 +374,68 @@ def _persist_concept_occurrences(
     occ = namedtuple("occ", ["name", "confidence"])
     for sid, concepts in seg_to_concepts.items():
         db.upsert_concept_occurrences([occ(name=c, confidence=1.0) for c in sorted(concepts)], sid)
+
+
+def _extract_and_persist_relations(
+    db: StateDB,
+    segments: list,
+    canonical_names: list[str],
+    fast: RoleEndpoint,
+    config: Config,
+) -> int:
+    """Run the Stage-3 relation-extraction pass over each segment and persist results.
+
+    `segments` may be sqlite3.Row (bracket-only access, e.g. from get_segments_for_source) or
+    any .id/.text-bearing object (e.g. a pseudo-segment); normalize both to a uniform shim so
+    extract_relations's duck-typed segment arg is satisfied. Returns the number of relations
+    upserted (for logging) — candidates that dedup to the same relation each still count.
+
+    Each segment is isolated with its own try/except: a failure on one segment (e.g. a
+    StructuredOutputError from the fast model) must not skip the remaining segments.
+    """
+    persisted = 0
+    # Resolve candidate endpoints to canonical concept names before persisting to
+    # `relations`, so the graph stays closed over known concepts: the fast model is told
+    # "do not invent concepts" but 4B-class models cannot be trusted to comply. Layered
+    # map (later wins): alias surfaces -> canonical, DB-wide canonical names, this note's
+    # canonical names. Folding through the FULL alias map is safe here — unlike concept
+    # normalization's blessed-only pre-fold, endpoint resolution never mints a concept, so
+    # there is no ordering side-effect. Candidates with an unresolvable endpoint are NOT
+    # upserted; relation_candidates keeps every raw LLM row as the hallucination audit
+    # trail. A qualified homonym like "Mercury (planet)" still won't match a bare
+    # "Mercury" relation — falling back to the base name would cross-link homonyms.
+    # list_alias_map keys are already concept_key(surface) (label_key), no re-keying needed.
+    canon_by_key: dict[str, str] = dict(db.list_alias_map())
+    for name in (*db.list_all_concept_names(), *canonical_names):
+        canon_by_key[_concept_key(name)] = name
+    for seg in segments:
+        seg_id, seg_text = (seg["id"], seg["text"]) if hasattr(seg, "keys") else (seg.id, seg.text)
+        try:
+            shim = SimpleNamespace(id=seg_id, text=seg_text)
+            result = extract_relations(shim, canonical_names, fast, config)
+            for candidate in result.relations:
+                subject = canon_by_key.get(_concept_key(candidate.subject))
+                object_ = canon_by_key.get(_concept_key(candidate.object))
+                if subject is None or object_ is None:
+                    log.debug(
+                        "dropping relation with unknown endpoint: %r -> %r",
+                        candidate.subject,
+                        candidate.object,
+                    )
+                    continue
+                db.upsert_relation(
+                    subject,
+                    candidate.predicate,
+                    object_,
+                    candidate.confidence,
+                    seg_id,
+                    candidate.evidence,
+                )
+                persisted += 1
+            db.insert_relation_candidates(result.relations, seg_id)
+        except Exception:
+            log.warning("relation extraction failed for segment %s", seg_id, exc_info=True)
+    return persisted
 
 
 def _analyze_body(
@@ -1550,13 +1630,12 @@ def ingest_note(
     chunk_units: list[tuple[str, list[str]]] | None = None
     chunk_attribution: dict[int, list[str]] | None = None
     if source_segments:
-        # Pack segments into chapter-sized analysis units. fast_ctx is in TOKENS; a target of
-        # ~1.5x fast_ctx CHARS (~0.4x fast_ctx tokens of input) keeps each call well within
-        # context while grouping whole sections, so thin/peripheral segments (title page,
-        # references) aren't analyzed in isolation — which would rate medium/low and, via the
-        # min-quality aggregation + quality cap, halve the extracted concept count.
-        unit_target = max(fast.ctx * 3 // 2, 4096)
-        chunk_units = _build_segment_units(source_segments, unit_target)
+        # Pack segments into chapter-sized analysis units (~1.5x fast ctx chars, see
+        # _unit_char_target) so each call stays well within context while grouping whole
+        # sections — thin/peripheral segments (title page, references) analyzed in
+        # isolation would rate medium/low and, via the min-quality aggregation +
+        # quality cap, halve the extracted concept count.
+        chunk_units = _build_segment_units(source_segments, _unit_char_target(fast.ctx))
         chunk_attribution = {}
     try:
         result: AnalysisResult = _analyze_body_with_checkpoints(
@@ -1674,6 +1753,38 @@ def ingest_note(
             )
         except Exception as e:  # noqa: BLE001
             log.warning("concept_occurrences attribution failed for %s: %s", path.name, e)
+
+    # Relation extraction (feature 26, opt-in): a third fast-model pass per packed unit
+    # linking concept pairs. Non-fatal: an extraction failure must not fail the ingest.
+    if config.pipeline.relation_extraction:
+        try:
+            # Re-ingest = replace: drop this source's evidence/candidate rows before
+            # re-extracting (mirrors clear_concept_occurrences_for_source). Safe as a
+            # single clear — _extract_and_persist_relations runs once per note.
+            db.clear_relation_artifacts_for_source(path.stem)
+            if chunk_units:
+                # Reuse the packed analysis units (one LLM call per unit, matching the
+                # documented cost), not one call per fine structural segment. Evidence
+                # is attributed to the unit's first segment id: it is a provenance
+                # pointer to where the unit starts, not a recall index — fanning the
+                # quote out to every member segment would fabricate attributions.
+                rel_segments = [
+                    SimpleNamespace(id=seg_ids[0], text=unit_text)
+                    for unit_text, seg_ids in chunk_units
+                ]
+            else:
+                # Plain notes have no source_segments row — re-derive the same fixed-size
+                # chunking the main analysis pass uses (see _analyze_body_with_checkpoints)
+                # so relation evidence stays traceable to a note+chunk id.
+                rel_chunk_size = config.resolve_role("fast").ctx // 2
+                rel_segments = [
+                    SimpleNamespace(id=f"note:{path.stem}:{i}", text=body[i : i + rel_chunk_size])
+                    for i in range(0, len(body), rel_chunk_size)
+                ]
+            n = _extract_and_persist_relations(db, rel_segments, canonical_names, fast, config)
+            log.info("relation extraction: %d relations from %d segments", n, len(rel_segments))
+        except Exception:
+            log.warning("relation extraction failed for %s", path.name, exc_info=True)
 
     title_for_items = str(meta.get("title") or path.stem.replace("-", " ").strip())
     item_candidates = [
@@ -1827,6 +1938,92 @@ def extract_terms(
     ]
     return TermExtractionResult(
         terms=terms,
+        source_segment_id=segment.id,
+        model=fast.model,
+    )
+
+
+_RELATION_PREDICATES = get_args(RelationCandidate.model_fields["predicate"].annotation)
+_RELATION_PREDICATE_SET = frozenset(_RELATION_PREDICATES)
+
+_RELATION_EXTRACTION_SYSTEM = (
+    "You are a relation extractor. Given a list of known concepts and a text passage, "
+    "extract directed relationships between those concepts only — do not invent concepts. "
+    f"predicate must be exactly one of: {', '.join(_RELATION_PREDICATES)}. "
+    "Include a short verbatim evidence quote from the passage and a confidence 0.0-1.0. "
+    "Return JSON only, no explanation."
+)
+
+
+class _RelationLLMItem(_BaseModel):
+    subject: str
+    predicate: str
+    object: str
+    evidence: str = ""
+    # An omitted confidence must sit BELOW the 0.7 graph-expansion gate (query.py):
+    # silence from the model is not evidence of certainty. The prompt example stays
+    # 0.8 on purpose — small models anchor on example values, and a 0.5 example
+    # would bias all scored output under the gate.
+    confidence: float = 0.5
+
+
+class _RelationLLMResponse(_BaseModel):
+    relations: list[_RelationLLMItem] = []
+
+
+def extract_relations(
+    segment: SourceSegment,
+    concepts: list[str],
+    fast: RoleEndpoint,
+    config: Config,
+) -> RelationExtractionResult:
+    """Third LLM pass: extract directed concept-to-concept relations from a source segment."""
+    if not concepts:
+        return RelationExtractionResult(
+            relations=[], source_segment_id=segment.id, model=fast.model
+        )
+
+    prompt = (
+        f"Known concepts: {', '.join(concepts)}\n\n"
+        "Extract directed relations between these concepts from the following text.\n"
+        'Return JSON: {"relations": [{"subject": "...", "predicate": "...", "object": "...", '
+        '"evidence": "...", "confidence": 0.8}]}\n\n'
+        f"{segment.text[: _unit_char_target(fast.ctx)]}"
+    )
+    llm_result = request_structured(
+        client=fast.client,
+        prompt=prompt,
+        model_class=_RelationLLMResponse,
+        model=fast.model,
+        system=_RELATION_EXTRACTION_SYSTEM,
+        num_ctx=fast.ctx,
+        temperature=fast.temperature if fast.temperature is not None else 0,
+        stage="relation_extraction",
+        model_role="fast",
+        think=fast.think,
+        options=fast.options,
+    )
+    relations = []
+    for r in llm_result.relations:
+        if r.predicate not in _RELATION_PREDICATE_SET:
+            log.debug("dropping relation with invalid predicate: %r", r.predicate)
+            continue
+        if not r.subject or not r.object:
+            log.debug("dropping relation with empty subject/object")
+            continue
+        relations.append(
+            RelationCandidate(
+                subject=r.subject,
+                predicate=r.predicate,  # type: ignore[arg-type]
+                object=r.object,
+                evidence=r.evidence,
+                source_segment_id=segment.id,
+                provenance="extracted",
+                confidence=min(max(r.confidence, 0.0), 1.0),
+            )
+        )
+    return RelationExtractionResult(
+        relations=relations,
         source_segment_id=segment.id,
         model=fast.model,
     )

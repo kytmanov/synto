@@ -1180,6 +1180,20 @@ with open(sys.argv[1], encoding='utf-8') as f:
 assert 'papers' in payload
 assert payload['papers'] == []
 PYEOF"
+# Feature 27 backward-compat gate: this vault never ran relation extraction, so the
+# graph capability and graph/graph.json must be absent (no relations => no graph).
+soft_check "pack export omits graph capability without relations" \
+    "uv run --project \"$REPO_DIR\" python - '$PACK_OUT/agent/manifest.json' <<'PYEOF'
+import json
+import sys
+
+with open(sys.argv[1], encoding='utf-8') as f:
+    payload = json.load(f)
+
+assert 'graph' not in payload['pack']['capabilities'], payload['pack']['capabilities']
+PYEOF"
+soft_check "pack export omits graph/graph.json without relations" \
+    "test ! -e '$PACK_OUT/graph/graph.json'"
 
 # ── report clear (Phase 1A) ──────────────────────────────────────────────────
 header "synto report clear"
@@ -2049,6 +2063,50 @@ if [[ -n "$_TRACE_WIKI" ]]; then
 else
     pass "trace article skipped (no published article)"
 fi
+
+# ── synto find + trace term/citation (Feature 27, default path) ──────────────
+# This vault has no relations (relation_extraction is off), so these exercise the
+# relation-less tiers: find's title match and trace's graceful degradation. The
+# relation-enabled paths live in smoke_feature_relation_graph.sh.
+header "synto find + trace term/citation"
+if [[ -n "$_TRACE_WIKI" ]]; then
+    _FIND_RC=0
+    FIND_OUT=$($OLW find "$_TRACE_TITLE" 2>&1) || _FIND_RC=$?
+    echo "$FIND_OUT"
+    check "find exits 0" "test $_FIND_RC -eq 0"
+    _TMP=$(mktemp); echo "$FIND_OUT" > "$_TMP"
+    check "find matches the published article by title" \
+        "! grep -q 'No articles found' \"$_TMP\""
+    rm -f "$_TMP"
+else
+    pass "find skipped (no published article)"
+fi
+
+_TT_CONCEPT=$(python3 - <<PYEOF
+import sqlite3
+conn = sqlite3.connect("$VAULT_DIR/.synto/state.db")
+row = conn.execute("SELECT name FROM concepts ORDER BY name LIMIT 1").fetchone()
+print(row[0] if row else "")
+conn.close()
+PYEOF
+)
+if [[ -n "$_TT_CONCEPT" ]]; then
+    _TT_RC=0
+    TT_OUT=$($OLW trace term "$_TT_CONCEPT" 2>&1) || _TT_RC=$?
+    echo "$TT_OUT"
+    check "trace term exits 0 on an extracted concept" "test $_TT_RC -eq 0"
+else
+    pass "trace term skipped (no concepts extracted)"
+fi
+
+_TCIT_RC=0
+TCIT_OUT=$($OLW trace citation "note:nonexistent:0" 2>&1) || _TCIT_RC=$?
+echo "$TCIT_OUT"
+check "trace citation exits 0 on an unknown plain-note segment" "test $_TCIT_RC -eq 0"
+_TMP=$(mktemp); echo "$TCIT_OUT" > "$_TMP"
+check "trace citation explains plain-note segments have no occurrences" \
+    "grep -qi 'no occurrence records' \"$_TMP\""
+rm -f "$_TMP"
 
 # ── synto add ─────────────────────────────────────────────────────────────────
 header "synto add"
