@@ -1,52 +1,54 @@
 # Changelog
 
-## [Unreleased]
+## [0.7.0] - 2026-07-20
+
+Concepts can now carry relations. An opt-in ingest pass extracts them, packs ship the
+resulting graph, and queries follow it. Alongside that: `synto find`, three new `trace`
+subcommands, and alias-level concept curation. Most of the smaller work here — alias
+management, advisory acks, and the Unicode and code-fence fixes — came out of
+@VibeSan7's report from a real-world setup (#94).
+
+Existing vaults migrate to schema v29 automatically on first run.
 
 ### Added
 
-- **Concept relation extraction (opt-in `pipeline.relation_extraction`).** A third
-  fast-model pass during ingest extracts directed relations between known concepts
-  ("Raft depends_on Consensus") into new `relations`/`relation_evidence` tables (schema
-  v29), with a verbatim evidence quote per extraction unit. Off by default — it adds one
-  LLM call per chunk (the same packed chapter-sized units the analysis pass uses);
-  enable with `relation_extraction = true` under `[pipeline]`.
-  Plain hand-written notes work too (chunk-level provenance ids `note:<name>:<offset>`).
-  Relations are only recorded between known concepts or their aliases — endpoints the
-  model invented never enter the graph, but every raw candidate is kept in
-  `relation_candidates` as an audit trail. Re-ingest replaces a source's
-  evidence/candidate rows and dedups relations by confidence-max; relations from a
-  removed source are not garbage-collected yet.
-  Compiled articles surface their top-10 relations in a `relations:` frontmatter block.
-- **Concept graph in pack export + graph-aware queries.** Packs now include
-  `graph/graph.json` (nodes = concepts, edges = relations, `graph` capability in the
-  manifest) whenever relations exist; every edge endpoint resolves to a node, so
-  consumers can assume a closed graph. `synto query` and MCP `ask` automatically pull
-  in up to 2 related articles via 1-hop graph expansion (confidence ≥ 0.7) — a no-op
-  for vaults without relations.
-- **`synto find <query>` reverse lookup.** Ranked search over the wiki: concept
-  name/alias match first, then title match, then first-paragraph body match.
-- **`synto trace term|relation|citation`.** Trace where a term occurs, the verbatim
-  evidence behind an extracted relation, or which articles consumed a source segment.
-  Extends the existing `trace article` group.
-- **Smoke coverage for relations + graph.** `scripts/smoke_feature_relation_graph.sh`
-  runs the opt-in extraction end to end against a live model (DB invariants, frontmatter
-  block, find/trace, closed graph.json, query expansion, replace-on-reingest); the main
-  smoke now also guards the relation-less default path (no `graph` capability, find and
-  trace degrade gracefully).
+- **Concept relation extraction, opt-in (#109).** A third fast-model pass during ingest
+  extracts directed relations between known concepts ("Raft depends_on Consensus") into
+  new `relations`/`relation_evidence` tables, each with a verbatim evidence
+  quote. Endpoints are restricted to known concepts and their aliases — relations the
+  model invents never enter the graph, though every raw candidate is kept in
+  `relation_candidates` as an audit trail. Compiled articles surface their top 10
+  relations in a `relations:` frontmatter block. Off by default, since it adds one LLM
+  call per chunk; enable with `relation_extraction = true` under `[pipeline]`. Relations
+  from a removed source are not garbage-collected yet.
 
-- **`synto concept alias add/remove/move` for fixing a wrong extracted alias.** The fast
-  model sometimes attaches a surface to the wrong entity (e.g. an npm package name
-  attached as a project alias) with no CLI remedy. `remove` now detaches the alias and
-  records a denial tombstone so the next ingest can't silently re-attach it; `move`
-  re-points it to the correct entity in one step. Both un-rewrite any `[[Canonical|Alias]]`
-  wiki links the wrong alias had produced, and denials survive a `state.db` rebuild via
-  the `.synto/INDEX.json` seed like blessed aliases already do.
-- **`synto maintain` can acknowledge known lint advisories.** Long-running vaults often
-  carry advisories that are true by construction (e.g. `graph_noise`) and permanently
-  clutter `maintain` output, hiding new issues. Set `[maintain] ack = ["graph_noise"]` (or
-  `"check:vault/relative/path.md"` for a single file) in `synto.toml` to collapse acked
-  issues into a one-line count. Acks are display-only — the health score and advisory
-  count are unaffected.
+- **Concept graph in packs, and graph-aware queries (#109).** Packs now include
+  `graph/graph.json` (nodes = concepts, edges = relations) and a `graph` capability in
+  the manifest whenever relations exist; every edge endpoint resolves to a node, so
+  consumers can assume a closed graph. `synto query` and the MCP `answer_question` tool
+  pull in up to 2 related articles via 1-hop expansion (confidence ≥ 0.7) — a no-op on
+  vaults without relations.
+
+- **`synto find <query>` (#109).** Reverse lookup over the wiki, ranked: concept
+  name/alias match first, then title match, then first-paragraph body match.
+
+- **`synto trace term|relation|citation` (#109).** Trace where a term occurs, the
+  verbatim evidence behind an extracted relation, or which articles consumed a source
+  segment. Extends the existing `trace article`.
+
+- **`synto concept alias add|remove|move` (#101).** The fast model sometimes attaches a
+  surface to the wrong entity (an npm package name landing as a project alias), with no
+  CLI remedy short of a merge. `remove` detaches the alias and records a denial tombstone
+  so the next ingest can't silently re-attach it; `move` re-points it to the right entity
+  in one step. Both un-rewrite the `[[Canonical|Alias]]` links the wrong alias had
+  produced, and denials survive a `state.db` rebuild via the `.synto/INDEX.json` seed.
+
+- **`synto maintain` can acknowledge known advisories (#102).** Long-running vaults carry
+  advisories that are true by construction (e.g. `graph_noise`), which clutter the output
+  and hide new issues. `[maintain] ack = ["graph_noise"]` in `synto.toml` collapses them
+  into a one-line count; scope one to a single file with
+  `"graph_noise:wiki/Some Note.md"`. Acks are display-only — the health score and
+  advisory count are unchanged.
 
 ### Fixed
 
@@ -80,12 +82,12 @@
   case variants (e.g. `Привет` vs `привет`). Both now compare via Python `casefold()`;
   remaining legacy `lower()` sites are tracked in #104.
 
-- **`StateDB._tx()` now opens a real transaction at depth 0.** sqlite3's legacy isolation
-  mode only implicit-BEGINs before DML, so a nested `_tx()`'s SAVEPOINT issued before any
-  outer write silently became the outermost transaction and committed early — a failed
-  `query --synthesize` file write could leave a phantom DB row that blocked re-synthesizing
-  that question, and migration hooks documented as atomic were not. Depth-0 frames now
-  BEGIN explicitly, making nesting and DDL frames atomic as documented.
+- **`StateDB._tx()` now opens a real transaction at depth 0 (#100).** sqlite3's legacy
+  isolation mode only implicit-BEGINs before DML, so a nested `_tx()`'s SAVEPOINT issued
+  before any outer write silently became the outermost transaction and committed early —
+  a failed `query --synthesize` file write could leave a phantom DB row that blocked
+  re-synthesizing that question, and migration hooks documented as atomic were not.
+  Depth-0 frames now BEGIN explicitly, making nesting and DDL frames atomic as documented.
 
 ## [0.6.3] - 2026-07-15
 
