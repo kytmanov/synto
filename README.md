@@ -169,6 +169,21 @@ candidate instead of silently absorbing it, so you decide.
 - `synto concept unmerge NAME` — best-effort reverse of the most recent merge for that name.
   Several things are not restored; see `synto concept unmerge --help` for the exact contract.
 
+**Fix a wrong alias** (auto-commits; no `--dry-run`):
+
+The fast model sometimes attaches a surface form to the wrong entity — a library name
+landing as an alias of the project that uses it. That is too small a problem for a merge:
+
+- `synto concept alias add ENTITY ALIAS` — attach a surface form you know belongs here.
+- `synto concept alias remove ENTITY ALIAS` — detach it, and record a denial tombstone so
+  the next ingest can't silently re-attach it.
+- `synto concept alias move FROM_ENTITY TO_ENTITY ALIAS` — re-point it to the right entity
+  in one step.
+
+`remove` and `move` also un-rewrite the `[[Canonical|Alias]]` links the wrong alias had
+already produced. Denials survive a `state.db` rebuild via the `.synto/INDEX.json` seed,
+the same way blessed aliases do.
+
 **Resolve homonyms:**
 
 - `synto concept keep SURFACE ENTITY` — assign the ambiguous occurrences of a surface form to
@@ -215,11 +230,24 @@ Works today with Markdown. Drop notes in `raw/`, run `synto run`, and get a cros
 
 **File watcher.** `synto watch` runs in the background and processes anything you drop into `raw/` automatically. Ingest and compile happen while you keep writing.
 
-**Query and synthesize.** `synto query "what is X?"` answers from your published wiki without embeddings or a vector database. Add `--synthesize` to save the answer as a permanent wiki page with source citations and hand-edit protection.
+**Query and synthesize.** `synto query "what is X?"` answers from your published wiki without embeddings or a vector database. Add `--synthesize` to save the answer as a permanent wiki page with source citations and hand-edit protection. If your vault has relations (below), the query also pulls in up to 2 related articles via one hop across the concept graph.
 
-**Pack export.** `synto pack export --target agents` produces a portable directory any file-aware agent can read: articles, `INDEX.json` for fast concept lookup, source provenance, and agent-readable entry points.
+**Reverse lookup.** `synto find "raft"` searches the wiki and returns ranked matches: concept names and aliases first, then article titles, then first-paragraph body text. Use it when you know a term but not which article covers it.
 
-**MCP server.** `synto serve` exposes your wiki as a local MCP server with 12 tools. Eight cover the published wiki: `list_articles`, `read_article`, `find_concept`, `search_articles`, `get_concept`, `list_sources`, `trace_lineage`, and `answer_question`. Four more (below) expose the raw source text. Wire it into Claude Code, Cursor, or any MCP-compatible client in one command. Drafts are hidden by default; `answer_question` runs the same routed query as `synto query` end-to-end (uses both fast and heavy models), so it may cost money on paid providers.
+**Concept relations.** An opt-in third ingest pass extracts directed relations between concepts your vault already knows about — "Raft depends_on Consensus" — each backed by a verbatim quote from the source. Compiled articles list their top 10 relations in a `relations:` frontmatter block, packs ship the resulting graph, and queries traverse it. Relations are only recorded between known concepts and their aliases, so endpoints the model invents never enter the graph.
+
+It is off by default because it costs one extra LLM call per chunk. Enable it in `synto.toml`:
+
+```toml
+[pipeline]
+relation_extraction = true
+```
+
+Relations from a source you later delete are not garbage-collected yet.
+
+**Pack export.** `synto pack export --target agents` produces a portable directory any file-aware agent can read: articles, `INDEX.json` for fast concept lookup, source provenance, and agent-readable entry points. Vaults with relations also get `graph/graph.json` and a `graph` capability in the manifest.
+
+**MCP server.** `synto serve` exposes your wiki as a local MCP server with 12 tools. Eight cover the published wiki: `list_articles`, `read_article`, `find_concept`, `search_articles`, `get_concept`, `list_sources`, `trace_lineage`, and `answer_question`. Four more (below) expose the raw source text. Wire it into Claude Code, Cursor, or any MCP-compatible client in one command. Drafts are hidden by default; `answer_question` runs the same routed query as `synto query` end-to-end (uses both fast and heavy models, and follows the concept graph the same way), so it may cost money on paid providers.
 
 ### Verbatim source tools
 
@@ -269,6 +297,15 @@ other three verbatim tools and every other command keep working.
 
 **Self-maintenance.** `synto maintain` repairs broken wikilinks, creates stubs for missing targets, and reports orphans, stale articles, and missing frontmatter. `--dry-run` shows the structural-health report without changing anything.
 
+A mature vault accumulates advisories that are true by construction and will never be fixed — they crowd out the findings you do care about. Acknowledge them in `synto.toml` and `maintain` collapses them into a one-line count:
+
+```toml
+[maintain]
+ack = ["graph_noise", "missing_media:wiki/Imported Note.md"]
+```
+
+An entry is a check name (matching every path) or `check:vault-relative-path` (matching one file). Only advisory checks can be acked — structural problems like orphans and broken links always report. Acks are display-only: the health score and the advisory count are unaffected, so acking never flatters the report.
+
 **A/B model comparison.** `synto compare` runs your query set against two different models in isolated copies of your vault so you can evaluate a model switch without touching anything live.
 
 **Quality evaluation.** `synto eval` scores your wiki offline: concept coverage, citation support, link resolution, `INDEX.json` validity. Run it before a pack export or in CI.
@@ -296,9 +333,13 @@ type for your document to get the matching ingest-analysis prompt:
 | `transcript` | Video/audio transcripts, interview notes |
 | `unknown_text` | Fallback when text doesn't fit a richer source type |
 
-**Compile lineage.** Every compiled article records which source notes and compile run it
-came from. `synto trace article <name>` prints the full history: timestamp, model,
-contributing sources.
+**Compile lineage and provenance tracing.** Every compiled article records which source
+notes and compile run it came from. `synto trace` answers four questions:
+
+- `trace article <name>` — the article's full history: timestamp, model, contributing sources.
+- `trace term <term>` — everywhere a term occurs across the wiki.
+- `trace relation <relation-id>` — the verbatim evidence quotes behind an extracted relation.
+- `trace citation <segment-id>` — which articles consumed a given source segment.
 
 **LLM response cache.** Identical prompts reuse cached responses from a local SQLite
 table instead of hitting the model. `synto maintain --clear-cache` flushes it;
@@ -592,18 +633,25 @@ request as-is and override the matching first-class field, so set computed value
 ## What ships now
 
 - Full ingest → compile → approve pipeline; supports Markdown notes and Obsidian vaults
-- `synto pack export --target agents` — portable knowledge pack with `INDEX.json` and agent metadata
+- `synto pack export --target agents` — portable knowledge pack with `INDEX.json`, agent metadata, and `graph/graph.json` when the vault has relations
 - `synto serve` — MCP server with stdio and Streamable HTTP transports, exposing 12 tools. Eight wiki tools: `list_articles`, `read_article`, `find_concept`, `search_articles`, `get_concept`, `list_sources`, `trace_lineage`, `answer_question`. Four verbatim-source tools: `search_source_segments`, `get_source_passages`, `read_source_segment`, `list_segments`. Quality signals (`status`, `confidence`, `source_count`, `single_source`) are surfaced on every article ref so agents can self-filter; `min_status` defaults to `"published"` to keep drafts out of agent context.
 - `synto doctor --backlog` — reads the MCP audit log to show what to ingest next: zero-result queries, single-source concepts in active demand, and the verbatim-vs-`answer_question` tool mix.
-- `synto query` — index-routed Q&A with optional synthesis to `wiki/synthesis/`
+- `synto query` — index-routed Q&A with optional synthesis to `wiki/synthesis/`, plus
+  1-hop concept-graph expansion when relations exist
+- `synto find QUERY` — reverse lookup over the wiki, ranked by concept/alias, title, then body
+- Concept relations (opt-in `[pipeline] relation_extraction`) — a fast-model ingest pass
+  extracts directed, evidence-backed relations between known concepts; articles carry a
+  `relations:` frontmatter block and packs export the graph
 - `synto review` — interactive draft review: approve, reject, edit, or diff before publishing
-- `synto concept rename|merge|split|unmerge|inspect|keep` — stable entity identity and
+- `synto concept rename|merge|split|unmerge|inspect|keep|alias` — stable entity identity and
   curation: `synto doctor`/`maintain` surface candidates and collisions; `inspect` diagnoses
   and `keep` resolves homonyms; `merge` folds two concepts into one and `split` creates a
   disambiguation page; `unmerge` is best-effort with explicit limitations (see command help);
-  `--dry-run` on `rename`/`merge`/`split`.
+  `--dry-run` on `rename`/`merge`/`split`; `alias add|remove|move` fixes a misattached
+  surface form, with a denial tombstone so re-ingest can't reattach it.
 - `synto watch` — file watcher: auto-ingest and compile on every save
-- `synto maintain` — wiki health check, stub creation, orphan cleanup
+- `synto maintain` — wiki health check, stub creation, orphan cleanup; `[maintain] ack`
+  collapses known advisories without touching the health score
 - `synto eval` — offline structural evaluation (coverage, citation support, link resolution)
 - `synto compare` — A/B model comparison without touching your vault
 - `synto doctor` — configuration and connectivity diagnostics
@@ -615,7 +663,8 @@ request as-is and override the matching first-class field, so set computed value
   `api_docs`, `web_article`, `corp_docs`, `transcript`, plus `unknown_text` fallback,
   select the optimal ingest strategy per document type
 - Compile lineage: every article records its source notes and compile run;
-  `synto trace article <name>` shows the full history
+  `synto trace article|term|relation|citation` traces history, term occurrences,
+  relation evidence, and which articles consumed a source segment
 - LLM response cache: identical prompts reuse cached responses;
   `synto maintain --clear-cache` manages it
 
@@ -629,6 +678,9 @@ request as-is and override the matching first-class field, so set computed value
   synthesis/          published synthesis articles (when present)
   index/
     INDEX.json        machine-readable index with stable article IDs
+  graph/
+    graph.json        concept graph: nodes = concepts, edges = relations (only when
+                      the vault has relations; declared as the "graph" capability)
   agent/
     manifest.json     capabilities and pack metadata
     concepts.json     concept registry with aliases
@@ -638,7 +690,7 @@ request as-is and override the matching first-class field, so set computed value
   CLAUDE.md           Claude Code context file
 ```
 
-Any file-aware agent can read the articles directly. `INDEX.json` enables fast concept lookup without a database. `synto serve` exposes 12 MCP tools — browse (`list_articles`), read (`read_article`, `get_concept`, `trace_lineage`, `list_sources`), search (`search_articles`, `find_concept`), answer (`answer_question`, which runs the full query pipeline), and read raw source text (`search_source_segments`, `get_source_passages`, `read_source_segment`, `list_segments`).
+Any file-aware agent can read the articles directly. `INDEX.json` enables fast concept lookup without a database. When `graph/graph.json` is present, every edge endpoint resolves to a node in the same file, so a consumer can assume a closed graph and walk it without lookups back into the vault. `synto serve` exposes 12 MCP tools — browse (`list_articles`), read (`read_article`, `get_concept`, `trace_lineage`, `list_sources`), search (`search_articles`, `find_concept`), answer (`answer_question`, which runs the full query pipeline), and read raw source text (`search_source_segments`, `get_source_passages`, `read_source_segment`, `list_segments`).
 
 ---
 
