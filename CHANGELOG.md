@@ -14,7 +14,7 @@ Existing vaults migrate to schema v29 automatically on first run.
 
 - **Concept relation extraction, opt-in (#109).** A third fast-model pass during ingest
   extracts directed relations between known concepts ("Raft depends_on Consensus") into
-  new `relations`/`relation_evidence` tables (schema v29), each with a verbatim evidence
+  new `relations`/`relation_evidence` tables, each with a verbatim evidence
   quote. Endpoints are restricted to known concepts and their aliases — relations the
   model invents never enter the graph, though every raw candidate is kept in
   `relation_candidates` as an audit trail. Compiled articles surface their top 10

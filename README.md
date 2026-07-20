@@ -180,9 +180,7 @@ landing as an alias of the project that uses it. That is too small a problem for
 - `synto concept alias move FROM_ENTITY TO_ENTITY ALIAS` — re-point it to the right entity
   in one step.
 
-`remove` and `move` also un-rewrite the `[[Canonical|Alias]]` links the wrong alias had
-already produced. Denials survive a `state.db` rebuild via the `.synto/INDEX.json` seed,
-the same way blessed aliases do.
+`remove` and `move` also fix any `[[Canonical|Alias]]` wiki links the wrong alias had produced.
 
 **Resolve homonyms:**
 
@@ -334,11 +332,10 @@ type for your document to get the matching ingest-analysis prompt:
 | `unknown_text` | Fallback when text doesn't fit a richer source type |
 
 **Compile lineage and provenance tracing.** Every compiled article records which source
-notes and compile run it came from. `synto trace` answers four questions:
+notes and compile run it came from. `synto trace` answers:
 
 - `trace article <name>` — the article's full history: timestamp, model, contributing sources.
-- `trace term <term>` — everywhere a term occurs across the wiki.
-- `trace relation <relation-id>` — the verbatim evidence quotes behind an extracted relation.
+- `trace term <term>` — source occurrences and covering published articles for a concept (name or alias).
 - `trace citation <segment-id>` — which articles consumed a given source segment.
 
 **LLM response cache.** Identical prompts reuse cached responses from a local SQLite
