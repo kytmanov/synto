@@ -1651,6 +1651,26 @@ def config_cmd():
     """Inspect or update vault-local configuration."""
 
 
+@cli.command("set-default-vault")
+@click.argument("vault_path", type=click.Path(path_type=Path))
+def set_default_vault(vault_path: Path) -> None:
+    """Set the default vault used by synto (updates user global config).
+
+    Example: `synto set-default-vault /path/to/my-vault`
+    """
+    from .global_config import GlobalConfig, load_global_config, save_global_config
+
+    vault = Path(vault_path).expanduser().resolve()
+    if not vault.exists() or not vault.is_dir():
+        click.echo(f"Error: vault path does not exist: {vault}", err=True)
+        sys.exit(1)
+
+    gcfg = load_global_config() or GlobalConfig()
+    gcfg.vault = str(vault)
+    save_global_config(gcfg)
+    console.print(f"[green]Default vault set to:[/green] {vault}")
+
+
 @config_cmd.command(name="inline-source-citations")
 @click.argument("action", type=click.Choice(["on", "off", "status"]))
 @click.option("--vault", "vault_str", envvar=VAULT_ENV_VAR, default=None)
