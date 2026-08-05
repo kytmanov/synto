@@ -26,6 +26,20 @@ def _no_client_backoff(monkeypatch):
     monkeypatch.setattr(openai_compat_client, "_CONNECTION_RETRY_DELAYS", zeroed)
 
 
+@pytest.fixture(autouse=True)
+def _isolated_global_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Redirect the user config dir for every test.
+
+    `synto init` registers each vault in the user config dir (vaults.toml), so any test
+    invoking it would otherwise write into the developer's real ~/.config/synto. Per-file
+    fixtures that set these same vars to their own tmp_path still win (they run after and
+    monkeypatch is idempotent per-test); git-committing tests use repo-local identity, so
+    hiding $XDG_CONFIG_HOME/git/config is harmless.
+    """
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+
+
 @pytest.fixture
 def vault(tmp_path: Path) -> Path:
     """Minimal vault structure for testing."""

@@ -465,7 +465,14 @@ def init(vault_path: str, existing: bool, non_interactive: bool, set_default: bo
     # Write or sync synto.toml from global config
     toml_path = vault / CONFIG_FILE_NAME
     from .config import default_wiki_toml
-    from .global_config import GlobalConfig, load_global_config, save_global_config
+    from .global_config import (
+        GlobalConfig,
+        GlobalConfigUnreadableError,
+        load_global_config,
+        load_global_config_strict,
+        register_known_vault,
+        save_global_config,
+    )
 
     gcfg = load_global_config()
 
@@ -620,11 +627,21 @@ def init(vault_path: str, existing: bool, non_interactive: bool, set_default: bo
             encoding="utf-8",
         )
 
+    register_known_vault(vault)
+
     if set_default:
         try:
-            _gcfg = gcfg if gcfg is not None else GlobalConfig()
+            # Strict load: a present-but-unparseable config must not be overwritten with a
+            # fresh one (it may still hold recoverable provider settings and API keys).
+            _gcfg = load_global_config_strict() or GlobalConfig()
             _gcfg.vault = str(vault)
             save_global_config(_gcfg)
+        except GlobalConfigUnreadableError:
+            console.print(
+                "[yellow]⚠ Global config exists but can't be parsed — not changing the "
+                "default vault. Fix or delete it, then re-run with --default.[/yellow]"
+            )
+            set_default = False
         except Exception:
             console.print("[yellow]⚠ Could not save default vault to global config.[/yellow]")
 
@@ -924,6 +941,157 @@ def migrate_olw(vault_str: Path) -> None:
         console.print(f"  copied {LEGACY_APP_DIR_NAME}/ -> {APP_DIR_NAME}/")
 
 
+# ── vault ─────────────────────────────────────────────────────────────────────
+
+
+@cli.group(name="vault", invoke_without_command=True)
+@click.pass_context
+def vault_group(ctx: click.Context) -> None:
+    """Show, switch, or manage known vaults."""
+    if ctx.invoked_subcommand is None:
+        _print_vault_list()
+
+
+def _is_vault_dir(path: Path) -> bool:
+    return path.is_dir() and (config_path(path).exists() or legacy_config_path(path).exists())
+
+
+def _print_vault_list() -> None:
+    import os
+
+    from .global_config import (
+        _global_config_path,
+        load_global_config,
+        load_known_vaults,
+    )
+
+    gcfg = load_global_config()
+    default = gcfg.vault if gcfg and gcfg.vault else None
+    if gcfg is None and _global_config_path().exists():
+        console.print("[dim]Global config exists but can't be parsed — no default vault.[/dim]")
+
+    vaults = load_known_vaults()
+    # A default set before the registry existed (or by hand-editing config.toml) must still
+    # show up — display the union. normcase: same-vault-different-case on Windows.
+    default_resolved = str(Path(default).expanduser().resolve()) if default else None
+    default_key = os.path.normcase(default_resolved) if default_resolved else None
+    if default_resolved and default_key not in {os.path.normcase(v) for v in vaults}:
+        vaults = [default_resolved, *vaults]
+
+    if not vaults:
+        console.print(
+            "No known vaults yet. Run "
+            f"[bold]{CLI_NAME} vault use <path>[/bold] or "
+            f"[bold]{CLI_NAME} init <path> --default[/bold]."
+        )
+        return
+
+    console.print("Known vaults:")
+    for v in vaults:
+        path = Path(v)
+        is_default = default_key is not None and os.path.normcase(v) == default_key
+        marker = "*" if is_default else " "
+        suffix = ""
+        if is_default:
+            suffix += " [dim](default)[/dim]"
+        if not _is_vault_dir(path):
+            suffix += " [yellow]\\[missing][/yellow]"
+        console.print(f"  {marker} {v}{suffix}")
+    if default_resolved is None:
+        console.print("[dim](no default vault set)[/dim]")
+    env_vault = os.environ.get(VAULT_ENV_VAR)
+    if env_vault:
+        console.print(f"[dim]{VAULT_ENV_VAR}={env_vault} is set and overrides the default.[/dim]")
+
+
+@vault_group.command("use")
+@click.argument("vault_path", type=click.Path(path_type=Path))
+def vault_use(vault_path: Path) -> None:
+    """Set VAULT_PATH as the default vault and remember it."""
+    import os
+
+    from .global_config import (
+        GlobalConfig,
+        GlobalConfigUnreadableError,
+        _global_config_path,
+        load_global_config_strict,
+        register_known_vault,
+        save_global_config,
+    )
+
+    vault = vault_path.expanduser().resolve()
+    if not vault.exists():
+        click.echo(
+            f"Error: vault path does not exist: {vault}\n"
+            f"Run `{CLI_NAME} init {vault}` to create it.",
+            err=True,
+        )
+        sys.exit(1)
+    if not vault.is_dir():
+        click.echo(
+            f"Error: vault path is not a directory: {vault}\n"
+            f"A vault is a directory containing {CONFIG_FILE_NAME}.",
+            err=True,
+        )
+        sys.exit(1)
+    if not (config_path(vault).exists() or legacy_config_path(vault).exists()):
+        click.echo(
+            f"Error: not a Synto vault (no {CONFIG_FILE_NAME} found): {vault}\n"
+            f"Run `{CLI_NAME} init {vault} --existing` to adopt an existing directory of notes.",
+            err=True,
+        )
+        sys.exit(1)
+
+    try:
+        gcfg = load_global_config_strict()
+    except GlobalConfigUnreadableError:
+        click.echo(
+            f"Error: global config exists but can't be parsed: {_global_config_path()}\n"
+            "Fix or delete it, then re-run. Refusing to overwrite it "
+            "(it may contain provider settings and API keys).",
+            err=True,
+        )
+        sys.exit(1)
+    gcfg = gcfg or GlobalConfig()
+    gcfg.vault = str(vault)
+    save_global_config(gcfg)
+    register_known_vault(vault)
+
+    if is_legacy_vault(vault):
+        console.print(
+            f"[dim]Legacy {LEGACY_CONFIG_FILE_NAME} vault — "
+            f"run [bold]{CLI_NAME} migrate-olw --vault {vault}[/bold] to upgrade.[/dim]"
+        )
+    console.print(f"[green]Default vault set to:[/green] {vault}")
+    env_vault = os.environ.get(VAULT_ENV_VAR)
+    if env_vault and str(Path(env_vault).expanduser().resolve()) != str(vault):
+        console.print(
+            f"[dim]Note: {VAULT_ENV_VAR}={env_vault} is set and overrides the default "
+            "until unset.[/dim]"
+        )
+
+
+@vault_group.command("forget")
+@click.argument("vault_path", type=click.Path(path_type=Path))
+def vault_forget(vault_path: Path) -> None:
+    """Remove VAULT_PATH from the known-vaults list (does not change the default)."""
+    from .global_config import forget_known_vault, load_global_config
+
+    vault = vault_path.expanduser().resolve()
+    if not forget_known_vault(vault):
+        click.echo(f"Not in known vaults: {vault}", err=True)
+        sys.exit(1)
+    gcfg = load_global_config()
+    is_default = bool(gcfg and gcfg.vault and Path(gcfg.vault).expanduser().resolve() == vault)
+    if is_default:
+        console.print(
+            f"[yellow]Removed from known vaults, but it is still the default vault. "
+            f"Run [bold]{CLI_NAME} vault use <path>[/bold] to switch.[/yellow]"
+        )
+    else:
+        console.print(f"[green]Removed from known vaults:[/green] {vault}")
+
+
 # ── setup ─────────────────────────────────────────────────────────────────────
 
 
@@ -1157,7 +1325,12 @@ def _finalize_per_role_providers(
         dedup_role_connections,
         multi_provider_vault_toml,
     )
-    from .global_config import GlobalConfig, load_global_config, save_global_config
+    from .global_config import (
+        GlobalConfig,
+        load_global_config,
+        register_known_vault,
+        save_global_config,
+    )
     from .vault import atomic_write
 
     # De-duplicate connections; the first becomes "default" so embed/string roles resolve.
@@ -1208,6 +1381,8 @@ def _finalize_per_role_providers(
         provider_keys=provider_keys or None,
     )
     save_global_config(gcfg)
+    if vault_input:
+        register_known_vault(vault_input)
 
     applied_to: Path | None = None
     if vault_input:
@@ -1271,7 +1446,12 @@ def _finalize_per_role_providers(
 )
 def setup(non_interactive: bool, reset: bool, provider_preset: str | None):
     """Interactive wizard: configure provider, models, and default vault."""
-    from .global_config import GlobalConfig, load_global_config, save_global_config
+    from .global_config import (
+        GlobalConfig,
+        load_global_config,
+        register_known_vault,
+        save_global_config,
+    )
     from .providers import PROVIDER_REGISTRY, get_provider
 
     # ── non-interactive: show current config ──────────────────────────────────
@@ -1584,6 +1764,8 @@ def setup(non_interactive: bool, reset: bool, provider_preset: str | None):
             experimental_inline_source_citations=experimental_inline_source_citations,
         )
         save_global_config(cfg)
+        if vault_path:
+            register_known_vault(vault_path)
 
         # ── Summary panel ─────────────────────────────────────────────────────
         init_target = vault_path or "~/my-wiki"
@@ -1649,26 +1831,6 @@ def setup(non_interactive: bool, reset: bool, provider_preset: str | None):
 @cli.group(name="config")
 def config_cmd():
     """Inspect or update vault-local configuration."""
-
-
-@cli.command("set-default-vault")
-@click.argument("vault_path", type=click.Path(path_type=Path))
-def set_default_vault(vault_path: Path) -> None:
-    """Set the default vault used by synto (updates user global config).
-
-    Example: `synto set-default-vault /path/to/my-vault`
-    """
-    from .global_config import GlobalConfig, load_global_config, save_global_config
-
-    vault = Path(vault_path).expanduser().resolve()
-    if not vault.exists() or not vault.is_dir():
-        click.echo(f"Error: vault path does not exist: {vault}", err=True)
-        sys.exit(1)
-
-    gcfg = load_global_config() or GlobalConfig()
-    gcfg.vault = str(vault)
-    save_global_config(gcfg)
-    console.print(f"[green]Default vault set to:[/green] {vault}")
 
 
 @config_cmd.command(name="inline-source-citations")
