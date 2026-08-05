@@ -7,6 +7,7 @@ Phase 0 skeletons remain for compatibility tests.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
@@ -71,6 +72,7 @@ class QueryEngine:
         config: Config,
         db: StateDB | None = None,
         query_config: QueryConfig | None = None,
+        visible_predicate: Callable[[str], bool] | None = None,
     ) -> None:
         self.reader = reader
         self.fast_ep = fast_ep
@@ -78,6 +80,7 @@ class QueryEngine:
         self.config = config
         self.db = db
         self.query_config = query_config or QueryConfig()
+        self.visible_predicate = visible_predicate
         self.last_selected_pages: tuple[str, ...] = ()
         self.last_index_found = True
 
@@ -92,6 +95,7 @@ class QueryEngine:
             question,
             max_pages=self.query_config.max_pages,
             graph_expand=self.query_config.graph_expand,
+            visible=self.visible_predicate,
         )
         self.last_selected_pages = tuple(result.selected_pages)
         self.last_index_found = result.index_found

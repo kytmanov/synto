@@ -858,6 +858,13 @@ def build_tool_handlers(
             from .client_factory import build_router
             from .engines import QueryConfig, QueryEngine
 
+            def _page_visible(title: str) -> bool:
+                try:
+                    _read_visible_article(reader, title, config.mcp)
+                except ArticleNotFound:
+                    return False
+                return True
+
             router = build_router(config)
             try:
                 engine = QueryEngine(
@@ -867,6 +874,7 @@ def build_tool_handlers(
                     config=config,
                     db=db,
                     query_config=QueryConfig(max_pages=max(1, int(max_pages))),
+                    visible_predicate=_page_visible,
                 )
                 answer = engine.query(question)
             finally:
