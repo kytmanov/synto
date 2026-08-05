@@ -858,9 +858,17 @@ def build_tool_handlers(
             from .client_factory import build_router
             from .engines import QueryConfig, QueryEngine
 
-            def _page_visible(title: str) -> bool:
+            def _page_visible(resolved_rel_path: str) -> bool:
+                # Source-summary pages (wiki/sources/) carry no `visibility`/`exclude_tags`
+                # frontmatter and are never in the reader's concept/synthesis article cache,
+                # so _read_visible_article always raises ArticleNotFound for them regardless
+                # of content. They are gated by the separate source_access/license mechanism
+                # (get_source_passages etc.), not by MCP article visibility, so leave them
+                # unfiltered here rather than dropping every source page outright.
+                if "sources" in Path(resolved_rel_path).parts:
+                    return True
                 try:
-                    _read_visible_article(reader, title, config.mcp)
+                    _read_visible_article(reader, resolved_rel_path, config.mcp)
                 except ArticleNotFound:
                     return False
                 return True

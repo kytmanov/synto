@@ -359,6 +359,48 @@ def test_answer_question_keeps_visible_content_when_a_hidden_page_is_also_select
     assert result["selected_pages"] == ["Public Topic"]
 
 
+def test_answer_question_still_includes_source_page_content(vault, db, monkeypatch):
+    """A source-summary page (wiki/sources/) carries no `visibility`/`exclude_tags`
+    frontmatter and is never in the reader's concept/synthesis article cache, so the MCP
+    visibility gate must exempt it rather than reading its absence from that cache as
+    hidden (review on #113: the gate dropped every source page outright)."""
+    import json
+    from unittest.mock import MagicMock
+
+    from conftest import as_router
+
+    from synto.vault import write_note
+
+    wiki = vault / "wiki"
+    sources_dir = wiki / "sources"
+    sources_dir.mkdir(parents=True, exist_ok=True)
+    write_note(sources_dir / "Source Note.md", {"title": "Source Note"}, "SOURCE-MARKER-77ee")
+    (wiki / "index.md").write_text(
+        "# Wiki Index\n\n## Sources\n- [[sources/Source Note]]\n", encoding="utf-8"
+    )
+    handlers, config = _build_tools(vault)
+
+    prompts: list[str] = []
+
+    def side_effect(**kwargs):
+        prompts.append(kwargs["prompt"])
+        if len(prompts) == 1:
+            return json.dumps({"pages": ["sources/Source Note"]})
+        return json.dumps({"answer": "a safe answer", "title": "Safe"})
+
+    client = MagicMock()
+    client.generate.side_effect = side_effect
+
+    from synto import client_factory
+
+    monkeypatch.setattr(client_factory, "build_router", lambda *_a, **_k: as_router(client))
+
+    handlers["answer_question"]("What does the source say?")
+
+    assert len(prompts) == 2
+    assert "SOURCE-MARKER-77ee" in prompts[1]
+
+
 def test_apply_filter_min_status_unknown_falls_through(vault, db):
     wiki = vault / "wiki"
     _write_article(wiki / "Pub.md", "published")

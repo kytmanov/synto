@@ -308,6 +308,22 @@ def test_load_pages_truncates_to_max_chars(vault, config):
     assert len(result) < len(long_body)
 
 
+def test_load_pages_gates_on_resolved_path_not_selection_title(vault, config):
+    """`visible` must see the page `_find_page` actually resolved to, not the raw
+    selection string: a title reached via the frontmatter-title fallback must be gated
+    on its real file identity, or a caller could dodge the gate by selecting an alias.
+    """
+    path = config.wiki_dir / "real-filename.md"
+    write_note(path, {"title": "Selectable Title", "tags": []}, "secret body")
+
+    def visible(rel_path: str) -> bool:
+        return rel_path != "wiki/real-filename.md"
+
+    result = _load_pages(config, ["Selectable Title"], visible=visible)
+
+    assert "secret body" not in result
+
+
 def test_run_query_passes_index_to_first_call(vault, config, db):
     """Fast model prompt must include index content."""
     index_text = "# Wiki Index\n\n## Concepts\n- [[Special Topic]]\n"

@@ -251,17 +251,22 @@ def _load_pages(
 ) -> str:
     """Return concatenated content of selected pages.
 
-    `visible`, when given, is consulted before a page's body is read: a title it
-    rejects never reaches the returned content (and, from there, the answering
-    model's prompt), regardless of why the caller selected that title.
+    `visible`, when given, is consulted against the RESOLVED page path (after alias and
+    filename-fallback resolution), not the raw selection title: an alias-selected page must
+    be gated the same as one selected by its canonical title.
     """
     parts: list[str] = []
     for title in page_titles[:max_pages]:
-        if visible is not None and not visible(title):
-            continue
         page = _find_page(config, title, db=db)
         if page is None:
             continue
+        if visible is not None:
+            try:
+                rel = str(page.relative_to(config.vault))
+            except ValueError:
+                rel = str(page)
+            if not visible(rel):
+                continue
         try:
             meta, body = parse_note(page)
             page_title = meta.get("title", title)
