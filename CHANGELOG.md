@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- **`synto vault` — see and switch between known vaults (#112).** `synto vault` lists every
+  vault synto has seen (default marked, missing paths flagged), `synto vault use <path>`
+  validates and switches the default without touching provider settings, and
+  `synto vault forget <path>` prunes the list. `init` and `setup` register vaults
+  automatically. Started by @balazsjdp; closes #51.
+
 ## [0.7.0] - 2026-07-20
 
 Concepts can now carry relations. An opt-in ingest pass extracts them, packs ship the
