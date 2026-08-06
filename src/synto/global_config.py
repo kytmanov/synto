@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .config import ModelProfile, ProviderBlock, to_toml
 from .paths import APP_NAME
+from .vault import atomic_write
 
 
 class GlobalConfig(BaseModel):
@@ -90,8 +91,7 @@ def save_global_config(cfg: GlobalConfig) -> None:
     change here. Only set fields are written (exclude_unset), so a partial config stays minimal.
     """
     path = _global_config_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(to_toml(cfg), encoding="utf-8")
+    atomic_write(path, to_toml(cfg))
 
 
 # ── known-vault registry (sidecar: vaults.toml, next to config.toml) ──────────
@@ -134,8 +134,7 @@ def save_known_vaults(paths: list[str]) -> None:
     import tomli_w
 
     path = _known_vaults_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(tomli_w.dumps({"vaults": paths}), encoding="utf-8")
+    atomic_write(path, tomli_w.dumps({"vaults": paths}))
 
 
 def register_known_vault(vault: Path | str) -> None:

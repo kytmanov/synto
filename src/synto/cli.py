@@ -642,8 +642,11 @@ def init(vault_path: str, existing: bool, non_interactive: bool, set_default: bo
                 "default vault. Fix or delete it, then re-run with --default.[/yellow]"
             )
             set_default = False
-        except Exception:
-            console.print("[yellow]⚠ Could not save default vault to global config.[/yellow]")
+        except Exception as exc:
+            console.print(
+                f"[yellow]⚠ Could not save default vault to global config: {exc}[/yellow]"
+            )
+            set_default = False
 
     # The --vault flag is only needed when this vault isn't the resolved default. It's the default
     # if --default was just passed, or if the global config (e.g. set by `synto setup`) already
@@ -994,8 +997,10 @@ def _print_vault_list() -> None:
         suffix = ""
         if is_default:
             suffix += " [dim](default)[/dim]"
-        if not _is_vault_dir(path):
+        if not path.exists():
             suffix += " [yellow]\\[missing][/yellow]"
+        elif not _is_vault_dir(path):
+            suffix += " [yellow]\\[not a vault][/yellow]"
         console.print(f"  {marker} {v}{suffix}")
     if default_resolved is None:
         console.print("[dim](no default vault set)[/dim]")
@@ -1059,8 +1064,8 @@ def vault_use(vault_path: Path) -> None:
 
     if is_legacy_vault(vault):
         console.print(
-            f"[dim]Legacy {LEGACY_CONFIG_FILE_NAME} vault — "
-            f"run [bold]{CLI_NAME} migrate-olw --vault {vault}[/bold] to upgrade.[/dim]"
+            f"[yellow]⚠ Legacy {LEGACY_CONFIG_FILE_NAME} vault — most commands will fail "
+            f"until you run [bold]{CLI_NAME} migrate-olw --vault {vault}[/bold].[/yellow]"
         )
     console.print(f"[green]Default vault set to:[/green] {vault}")
     env_vault = os.environ.get(VAULT_ENV_VAR)

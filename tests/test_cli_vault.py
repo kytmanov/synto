@@ -157,7 +157,10 @@ def test_vault_use_accepts_legacy_wiki_toml_vault(runner: CliRunner, cfg_dir: Pa
 
     result = runner.invoke(cli, ["vault", "use", str(vault)])
     assert result.exit_code == 0, result.output
+    # The default IS set, but most commands hard-fail on a legacy vault until migration —
+    # the success message must not bury that.
     assert "migrate-olw" in result.output
+    assert "most commands will fail" in result.output
     cfg = load_global_config()
     assert cfg is not None and cfg.vault == str(vault.resolve())
 
@@ -189,19 +192,26 @@ def test_bare_vault_lists_and_marks_default(runner: CliRunner, cfg_dir: Path, tm
     assert default_line.lstrip().startswith("*")
 
 
-def test_bare_vault_flags_missing(runner: CliRunner, cfg_dir: Path, tmp_path: Path):
+def test_bare_vault_flags_missing_and_not_a_vault(runner: CliRunner, cfg_dir: Path, tmp_path: Path):
+    """A deleted dir and a dir that merely lost its config are different problems with
+    different fixes (forget vs re-init) — the list must not lump both under [missing]."""
     import shutil
 
     vault_a = _make_vault(tmp_path, "vault-a")
     vault_b = _make_vault(tmp_path, "vault-b")
+    vault_c = _make_vault(tmp_path, "vault-c")
     runner.invoke(cli, ["vault", "use", str(vault_b)])
+    runner.invoke(cli, ["vault", "use", str(vault_c)])
     runner.invoke(cli, ["vault", "use", str(vault_a)])
     shutil.rmtree(vault_b)
+    (vault_c / "synto.toml").unlink()
 
     result = runner.invoke(cli, ["vault"])
     assert result.exit_code == 0
     missing_line = next(line for line in result.output.splitlines() if "[missing]" in line)
     assert "vault-b" in missing_line
+    not_vault_line = next(line for line in result.output.splitlines() if "[not a vault]" in line)
+    assert "vault-c" in not_vault_line
 
 
 def test_bare_vault_shows_unregistered_default(runner: CliRunner, cfg_dir: Path, tmp_path: Path):
@@ -329,6 +339,23 @@ def test_init_default_refuses_overwrite_when_config_malformed(
     assert "can't be parsed" in result.output
     assert path.read_bytes() == before
     assert vault.is_dir()
+
+
+def test_init_default_save_failure_does_not_claim_default(
+    runner: CliRunner, cfg_dir: Path, tmp_path: Path
+):
+    """When the global-config save fails for a non-parse reason (permissions, disk full),
+    init must not print the set-as-default success line or drop --vault from the next
+    steps — the default was never saved and later commands would not resolve this vault."""
+    vault = tmp_path / "fresh-vault"
+    with patch("synto.global_config.save_global_config", side_effect=OSError("disk full")):
+        result = runner.invoke(cli, ["init", str(vault), "--default"])
+
+    assert result.exit_code == 0, result.output
+    assert "Could not save default vault" in result.output
+    assert "Set as default vault" not in result.output
+    assert "--vault" in result.output
+    assert load_global_config() is None
 
 
 def test_setup_wizard_registers_vault(runner: CliRunner, cfg_dir: Path, tmp_path: Path):
