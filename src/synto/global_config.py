@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import tomllib
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -104,29 +105,37 @@ def _known_vaults_path() -> Path:
     return _global_config_path().parent / "vaults.toml"
 
 
-def _vault_key(vault: Path | str) -> str:
+def vault_key(vault: Path | str) -> str:
+    """Canonical identity of a vault path — the one definition of "same vault"."""
     # normcase: paths differing only by case are the same vault on Windows.
     return os.path.normcase(str(Path(vault).expanduser().resolve()))
+
+
+def _read_known_vaults() -> tuple[list[str], bool]:
+    """(paths, malformed). `malformed` is True only when the file exists but could not be read
+    as a list of strings — the case where a blind rewrite would destroy data, as opposed to
+    "nothing registered yet"."""
+    path = _known_vaults_path()
+    if not path.exists():
+        return [], False
+    try:
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+        vaults = data.get("vaults")
+        if not isinstance(vaults, list):
+            return [], True
+        return [v for v in vaults if isinstance(v, str)], False
+    except Exception:
+        return [], True
 
 
 def load_known_vaults() -> list[str]:
     """Registered vault paths (resolved strings, insertion order).
 
     [] on missing or malformed file — unlike config.toml, the registry holds no secrets and is
-    regenerable by re-running `vault use`, so reads fail open and the next write repairs it.
+    regenerable by re-running `vault use`, so reads fail open.
     """
-    path = _known_vaults_path()
-    if not path.exists():
-        return []
-    try:
-        with open(path, "rb") as f:
-            data = tomllib.load(f)
-        vaults = data.get("vaults")
-        if not isinstance(vaults, list):
-            return []
-        return [v for v in vaults if isinstance(v, str)]
-    except Exception:
-        return []
+    return _read_known_vaults()[0]
 
 
 def save_known_vaults(paths: list[str]) -> None:
@@ -140,30 +149,40 @@ def save_known_vaults(paths: list[str]) -> None:
 def register_known_vault(vault: Path | str) -> None:
     """Best-effort add to the registry (dedup by resolved, case-normalized path).
 
-    Never raises: registry bookkeeping must not crash init/setup/vault-use.
+    Never raises: registry bookkeeping must not crash init/setup/vault-use. That also means a
+    failed write leaves the registry stale and silent — acceptable, because the caller's real
+    work (creating the vault, saving the default) has already succeeded.
     """
     try:
         resolved = str(Path(vault).expanduser().resolve())
-        vaults = load_known_vaults()
-        if _vault_key(resolved) in {_vault_key(v) for v in vaults}:
+        vaults, malformed = _read_known_vaults()
+        if vault_key(resolved) in {vault_key(v) for v in vaults}:
             return
+        if malformed:
+            # We are about to overwrite a file we could not read, which may list vaults the user
+            # would otherwise have to remember by hand. Move it aside first; if the write below
+            # then fails, the quarantined copy is the only recoverable form of it anyway.
+            reg = _known_vaults_path()
+            reg.replace(reg.with_name(reg.name + ".corrupt"))
         save_known_vaults([*vaults, resolved])
     except Exception:
         pass
 
 
-def forget_known_vault(vault: Path | str) -> bool:
-    """Remove the registry entry matching the resolved path. True if one was removed.
+def forget_known_vault(vault: Path | str) -> Literal["removed", "absent", "error"]:
+    """Remove the registry entry matching the resolved path.
 
-    Never raises.
+    Never raises. "error" is distinct from "absent" so callers cannot report a failed write as
+    "this vault was never registered". A malformed registry parses to nothing, so it reports
+    "absent" and is left untouched rather than rewritten.
     """
     try:
-        key = _vault_key(vault)
+        key = vault_key(vault)
         vaults = load_known_vaults()
-        kept = [v for v in vaults if _vault_key(v) != key]
+        kept = [v for v in vaults if vault_key(v) != key]
         if len(kept) == len(vaults):
-            return False
+            return "absent"
         save_known_vaults(kept)
-        return True
+        return "removed"
     except Exception:
-        return False
+        return "error"

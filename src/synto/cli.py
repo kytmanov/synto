@@ -472,6 +472,7 @@ def init(vault_path: str, existing: bool, non_interactive: bool, set_default: bo
         load_global_config_strict,
         register_known_vault,
         save_global_config,
+        vault_key,
     )
 
     gcfg = load_global_config()
@@ -654,7 +655,7 @@ def init(vault_path: str, existing: bool, non_interactive: bool, set_default: bo
     vault_is_default = set_default
     if not vault_is_default and gcfg is not None and gcfg.vault:
         try:
-            vault_is_default = Path(gcfg.vault).expanduser().resolve() == vault
+            vault_is_default = vault_key(gcfg.vault) == vault_key(vault)
         except Exception:
             vault_is_default = False
 
@@ -964,8 +965,9 @@ def _print_vault_list() -> None:
 
     from .global_config import (
         _global_config_path,
+        _read_known_vaults,
         load_global_config,
-        load_known_vaults,
+        vault_key,
     )
 
     gcfg = load_global_config()
@@ -973,12 +975,17 @@ def _print_vault_list() -> None:
     if gcfg is None and _global_config_path().exists():
         console.print("[dim]Global config exists but can't be parsed — no default vault.[/dim]")
 
-    vaults = load_known_vaults()
+    vaults, malformed = _read_known_vaults()
+    if malformed:
+        console.print(
+            "[dim]Known-vaults list is unreadable — it will be moved aside and replaced on the "
+            f"next [bold]{CLI_NAME} vault use[/bold].[/dim]"
+        )
     # A default set before the registry existed (or by hand-editing config.toml) must still
-    # show up — display the union. normcase: same-vault-different-case on Windows.
+    # show up — display the union.
     default_resolved = str(Path(default).expanduser().resolve()) if default else None
-    default_key = os.path.normcase(default_resolved) if default_resolved else None
-    if default_resolved and default_key not in {os.path.normcase(v) for v in vaults}:
+    default_key = vault_key(default_resolved) if default_resolved else None
+    if default_resolved and default_key not in {vault_key(v) for v in vaults}:
         vaults = [default_resolved, *vaults]
 
     if not vaults:
@@ -992,7 +999,7 @@ def _print_vault_list() -> None:
     console.print("Known vaults:")
     for v in vaults:
         path = Path(v)
-        is_default = default_key is not None and os.path.normcase(v) == default_key
+        is_default = default_key is not None and vault_key(v) == default_key
         marker = "*" if is_default else " "
         suffix = ""
         if is_default:
@@ -1022,6 +1029,7 @@ def vault_use(vault_path: Path) -> None:
         load_global_config_strict,
         register_known_vault,
         save_global_config,
+        vault_key,
     )
 
     vault = vault_path.expanduser().resolve()
@@ -1059,7 +1067,16 @@ def vault_use(vault_path: Path) -> None:
         sys.exit(1)
     gcfg = gcfg or GlobalConfig()
     gcfg.vault = str(vault)
-    save_global_config(gcfg)
+    try:
+        save_global_config(gcfg)
+    except Exception as exc:
+        # Unlike `init --default`, switching the default IS this command — a warning over a
+        # no-op would leave the user believing later commands resolve to this vault.
+        click.echo(
+            f"Error: could not save the default vault to {_global_config_path()}: {exc}",
+            err=True,
+        )
+        sys.exit(1)
     register_known_vault(vault)
 
     if is_legacy_vault(vault):
@@ -1069,7 +1086,7 @@ def vault_use(vault_path: Path) -> None:
         )
     console.print(f"[green]Default vault set to:[/green] {vault}")
     env_vault = os.environ.get(VAULT_ENV_VAR)
-    if env_vault and str(Path(env_vault).expanduser().resolve()) != str(vault):
+    if env_vault and vault_key(env_vault) != vault_key(vault):
         console.print(
             f"[dim]Note: {VAULT_ENV_VAR}={env_vault} is set and overrides the default "
             "until unset.[/dim]"
@@ -1080,14 +1097,26 @@ def vault_use(vault_path: Path) -> None:
 @click.argument("vault_path", type=click.Path(path_type=Path))
 def vault_forget(vault_path: Path) -> None:
     """Remove VAULT_PATH from the known-vaults list (does not change the default)."""
-    from .global_config import forget_known_vault, load_global_config
+    from .global_config import (
+        _known_vaults_path,
+        forget_known_vault,
+        load_global_config,
+        vault_key,
+    )
 
     vault = vault_path.expanduser().resolve()
-    if not forget_known_vault(vault):
+    outcome = forget_known_vault(vault)
+    if outcome == "absent":
         click.echo(f"Not in known vaults: {vault}", err=True)
         sys.exit(1)
+    if outcome == "error":
+        click.echo(
+            f"Error: could not update the known-vaults registry: {_known_vaults_path()}",
+            err=True,
+        )
+        sys.exit(1)
     gcfg = load_global_config()
-    is_default = bool(gcfg and gcfg.vault and Path(gcfg.vault).expanduser().resolve() == vault)
+    is_default = bool(gcfg and gcfg.vault and vault_key(gcfg.vault) == vault_key(vault))
     if is_default:
         console.print(
             f"[yellow]Removed from known vaults, but it is still the default vault. "

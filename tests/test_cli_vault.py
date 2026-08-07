@@ -150,6 +150,22 @@ def test_vault_use_refuses_when_global_config_malformed(
     assert path.read_bytes() == before
 
 
+def test_vault_use_save_failure_exits_and_does_not_claim_success(
+    runner: CliRunner, cfg_dir: Path, tmp_path: Path
+):
+    """Switching the default IS this command. If the save fails (permissions, disk full) the
+    user must not be told it worked — every later command would still resolve the old vault."""
+    vault = _make_vault(tmp_path, "my-wiki")
+
+    with patch("synto.global_config.save_global_config", side_effect=OSError("disk full")):
+        result = runner.invoke(cli, ["vault", "use", str(vault)])
+
+    assert result.exit_code == 1
+    assert "Default vault set to" not in result.output
+    assert "disk full" in result.output
+    assert load_global_config() is None
+
+
 def test_vault_use_accepts_legacy_wiki_toml_vault(runner: CliRunner, cfg_dir: Path, tmp_path: Path):
     vault = tmp_path / "old-vault"
     vault.mkdir()
@@ -186,10 +202,16 @@ def test_bare_vault_lists_and_marks_default(runner: CliRunner, cfg_dir: Path, tm
     assert "Known vaults:" in result.output
     assert "vault-a" in result.output
     assert "vault-b" in result.output
-    # vault-b is the default: its line carries the marker
-    default_line = next(line for line in result.output.splitlines() if "(default)" in line)
-    assert "vault-b" in default_line
-    assert default_line.lstrip().startswith("*")
+    # vault-b is the default: marker + path + (default). Rich may soft-wrap long paths
+    # across lines, so join the entry rather than requiring a single physical line.
+    lines = result.output.splitlines()
+    default_idx = next(i for i, line in enumerate(lines) if "(default)" in line)
+    # Walk back to the list entry that starts with the marker (or its wrap siblings).
+    entry = "\n".join(lines[max(0, default_idx - 2) : default_idx + 1])
+    assert "vault-b" in entry
+    assert "*" in entry
+    # Non-default vault must not be marked as default.
+    assert "(default)" not in "\n".join(line for line in lines if "vault-a" in line)
 
 
 def test_bare_vault_flags_missing_and_not_a_vault(runner: CliRunner, cfg_dir: Path, tmp_path: Path):
@@ -237,10 +259,30 @@ def test_bare_vault_survives_malformed_registry(runner: CliRunner, cfg_dir: Path
     result = runner.invoke(cli, ["vault"])
     assert result.exit_code == 0
     assert "my-wiki" in result.output
+    # The rewrite is destructive, so it must be announced before it happens.
+    assert "unreadable" in result.output
 
     # The next successful registration rewrites the corrupt registry.
     assert runner.invoke(cli, ["vault", "use", str(vault)]).exit_code == 0
     assert load_known_vaults() == [str(vault.resolve())]
+
+
+def test_malformed_registry_is_quarantined_not_clobbered(
+    runner: CliRunner, cfg_dir: Path, tmp_path: Path
+):
+    """A registry that fails to parse still holds the only record of which vaults the user has.
+    Overwriting it with the one vault being registered loses the rest silently."""
+    vault_c = _make_vault(tmp_path, "vault-c")
+    reg = _known_vaults_path()
+    reg.parent.mkdir(parents=True, exist_ok=True)
+    corrupt = 'vaults = ["/a/vault-a", "/b/vault-b"\n'  # truncated: valid paths, invalid TOML
+    reg.write_bytes(corrupt.encode())
+
+    assert runner.invoke(cli, ["vault", "use", str(vault_c)]).exit_code == 0
+
+    quarantined = reg.with_name(reg.name + ".corrupt")
+    assert quarantined.read_bytes() == corrupt.encode()
+    assert load_known_vaults() == [str(vault_c.resolve())]
 
 
 def test_bare_vault_empty_state(runner: CliRunner, cfg_dir: Path):
@@ -296,10 +338,54 @@ def test_vault_forget_default_warns_and_keeps_default(
     assert cfg is not None and cfg.vault == str(vault.resolve())
 
 
+def test_vault_forget_default_warning_survives_non_canonical_default(
+    runner: CliRunner, cfg_dir: Path, tmp_path: Path
+):
+    """The still-the-default check must compare canonical vault identity, not path strings.
+
+    `config.toml` is user-editable and `synto setup` stores whatever the user typed, so the
+    default can be a non-normalized spelling of the vault being forgotten. A raw string compare
+    misses it and drops the warning, leaving the user to think forgetting also cleared the
+    default.
+    """
+    vault = _make_vault(tmp_path, "my-wiki")
+    runner.invoke(cli, ["vault", "use", str(vault)])
+
+    # Same vault, different spelling — survives the TOML round-trip uncollapsed.
+    cfg = load_global_config()
+    assert cfg is not None
+    cfg.vault = f"{tmp_path}/./my-wiki"
+    save_global_config(cfg)
+    assert load_global_config().vault != str(vault.resolve())
+
+    result = runner.invoke(cli, ["vault", "forget", str(vault)])
+
+    assert result.exit_code == 0, result.output
+    assert "still the default" in result.output
+
+
 def test_vault_forget_unknown_exits_1(runner: CliRunner, cfg_dir: Path, tmp_path: Path):
     result = runner.invoke(cli, ["vault", "forget", str(tmp_path / "never-registered")])
     assert result.exit_code == 1
     assert "Not in known vaults" in result.output
+
+
+def test_vault_forget_write_failure_reports_registry_error(
+    runner: CliRunner, cfg_dir: Path, tmp_path: Path
+):
+    """A registry the CLI could not write is not the same as a vault it never knew about —
+    reporting the write failure as "Not in known vaults" tells the user the entry is gone when
+    it is still there."""
+    vault = _make_vault(tmp_path, "my-wiki")
+    runner.invoke(cli, ["vault", "use", str(vault)])
+
+    with patch("synto.global_config.save_known_vaults", side_effect=OSError("read-only fs")):
+        result = runner.invoke(cli, ["vault", "forget", str(vault)])
+
+    assert result.exit_code == 1
+    assert "Not in known vaults" not in result.output
+    assert "known-vaults registry" in result.output
+    assert load_known_vaults() == [str(vault.resolve())]
 
 
 # ── auto-registration: init / setup ───────────────────────────────────────────

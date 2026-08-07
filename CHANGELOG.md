@@ -8,7 +8,9 @@
   vault synto has seen (default marked, missing paths flagged), `synto vault use <path>`
   validates and switches the default without touching provider settings, and
   `synto vault forget <path>` prunes the list. `init` and `setup` register vaults
-  automatically. Started by @balazsjdp; closes #51.
+  automatically. Registry failures report themselves rather than passing for "not in known
+  vaults", and a list that can't be parsed is moved aside instead of overwritten.
+  Started by @balazsjdp; closes #51.
 
 ## [0.7.0] - 2026-07-20
 
