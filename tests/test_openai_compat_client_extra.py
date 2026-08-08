@@ -81,14 +81,18 @@ def test_wrap_error_timeout():
 
 
 def test_wrap_error_401():
-    """401 error mentions API key."""
+    """401 names the env var to fix and never echoes the key (#114)."""
     client = _make_client()
     mock_resp = MagicMock()
     mock_resp.status_code = 401
     mock_resp.text = "Unauthorized"
     err = client._wrap_error(httpx.HTTPStatusError("401", request=MagicMock(), response=mock_resp))
-    assert "401" in str(err)
-    assert "API key" in str(err)
+    msg = str(err)
+    assert "401" in msg
+    # Provider "test" is not in the registry, so the hint falls back to the generic var.
+    assert "$SYNTO_API_KEY" in msg
+    assert "rejected" in msg
+    assert "sk-test" not in msg
 
 
 def test_wrap_error_429():

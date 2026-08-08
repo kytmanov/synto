@@ -200,6 +200,11 @@ def dedup_role_connections(
     "default" so string-form/embed roles resolve to it. Connections that differ by api_key_env
     (a different account) or headers stay distinct. Returns ({alias: ProviderBlock}, {role: alias}).
     Shared by `synto setup` and the `synto compare` contestant materializer (synthesize path).
+
+    An optional `api_key_fingerprint` (short sha256 prefix of a raw key, never the key itself)
+    also discriminates: two raw keys on the same provider+URL both carry `api_key_env = None`,
+    so without this they'd collapse into one alias and one key would be silently overwritten.
+    The compare materializer never sets it, so its specs are unaffected.
     """
 
     def _key(spec: dict) -> tuple:
@@ -208,6 +213,7 @@ def dedup_role_connections(
             spec.get("url"),
             spec.get("timeout"),
             spec.get("api_key_env"),
+            spec.get("api_key_fingerprint"),
             spec.get("azure_api_version"),
             tuple(sorted((spec.get("headers") or {}).items())),
         )

@@ -46,6 +46,7 @@ def _build_client_for(resolved: ResolvedModel, cache: LLMCache | None) -> LLMCli
             cache=cache,
             extra_headers=headers,
             cache_namespace=namespace,
+            api_key_env=resolved.api_key_env,
         )
 
     return OpenAICompatClient(
@@ -60,6 +61,7 @@ def _build_client_for(resolved: ResolvedModel, cache: LLMCache | None) -> LLMCli
         cache=cache,
         extra_headers=headers,
         cache_namespace=namespace,
+        api_key_env=resolved.api_key_env,
     )
 
 

@@ -211,6 +211,28 @@ def test_dedup_role_connections_shares_and_splits():
     assert role_alias["fast"] != role_alias["heavy"]
     assert providers[role_alias["fast"]].api_key_env == "KEY_A"
 
+    # Same provider+URL, both raw-keyed (api_key_env=None for both) but different accounts
+    # (issue #114 second-order bug): the fingerprint must keep them from collapsing into one
+    # alias, which would silently overwrite one account's key with the other's.
+    providers, role_alias = dedup_role_connections(
+        {
+            "fast": {
+                "name": "deepinfra",
+                "url": "https://api.deepinfra.com/v1/openai",
+                "api_key_env": None,
+                "api_key_fingerprint": "aaaaaaaaaaaa",
+            },
+            "heavy": {
+                "name": "deepinfra",
+                "url": "https://api.deepinfra.com/v1/openai",
+                "api_key_env": None,
+                "api_key_fingerprint": "bbbbbbbbbbbb",
+            },
+        }
+    )
+    assert len(providers) == 2
+    assert role_alias["fast"] != role_alias["heavy"]
+
 
 def test_nested_options_round_trip_through_toml_writers(tmp_path):
     # Provider-native options can be nested ({"thinking": {"budget": 1}}) and the runtime accepts

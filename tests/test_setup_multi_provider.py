@@ -31,20 +31,25 @@ def _isolate_global_config(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
 
 
-def _spec(name: str, model: str, api_key_env: str | None = None) -> dict:
+def _spec(
+    name: str, model: str, api_key_env: str | None = None, api_key_fingerprint: str | None = None
+) -> dict:
     """A connection spec in the shape `_collect_role_provider` / the setup branch produce."""
     prov = PROVIDER_REGISTRY[name]
     return {
         "name": name,
         "url": prov.default_url or "",
         "api_key_env": api_key_env,
+        "api_key_fingerprint": api_key_fingerprint,
         "azure_api_version": None,
         "model": model,
         "timeout": int(prov.default_timeout),
     }
 
 
-def _finalize(fast, heavy, *, vault_input="", citations=False, fast_api_key=None):
+def _finalize(
+    fast, heavy, *, vault_input="", citations=False, fast_api_key=None, heavy_api_key=None
+):
     _finalize_per_role_providers(
         Console(),
         fast=fast,
@@ -52,6 +57,7 @@ def _finalize(fast, heavy, *, vault_input="", citations=False, fast_api_key=None
         vault_input=vault_input,
         citations=citations,
         fast_api_key=fast_api_key,
+        heavy_api_key=heavy_api_key,
     )
 
 
@@ -98,6 +104,48 @@ def test_reused_primary_raw_key_lands_in_provider_keys_under_fast_alias():
     fast_alias = g.models["fast"].provider
     assert g.provider_keys[fast_alias] == "raw-fast-secret"
     assert g.providers[fast_alias].api_key_env is None
+
+
+def test_heavy_raw_key_lands_in_provider_keys_not_vault_toml(tmp_path):
+    # Issue #114: the heavy role must be able to store a raw key (mirroring fast), and it must
+    # land only in the user-private global config — never in the vault's git-committed synto.toml.
+    vault = tmp_path / "wiki"
+    vault.mkdir()
+    _finalize(
+        _spec("ollama", "gemma4:e4b"),
+        _spec("deepinfra", "openai/gpt-oss-120b"),  # api_key_env=None -> the raw-key path
+        vault_input=str(vault),
+        heavy_api_key="raw-heavy-secret",
+    )
+
+    g = load_global_config()
+    heavy_alias = g.models["heavy"].provider
+    assert g.provider_keys[heavy_alias] == "raw-heavy-secret"
+    assert g.providers[heavy_alias].api_key_env is None
+
+    toml_text = (vault / "synto.toml").read_text()
+    assert "raw-heavy-secret" not in toml_text
+    config_text = _global_config_path().read_text()
+    assert "raw-heavy-secret" in config_text  # confirms it landed somewhere, not silently dropped
+
+
+def test_two_raw_keys_same_provider_url_stay_distinct():
+    # Second-order bug (#114): fast and heavy on the same provider+URL but different accounts,
+    # both raw-keyed (api_key_env=None for both), must NOT collapse into one alias/one key.
+    _finalize(
+        _spec("deepinfra", "model-a", api_key_fingerprint="fast-fp"),
+        _spec("deepinfra", "model-b", api_key_fingerprint="heavy-fp"),
+        fast_api_key="fast-secret",
+        heavy_api_key="heavy-secret",
+    )
+
+    g = load_global_config()
+    assert g is not None and g.is_multi_provider
+    fast_alias = g.models["fast"].provider
+    heavy_alias = g.models["heavy"].provider
+    assert fast_alias != heavy_alias  # two distinct provider blocks, not one collapsed alias
+    assert g.provider_keys[fast_alias] == "fast-secret"
+    assert g.provider_keys[heavy_alias] == "heavy-secret"
 
 
 def test_optionally_applies_to_existing_vault_preserving_pipeline(tmp_path):

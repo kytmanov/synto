@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **401s and `synto doctor` now name the missing credential instead of a bare "unauthorized" (#114).**
+  A cloud provider's `/models` endpoint often answers without auth, so setup's connectivity
+  probe and `doctor` could both report success on a connection that would 401 on the real
+  request. Both now check whether a key actually resolved: the setup wizard reports "reachable,
+  but no API key found" with the env var to export, and `doctor` gives an uncredentialed role
+  its own `✗` instead of a false `✓`. 401 error messages name the env var to set (or say the
+  key was rejected) without ever echoing the key itself. The heavy role's provider prompt can
+  now also take a raw key (mirroring the fast/primary role), stored only in the user-private
+  global config, never the vault's `synto.toml`.
+
 ### Added
 
 - **`synto vault` — see and switch between known vaults (#112).** `synto vault` lists every

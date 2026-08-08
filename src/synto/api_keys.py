@@ -20,6 +20,8 @@ import os
 from .paths import API_KEY_ENV_VAR
 from .providers import get_provider
 
+_LOCAL_URL_PREFIXES = ("http://localhost", "http://127.0.0.1")
+
 
 def resolve_api_key(
     provider_kind: str,
@@ -60,3 +62,34 @@ def resolve_api_key(
         return gcfg.api_key
 
     return None
+
+
+def credential_gap(
+    provider_kind: str,
+    *,
+    api_key: str | None,
+    api_key_env: str | None,
+    url: str,
+    has_custom_headers: bool,
+) -> tuple[str, str | None] | None:
+    """(reason, suggested_env_var) when a role has no working credential, else None.
+
+    Takes primitives rather than a ResolvedModel: config.py imports this module, so
+    importing ResolvedModel back would cycle. Reason is "declared" (the block named an
+    env var that resolved to nothing) or "missing" (nothing was configured at all); the
+    suggested var may be None for "missing" when the provider has no conventional env var.
+    """
+    if api_key:
+        return None
+    if has_custom_headers:
+        return None
+    prov = get_provider(provider_kind)
+    if prov is None:
+        return None
+    if not prov.requires_auth:
+        return None
+    if url.startswith(_LOCAL_URL_PREFIXES):
+        return None
+    if api_key_env:
+        return ("declared", api_key_env)
+    return ("missing", prov.env_var)

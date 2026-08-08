@@ -568,6 +568,17 @@ blocks at the same provider with different `api_key_env`) or none at all (local 
 Keys are read from the named env var, the provider's conventional env var, `SYNTO_API_KEY`,
 or the user-private `~/.config/synto/config.toml` — **never** from the vault's `synto.toml`.
 
+`api_key_env` only names an env var — it doesn't set one. synto reads it from the environment
+at run time, so it must be exported in the shell that runs `synto`, not just typed once during
+`synto setup`:
+
+```bash
+export NVIDIA_API_KEY=...
+synto compile --vault ~/my-wiki
+```
+
+Run `synto doctor` to check whether a role's key actually resolves before you hit a 401 mid-run.
+
 `synto setup` can configure this interactively: after you pick the primary provider and fast
 model, answer "yes" to "Use a different provider for the heavy (writing) model?" and the primary
 is reused as the fast role while you set up the heavy one. It saves the split to the global config

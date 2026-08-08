@@ -443,11 +443,11 @@ def test_setup_wizard_per_role_branch_reuses_primary_as_fast(runner: CliRunner, 
         MockCloudClient.return_value = cloud_instance
 
         # primary=ollama default + fast model, "y" to a different heavy provider, then the heavy
-        # provider (groq, default key env, model), no vault, citations off.
+        # provider (groq, blank raw key, default key env, model), no vault, citations off.
         result = runner.invoke(
             cli,
             ["setup"],
-            input="\n\ngemma4:e4b\ny\ngroq\n\n\nllama-3.3-70b\n\n\n",
+            input="\n\ngemma4:e4b\ny\ngroq\n\n\n\nllama-3.3-70b\n\n\n",
             catch_exceptions=False,
         )
 
@@ -467,6 +467,97 @@ def test_setup_wizard_per_role_branch_reuses_primary_as_fast(runner: CliRunner, 
     assert cfg.providers[heavy_alias].name == "groq"
     assert cfg.providers[heavy_alias].api_key_env == "GROQ_API_KEY"
     assert cfg.models["heavy"].model == "llama-3.3-70b"
+
+
+def test_setup_wizard_cloud_provider_no_key_does_not_claim_connected(
+    runner: CliRunner, cfg_dir: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Issue #114: DeepInfra's (and Groq's) /models returns 200 with no auth. A reachable cloud
+    provider with no credential must not print the same ✓ connected verdict as an authenticated
+    one — it must name the missing env var instead."""
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.delenv("SYNTO_API_KEY", raising=False)
+    with patch("synto.openai_compat_client.OpenAICompatClient") as MockClient:
+        instance = MagicMock()
+        instance.healthcheck.return_value = True
+        instance.list_models_detailed.return_value = []
+        MockClient.return_value = instance
+
+        # provider=groq, URL default, key blank, fast model, same heavy provider, heavy model,
+        # no vault, citations off.
+        result = runner.invoke(
+            cli,
+            ["setup"],
+            input="groq\n\n\nllama3\n\nllama3\n\n\n",
+            catch_exceptions=False,
+        )
+
+    assert result.exit_code == 0
+    assert "✓ connected" not in result.output
+    assert "reachable, but no API key found" in result.output
+    assert "export GROQ_API_KEY=" in result.output
+
+
+def test_setup_wizard_exported_env_var_counts_as_a_key(
+    runner: CliRunner, cfg_dir: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Leaving the key blank is the documented way to use an already-exported var.
+
+    The key prompt itself says "(or set GROQ_API_KEY env var)", so warning that no key was
+    found when that var IS exported would contradict the wizard's own instruction and push
+    users toward pasting a secret they don't need to store.
+    """
+    monkeypatch.setenv("GROQ_API_KEY", "gsk-already-exported")
+    with patch("synto.openai_compat_client.OpenAICompatClient") as MockClient:
+        instance = MagicMock()
+        instance.healthcheck.return_value = True
+        instance.list_models_detailed.return_value = []
+        MockClient.return_value = instance
+
+        result = runner.invoke(
+            cli,
+            ["setup"],
+            input="groq\n\n\nllama3\n\nllama3\n\n\n",
+            catch_exceptions=False,
+        )
+
+    assert result.exit_code == 0
+    assert "✓ connected" in result.output
+    assert "no API key found" not in result.output
+
+
+def test_setup_wizard_per_role_heavy_no_key_does_not_claim_connected(
+    runner: CliRunner, cfg_dir: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Same as above, for the separately-collected heavy provider (_collect_role_provider)."""
+    monkeypatch.delenv("DEEPINFRA_API_KEY", raising=False)
+    monkeypatch.delenv("SYNTO_API_KEY", raising=False)
+    with (
+        patch("synto.ollama_client.OllamaClient") as MockClient,
+        patch("synto.openai_compat_client.OpenAICompatClient") as MockCloudClient,
+    ):
+        instance = MagicMock()
+        instance.healthcheck.return_value = False
+        instance.list_models_detailed.return_value = []
+        MockClient.return_value = instance
+        cloud_instance = MagicMock()
+        cloud_instance.healthcheck.return_value = True
+        cloud_instance.list_models_detailed.return_value = []
+        MockCloudClient.return_value = cloud_instance
+
+        # primary=ollama default + fast model, "y" to a different heavy provider, heavy=deepinfra,
+        # blank raw key, default key env, model, no vault, citations off.
+        result = runner.invoke(
+            cli,
+            ["setup"],
+            input="\n\ngemma4:e4b\ny\ndeepinfra\n\n\n\nopenai/gpt-oss-120b\n\n\n",
+            catch_exceptions=False,
+        )
+
+    assert result.exit_code == 0
+    assert "✓ connected" not in result.output
+    assert "reachable, but no API key found" in result.output
+    assert "export DEEPINFRA_API_KEY=" in result.output
 
 
 def test_setup_wizard_per_role_heavy_lists_models(runner: CliRunner, cfg_dir: Path):

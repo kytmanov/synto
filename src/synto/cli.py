@@ -1178,10 +1178,13 @@ def _select_provider(console):
 
 
 def _build_probe_client(name, url, prov, *, api_key=None):
-    """Build a short-timeout client for a provider and return (client, connected).
+    """Build a short-timeout client for a provider and return (client, connected, resolved_key).
 
     Resolves the key like the live pipeline: explicit api_key → prov.env_var env →
     SYNTO_API_KEY. Client classes are imported locally so test patches on them apply.
+    resolved_key is always None for Ollama (no auth concept); for cloud providers it's
+    whatever key actually got sent, so callers can tell "connected" apart from "reachable
+    but nothing would authenticate" (#114).
     """
     import os
 
@@ -1189,6 +1192,7 @@ def _build_probe_client(name, url, prov, *, api_key=None):
         from .ollama_client import OllamaClient
 
         client = OllamaClient(base_url=url, timeout=5)
+        resolved_key = None
     else:
         from .openai_compat_client import OpenAICompatClient
 
@@ -1206,7 +1210,14 @@ def _build_probe_client(name, url, prov, *, api_key=None):
             supports_embeddings=prov.supports_embeddings,
             azure=prov.azure,
         )
-    return client, client.healthcheck()
+    return client, client.healthcheck(), resolved_key
+
+
+def _short_fingerprint(raw_key: str) -> str:
+    """8-char sha256 prefix — enough to tell two raw keys apart in dedup, never reversible."""
+    import hashlib
+
+    return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()[:8]
 
 
 def _pick_model(
@@ -1256,15 +1267,21 @@ def _pick_model(
         return raw if raw else default_fallback
 
 
-def _collect_role_provider(console, role_label: str, default_model: str = "") -> dict:
-    """Prompt for one role's provider, URL, API-key env var, and model.
+def _collect_role_provider(
+    console, role_label: str, default_model: str = ""
+) -> tuple[dict, str | None]:
+    """Prompt for one role's provider, URL, API key (raw or env var), and model.
 
     Mirrors the primary/Fast step: same rich Local/Cloud/Custom provider list
     (`_select_provider`), a live probe (`_build_probe_client`), and the numbered model
-    table (`_pick_model`). Additional providers store an `api_key_env` reference (never a
-    raw key) because the vault synto.toml is git-committed.
+    table (`_pick_model`). Returns (spec, raw_api_key): the spec's `api_key_env` is only
+    ever an env-var reference (never a raw key), because the vault synto.toml is
+    git-committed; a typed raw key is returned separately for the caller to store in the
+    user-private global config only (mirrors the primary/fast flow's Step 3).
     """
     import os
+
+    from .api_keys import credential_gap
 
     console.print(f"  [bold]{role_label}[/bold]  pick its provider, then model")
     prov, name = _select_provider(console)
@@ -1286,13 +1303,25 @@ def _collect_role_provider(console, role_label: str, default_model: str = "") ->
         console.print("    [red]URL is required for this provider.[/red]")
 
     api_key_env: str | None = None
+    role_api_key: str | None = None
     # Only cloud providers need a key. Local servers (Ollama/LM Studio/vLLM/…) are no-auth;
     # prompting here would default to a phantom PROVIDER_API_KEY env var (env_var is None for
     # locals), which then also blocks dedup against an identical key-less primary connection.
     if not prov.is_local:
+        console.print()
+        console.print("    API key  [dim](optional — press Enter to skip)[/dim]")
+        try:
+            raw_key = Prompt.ask("    Key", default="", password=True, console=console).strip()
+        except Exception:
+            console.print(
+                "    [dim]Note: terminal does not support hidden input — key will be visible[/dim]"
+            )
+            raw_key = Prompt.ask("    Key", default="", console=console).strip()
+        role_api_key = raw_key or None
+
         default_env = prov.env_var or "PROVIDER_API_KEY"
         console.print(
-            "    [dim]Enter the env var name that holds the key (not the key itself).[/dim]"
+            "    [dim]Or the env var name that already holds the key (not the key itself).[/dim]"
         )
         api_key_env = (
             Prompt.ask("    API key env var", default=default_env, console=console).strip() or None
@@ -1306,11 +1335,24 @@ def _collect_role_provider(console, role_label: str, default_model: str = "") ->
             or "2024-02-15-preview"
         )
 
-    client, connected = _build_probe_client(
-        name, url, prov, api_key=os.environ.get(api_key_env) if api_key_env else None
+    client, connected, resolved_key = _build_probe_client(
+        name,
+        url,
+        prov,
+        api_key=role_api_key or (os.environ.get(api_key_env) if api_key_env else None),
     )
     if connected:
-        console.print("    [green]✓ connected[/green]")
+        gap = credential_gap(
+            name, api_key=resolved_key, api_key_env=api_key_env, url=url, has_custom_headers=False
+        )
+        if gap is not None:
+            var = gap[1] or "SYNTO_API_KEY"
+            # Split across short prints — a single long line wraps at the console's default
+            # width, which can break "export VAR=" across lines and defeat substring checks.
+            console.print(f"    [yellow]{url} is reachable, but no API key found.[/yellow]")
+            console.print(f"    [dim]Run: export {var}=...[/dim]")
+        else:
+            console.print("    [green]✓ connected[/green]")
     else:
         console.print(f"    [yellow]Warning:[/yellow] Cannot reach {url} — continuing anyway.")
 
@@ -1326,14 +1368,18 @@ def _collect_role_provider(console, role_label: str, default_model: str = "") ->
     client.close()
     while not model:
         model = Prompt.ask("    Model name (required)", console=console).strip()
-    return {
+    spec = {
         "name": name,
         "url": url,
-        "api_key_env": api_key_env,
+        # A raw key is carried separately (role_api_key, never the vault); only fall back to
+        # the env-var reference when no raw key was typed.
+        "api_key_env": api_key_env if not role_api_key else None,
+        "api_key_fingerprint": _short_fingerprint(role_api_key) if role_api_key else None,
         "azure_api_version": azure_api_version,
         "model": model,
         "timeout": int(prov.default_timeout),
     }
+    return spec, role_api_key
 
 
 def _finalize_per_role_providers(
@@ -1344,14 +1390,15 @@ def _finalize_per_role_providers(
     vault_input: str,
     citations: bool,
     fast_api_key: str | None = None,
+    heavy_api_key: str | None = None,
 ) -> None:
     """Persist a per-role provider split and optionally apply it to a vault.
 
     `fast`/`heavy` are connection specs in the shape `_collect_role_provider` returns. Writes
     only env-var references (api_key_env) into a vault's synto.toml — never raw keys — targeting
     an existing vault (preserving [pipeline] etc.), matching the documented secure path. A raw key
-    for the reused primary (fast) provider, if any, is passed as `fast_api_key` and stored only in
-    the user-private global config under provider_keys[<fast alias>] (resolve_api_key step 3).
+    typed for either role, if any, is passed as `fast_api_key`/`heavy_api_key` and stored only in
+    the user-private global config under provider_keys[<role alias>] (resolve_api_key step 3).
     """
     from .config import (
         ModelProfile,
@@ -1404,6 +1451,8 @@ def _finalize_per_role_providers(
             del provider_keys[alias]
     if fast_api_key:
         provider_keys[role_alias["fast"]] = fast_api_key
+    if heavy_api_key:
+        provider_keys[role_alias["heavy"]] = heavy_api_key
     gcfg = GlobalConfig(
         vault=vault_input or (existing.vault if existing else None),
         experimental_inline_source_citations=citations,
@@ -1622,11 +1671,29 @@ def setup(non_interactive: bool, reset: bool, provider_preset: str | None):
             api_key = raw_key if raw_key else None
 
         # ── Build a temp client to probe for model list ───────────────────────
-        temp_client, connected = _build_probe_client(
+        temp_client, connected, resolved_key = _build_probe_client(
             chosen_name, provider_url, chosen_prov, api_key=api_key
         )
         if connected:
-            console.print("    [green]✓ connected[/green]")
+            from .api_keys import credential_gap
+
+            gap = credential_gap(
+                chosen_name,
+                api_key=resolved_key,
+                api_key_env=chosen_prov.env_var if needs_key_prompt else None,
+                url=provider_url,
+                has_custom_headers=False,
+            )
+            if gap is not None:
+                var = gap[1] or "SYNTO_API_KEY"
+                # Split across short prints — a single long line wraps at the console's default
+                # width, which can break "export VAR=" across lines and defeat substring checks.
+                console.print(
+                    f"    [yellow]{provider_url} is reachable, but no API key found.[/yellow]"
+                )
+                console.print(f"    [dim]Run: export {var}=...[/dim]")
+            else:
+                console.print("    [green]✓ connected[/green]")
         else:
             console.print(
                 f"    [yellow]Warning:[/yellow] Cannot reach {provider_url} — continuing anyway."
@@ -1661,6 +1728,7 @@ def setup(non_interactive: bool, reset: bool, provider_preset: str | None):
         # provider configured above is reused as the fast role; only the heavy provider is
         # collected anew. Skipped under --provider to keep preset setup single-provider.
         heavy_spec: dict | None = None
+        heavy_api_key: str | None = None
         if not provider_preset:
             different_heavy = (
                 Prompt.ask(
@@ -1675,7 +1743,9 @@ def setup(non_interactive: bool, reset: bool, provider_preset: str | None):
             )
             if different_heavy == "y":
                 console.print()
-                heavy_spec = _collect_role_provider(console, "Heavy", default_model="qwen2.5:14b")
+                heavy_spec, heavy_api_key = _collect_role_provider(
+                    console, "Heavy", default_model="qwen2.5:14b"
+                )
 
         heavy_model = ""
         if heavy_spec is None:
@@ -1733,6 +1803,7 @@ def setup(non_interactive: bool, reset: bool, provider_preset: str | None):
                 "api_key_env": (
                     chosen_prov.env_var if (needs_key_prompt and not api_key) else None
                 ),
+                "api_key_fingerprint": _short_fingerprint(api_key) if api_key else None,
                 "azure_api_version": "2024-02-15-preview" if chosen_name == "azure" else None,
                 "model": fast_model,
                 "timeout": int(chosen_prov.default_timeout),
@@ -1744,6 +1815,7 @@ def setup(non_interactive: bool, reset: bool, provider_preset: str | None):
                 vault_input=vault_path or "",
                 citations=experimental_inline_source_citations,
                 fast_api_key=api_key,
+                heavy_api_key=heavy_api_key,
             )
             return
 
@@ -2877,6 +2949,7 @@ def _render_mcp_backlog(db, since: str) -> None:
 )
 def doctor(vault_str, backlog, since, reconcile):
     """Check LLM provider connection, model availability, and vault health."""
+    from .api_keys import credential_gap
     from .client_factory import LLMError, build_router
     from .config import HEALTHCHECK_ROLES, ROLES
 
@@ -2967,6 +3040,31 @@ def doctor(vault_str, backlog, since, reconcile):
                         f"  [yellow]•[/yellow] {role}: {resolved.model} — {conn} unreachable "
                         f"[dim](optional — only used if embeddings/RAG are enabled)[/dim]"
                     )
+                continue
+            # A reachable /models endpoint can succeed with no credential at all (#114) —
+            # require_healthy proves connectivity, not that the actual chat call would carry a key.
+            gap = credential_gap(
+                resolved.provider_kind,
+                api_key=resolved.api_key,
+                api_key_env=resolved.api_key_env,
+                url=resolved.url,
+                has_custom_headers=bool(resolved.headers),
+            )
+            if gap is not None:
+                var = gap[1] or "SYNTO_API_KEY"
+                # Split across short prints — a single long line wraps at the console's default
+                # width, which can break "$VAR is not set" across lines and defeat substring
+                # checks (both in tests and in a user's actual terminal).
+                if required:
+                    console.print(f"  [red]✗[/red] {role}: {resolved.model} — {conn}")
+                    console.print(f"      ${var} is not set  [dim]Run: export {var}=...[/dim]")
+                    ok = False
+                else:
+                    console.print(
+                        f"  [yellow]•[/yellow] {role}: {resolved.model} — {conn} "
+                        f"[dim](optional — only used if embeddings/RAG are enabled)[/dim]"
+                    )
+                    console.print(f"      ${var} is not set")
                 continue
             if any(resolved.model in m for m in models):
                 console.print(

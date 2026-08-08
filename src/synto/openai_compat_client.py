@@ -34,6 +34,8 @@ from typing import TYPE_CHECKING
 
 import httpx
 
+from .providers import get_provider
+
 if TYPE_CHECKING:
     from .cache import LLMCache
 
@@ -222,10 +224,15 @@ class OpenAICompatClient:
         cache: LLMCache | None = None,
         extra_headers: dict[str, str] | None = None,
         cache_namespace: str | None = None,
+        api_key_env: str | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.provider_name = provider_name
         self._api_key = api_key
+        # The block-declared env var name (not the secret), for a self-diagnosing 401 message.
+        # No caller passes build_router(..., api_key_env=...), so this always equals the block's
+        # declared ResolvedModel.api_key_env — the hint below names the variable the user set.
+        self._api_key_env = api_key_env
         self._timeout = timeout
         self.supports_json_mode = supports_json_mode
         self.supports_embeddings = supports_embeddings
@@ -294,11 +301,25 @@ class OpenAICompatClient:
             if code == 400:
                 return LLMBadRequestError(f"{prefix}HTTP {code}: {exc.response.text[:200]}")
             if code == 401:
-                return LLMError(f"{prefix}HTTP 401 Unauthorized. Check your API key.")
+                return LLMError(f"{prefix}{self._unauthorized_message()}")
             if code == 429:
                 return LLMError(f"{prefix}HTTP 429 Rate limit exceeded. Wait and retry.")
             return LLMError(f"{prefix}HTTP {code}: {exc.response.text[:200]}")
         return LLMError(f"{prefix}{exc}")
+
+    def _unauthorized_message(self) -> str:
+        """401 message that names the env var to fix, never the key value (#114)."""
+        prov = get_provider(self.provider_name)
+        var = self._api_key_env or (prov.env_var if prov else None) or "SYNTO_API_KEY"
+        if not self._api_key:
+            return (
+                f"HTTP 401 Unauthorized — no API key was sent. Set ${var} in your "
+                f"environment (export {var}=...), then re-run. See: synto doctor"
+            )
+        return (
+            f"HTTP 401 Unauthorized — the key from ${var} was rejected. "
+            "Check that it is valid for this account."
+        )
 
     def _is_local(self) -> bool:
         return self.base_url.startswith("http://localhost") or self.base_url.startswith(
