@@ -329,7 +329,9 @@ def extract_bibliographic_metadata(path: Path, first_page_md: str) -> Bibliograp
     """Heuristic extraction of bibliographic metadata from a PDF file.
 
     Tries PDF metadata dict first, then falls back to first-page text heuristics
-    for title.  DOI and year are extracted via regex from the first page markdown.
+    for title.  DOI is extracted via regex from the first page markdown.  Year
+    prefers the PDF's own creationDate, since the first-page body text often
+    cites an earlier year (a reference, a prior report) before its own.
     """
     doc = fitz.open(str(path))
     try:
@@ -356,14 +358,14 @@ def extract_bibliographic_metadata(path: Path, first_page_md: str) -> Bibliograp
         doi = doi_match.group(0).rstrip(".,;)")
 
     year: int | None = None
-    year_match = re.search(r"\b(19|20)\d{2}\b", first_page_md)
-    if year_match:
-        year = int(year_match.group(0))
+    creation_date = meta.get("creationDate", "")
+    date_match = re.search(r"D:(\d{4})", creation_date)
+    if date_match:
+        year = int(date_match.group(1))
     if year is None:
-        creation_date = meta.get("creationDate", "")
-        date_match = re.search(r"D:(\d{4})", creation_date)
-        if date_match:
-            year = int(date_match.group(1))
+        year_match = re.search(r"\b(19|20)\d{2}\b", first_page_md)
+        if year_match:
+            year = int(year_match.group(0))
 
     return BibliographicMetadata(
         title=title or "Unknown",

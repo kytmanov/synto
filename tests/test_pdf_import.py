@@ -97,6 +97,19 @@ def pdf_with_metadata(tmp_path: Path) -> Path:
     return out
 
 
+@pytest.fixture()
+def pdf_citing_earlier_year(tmp_path: Path) -> Path:
+    """A PDF whose own creationDate is 2026 but whose body cites an earlier work."""
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), "In homage to Spitzer's 1946 report, we present...")
+    doc.set_metadata({"creationDate": "D:20260601000000"})
+    out = tmp_path / "cites_earlier_year.pdf"
+    doc.save(str(out))
+    doc.close()
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Stage 1: basic extraction and stable IDs
 # ---------------------------------------------------------------------------
@@ -221,6 +234,16 @@ def test_bibliographic_metadata_year(pdf_with_metadata: Path) -> None:
     first_page_md = "Published in 2021. DOI: 10.9999/example.2021"
     meta = extract_bibliographic_metadata(pdf_with_metadata, first_page_md)
     assert meta.year == 2021
+
+
+def test_bibliographic_metadata_year_prefers_creation_date_over_body_citation(
+    pdf_citing_earlier_year: Path,
+) -> None:
+    """A year cited in body prose (a reference to prior work) must not win over
+    the PDF's own creationDate."""
+    first_page_md = "In homage to Spitzer's 1946 report, we present..."
+    meta = extract_bibliographic_metadata(pdf_citing_earlier_year, first_page_md)
+    assert meta.year == 2026
 
 
 def test_bibliographic_metadata_title_fallback(tmp_path: Path) -> None:
