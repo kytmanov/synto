@@ -79,6 +79,25 @@ _ensure_utf8_streams()
 console = Console()
 err_console = Console(stderr=True, style="bold red")
 
+_STAGE_LABELS = {
+    "ingest": "Ingesting",
+    "analyze": "Analyzing",
+    "relations": "Extracting relations",
+    "compile": "Compiling",
+    "lint": "Linting",
+    "approve": "Publishing",
+}
+
+
+def _stage_description(stage: str, current: int, total: int, detail: str) -> str:
+    label = _STAGE_LABELS.get(stage, stage)
+    name = Path(detail).name if detail else ""
+    inner = f" ({current}/{total})" if total > 0 else ""
+    if name:
+        return f"{label} · {name}{inner}"
+    return f"{label}{inner}"
+
+
 PROJECT_REPO_URL = "https://github.com/kytmanov/synto"
 PROJECT_ISSUES_URL = f"{PROJECT_REPO_URL}/issues"
 PROJECT_DISCUSSIONS_URL = f"{PROJECT_REPO_URL}/discussions"
@@ -2040,12 +2059,16 @@ def ingest(
                     description=f"[dim]{Path(current_note_path).name}[/dim]",
                 )
 
+            def _on_stage(stage: str, current: int, total: int, detail: str) -> None:
+                progress.update(task, description=_stage_description(stage, current, total, detail))
+
             results = _ingest_all(
                 config=config,
                 router=router,
                 db=db,
                 force=force,
                 on_progress=_update_ingest_progress,
+                on_stage=_on_stage,
             )
 
         for path, result in results:
@@ -2071,6 +2094,9 @@ def ingest(
         ) as progress:
             task = progress.add_task("Ingesting...", total=len(target_paths))
 
+            def _on_stage(stage: str, current: int, total: int, detail: str) -> None:
+                progress.update(task, description=_stage_description(stage, current, total, detail))
+
             for path in target_paths:
                 progress.update(task, description=f"[dim]{path.name}[/dim]")
                 from .pipeline.ingest import ingest_note as _ingest_note
@@ -2081,6 +2107,7 @@ def ingest(
                     router=router,
                     db=db,
                     force=force,
+                    on_stage=_on_stage,
                 )
                 if result is None:
                     # Distinguish skip vs failure by checking DB status

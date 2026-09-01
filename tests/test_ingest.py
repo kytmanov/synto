@@ -1247,9 +1247,12 @@ def test_cli_ingest_all_passes_progress_callback(vault, db, monkeypatch):
     _write_raw(vault, "a.md", "# A\n\nAlpha content.")
     captured: dict[str, object] = {}
 
-    def fake_ingest_all(*, config, router, db, force, on_progress):
+    def fake_ingest_all(*, config, router, db, force, on_progress, on_stage=None):
         captured["on_progress"] = on_progress
+        captured["on_stage"] = on_stage
         on_progress(1, 1, "raw/a.md")
+        if on_stage is not None:
+            on_stage("relations", 2, 5, "a.md")
         return [(config.raw_dir / "a.md", None)]
 
     monkeypatch.setattr("synto.cli._load_deps", lambda cfg: (object(), db))
@@ -1269,6 +1272,17 @@ def test_cli_ingest_all_passes_progress_callback(vault, db, monkeypatch):
 
     assert result.exit_code == 0
     assert callable(captured["on_progress"])
+    assert callable(captured["on_stage"])
+
+
+def test_stage_description_formats_inner_count():
+    from synto.cli import _stage_description
+
+    assert _stage_description("relations", 42, 80, "raw/paper.md") == (
+        "Extracting relations · paper.md (42/80)"
+    )
+    assert _stage_description("analyze", 0, 0, "paper.md") == "Analyzing · paper.md"
+    assert _stage_description("lint", 0, 0, "") == "Linting"
 
 
 def test_ingest_note_reuses_matching_source_concept_seed_when_db_empty(vault, config, db):
