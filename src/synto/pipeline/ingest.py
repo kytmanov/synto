@@ -382,6 +382,9 @@ def _extract_and_persist_relations(
     canonical_names: list[str],
     fast: RoleEndpoint,
     config: Config,
+    *,
+    on_stage: Callable[[str, int, int, str], None] | None = None,
+    detail: str = "",
 ) -> int:
     """Run the Stage-3 relation-extraction pass over each segment and persist results.
 
@@ -408,7 +411,10 @@ def _extract_and_persist_relations(
     canon_by_key: dict[str, str] = dict(db.list_alias_map())
     for name in (*db.list_all_concept_names(), *canonical_names):
         canon_by_key[_concept_key(name)] = name
-    for seg in segments:
+    n_units = len(segments)
+    for i, seg in enumerate(segments, 1):
+        if on_stage is not None:
+            on_stage("relations", i, n_units, detail)
         seg_id, seg_text = (seg["id"], seg["text"]) if hasattr(seg, "keys") else (seg.id, seg.text)
         try:
             shim = SimpleNamespace(id=seg_id, text=seg_text)
@@ -1528,6 +1534,7 @@ def ingest_note(
     seed_alias_map: dict[str, str] | None = None,
     source_concept_seeds: dict[str, tuple[str, list[str]]] | None = None,
     force: bool = False,
+    on_stage: Callable[[str, int, int, str], None] | None = None,
 ) -> AnalysisResult | None:
     """
     Ingest a single raw note.
@@ -1637,6 +1644,8 @@ def ingest_note(
         # quality cap, halve the extracted concept count.
         chunk_units = _build_segment_units(source_segments, _unit_char_target(fast.ctx))
         chunk_attribution = {}
+    if on_stage is not None:
+        on_stage("analyze", 0, 0, path.name)
     try:
         result: AnalysisResult = _analyze_body_with_checkpoints(
             body=body,
@@ -1781,7 +1790,15 @@ def ingest_note(
                     SimpleNamespace(id=f"note:{path.stem}:{i}", text=body[i : i + rel_chunk_size])
                     for i in range(0, len(body), rel_chunk_size)
                 ]
-            n = _extract_and_persist_relations(db, rel_segments, canonical_names, fast, config)
+            n = _extract_and_persist_relations(
+                db,
+                rel_segments,
+                canonical_names,
+                fast,
+                config,
+                on_stage=on_stage,
+                detail=path.name,
+            )
             log.info("relation extraction: %d relations from %d segments", n, len(rel_segments))
         except Exception:
             log.warning("relation extraction failed for %s", path.name, exc_info=True)
@@ -1831,6 +1848,7 @@ def ingest_all(
     rag=None,
     force: bool = False,
     on_progress: Callable[[int, int, str], None] | None = None,
+    on_stage: Callable[[str, int, int, str], None] | None = None,
 ) -> list[tuple[Path, AnalysisResult | None]]:
     """Ingest all .md files in raw/ (excluding raw/processed/ subfolders)."""
     raw_files = [
@@ -1865,6 +1883,7 @@ def ingest_all(
             seed_alias_map=seed_alias_map,
             source_concept_seeds=source_concept_seeds,
             force=force,
+            on_stage=on_stage,
         )
         results.append((path, result))
         if result is not None:

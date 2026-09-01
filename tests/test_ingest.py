@@ -1039,6 +1039,22 @@ def test_ingest_all_reports_progress(vault, config, db):
     ]
 
 
+def test_ingest_all_forwards_on_stage(vault, config, db):
+    _write_raw(vault, "a.md", "# A\n\nAlpha content.")
+    client = as_router(MagicMock())
+    client.generate.side_effect = [_analysis_json(concepts=["Alpha Concept"])]
+    stages: list[tuple] = []
+
+    ingest_all(
+        config,
+        client,
+        db,
+        on_stage=lambda *a: stages.append(a),
+    )
+
+    assert any(s[0] == "analyze" and s[3] == "a.md" for s in stages)
+
+
 def test_ingest_all_seeds_existing_topics_from_index_when_db_empty(vault, config, db):
     _write_raw(vault, "a.md", "# A\n\nAlpha content.")
     (vault / ".synto" / "INDEX.json").write_text(
