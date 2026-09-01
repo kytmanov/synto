@@ -1311,6 +1311,51 @@ def test_stage_progress_update_drives_bar_only_for_ingest_and_compile():
     assert "total" not in lint
 
 
+def test_advance_bar_state_keeps_ingest_bar_during_analyze_and_relations():
+    from synto.cli import _advance_bar_state
+
+    u, bar = _advance_bar_state("ingest", 50, 50, "z.md", None)
+    assert u["completed"] == 49
+    assert bar == ("ingest", 50)
+
+    u, bar = _advance_bar_state("analyze", 3, 12, "z.md", bar)
+    assert "completed" not in u
+    assert "total" not in u
+    assert bar == ("ingest", 50)
+
+    u, bar = _advance_bar_state("relations", 42, 80, "z.md", bar)
+    assert "completed" not in u
+    assert bar == ("ingest", 50)
+
+
+def test_advance_bar_state_resets_on_compile_and_completes_on_lint():
+    from synto.cli import _advance_bar_state
+
+    _, bar = _advance_bar_state("ingest", 50, 50, "z.md", None)
+    u, bar = _advance_bar_state("compile", 1, 12, "Qubit", bar)
+    assert u["total"] == 12
+    assert u["completed"] == 0
+    assert bar == ("compile", 12)
+
+    u, bar = _advance_bar_state("lint", 0, 0, "", bar)
+    assert u["total"] == 12
+    assert u["completed"] == 12
+    assert bar is None
+
+
+def test_optional_mofn_column_blank_when_total_none():
+    from rich.progress import Progress
+
+    from synto.cli import _OptionalMofNColumn
+
+    col = _OptionalMofNColumn()
+    with Progress(col, transient=True) as progress:
+        task = progress.add_task("Starting…", total=None)
+        assert col.render(progress.tasks[task]).plain == ""
+        progress.update(task, total=50, completed=49)
+        assert col.render(progress.tasks[task]).plain == "49/50"
+
+
 def test_cli_run_passes_on_stage(vault, db, monkeypatch):
     from synto.pipeline.orchestrator import PipelineReport
 

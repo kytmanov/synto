@@ -27,7 +27,14 @@ from typing import TYPE_CHECKING
 import click
 from rich.console import Console
 from rich.panel import Panel
-from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+from rich.progress import (
+    BarColumn,
+    Progress,
+    ProgressColumn,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
 from rich.prompt import Prompt
 from rich.table import Table
 from rich.text import Text
@@ -90,6 +97,19 @@ _STAGE_LABELS = {
 }
 
 _BAR_STAGES = frozenset({"ingest", "compile"})
+_INNER_STAGES: dict[str, frozenset[str]] = {
+    "ingest": frozenset({"analyze", "relations"}),
+    "compile": frozenset(),
+}
+
+
+class _OptionalMofNColumn(ProgressColumn):
+    """Like completed/total, but blank while the task has no total (avoids 0/None)."""
+
+    def render(self, task) -> Text:
+        if task.total is None:
+            return Text("")
+        return Text(f"{int(task.completed)}/{int(task.total)}")
 
 
 def _stage_description(stage: str, current: int, total: int, detail: str) -> str:
@@ -110,6 +130,23 @@ def _stage_progress_update(stage: str, current: int, total: int, detail: str) ->
         update["total"] = total
         update["completed"] = max(current - 1, 0)
     return update
+
+
+def _advance_bar_state(
+    stage: str,
+    current: int,
+    total: int,
+    detail: str,
+    bar: tuple[str, int] | None,
+) -> tuple[dict[str, object], tuple[str, int] | None]:
+    update = _stage_progress_update(stage, current, total, detail)
+    if stage in _BAR_STAGES and total > 0:
+        return update, (stage, total)
+    if bar is not None and stage not in _INNER_STAGES.get(bar[0], frozenset()):
+        update["total"] = bar[1]
+        update["completed"] = bar[1]
+        return update, None
+    return update, bar
 
 
 PROJECT_REPO_URL = "https://github.com/kytmanov/synto"
@@ -3459,16 +3496,19 @@ def watch(vault_str, auto_approve):
                     SpinnerColumn(),
                     TextColumn("[progress.description]{task.description}"),
                     BarColumn(),
-                    TextColumn("{task.completed}/{task.total}"),
+                    _OptionalMofNColumn(),
                     TimeElapsedColumn(),
                     console=console,
                 ) as progress:
                     task = progress.add_task("Starting…", total=None)
+                    bar_state: tuple[str, int] | None = None
 
                     def _on_stage(stage: str, current: int, total: int, detail: str) -> None:
-                        progress.update(
-                            task, **_stage_progress_update(stage, current, total, detail)
+                        nonlocal bar_state
+                        update, bar_state = _advance_bar_state(
+                            stage, current, total, detail, bar_state
                         )
+                        progress.update(task, **update)
 
                     report = orchestrator.run(
                         paths=md_paths,
@@ -3611,14 +3651,17 @@ def run(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
-            TextColumn("{task.completed}/{task.total}"),
+            _OptionalMofNColumn(),
             TimeElapsedColumn(),
             console=console,
         ) as progress:
             task = progress.add_task("Starting…", total=None)
+            bar_state: tuple[str, int] | None = None
 
             def _on_stage(stage: str, current: int, total: int, detail: str) -> None:
-                progress.update(task, **_stage_progress_update(stage, current, total, detail))
+                nonlocal bar_state
+                update, bar_state = _advance_bar_state(stage, current, total, detail, bar_state)
+                progress.update(task, **update)
 
             report = orchestrator.run(
                 auto_approve=auto_approve,
