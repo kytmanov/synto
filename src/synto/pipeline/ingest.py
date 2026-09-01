@@ -457,6 +457,7 @@ def _analyze_body(
     source_type: str = "notes",
     units: list[tuple[str, list[str]]] | None = None,
     attribution: dict[int, list[str]] | None = None,
+    on_stage: Callable[[str, int, int, str], None] | None = None,
 ) -> AnalysisResult:
     """Analyze note body, splitting into chunks if body exceeds fast_ctx // 2 chars.
 
@@ -552,6 +553,8 @@ def _analyze_body(
         chunk_results: list[AnalysisResult | None] = [None] * len(chunks)
         errors: list[Exception] = []
         pending = [(i, chunk) for i, chunk in enumerate(chunks) if i not in completed]
+        done = len(completed)
+        n_chunks = len(chunks)
         if pending:
             with ThreadPoolExecutor(max_workers=len(pending)) as executor:
                 futures = {executor.submit(_analyze_chunk, chunk, i): i for i, chunk in pending}
@@ -567,6 +570,9 @@ def _analyze_body(
                         attribution[idx] = [c.name for c in result.concepts]
                     if on_chunk_result is not None:
                         on_chunk_result(idx, result)
+                    done += 1
+                    if on_stage is not None:
+                        on_stage("analyze", done, n_chunks, path_name)
             if errors:
                 raise errors[0]
         results = [r for r in chunk_results if r is not None]
@@ -575,6 +581,8 @@ def _analyze_body(
         for i, chunk in enumerate(chunks):
             if i in completed:
                 continue
+            if on_stage is not None:
+                on_stage("analyze", i + 1, len(chunks), path_name)
             result = _analyze_chunk(chunk, i)
             if attribution is not None:
                 attribution[i] = [c.name for c in result.concepts]
@@ -599,6 +607,7 @@ def _analyze_body_with_checkpoints(
     source_type: str = "notes",
     units: list[tuple[str, list[str]]] | None = None,
     attribution: dict[int, list[str]] | None = None,
+    on_stage: Callable[[str, int, int, str], None] | None = None,
 ) -> AnalysisResult:
     chunk_size = config.resolve_role("fast").ctx // 2
     rel_path = rel_posix(path, config.vault)
@@ -623,6 +632,7 @@ def _analyze_body_with_checkpoints(
             prompt_contexts=prompt_contexts,
             source_type=source_type,
             attribution=attribution,
+            on_stage=on_stage,
         )
 
     # Tracked sources pass segment-aligned units; plain notes split the body by size.
@@ -682,6 +692,7 @@ def _analyze_body_with_checkpoints(
             source_type=source_type,
             units=units,
             attribution=attribution,
+            on_stage=on_stage,
         )
 
     results = [result for result in chunk_results if result is not None]
@@ -1660,6 +1671,7 @@ def ingest_note(
             source_type=source_type,
             units=chunk_units,
             attribution=chunk_attribution,
+            on_stage=on_stage,
         )
     except Exception as e:
         log.error("Analysis failed for %s: %s", path.name, e, exc_info=True)

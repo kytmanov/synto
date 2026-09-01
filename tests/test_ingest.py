@@ -1507,6 +1507,29 @@ def test_analyze_body_single_call_for_short_note(vault, config, db):
     assert client.generate.call_count == 1
 
 
+def test_analyze_body_emits_on_stage_per_chunk(vault, config):
+    """Multi-chunk analysis must ping before each LLM call, or the spinner
+    freezes on Analyzing · file for the longest pass in the pipeline."""
+    config2 = Config(vault=vault, ollama={"fast_ctx": 100})
+    config2.pipeline.ingest_parallel = False
+    body = "x" * 100  # 2 chunks of 50
+    client = _make_client(_analysis_json(concepts=["Alpha"]))
+    events: list[tuple] = []
+    _analyze_body(
+        body,
+        [],
+        "paper.md",
+        client,
+        config2,
+        on_stage=lambda *a: events.append(a),
+    )
+    assert events == [
+        ("analyze", 1, 2, "paper.md"),
+        ("analyze", 2, 2, "paper.md"),
+    ]
+    assert client.generate.call_count == 2
+
+
 def test_analyze_body_multi_call_for_long_note(vault, config, db):
     """Body > fast_ctx // 2 → one call per chunk."""
     config2 = Config(vault=vault, ollama={"fast_ctx": 100})  # tiny ctx for test
