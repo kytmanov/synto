@@ -89,6 +89,49 @@ def test_generate_parses_anthropic_response(client):
     assert result == "Hello from Kimi!"
 
 
+def test_generate_skips_thinking_blocks(client):
+    """Reasoning models (Kimi, Claude extended thinking) emit a thinking block first."""
+    resp = _ok_response("ignored")
+    resp.json.return_value["content"] = [
+        {"type": "thinking", "thinking": "let me work this out", "signature": "sig"},
+        {"type": "text", "text": "Hello from Kimi!"},
+    ]
+    client._post_chat = MagicMock(return_value=resp)
+
+    assert client.generate(prompt="hi", model="kimi-k2") == "Hello from Kimi!"
+
+
+def test_generate_joins_multiple_text_blocks(client):
+    resp = _ok_response("ignored")
+    resp.json.return_value["content"] = [
+        {"type": "text", "text": "part one "},
+        {"type": "text", "text": "part two"},
+    ]
+    client._post_chat = MagicMock(return_value=resp)
+
+    assert client.generate(prompt="hi", model="m") == "part one part two"
+
+
+def test_generate_thinking_only_response_is_truncation(client):
+    """A response with no text block is an empty completion, not a format error."""
+    resp = _ok_response("ignored")
+    resp.json.return_value["content"] = [{"type": "thinking", "thinking": "..."}]
+    client._post_chat = MagicMock(return_value=resp)
+
+    with pytest.raises(LLMTruncatedError):
+        client.generate(prompt="hi", model="m")
+
+
+def test_generate_missing_content_key_raises_llm_error(client):
+    resp = _ok_response("ignored")
+    resp.json.return_value = {"error": {"message": "nope"}}
+    resp.text = '{"error": {"message": "nope"}}'
+    client._post_chat = MagicMock(return_value=resp)
+
+    with pytest.raises(LLMError, match="unexpected response format"):
+        client.generate(prompt="hi", model="m")
+
+
 def test_generate_system_prompt_top_level(client):
     """System prompt must be a top-level field, not in the messages array."""
     client._post_chat = MagicMock(return_value=_ok_response("ok"))

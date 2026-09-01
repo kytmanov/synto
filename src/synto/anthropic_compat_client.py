@@ -221,9 +221,15 @@ class AnthropicCompatClient:
 
         try:
             body = resp.json()
-            content = body["content"][0]["text"]
+            # Reasoning models (Kimi, Claude extended thinking) put a `thinking` block
+            # before the answer, so content[0] is not necessarily the text block. Join
+            # every text block and ignore the rest; a block with no `type` is treated as
+            # text so providers that omit the discriminator keep working.
+            content = "".join(
+                b.get("text", "") for b in body["content"] if b.get("type", "text") == "text"
+            )
             stop_reason = body.get("stop_reason")
-        except (KeyError, IndexError, ValueError) as e:
+        except (AttributeError, KeyError, IndexError, TypeError, ValueError) as e:
             self._last_stats = {"latency_ms": int((time.monotonic() - t0) * 1000)}
             raise LLMError(
                 f"{self.provider_name}: unexpected response format: {resp.text[:200]}"

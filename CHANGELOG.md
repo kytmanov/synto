@@ -11,6 +11,13 @@
   at all. It now prefers `creationDate` and falls back to the first-page match only when the
   PDF carries no creation date.
 
+- **Anthropic-compatible providers no longer fail on reasoning models.** Kimi's
+  `kimi-coding` endpoint returns a `thinking` block ahead of the answer, and the client
+  read `content[0]["text"]` unconditionally, so every call died with
+  `kimi: unexpected response format` and no note could be ingested. The client now joins
+  all `text` blocks and skips `thinking`. A response with no text block is reported as an
+  empty completion (`LLMTruncatedError`) rather than a format error.
+
 - **401s and `synto doctor` now name the missing credential instead of a bare "unauthorized" (#114).**
   A cloud provider's `/models` endpoint often answers without auth, so setup's connectivity
   probe and `doctor` could both report success on a connection that would 401 on the real
