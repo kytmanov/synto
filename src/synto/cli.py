@@ -3441,11 +3441,25 @@ def watch(vault_str, auto_approve):
                 console.print("[yellow]⚠ compile skipped — pipeline already running[/yellow]")
                 return
             try:
-                report = orchestrator.run(
-                    paths=md_paths,
-                    auto_approve=auto_approve or config.pipeline.auto_approve,
-                    fix=config.pipeline.auto_maintain,
-                )
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    TimeElapsedColumn(),
+                    console=console,
+                ) as progress:
+                    task = progress.add_task("Starting…", total=None)
+
+                    def _on_stage(stage: str, current: int, total: int, detail: str) -> None:
+                        progress.update(
+                            task, description=_stage_description(stage, current, total, detail)
+                        )
+
+                    report = orchestrator.run(
+                        paths=md_paths,
+                        auto_approve=auto_approve or config.pipeline.auto_approve,
+                        fix=config.pipeline.auto_maintain,
+                        on_stage=_on_stage,
+                    )
             except Exception as exc:
                 console.print(f"[red]Pipeline error:[/red] {exc}")
                 return
@@ -3577,13 +3591,25 @@ def run(
             err_console.print("Pipeline already running — lock held. Check `synto status`.")
             sys.exit(1)
         orchestrator = PipelineOrchestrator(config, router, db)
-        report = orchestrator.run(
-            auto_approve=auto_approve,
-            fix=fix,
-            max_rounds=max_rounds,
-            dry_run=dry_run,
-            min_confidence=min_confidence,
-        )
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task("Starting…", total=None)
+
+            def _on_stage(stage: str, current: int, total: int, detail: str) -> None:
+                progress.update(task, description=_stage_description(stage, current, total, detail))
+
+            report = orchestrator.run(
+                auto_approve=auto_approve,
+                fix=fix,
+                max_rounds=max_rounds,
+                dry_run=dry_run,
+                min_confidence=min_confidence,
+                on_stage=_on_stage,
+            )
 
     table = Table(title="Pipeline Report", show_header=True)
     table.add_column("Step")

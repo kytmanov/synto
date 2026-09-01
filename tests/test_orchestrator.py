@@ -344,7 +344,7 @@ def test_orchestrator_selective_recompile_with_absolute_paths(config, db):
 
     original_ingest = ingest_mod.ingest_note
 
-    def fake_ingest(path, config, router, db):
+    def fake_ingest(path, config, router, db, on_stage=None):
         return object()  # truthy — simulates successful ingest
 
     ingest_mod.ingest_note = fake_ingest
@@ -525,6 +525,49 @@ def test_orchestrator_fix_creates_stubs(config, db):
 
     assert "issues" in stubs_called_with  # create_stubs was called
     assert report.stubs_created == 1
+
+
+def test_orchestrator_run_emits_stage_progress(config, db):
+    raw_file = config.vault / "raw" / "a.md"
+    raw_file.write_text("# A\n\nHello world.\n")
+    db.upsert_raw(RawNoteRecord(path="raw/a.md", content_hash="h", status="new"))
+    stages: list[tuple] = []
+
+    with (
+        patch("synto.pipeline.ingest.ingest_note", return_value=MagicMock()) as ingest,
+        patch("synto.pipeline.orchestrator._run_compile", return_value=([], [], {})),
+        patch("synto.pipeline.lint.run_lint") as lint,
+    ):
+        lint.return_value.issues = []
+        PipelineOrchestrator(config, make_mock_client(), db).run(
+            paths=[str(raw_file)],
+            on_stage=lambda *a: stages.append(a),
+        )
+
+    ingest.assert_called_once()
+    assert ingest.call_args.kwargs["on_stage"] is not None
+    assert any(s[0] == "ingest" for s in stages)
+    assert any(s[0] == "lint" for s in stages)
+
+
+def test_orchestrator_forwards_compile_progress_as_stage(config, db):
+    stages: list[tuple] = []
+
+    def fake_compile_concepts(**kwargs):
+        kwargs["on_progress"](1, 2, "Qubit")
+        return [], [], {}
+
+    with patch("synto.pipeline.compile.compile_concepts", side_effect=fake_compile_concepts):
+        _run_compile(
+            config,
+            make_mock_client(),
+            db,
+            concepts=["Qubit"],
+            dry_run=True,
+            on_progress=lambda idx, total, name: stages.append(("compile", idx, total, name)),
+        )
+
+    assert stages == [("compile", 1, 2, "Qubit")]
 
 
 # ── Truncation escalation (Fix 2) ───────────────────────────────────────────────
