@@ -158,6 +158,58 @@ def test_unknown_type_falls_back_to_notes() -> None:
 
 
 def test_all_known_types_load() -> None:
-    for st in ("notes", "textbook", "paper", "api_docs", "web_article", "corp_docs"):
+    for st in ("notes", "textbook", "paper", "api_docs", "web_article", "corp_docs", "sql"):
         prompt = load_prompt(st)
         assert prompt, f"load_prompt({st!r}) returned empty string"
+
+
+# ---------------------------------------------------------------------------
+# Stage 5: sql prompt
+# ---------------------------------------------------------------------------
+
+
+def test_sql_prompt_non_empty() -> None:
+    prompt = load_prompt("sql")
+    assert prompt
+    assert prompt != load_prompt("notes")
+
+
+def test_sql_prompt_content() -> None:
+    prompt = load_prompt("sql").lower()
+    assert "sql" in prompt
+    assert "create" in prompt
+    assert "unqualified" in prompt
+    assert "named_references" in prompt
+    assert "keyword" in prompt
+
+
+def test_ingest_uses_sql_prompt(tmp_path: Path, config, db) -> None:
+    from unittest.mock import MagicMock, patch
+
+    from synto.models import AnalysisResult, Concept
+    from synto.pipeline.ingest import ingest_note
+
+    note = tmp_path / "usp_get_orders.md"
+    note.write_text(
+        "---\nsource_type: sql\n---\n"
+        "CREATE PROCEDURE usp_GetOrders AS SELECT * FROM Orders;\n"
+    )
+    mock_result = AnalysisResult(
+        summary="test",
+        concepts=[Concept(name="usp_GetOrders", aliases=[])],
+        suggested_topics=[],
+        named_references=["Orders"],
+        quality="high",
+        language="en",
+    )
+    captured: list[str] = []
+
+    def fake_request(**kwargs):
+        captured.append(kwargs.get("system", ""))
+        return mock_result
+
+    with patch("synto.pipeline.ingest.request_structured", side_effect=fake_request):
+        ingest_note(note, config, MagicMock(), db)
+
+    assert captured, "request_structured should have been called"
+    assert captured[0] == load_prompt("sql")
