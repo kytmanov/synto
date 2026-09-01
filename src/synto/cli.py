@@ -4822,6 +4822,7 @@ _SOURCE_TYPES = [
     "textbook",
     "paper",
     "spec",
+    "sql",
     "api_docs",
     "web_article",
     "corp_docs",
@@ -4862,7 +4863,7 @@ def _decode_import_text(data: bytes) -> str:
     "source_type",
     default=None,
     type=click.Choice(_SOURCE_TYPES),
-    help="Override source type (default: paper for PDFs, notes otherwise).",
+    help="Override source type (default: paper for PDFs, sql for .sql, notes otherwise).",
 )
 @click.option("--vault", "vault_str", envvar=VAULT_ENV_VAR, default=None)
 @click.option(
@@ -4882,7 +4883,7 @@ def add(
 ) -> None:
     """Import a source document into the vault.
 
-    SOURCE is a file path (PDF, markdown, text).  The original is copied to
+    SOURCE is a file path (PDF, markdown, text, or SQL).  The original is copied to
     .synto/sources/<source_id>/ and recorded in the state database.  For PDF
     files, segments are extracted immediately.
     """
@@ -4904,7 +4905,12 @@ def add(
 
     # Infer source_type from extension when not provided
     if source_type is None:
-        source_type = "paper" if ext == ".pdf" else "notes"
+        if ext == ".pdf":
+            source_type = "paper"
+        elif ext == ".sql":
+            source_type = "sql"
+        else:
+            source_type = "notes"
 
     # Compute content hash and stable source_id
     raw_bytes = src_path.read_bytes()
