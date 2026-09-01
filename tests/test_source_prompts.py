@@ -191,8 +191,7 @@ def test_ingest_uses_sql_prompt(tmp_path: Path, config, db) -> None:
 
     note = tmp_path / "usp_get_orders.md"
     note.write_text(
-        "---\nsource_type: sql\n---\n"
-        "CREATE PROCEDURE usp_GetOrders AS SELECT * FROM Orders;\n"
+        "---\nsource_type: sql\n---\nCREATE PROCEDURE usp_GetOrders AS SELECT * FROM Orders;\n"
     )
     mock_result = AnalysisResult(
         summary="test",

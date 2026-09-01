@@ -118,13 +118,15 @@ synto approve --min-confidence 0.8              # publish reviewed or fresh draf
 **No embeddings, no vector database.** `synto query` routes questions to relevant articles using `INDEX.json`. It works on any machine without a GPU, FAISS, or Chroma.
 
 **Source-type analysis.** Imported documents carry a type — `notes`, `textbook`, `paper`,
-`spec`, `api_docs`, `web_article`, `corp_docs`, `transcript`, or `unknown_text`. During ingest
+`spec`, `sql`, `api_docs`, `web_article`, `corp_docs`, `transcript`, or `unknown_text`. During ingest
 analysis the fast model receives a matching system prompt: a `paper` prompt extracts
 abstract/methods/results structure; an `api_docs` prompt preserves parameter names; a
-`textbook` prompt follows chapter/definition flow. If `--type` is omitted, PDFs default to
-`paper` and everything else to `notes` — pass `--type` for anything more specific. Long-form
-source types also get higher built-in concept ceilings during ingest: `textbook` defaults to
-25 concepts and `paper` to 15 unless you set an explicit override in `synto.toml`.
+`textbook` prompt follows chapter/definition flow; an `sql` prompt mints the objects a file
+defines (CREATE/ALTER) as concepts and ignores SQL keywords. If `--type` is omitted, PDFs
+default to `paper`, `.sql` files to `sql`, and everything else to `notes` — pass `--type`
+for anything more specific. Long-form source types also get higher built-in concept ceilings
+during ingest: `textbook` defaults to 25 concepts and `paper` to 15 unless you set an
+explicit override in `synto.toml`.
 
 **Concept identity and curation.** A concept's identity is a stable `entity_id`, not its
 name. Names and surface forms are just labels pointing at that id, so you can rename,
@@ -325,6 +327,7 @@ type for your document to get the matching ingest-analysis prompt:
 | `textbook` | Educational material with chapters and exercises |
 | `paper` | Academic papers (abstract / methods / results) |
 | `spec` | Technical specifications, RFCs, standards |
+| `sql` | SQL functions, procedures, views, tables, triggers |
 | `api_docs` | API references, SDK docs, OpenAPI specs |
 | `web_article` | Blog posts, news articles, web clips |
 | `corp_docs` | Internal wikis, runbooks, design documents |
@@ -436,14 +439,37 @@ Drop any `.md` files into `~/my-wiki/raw/`. Web clips, book notes, meeting notes
 synto add paper.pdf --type paper --vault ~/my-wiki
 synto add textbook_chapter.pdf --type textbook --vault ~/my-wiki
 synto add api-reference.md --type api_docs --vault ~/my-wiki
+synto add usp_GetOrders.sql --vault ~/my-wiki   # infers --type sql
 ```
 
 Use `--type` to select the matching ingest-analysis prompt (see the table in Features).
-If omitted, PDFs are treated as `paper` and everything else as `notes` — pass `--type` for
-anything more specific (`spec`, `transcript`, `api_docs`, …).
+If omitted, PDFs are treated as `paper`, `.sql` files as `sql`, and everything else as
+`notes` — pass `--type` for anything more specific (`spec`, `transcript`, `api_docs`, …).
+Do not drop `.sql` files into `raw/` — ingest only reads `raw/**/*.md`. Import via
+`synto add`, or wrap the SQL in a markdown file with `source_type: sql`.
 
 `synto add --force` re-imports an existing source in place. `--extend-pack` is reserved for
 future pack integration and is currently a safe no-op.
+
+**SQL sources.** Import one object per file:
+
+```bash
+synto add usp_GetOrders.sql --vault ~/my-wiki
+synto ingest --all --vault ~/my-wiki
+```
+
+A script that defines many objects is capped at `max_concepts_per_source` (default 8).
+Raise it for schema dumps:
+
+```toml
+[pipeline.source_overrides.sql]
+max_concepts_per_source = 25
+```
+
+Compile still uses the generic wiki editor. Put SQL article conventions in
+`vault-schema.md` (injected at compile, first 1500 characters). Type names are lowercase
+(`--type sql`, not `SQL`). After changing an already-ingested prompt or override, re-run
+`synto ingest --force`.
 
 ### 5. Run the pipeline
 
@@ -665,10 +691,10 @@ request as-is and override the matching first-class field, so set computed value
 - `synto doctor` — configuration and connectivity diagnostics
 - Multi-language: notes are ingested and compiled in their source language
 - 20+ LLM providers supported via OpenAI-compatible API
-- `synto add SOURCE` — import PDF, Markdown, or text files as tracked source documents;
+- `synto add SOURCE` — import PDF, Markdown, text, or SQL files as tracked source documents;
   PDFs are segmented automatically into heading-aware chunks and written back as canonical raw notes
 - Source-type prompts: built-in templates for `notes`, `textbook`, `paper`, `spec`,
-  `api_docs`, `web_article`, `corp_docs`, `transcript`, plus `unknown_text` fallback,
+  `sql`, `api_docs`, `web_article`, `corp_docs`, `transcript`, plus `unknown_text` fallback,
   select the optimal ingest strategy per document type
 - Compile lineage: every article records its source notes and compile run;
   `synto trace article|term|relation|citation` traces history, term occurrences,

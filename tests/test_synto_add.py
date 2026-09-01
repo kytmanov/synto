@@ -356,9 +356,7 @@ def test_add_md_with_type_sql(
 ) -> None:
     src = tmp_path / "view.md"
     src.write_text("CREATE VIEW vw_Active AS SELECT 1;\n", encoding="utf-8")
-    result = runner.invoke(
-        cli, ["add", str(src), "--type", "sql", "--vault", str(config.vault)]
-    )
+    result = runner.invoke(cli, ["add", str(src), "--type", "sql", "--vault", str(config.vault)])
     assert result.exit_code == 0, result.output
     assert db.list_source_documents()[0][2] == "sql"
     raw = next((config.vault / "raw").glob("*.md"))
