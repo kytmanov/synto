@@ -86,7 +86,10 @@ _STAGE_LABELS = {
     "compile": "Compiling",
     "lint": "Linting",
     "approve": "Publishing",
+    "commit": "Committing",
 }
+
+_BAR_STAGES = frozenset({"ingest", "compile"})
 
 
 def _stage_description(stage: str, current: int, total: int, detail: str) -> str:
@@ -96,6 +99,17 @@ def _stage_description(stage: str, current: int, total: int, detail: str) -> str
     if name:
         return f"{label} · {name}{inner}"
     return f"{label}{inner}"
+
+
+def _stage_progress_update(stage: str, current: int, total: int, detail: str) -> dict[str, object]:
+    """Description for every stage; bar totals only for vault-level loops."""
+    update: dict[str, object] = {
+        "description": _stage_description(stage, current, total, detail),
+    }
+    if stage in _BAR_STAGES and total > 0:
+        update["total"] = total
+        update["completed"] = max(current - 1, 0)
+    return update
 
 
 PROJECT_REPO_URL = "https://github.com/kytmanov/synto"
@@ -3444,6 +3458,8 @@ def watch(vault_str, auto_approve):
                 with Progress(
                     SpinnerColumn(),
                     TextColumn("[progress.description]{task.description}"),
+                    BarColumn(),
+                    TextColumn("{task.completed}/{task.total}"),
                     TimeElapsedColumn(),
                     console=console,
                 ) as progress:
@@ -3451,7 +3467,7 @@ def watch(vault_str, auto_approve):
 
                     def _on_stage(stage: str, current: int, total: int, detail: str) -> None:
                         progress.update(
-                            task, description=_stage_description(stage, current, total, detail)
+                            task, **_stage_progress_update(stage, current, total, detail)
                         )
 
                     report = orchestrator.run(
@@ -3594,13 +3610,15 @@ def run(
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("{task.completed}/{task.total}"),
             TimeElapsedColumn(),
             console=console,
         ) as progress:
             task = progress.add_task("Starting…", total=None)
 
             def _on_stage(stage: str, current: int, total: int, detail: str) -> None:
-                progress.update(task, description=_stage_description(stage, current, total, detail))
+                progress.update(task, **_stage_progress_update(stage, current, total, detail))
 
             report = orchestrator.run(
                 auto_approve=auto_approve,

@@ -1285,6 +1285,57 @@ def test_stage_description_formats_inner_count():
     assert _stage_description("lint", 0, 0, "") == "Linting"
 
 
+def test_stage_progress_update_drives_bar_only_for_ingest_and_compile():
+    from synto.cli import _stage_progress_update
+
+    ingest = _stage_progress_update("ingest", 3, 50, "a.md")
+    assert ingest["description"] == "Ingesting · a.md (3/50)"
+    assert ingest["total"] == 50
+    assert ingest["completed"] == 2
+
+    analyze = _stage_progress_update("analyze", 0, 0, "a.md")
+    assert analyze["description"] == "Analyzing · a.md"
+    assert "total" not in analyze
+    assert "completed" not in analyze
+
+    relations = _stage_progress_update("relations", 42, 80, "a.md")
+    assert relations["description"] == "Extracting relations · a.md (42/80)"
+    assert "total" not in relations
+
+    compile_u = _stage_progress_update("compile", 1, 10, "Qubit")
+    assert compile_u["total"] == 10
+    assert compile_u["completed"] == 0
+
+    lint = _stage_progress_update("lint", 0, 0, "")
+    assert lint["description"] == "Linting"
+    assert "total" not in lint
+
+
+def test_cli_run_passes_on_stage(vault, db, monkeypatch):
+    from synto.pipeline.orchestrator import PipelineReport
+
+    captured: dict[str, object] = {}
+
+    def fake_run(self, **kwargs):
+        captured["on_stage"] = kwargs.get("on_stage")
+        cb = captured["on_stage"]
+        if cb is not None:
+            cb("ingest", 1, 5, "a.md")
+            cb("analyze", 0, 0, "a.md")
+        return PipelineReport()
+
+    monkeypatch.setattr("synto.cli._load_deps", lambda cfg: (object(), db))
+    monkeypatch.setattr(
+        "synto.pipeline.orchestrator.PipelineOrchestrator.run",
+        fake_run,
+    )
+
+    result = CliRunner().invoke(cli, ["run", "--vault", str(vault)])
+
+    assert result.exit_code == 0, result.output
+    assert callable(captured["on_stage"])
+
+
 def test_ingest_note_reuses_matching_source_concept_seed_when_db_empty(vault, config, db):
     path = _write_raw(
         vault,
