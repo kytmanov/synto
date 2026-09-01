@@ -550,6 +550,62 @@ def test_orchestrator_run_emits_stage_progress(config, db):
     assert any(s[0] == "lint" for s in stages)
 
 
+def test_orchestrator_dry_run_does_not_emit_lint_stage(config, db):
+    """Lint is skipped on dry-run; a Linting spinner would be a lie."""
+    stages: list[tuple] = []
+    PipelineOrchestrator(config, make_mock_client(), db).run(
+        paths=[],
+        dry_run=True,
+        on_stage=lambda *a: stages.append(a),
+    )
+    assert not any(s[0] == "lint" for s in stages)
+    assert not any(s[0] == "approve" for s in stages)
+    assert not any(s[0] == "commit" for s in stages)
+
+
+def test_orchestrator_auto_approve_emits_approve_stage(config, db):
+    draft = config.drafts_dir / "Topic.md"
+    draft.write_text("x")
+    stages: list[tuple] = []
+
+    with (
+        patch("synto.pipeline.orchestrator._run_compile", return_value=([draft], [], {})),
+        patch("synto.pipeline.compile.approve_drafts", return_value=[draft]) as approve,
+        patch("synto.pipeline.lint.run_lint") as lint,
+    ):
+        lint.return_value.issues = []
+        PipelineOrchestrator(config, make_mock_client(), db).run(
+            paths=[],
+            auto_approve=True,
+            on_stage=lambda *a: stages.append(a),
+        )
+
+    approve.assert_called_once()
+    assert ("approve", 0, 0, "") in stages
+    assert any(s[0] == "lint" for s in stages)
+
+
+def test_orchestrator_auto_commit_emits_commit_stage(config, db):
+    config.pipeline.auto_commit = True
+    draft = config.drafts_dir / "Topic.md"
+    draft.write_text("x")
+    stages: list[tuple] = []
+
+    with (
+        patch("synto.pipeline.orchestrator._run_compile", return_value=([draft], [], {})),
+        patch("synto.pipeline.lint.run_lint") as lint,
+        patch("synto.git_ops.git_commit", return_value="committed") as commit,
+    ):
+        lint.return_value.issues = []
+        PipelineOrchestrator(config, make_mock_client(), db).run(
+            paths=[],
+            on_stage=lambda *a: stages.append(a),
+        )
+
+    commit.assert_called_once()
+    assert ("commit", 0, 0, "") in stages
+
+
 def test_orchestrator_forwards_compile_progress_as_stage(config, db):
     stages: list[tuple] = []
 

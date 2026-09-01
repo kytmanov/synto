@@ -183,9 +183,9 @@ class PipelineOrchestrator:
 
         # ── Lint ──────────────────────────────────────────────────────────────
         log.info("── Lint ─────────────────────────────────────────────────────")
-        if on_stage is not None:
-            on_stage("lint", 0, 0, "")
         if not dry_run:
+            if on_stage is not None:
+                on_stage("lint", 0, 0, "")
             lint_result = run_lint(config, db)
             report.lint_issues = len(lint_result.issues)
             report.lint_issues_acked = len(
@@ -249,6 +249,8 @@ class PipelineOrchestrator:
 
         # ── Approve ────────────────────────────────────────────────────────────
         if auto_approve and draft_paths and not dry_run:
+            if on_stage is not None:
+                on_stage("approve", 0, 0, "")
             log.info(
                 "── Auto-approve (%d draft(s)) ───────────────────────────────", len(draft_paths)
             )  # noqa: E501
@@ -265,6 +267,8 @@ class PipelineOrchestrator:
 
         # ── Commit ─────────────────────────────────────────────────────────────
         if config.pipeline.auto_commit and not dry_run and (report.compiled or report.published):
+            if on_stage is not None:
+                on_stage("commit", 0, 0, "")
             msg = f"run: {report.compiled} compiled"
             if report.published:
                 msg += f", {report.published} published"
