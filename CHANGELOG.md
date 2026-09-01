@@ -30,6 +30,12 @@
 
 ### Added
 
+- **CLI shows the current pipeline stage and a spinner while work is in progress (#122).**
+  `synto ingest`, `run`, and `watch` label Analyzing / Extracting relations / Compiling /
+  Linting / Publishing / Committing. Analysis and relation extraction report chunk/unit
+  `i/n`; `run` and `watch` keep a note/concept bar so vault position is not lost during a
+  sub-stage.
+
 - **`synto vault` — see and switch between known vaults (#112).** `synto vault` lists every
   vault synto has seen (default marked, missing paths flagged), `synto vault use <path>`
   validates and switches the default without touching provider settings, and

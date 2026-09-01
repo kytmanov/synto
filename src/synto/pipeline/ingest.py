@@ -382,6 +382,9 @@ def _extract_and_persist_relations(
     canonical_names: list[str],
     fast: RoleEndpoint,
     config: Config,
+    *,
+    on_stage: Callable[[str, int, int, str], None] | None = None,
+    detail: str = "",
 ) -> int:
     """Run the Stage-3 relation-extraction pass over each segment and persist results.
 
@@ -408,7 +411,10 @@ def _extract_and_persist_relations(
     canon_by_key: dict[str, str] = dict(db.list_alias_map())
     for name in (*db.list_all_concept_names(), *canonical_names):
         canon_by_key[_concept_key(name)] = name
-    for seg in segments:
+    n_units = len(segments)
+    for i, seg in enumerate(segments, 1):
+        if on_stage is not None:
+            on_stage("relations", i, n_units, detail)
         seg_id, seg_text = (seg["id"], seg["text"]) if hasattr(seg, "keys") else (seg.id, seg.text)
         try:
             shim = SimpleNamespace(id=seg_id, text=seg_text)
@@ -451,6 +457,7 @@ def _analyze_body(
     source_type: str = "notes",
     units: list[tuple[str, list[str]]] | None = None,
     attribution: dict[int, list[str]] | None = None,
+    on_stage: Callable[[str, int, int, str], None] | None = None,
 ) -> AnalysisResult:
     """Analyze note body, splitting into chunks if body exceeds fast_ctx // 2 chars.
 
@@ -546,6 +553,8 @@ def _analyze_body(
         chunk_results: list[AnalysisResult | None] = [None] * len(chunks)
         errors: list[Exception] = []
         pending = [(i, chunk) for i, chunk in enumerate(chunks) if i not in completed]
+        done = len(completed)
+        n_chunks = len(chunks)
         if pending:
             with ThreadPoolExecutor(max_workers=len(pending)) as executor:
                 futures = {executor.submit(_analyze_chunk, chunk, i): i for i, chunk in pending}
@@ -561,6 +570,9 @@ def _analyze_body(
                         attribution[idx] = [c.name for c in result.concepts]
                     if on_chunk_result is not None:
                         on_chunk_result(idx, result)
+                    done += 1
+                    if on_stage is not None:
+                        on_stage("analyze", done, n_chunks, path_name)
             if errors:
                 raise errors[0]
         results = [r for r in chunk_results if r is not None]
@@ -569,6 +581,8 @@ def _analyze_body(
         for i, chunk in enumerate(chunks):
             if i in completed:
                 continue
+            if on_stage is not None:
+                on_stage("analyze", i + 1, len(chunks), path_name)
             result = _analyze_chunk(chunk, i)
             if attribution is not None:
                 attribution[i] = [c.name for c in result.concepts]
@@ -593,6 +607,7 @@ def _analyze_body_with_checkpoints(
     source_type: str = "notes",
     units: list[tuple[str, list[str]]] | None = None,
     attribution: dict[int, list[str]] | None = None,
+    on_stage: Callable[[str, int, int, str], None] | None = None,
 ) -> AnalysisResult:
     chunk_size = config.resolve_role("fast").ctx // 2
     rel_path = rel_posix(path, config.vault)
@@ -617,6 +632,7 @@ def _analyze_body_with_checkpoints(
             prompt_contexts=prompt_contexts,
             source_type=source_type,
             attribution=attribution,
+            on_stage=on_stage,
         )
 
     # Tracked sources pass segment-aligned units; plain notes split the body by size.
@@ -676,6 +692,7 @@ def _analyze_body_with_checkpoints(
             source_type=source_type,
             units=units,
             attribution=attribution,
+            on_stage=on_stage,
         )
 
     results = [result for result in chunk_results if result is not None]
@@ -1528,6 +1545,7 @@ def ingest_note(
     seed_alias_map: dict[str, str] | None = None,
     source_concept_seeds: dict[str, tuple[str, list[str]]] | None = None,
     force: bool = False,
+    on_stage: Callable[[str, int, int, str], None] | None = None,
 ) -> AnalysisResult | None:
     """
     Ingest a single raw note.
@@ -1637,6 +1655,8 @@ def ingest_note(
         # quality cap, halve the extracted concept count.
         chunk_units = _build_segment_units(source_segments, _unit_char_target(fast.ctx))
         chunk_attribution = {}
+    if on_stage is not None:
+        on_stage("analyze", 0, 0, path.name)
     try:
         result: AnalysisResult = _analyze_body_with_checkpoints(
             body=body,
@@ -1651,6 +1671,7 @@ def ingest_note(
             source_type=source_type,
             units=chunk_units,
             attribution=chunk_attribution,
+            on_stage=on_stage,
         )
     except Exception as e:
         log.error("Analysis failed for %s: %s", path.name, e, exc_info=True)
@@ -1781,7 +1802,15 @@ def ingest_note(
                     SimpleNamespace(id=f"note:{path.stem}:{i}", text=body[i : i + rel_chunk_size])
                     for i in range(0, len(body), rel_chunk_size)
                 ]
-            n = _extract_and_persist_relations(db, rel_segments, canonical_names, fast, config)
+            n = _extract_and_persist_relations(
+                db,
+                rel_segments,
+                canonical_names,
+                fast,
+                config,
+                on_stage=on_stage,
+                detail=path.name,
+            )
             log.info("relation extraction: %d relations from %d segments", n, len(rel_segments))
         except Exception:
             log.warning("relation extraction failed for %s", path.name, exc_info=True)
@@ -1831,6 +1860,7 @@ def ingest_all(
     rag=None,
     force: bool = False,
     on_progress: Callable[[int, int, str], None] | None = None,
+    on_stage: Callable[[str, int, int, str], None] | None = None,
 ) -> list[tuple[Path, AnalysisResult | None]]:
     """Ingest all .md files in raw/ (excluding raw/processed/ subfolders)."""
     raw_files = [
@@ -1865,6 +1895,7 @@ def ingest_all(
             seed_alias_map=seed_alias_map,
             source_concept_seeds=source_concept_seeds,
             force=force,
+            on_stage=on_stage,
         )
         results.append((path, result))
         if result is not None:

@@ -642,6 +642,37 @@ def test_extract_and_persist_relations_isolates_segment_failures(tmp_path: Path,
     assert relations[0]["source_segment_id"] == "seg-2"
 
 
+def test_extract_and_persist_relations_emits_on_stage(db, config) -> None:
+    """Live CLI needs one event per unit *before* the LLM call, or a 80-unit
+    pass still looks hung after analysis logs stop."""
+    from unittest.mock import patch
+
+    from synto.pipeline.ingest import _extract_and_persist_relations
+
+    events: list[tuple] = []
+    segs = [SimpleNamespace(id=f"s{i}", text="Alpha depends on Beta.") for i in range(3)]
+    empty = RelationExtractionResult(relations=[], source_segment_id="s", model="m")
+
+    with patch("synto.pipeline.ingest.extract_relations", return_value=empty) as mocked:
+        n = _extract_and_persist_relations(
+            db,
+            segs,
+            ["Alpha", "Beta"],
+            as_endpoint(MagicMock()),
+            config,
+            on_stage=lambda *a: events.append(a),
+            detail="paper.md",
+        )
+
+    assert n == 0
+    assert mocked.call_count == 3
+    assert events == [
+        ("relations", 1, 3, "paper.md"),
+        ("relations", 2, 3, "paper.md"),
+        ("relations", 3, 3, "paper.md"),
+    ]
+
+
 def test_extract_and_persist_relations_normalizes_to_canonical_casing(
     tmp_path: Path, config
 ) -> None:

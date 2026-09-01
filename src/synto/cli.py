@@ -27,7 +27,14 @@ from typing import TYPE_CHECKING
 import click
 from rich.console import Console
 from rich.panel import Panel
-from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+from rich.progress import (
+    BarColumn,
+    Progress,
+    ProgressColumn,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
 from rich.prompt import Prompt
 from rich.table import Table
 from rich.text import Text
@@ -78,6 +85,69 @@ _ensure_utf8_streams()
 
 console = Console()
 err_console = Console(stderr=True, style="bold red")
+
+_STAGE_LABELS = {
+    "ingest": "Ingesting",
+    "analyze": "Analyzing",
+    "relations": "Extracting relations",
+    "compile": "Compiling",
+    "lint": "Linting",
+    "approve": "Publishing",
+    "commit": "Committing",
+}
+
+_BAR_STAGES = frozenset({"ingest", "compile"})
+_INNER_STAGES: dict[str, frozenset[str]] = {
+    "ingest": frozenset({"analyze", "relations"}),
+    "compile": frozenset(),
+}
+
+
+class _OptionalMofNColumn(ProgressColumn):
+    """Like completed/total, but blank while the task has no total (avoids 0/None)."""
+
+    def render(self, task) -> Text:
+        if task.total is None:
+            return Text("")
+        return Text(f"{int(task.completed)}/{int(task.total)}")
+
+
+def _stage_description(stage: str, current: int, total: int, detail: str) -> str:
+    label = _STAGE_LABELS.get(stage, stage)
+    name = Path(detail).name if detail else ""
+    inner = f" ({current}/{total})" if total > 0 else ""
+    if name:
+        return f"{label} · {name}{inner}"
+    return f"{label}{inner}"
+
+
+def _stage_progress_update(stage: str, current: int, total: int, detail: str) -> dict[str, object]:
+    """Description for every stage; bar totals only for vault-level loops."""
+    update: dict[str, object] = {
+        "description": _stage_description(stage, current, total, detail),
+    }
+    if stage in _BAR_STAGES and total > 0:
+        update["total"] = total
+        update["completed"] = max(current - 1, 0)
+    return update
+
+
+def _advance_bar_state(
+    stage: str,
+    current: int,
+    total: int,
+    detail: str,
+    bar: tuple[str, int] | None,
+) -> tuple[dict[str, object], tuple[str, int] | None]:
+    update = _stage_progress_update(stage, current, total, detail)
+    if stage in _BAR_STAGES and total > 0:
+        return update, (stage, total)
+    if bar is not None and stage not in _INNER_STAGES.get(bar[0], frozenset()):
+        update["total"] = bar[1]
+        update["completed"] = bar[1]
+        return update, None
+    return update, bar
+
 
 PROJECT_REPO_URL = "https://github.com/kytmanov/synto"
 PROJECT_ISSUES_URL = f"{PROJECT_REPO_URL}/issues"
@@ -2040,12 +2110,16 @@ def ingest(
                     description=f"[dim]{Path(current_note_path).name}[/dim]",
                 )
 
+            def _on_stage(stage: str, current: int, total: int, detail: str) -> None:
+                progress.update(task, description=_stage_description(stage, current, total, detail))
+
             results = _ingest_all(
                 config=config,
                 router=router,
                 db=db,
                 force=force,
                 on_progress=_update_ingest_progress,
+                on_stage=_on_stage,
             )
 
         for path, result in results:
@@ -2071,6 +2145,9 @@ def ingest(
         ) as progress:
             task = progress.add_task("Ingesting...", total=len(target_paths))
 
+            def _on_stage(stage: str, current: int, total: int, detail: str) -> None:
+                progress.update(task, description=_stage_description(stage, current, total, detail))
+
             for path in target_paths:
                 progress.update(task, description=f"[dim]{path.name}[/dim]")
                 from .pipeline.ingest import ingest_note as _ingest_note
@@ -2081,6 +2158,7 @@ def ingest(
                     router=router,
                     db=db,
                     force=force,
+                    on_stage=_on_stage,
                 )
                 if result is None:
                     # Distinguish skip vs failure by checking DB status
@@ -3414,11 +3492,30 @@ def watch(vault_str, auto_approve):
                 console.print("[yellow]⚠ compile skipped — pipeline already running[/yellow]")
                 return
             try:
-                report = orchestrator.run(
-                    paths=md_paths,
-                    auto_approve=auto_approve or config.pipeline.auto_approve,
-                    fix=config.pipeline.auto_maintain,
-                )
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(),
+                    _OptionalMofNColumn(),
+                    TimeElapsedColumn(),
+                    console=console,
+                ) as progress:
+                    task = progress.add_task("Starting…", total=None)
+                    bar_state: tuple[str, int] | None = None
+
+                    def _on_stage(stage: str, current: int, total: int, detail: str) -> None:
+                        nonlocal bar_state
+                        update, bar_state = _advance_bar_state(
+                            stage, current, total, detail, bar_state
+                        )
+                        progress.update(task, **update)
+
+                    report = orchestrator.run(
+                        paths=md_paths,
+                        auto_approve=auto_approve or config.pipeline.auto_approve,
+                        fix=config.pipeline.auto_maintain,
+                        on_stage=_on_stage,
+                    )
             except Exception as exc:
                 console.print(f"[red]Pipeline error:[/red] {exc}")
                 return
@@ -3550,13 +3647,30 @@ def run(
             err_console.print("Pipeline already running — lock held. Check `synto status`.")
             sys.exit(1)
         orchestrator = PipelineOrchestrator(config, router, db)
-        report = orchestrator.run(
-            auto_approve=auto_approve,
-            fix=fix,
-            max_rounds=max_rounds,
-            dry_run=dry_run,
-            min_confidence=min_confidence,
-        )
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            _OptionalMofNColumn(),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task("Starting…", total=None)
+            bar_state: tuple[str, int] | None = None
+
+            def _on_stage(stage: str, current: int, total: int, detail: str) -> None:
+                nonlocal bar_state
+                update, bar_state = _advance_bar_state(stage, current, total, detail, bar_state)
+                progress.update(task, **update)
+
+            report = orchestrator.run(
+                auto_approve=auto_approve,
+                fix=fix,
+                max_rounds=max_rounds,
+                dry_run=dry_run,
+                min_confidence=min_confidence,
+                on_stage=_on_stage,
+            )
 
     table = Table(title="Pipeline Report", show_header=True)
     table.add_column("Step")

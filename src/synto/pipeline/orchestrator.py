@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -84,6 +85,7 @@ class PipelineOrchestrator:
         max_rounds: int = 2,
         dry_run: bool = False,
         min_confidence: float = 0.0,
+        on_stage: Callable[[str, int, int, str], None] | None = None,
     ) -> PipelineReport:
         """
         Run full pipeline: ingest → compile → lint → [stubs] → [approve].
@@ -119,17 +121,20 @@ class PipelineOrchestrator:
             )
 
         log.info("── Ingest (%d note(s)) ──────────────────────────────────", len(md_paths))
-        for raw_path_str in md_paths:
+        n_notes = len(md_paths)
+        for i, raw_path_str in enumerate(md_paths, 1):
             p = Path(raw_path_str)
             if not p.exists():
                 continue
+            if on_stage is not None:
+                on_stage("ingest", i, n_notes, p.name)
             if dry_run:
                 log.info("[dry-run] would ingest: %s", p.name)
                 ingested_paths.append(raw_path_str)
                 report.ingested += 1
                 continue
             try:
-                result = ingest_note(path=p, config=config, router=router, db=db)
+                result = ingest_note(path=p, config=config, router=router, db=db, on_stage=on_stage)
                 if result is not None:
                     report.ingested += 1
                     ingested_paths.append(raw_path_str)
@@ -155,11 +160,20 @@ class PipelineOrchestrator:
                     relative_ingested.append(p_str)  # already relative
             priority_concepts = db.get_concepts_for_sources(relative_ingested) or None
 
+        def _compile_stage(idx: int, total: int, name: str) -> None:
+            if on_stage is not None:
+                on_stage("compile", idx, total, name)
+
         n_concepts = len(priority_concepts) if priority_concepts else "all"
         log.info("── Compile round 1 (%s concept(s)) ─────────────────────────", n_concepts)
         t1 = time.monotonic()
         draft_paths, round1_failed, r1_timings = _run_compile(
-            config, router, db, concepts=priority_concepts, dry_run=dry_run
+            config,
+            router,
+            db,
+            concepts=priority_concepts,
+            dry_run=dry_run,
+            on_progress=_compile_stage,
         )
         report.timings["compile_r1"] = time.monotonic() - t1
         report.compiled += len(draft_paths)
@@ -170,6 +184,8 @@ class PipelineOrchestrator:
         # ── Lint ──────────────────────────────────────────────────────────────
         log.info("── Lint ─────────────────────────────────────────────────────")
         if not dry_run:
+            if on_stage is not None:
+                on_stage("lint", 0, 0, "")
             lint_result = run_lint(config, db)
             report.lint_issues = len(lint_result.issues)
             report.lint_issues_acked = len(
@@ -188,7 +204,12 @@ class PipelineOrchestrator:
             transient_concepts = [f.concept for f in transient]
             t2 = time.monotonic()
             r2_drafts, r2_failed, r2_timings = _run_compile(
-                config, router, db, concepts=transient_concepts, dry_run=dry_run
+                config,
+                router,
+                db,
+                concepts=transient_concepts,
+                dry_run=dry_run,
+                on_progress=_compile_stage,
             )
             report.timings["compile_r2"] = time.monotonic() - t2
             report.compiled += len(r2_drafts)
@@ -215,6 +236,7 @@ class PipelineOrchestrator:
                 concepts=truncated_concepts,
                 dry_run=dry_run,
                 ignore_soft_cap=True,
+                on_progress=_compile_stage,
             )
             report.timings["compile_escalation"] = time.monotonic() - te
             report.compiled += len(re_drafts)
@@ -227,6 +249,8 @@ class PipelineOrchestrator:
 
         # ── Approve ────────────────────────────────────────────────────────────
         if auto_approve and draft_paths and not dry_run:
+            if on_stage is not None:
+                on_stage("approve", 0, 0, "")
             log.info(
                 "── Auto-approve (%d draft(s)) ───────────────────────────────", len(draft_paths)
             )  # noqa: E501
@@ -243,6 +267,8 @@ class PipelineOrchestrator:
 
         # ── Commit ─────────────────────────────────────────────────────────────
         if config.pipeline.auto_commit and not dry_run and (report.compiled or report.published):
+            if on_stage is not None:
+                on_stage("commit", 0, 0, "")
             msg = f"run: {report.compiled} compiled"
             if report.published:
                 msg += f", {report.published} published"
@@ -262,6 +288,7 @@ def _run_compile(
     concepts: list[str] | None,
     dry_run: bool,
     ignore_soft_cap: bool = False,
+    on_progress: Callable[[int, int, str], None] | None = None,
 ) -> tuple[list[Path], list[FailureRecord], dict[str, float]]:
     """Run compile_concepts and classify failures by reason."""
     from ..openai_compat_client import LLMBadRequestError, LLMError
@@ -275,6 +302,7 @@ def _run_compile(
             dry_run=dry_run,
             concepts=concepts,
             ignore_soft_cap=ignore_soft_cap,
+            on_progress=on_progress,
         )
     except LLMBadRequestError as e:
         # Bad request (HTTP 400) — non-retryable; mark all as UNKNOWN not TRANSIENT

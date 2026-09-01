@@ -1039,6 +1039,22 @@ def test_ingest_all_reports_progress(vault, config, db):
     ]
 
 
+def test_ingest_all_forwards_on_stage(vault, config, db):
+    _write_raw(vault, "a.md", "# A\n\nAlpha content.")
+    client = as_router(MagicMock())
+    client.generate.side_effect = [_analysis_json(concepts=["Alpha Concept"])]
+    stages: list[tuple] = []
+
+    ingest_all(
+        config,
+        client,
+        db,
+        on_stage=lambda *a: stages.append(a),
+    )
+
+    assert any(s[0] == "analyze" and s[3] == "a.md" for s in stages)
+
+
 def test_ingest_all_seeds_existing_topics_from_index_when_db_empty(vault, config, db):
     _write_raw(vault, "a.md", "# A\n\nAlpha content.")
     (vault / ".synto" / "INDEX.json").write_text(
@@ -1231,9 +1247,12 @@ def test_cli_ingest_all_passes_progress_callback(vault, db, monkeypatch):
     _write_raw(vault, "a.md", "# A\n\nAlpha content.")
     captured: dict[str, object] = {}
 
-    def fake_ingest_all(*, config, router, db, force, on_progress):
+    def fake_ingest_all(*, config, router, db, force, on_progress, on_stage=None):
         captured["on_progress"] = on_progress
+        captured["on_stage"] = on_stage
         on_progress(1, 1, "raw/a.md")
+        if on_stage is not None:
+            on_stage("relations", 2, 5, "a.md")
         return [(config.raw_dir / "a.md", None)]
 
     monkeypatch.setattr("synto.cli._load_deps", lambda cfg: (object(), db))
@@ -1253,6 +1272,113 @@ def test_cli_ingest_all_passes_progress_callback(vault, db, monkeypatch):
 
     assert result.exit_code == 0
     assert callable(captured["on_progress"])
+    assert callable(captured["on_stage"])
+
+
+def test_stage_description_formats_inner_count():
+    from synto.cli import _stage_description
+
+    assert _stage_description("relations", 42, 80, "raw/paper.md") == (
+        "Extracting relations · paper.md (42/80)"
+    )
+    assert _stage_description("analyze", 0, 0, "paper.md") == "Analyzing · paper.md"
+    assert _stage_description("lint", 0, 0, "") == "Linting"
+
+
+def test_stage_progress_update_drives_bar_only_for_ingest_and_compile():
+    from synto.cli import _stage_progress_update
+
+    ingest = _stage_progress_update("ingest", 3, 50, "a.md")
+    assert ingest["description"] == "Ingesting · a.md (3/50)"
+    assert ingest["total"] == 50
+    assert ingest["completed"] == 2
+
+    analyze = _stage_progress_update("analyze", 0, 0, "a.md")
+    assert analyze["description"] == "Analyzing · a.md"
+    assert "total" not in analyze
+    assert "completed" not in analyze
+
+    relations = _stage_progress_update("relations", 42, 80, "a.md")
+    assert relations["description"] == "Extracting relations · a.md (42/80)"
+    assert "total" not in relations
+
+    compile_u = _stage_progress_update("compile", 1, 10, "Qubit")
+    assert compile_u["total"] == 10
+    assert compile_u["completed"] == 0
+
+    lint = _stage_progress_update("lint", 0, 0, "")
+    assert lint["description"] == "Linting"
+    assert "total" not in lint
+
+
+def test_advance_bar_state_keeps_ingest_bar_during_analyze_and_relations():
+    from synto.cli import _advance_bar_state
+
+    u, bar = _advance_bar_state("ingest", 50, 50, "z.md", None)
+    assert u["completed"] == 49
+    assert bar == ("ingest", 50)
+
+    u, bar = _advance_bar_state("analyze", 3, 12, "z.md", bar)
+    assert "completed" not in u
+    assert "total" not in u
+    assert bar == ("ingest", 50)
+
+    u, bar = _advance_bar_state("relations", 42, 80, "z.md", bar)
+    assert "completed" not in u
+    assert bar == ("ingest", 50)
+
+
+def test_advance_bar_state_resets_on_compile_and_completes_on_lint():
+    from synto.cli import _advance_bar_state
+
+    _, bar = _advance_bar_state("ingest", 50, 50, "z.md", None)
+    u, bar = _advance_bar_state("compile", 1, 12, "Qubit", bar)
+    assert u["total"] == 12
+    assert u["completed"] == 0
+    assert bar == ("compile", 12)
+
+    u, bar = _advance_bar_state("lint", 0, 0, "", bar)
+    assert u["total"] == 12
+    assert u["completed"] == 12
+    assert bar is None
+
+
+def test_optional_mofn_column_blank_when_total_none():
+    from rich.progress import Progress
+
+    from synto.cli import _OptionalMofNColumn
+
+    col = _OptionalMofNColumn()
+    with Progress(col, transient=True) as progress:
+        task = progress.add_task("Starting…", total=None)
+        assert col.render(progress.tasks[task]).plain == ""
+        progress.update(task, total=50, completed=49)
+        assert col.render(progress.tasks[task]).plain == "49/50"
+
+
+def test_cli_run_passes_on_stage(vault, db, monkeypatch):
+    from synto.pipeline.orchestrator import PipelineReport
+
+    captured: dict[str, object] = {}
+
+    def fake_run(self, **kwargs):
+        captured["on_stage"] = kwargs.get("on_stage")
+        cb = captured["on_stage"]
+        if cb is not None:
+            cb("ingest", 1, 5, "a.md")
+            cb("analyze", 0, 0, "a.md")
+        return PipelineReport()
+
+    monkeypatch.setattr("synto.cli._load_deps", lambda cfg: (object(), db))
+    monkeypatch.setattr(
+        "synto.pipeline.orchestrator.PipelineOrchestrator.run",
+        fake_run,
+    )
+
+    result = CliRunner().invoke(cli, ["run", "--vault", str(vault)])
+
+    assert result.exit_code == 0, result.output
+    assert callable(captured["on_stage"])
 
 
 def test_ingest_note_reuses_matching_source_concept_seed_when_db_empty(vault, config, db):
@@ -1379,6 +1505,29 @@ def test_analyze_body_single_call_for_short_note(vault, config, db):
     body = "Short note content."
     _analyze_body(body, [], "test.md", client, config)
     assert client.generate.call_count == 1
+
+
+def test_analyze_body_emits_on_stage_per_chunk(vault, config):
+    """Multi-chunk analysis must ping before each LLM call, or the spinner
+    freezes on Analyzing · file for the longest pass in the pipeline."""
+    config2 = Config(vault=vault, ollama={"fast_ctx": 100})
+    config2.pipeline.ingest_parallel = False
+    body = "x" * 100  # 2 chunks of 50
+    client = _make_client(_analysis_json(concepts=["Alpha"]))
+    events: list[tuple] = []
+    _analyze_body(
+        body,
+        [],
+        "paper.md",
+        client,
+        config2,
+        on_stage=lambda *a: events.append(a),
+    )
+    assert events == [
+        ("analyze", 1, 2, "paper.md"),
+        ("analyze", 2, 2, "paper.md"),
+    ]
+    assert client.generate.call_count == 2
 
 
 def test_analyze_body_multi_call_for_long_note(vault, config, db):
