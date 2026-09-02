@@ -2080,6 +2080,32 @@ def test_write_source_content_md_preserves_image_refs(tmp_path):
     assert "![[assets/src-003/img-0-0.png]]" in content
 
 
+def test_write_source_content_md_fences_sql(tmp_path):
+    path = write_source_content_md(
+        "usp-1",
+        "sql",
+        "usp_GetOrders",
+        [_seg("CREATE PROCEDURE dbo.usp_GetOrders\n    @CustomerId INT\nAS\nBEGIN\n")],
+        tmp_path,
+    )
+    content = path.read_text()
+    assert "```sql" in content
+    assert "CREATE PROCEDURE dbo.usp_GetOrders" in content
+    assert content.count("```") == 2
+
+
+def test_write_source_content_md_does_not_double_fence_sql(tmp_path):
+    already = "```sql\nCREATE VIEW vw_Active AS SELECT 1;\n```"
+    path = write_source_content_md("vw-1", "sql", "vw_Active", [_seg(already)], tmp_path)
+    content = path.read_text()
+    assert content.count("```sql") == 1
+
+
+def test_write_source_content_md_does_not_fence_notes(tmp_path):
+    path = write_source_content_md("n-1", "notes", None, [_seg("Plain text content.")], tmp_path)
+    assert "```sql" not in path.read_text()
+
+
 def test_media_section_stripped_before_llm_analysis(vault, config, db):
     """### Media + ![[...]] embeds are removed from body before LLM sees it.
 

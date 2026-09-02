@@ -346,6 +346,7 @@ def test_add_sql_infers_source_type(
     raw = next((config.vault / "raw").glob("*.md"))
     content = raw.read_text()
     assert "source_type: sql" in content
+    assert "```sql" in content
     assert "CREATE PROCEDURE usp_GetOrders" in content
     copies = list((config.app_dir / "sources").glob("*/original.sql"))
     assert len(copies) == 1
