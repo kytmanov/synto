@@ -4,6 +4,13 @@
 
 ### Fixed
 
+- **A first compile of a fresh vault produces cross-links again (#124).** Same-run wikilinks
+  are stripped because the target concept may never materialize, but the resolvable-title
+  list was built once before the loop and never updated, so a concept could not link to a
+  sibling whose draft had already been written in the same run. Each draft now joins the
+  resolvable set as it lands: links to a sibling still pending compile are stripped as
+  before, links to one already on disk survive.
+
 - **PDF import no longer mistakes a cited year for the paper's own publication year (#70).**
   `extract_bibliographic_metadata` picked the first `19xx`/`20xx` match on the first page,
   which is often a reference to earlier work (a citation, a prior report) rather than the

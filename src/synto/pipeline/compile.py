@@ -1035,6 +1035,12 @@ def compile_concepts(
             failed.append(name)
         failure_categories.setdefault(category, []).append(name)
 
+    def _mark_resolvable(title: str) -> None:
+        # Only titles already on disk are link targets (#65): seeding the whole run up front
+        # would ship links to concepts whose compile later fails.
+        if title not in resolvable_titles:
+            resolvable_titles.append(title)
+
     for idx, name in enumerate(concept_names, 1):
         if on_progress:
             on_progress(idx, total, name)
@@ -1147,6 +1153,7 @@ def compile_concepts(
                 pipeline=pipeline,
             )
             draft_paths.append(draft_path)
+            _mark_resolvable(name)
             if not dry_run and db._has_table("compile_runs"):
                 rel = str(draft_path.relative_to(config.vault))
                 db.update_article_compile_run(rel, run_ulid)
@@ -1377,6 +1384,7 @@ def compile_concepts(
             pipeline=pipeline,
         )
         draft_paths.append(draft_path)
+        _mark_resolvable(name)
         db.mark_concept_compile_state(name, resolved_paths, "compiled")
         # Track per-article compile run
         if not dry_run and db._has_table("compile_runs"):

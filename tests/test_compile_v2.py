@@ -950,6 +950,35 @@ def test_compile_concepts_unwraps_same_batch_concepts_until_materialized(config,
     assert "[[Beta]]" not in alpha_body
 
 
+def test_compile_concepts_links_to_earlier_sibling_once_materialized(config, db):
+    """A later concept may link to an earlier sibling whose draft already exists on disk.
+
+    Speculative links are stripped (#65) because the target may never materialize. Once a
+    sibling's draft is written, that reason is gone — stripping it anyway leaves a first
+    compile of a fresh vault with zero cross-links between concepts (#124).
+    """
+    import json
+
+    db.upsert_raw(RawNoteRecord(path="raw/a.md", content_hash="h1", status="ingested"))
+    db.upsert_raw(RawNoteRecord(path="raw/b.md", content_hash="h2", status="ingested"))
+    db.upsert_concepts("raw/a.md", ["Alpha"])
+    db.upsert_concepts("raw/b.md", ["Beta"])
+    (config.vault / "raw" / "a.md").write_text("---\ntitle: A\n---\nAlpha.")
+    (config.vault / "raw" / "b.md").write_text("---\ntitle: B\n---\nBeta mentions Alpha.")
+
+    client = make_mock_client()
+    client.generate.side_effect = [
+        json.dumps({"title": "Alpha", "content": "Alpha details.", "tags": []}),
+        json.dumps({"title": "Beta", "content": "Beta builds on [[Alpha]].", "tags": []}),
+    ]
+
+    drafts, failed, _ = compile_concepts(config, client, db)
+
+    assert failed == []
+    beta = next(path for path in drafts if path.name == "Beta.md")
+    assert "[[Alpha]]" in beta.read_text()
+
+
 def test_compile_concepts_skips_pending_draft(config, db):
     import json
 
