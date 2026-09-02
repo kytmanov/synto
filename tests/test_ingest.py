@@ -552,13 +552,15 @@ def _analysis_json(
     summary="A summary.",
     suggested_topics=None,
     named_references=None,
+    aliases_by_name=None,
 ):
     names = ["Quantum Computing", "Qubit"] if concepts is None else concepts
     topics = ["Quantum Computing"] if suggested_topics is None else suggested_topics
+    aliases_by_name = aliases_by_name or {}
     return json.dumps(
         {
             "summary": summary,
-            "concepts": [{"name": c, "aliases": []} for c in names],
+            "concepts": [{"name": c, "aliases": list(aliases_by_name.get(c, []))} for c in names],
             "suggested_topics": topics,
             "named_references": named_references or [],
             "quality": quality,
@@ -747,6 +749,73 @@ def test_ingest_note_stores_concepts(vault, config, db):
     names = db.list_all_concept_names()
     assert "Neural Networks" in names
     assert "Backpropagation" in names
+
+
+def test_sql_cross_schema_homonyms_stay_distinct(vault, config, db):
+    """dbo.Orders and staging.Orders must not share one entity.
+
+    The sql prompt strips only default schemas; non-default qualifiers stay in
+    the concept name. preferred_entity_for_surface matches label_key exactly,
+    so two different names mint two entities. Collapsing them is wiki corruption
+    for a multi-schema legacy DB (#116 F1).
+    """
+    dbo = _write_raw(
+        vault,
+        "dbo_orders.md",
+        "---\nsource_type: sql\n---\nCREATE TABLE dbo.Orders (id INT);\n",
+    )
+    staging = _write_raw(
+        vault,
+        "staging_orders.md",
+        "---\nsource_type: sql\n---\nCREATE TABLE staging.Orders (id INT);\n",
+    )
+    ingest_note(dbo, config, _make_client(_analysis_json(concepts=["Orders"])), db)
+    ingest_note(
+        staging,
+        config,
+        _make_client(_analysis_json(concepts=["staging.Orders"])),
+        db,
+    )
+    names = db.list_all_concept_names()
+    assert "Orders" in names
+    assert "staging.Orders" in names
+    assert len(names) == 2
+
+
+@pytest.mark.parametrize("staging_first", [False, True])
+def test_sql_unqualified_alias_does_not_merge_cross_schema(vault, config, db, staging_first):
+    """Prompt puts unqualified Orders on staging.Orders as an alias.
+
+    That alias equals dbo's preferred label. Either ingest order must keep
+    two entities and must not leave Orders as a live alias (#116 F1).
+    """
+    dbo = _write_raw(
+        vault,
+        "dbo_orders.md",
+        "---\nsource_type: sql\n---\nCREATE TABLE dbo.Orders (id INT);\n",
+    )
+    staging = _write_raw(
+        vault,
+        "staging_orders.md",
+        "---\nsource_type: sql\n---\nCREATE TABLE staging.Orders (id INT);\n",
+    )
+    dbo_client = _make_client(_analysis_json(concepts=["Orders"]))
+    staging_client = _make_client(
+        _analysis_json(
+            concepts=["staging.Orders"],
+            aliases_by_name={"staging.Orders": ["Orders"]},
+        )
+    )
+    if staging_first:
+        ingest_note(staging, config, staging_client, db)
+        ingest_note(dbo, config, dbo_client, db)
+    else:
+        ingest_note(dbo, config, dbo_client, db)
+        ingest_note(staging, config, staging_client, db)
+
+    names = db.list_all_concept_names()
+    assert sorted(names) == ["Orders", "staging.Orders"]
+    assert "orders" not in db.list_alias_map()
 
 
 def test_ingest_note_uses_suggested_topics_when_concepts_empty(vault, config, db):
@@ -2047,6 +2116,49 @@ def test_write_source_content_md_preserves_image_refs(tmp_path):
     content = path.read_text()
     assert "### Media" in content
     assert "![[assets/src-003/img-0-0.png]]" in content
+
+
+def test_write_source_content_md_fences_sql(tmp_path):
+    path = write_source_content_md(
+        "usp-1",
+        "sql",
+        "usp_GetOrders",
+        [_seg("CREATE PROCEDURE dbo.usp_GetOrders\n    @CustomerId INT\nAS\nBEGIN\n")],
+        tmp_path,
+    )
+    content = path.read_text()
+    assert "```sql" in content
+    assert "CREATE PROCEDURE dbo.usp_GetOrders" in content
+    assert content.count("```") == 2
+
+
+def test_write_source_content_md_does_not_double_fence_sql(tmp_path):
+    already = "```sql\nCREATE VIEW vw_Active AS SELECT 1;\n```"
+    path = write_source_content_md("vw-1", "sql", "vw_Active", [_seg(already)], tmp_path)
+    content = path.read_text()
+    assert content.count("```sql") == 1
+
+
+def test_write_source_content_md_does_not_wrap_prose_with_inner_sql_fence(tmp_path):
+    """A markdown note with an inner fence must not get an outer ```sql wrapper.
+
+    startswith('```') is false for prose-first bodies, so the old guard nested
+    fences and Obsidian closed the block at the inner closer (#116 F6).
+    """
+    body = "# Orders proc\n\nReturns open orders:\n\n```sql\nSELECT 1;\n```\n\nSee also the view.\n"
+    path = write_source_content_md("orders-1", "sql", "Orders", [_seg(body)], tmp_path)
+    content = path.read_text()
+    assert content.count("```") == 2
+    assert content.count("```sql") == 1
+    assert "# Orders proc" in content
+    assert "See also the view." in content
+    # Outer wrap would put the heading inside a sql fence.
+    assert "```sql\n# Orders proc" not in content
+
+
+def test_write_source_content_md_does_not_fence_notes(tmp_path):
+    path = write_source_content_md("n-1", "notes", None, [_seg("Plain text content.")], tmp_path)
+    assert "```sql" not in path.read_text()
 
 
 def test_media_section_stripped_before_llm_analysis(vault, config, db):

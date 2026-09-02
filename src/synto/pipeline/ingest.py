@@ -1530,7 +1530,10 @@ def write_source_content_md(
     if title:
         meta.setdefault("title", title)
 
-    write_note(dest, meta, "\n".join(lines))
+    body = "\n".join(lines).strip("\n")
+    if source_type == "sql" and "```" not in body:
+        body = f"```sql\n{body.strip()}\n```"
+    write_note(dest, meta, body)
     return dest
 
 

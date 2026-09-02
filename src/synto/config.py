@@ -533,6 +533,7 @@ class PipelineConfig(BaseModel):
             "textbook",
             "paper",
             "spec",
+            "sql",
             "api_docs",
             "web_article",
             "corp_docs",

@@ -64,6 +64,21 @@ def test_unknown_source_type_warns_not_raises(caplog):
     assert any("unknown source type" in r.message for r in caplog.records)
 
 
+def test_sql_is_a_known_source_type(caplog) -> None:
+    with caplog.at_level("WARNING"):
+        config = Config(
+            vault="/tmp/v",
+            pipeline={"source_overrides": {"sql": {"max_concepts_per_source": 25}}},
+        )
+    assert not any("unknown source type" in r.message for r in caplog.records)
+    assert config.pipeline.effective_max_concepts("sql") == 25
+
+
+def test_sql_default_ceiling_is_global() -> None:
+    config = Config(vault="/tmp/v")
+    assert config.pipeline.effective_max_concepts("sql") == 8
+
+
 # ── Stage 2: effective_max_concepts() ──────────────────────────────────────
 
 

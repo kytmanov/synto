@@ -334,6 +334,52 @@ def test_add_md_preserves_existing_frontmatter(
     assert "Imported markdown body." in content
 
 
+def test_add_sql_infers_source_type(
+    config: Config, db: StateDB, tmp_path: Path, runner: CliRunner
+) -> None:
+    src = tmp_path / "usp_GetOrders.sql"
+    src.write_text("CREATE PROCEDURE usp_GetOrders AS SELECT 1;\n", encoding="utf-8")
+    result = runner.invoke(cli, ["add", str(src), "--vault", str(config.vault)])
+    assert result.exit_code == 0, result.output
+    rows = db.list_source_documents()
+    assert rows[0][2] == "sql"
+    raw = next((config.vault / "raw").glob("*.md"))
+    content = raw.read_text()
+    assert "source_type: sql" in content
+    assert "```sql" in content
+    assert "CREATE PROCEDURE usp_GetOrders" in content
+    copies = list((config.app_dir / "sources").glob("*/original.sql"))
+    assert len(copies) == 1
+
+
+def test_add_md_with_type_sql(
+    config: Config, db: StateDB, tmp_path: Path, runner: CliRunner
+) -> None:
+    src = tmp_path / "view.md"
+    src.write_text("CREATE VIEW vw_Active AS SELECT 1;\n", encoding="utf-8")
+    result = runner.invoke(cli, ["add", str(src), "--type", "sql", "--vault", str(config.vault)])
+    assert result.exit_code == 0, result.output
+    assert db.list_source_documents()[0][2] == "sql"
+    raw = next((config.vault / "raw").glob("*.md"))
+    assert "source_type: sql" in raw.read_text()
+
+
+def test_add_md_type_sql_does_not_wrap_existing_fence(
+    config: Config, db: StateDB, tmp_path: Path, runner: CliRunner
+) -> None:
+    src = tmp_path / "notes.md"
+    src.write_text(
+        "# Orders proc\n\nReturns open orders:\n\n```sql\nSELECT 1;\n```\n\nSee also the view.\n",
+        encoding="utf-8",
+    )
+    result = runner.invoke(cli, ["add", str(src), "--type", "sql", "--vault", str(config.vault)])
+    assert result.exit_code == 0, result.output
+    content = next((config.vault / "raw").glob("*.md")).read_text()
+    assert "source_type: sql" in content
+    assert content.count("```") == 2
+    assert "```sql\n# Orders proc" not in content
+
+
 def test_add_pdf_writes_raw_note_with_segments(
     config: Config, db: StateDB, sample_pdf: Path, runner: CliRunner
 ) -> None:
