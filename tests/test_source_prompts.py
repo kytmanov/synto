@@ -178,9 +178,11 @@ def test_sql_prompt_content() -> None:
     prompt = load_prompt("sql").lower()
     assert "sql" in prompt
     assert "create" in prompt
-    assert "unqualified" in prompt
     assert "named_references" in prompt
     assert "keyword" in prompt
+    assert "dbo" in prompt
+    assert "public" in prompt
+    assert "staging.orders" in prompt
 
 
 def test_ingest_uses_sql_prompt(tmp_path: Path, config, db) -> None:

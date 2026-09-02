@@ -749,6 +749,37 @@ def test_ingest_note_stores_concepts(vault, config, db):
     assert "Backpropagation" in names
 
 
+def test_sql_cross_schema_homonyms_stay_distinct(vault, config, db):
+    """dbo.Orders and staging.Orders must not share one entity.
+
+    The sql prompt strips only default schemas; non-default qualifiers stay in
+    the concept name. preferred_entity_for_surface matches label_key exactly,
+    so two different names mint two entities. Collapsing them is wiki corruption
+    for a multi-schema legacy DB (#116 F1).
+    """
+    dbo = _write_raw(
+        vault,
+        "dbo_orders.md",
+        "---\nsource_type: sql\n---\nCREATE TABLE dbo.Orders (id INT);\n",
+    )
+    staging = _write_raw(
+        vault,
+        "staging_orders.md",
+        "---\nsource_type: sql\n---\nCREATE TABLE staging.Orders (id INT);\n",
+    )
+    ingest_note(dbo, config, _make_client(_analysis_json(concepts=["Orders"])), db)
+    ingest_note(
+        staging,
+        config,
+        _make_client(_analysis_json(concepts=["staging.Orders"])),
+        db,
+    )
+    names = db.list_all_concept_names()
+    assert "Orders" in names
+    assert "staging.Orders" in names
+    assert len(names) == 2
+
+
 def test_ingest_note_uses_suggested_topics_when_concepts_empty(vault, config, db):
     path = _write_raw(
         vault,
