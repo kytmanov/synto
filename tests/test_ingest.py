@@ -2101,6 +2101,28 @@ def test_write_source_content_md_does_not_double_fence_sql(tmp_path):
     assert content.count("```sql") == 1
 
 
+def test_write_source_content_md_does_not_wrap_prose_with_inner_sql_fence(tmp_path):
+    """A markdown note with an inner fence must not get an outer ```sql wrapper.
+
+    startswith('```') is false for prose-first bodies, so the old guard nested
+    fences and Obsidian closed the block at the inner closer (#116 F6).
+    """
+    body = (
+        "# Orders proc\n\n"
+        "Returns open orders:\n\n"
+        "```sql\nSELECT 1;\n```\n\n"
+        "See also the view.\n"
+    )
+    path = write_source_content_md("orders-1", "sql", "Orders", [_seg(body)], tmp_path)
+    content = path.read_text()
+    assert content.count("```") == 2
+    assert content.count("```sql") == 1
+    assert "# Orders proc" in content
+    assert "See also the view." in content
+    # Outer wrap would put the heading inside a sql fence.
+    assert "```sql\n# Orders proc" not in content
+
+
 def test_write_source_content_md_does_not_fence_notes(tmp_path):
     path = write_source_content_md("n-1", "notes", None, [_seg("Plain text content.")], tmp_path)
     assert "```sql" not in path.read_text()

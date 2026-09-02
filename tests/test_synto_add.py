@@ -364,6 +364,22 @@ def test_add_md_with_type_sql(
     assert "source_type: sql" in raw.read_text()
 
 
+def test_add_md_type_sql_does_not_wrap_existing_fence(
+    config: Config, db: StateDB, tmp_path: Path, runner: CliRunner
+) -> None:
+    src = tmp_path / "notes.md"
+    src.write_text(
+        "# Orders proc\n\nReturns open orders:\n\n```sql\nSELECT 1;\n```\n\nSee also the view.\n",
+        encoding="utf-8",
+    )
+    result = runner.invoke(cli, ["add", str(src), "--type", "sql", "--vault", str(config.vault)])
+    assert result.exit_code == 0, result.output
+    content = next((config.vault / "raw").glob("*.md")).read_text()
+    assert "source_type: sql" in content
+    assert content.count("```") == 2
+    assert "```sql\n# Orders proc" not in content
+
+
 def test_add_pdf_writes_raw_note_with_segments(
     config: Config, db: StateDB, sample_pdf: Path, runner: CliRunner
 ) -> None:

@@ -1531,7 +1531,7 @@ def write_source_content_md(
         meta.setdefault("title", title)
 
     body = "\n".join(lines).strip("\n")
-    if source_type == "sql" and not body.lstrip().startswith("```"):
+    if source_type == "sql" and "```" not in body:
         body = f"```sql\n{body.strip()}\n```"
     write_note(dest, meta, body)
     return dest
