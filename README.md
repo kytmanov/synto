@@ -458,6 +458,8 @@ synto add usp_GetOrders.sql --vault ~/my-wiki
 synto ingest --all --vault ~/my-wiki
 ```
 
+Concept names keep a non-default schema (`staging.Orders`); `dbo` and `public` are stripped so they merge with unqualified names.
+
 A script that defines many objects is capped at `max_concepts_per_source` (default 8).
 Raise it for schema dumps:
 

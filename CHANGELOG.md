@@ -34,8 +34,11 @@
   Exported procedures, functions, and views were ingested with the notes prompt, so
   concept names drifted to generic topics and comment-light DDL was often rated low.
   `source_type: sql` (inferred by `synto add` for `.sql` files) uses a dedicated
-  analysis prompt that mints defined objects as concepts. Ingest still only reads
-  `raw/**/*.md` — import `.sql` via `synto add`, do not drop it in `raw/`.
+  analysis prompt that mints defined objects as concepts, keeping non-default schema
+  qualifiers so `dbo.Orders` and `staging.Orders` do not collapse. Imported SQL is
+  wrapped in a `sql` fence so Obsidian does not treat indented parameters as code
+  blocks. Ingest still only reads `raw/**/*.md` — import `.sql` via `synto add`,
+  do not drop it in `raw/`.
 
 - **CLI shows the current pipeline stage and a spinner while work is in progress (#122).**
   `synto ingest`, `run`, and `watch` label Analyzing / Extracting relations / Compiling /
