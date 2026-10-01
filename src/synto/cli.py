@@ -1262,15 +1262,24 @@ def _build_probe_client(name, url, prov, *, api_key=None):
         from .ollama_client import OllamaClient
 
         client = OllamaClient(base_url=url, timeout=5)
-        resolved_key = None
+        return client, client.healthcheck(), None
+
+    resolved_key = api_key
+    if not resolved_key and prov.env_var:
+        resolved_key = os.environ.get(prov.env_var)
+    if not resolved_key:
+        resolved_key = os.environ.get("SYNTO_API_KEY")
+    if prov.anthropic_compat:
+        # Probe with the client the pipeline will use (#40): the OpenAI client would hit
+        # /models with a Bearer header, which Messages-API providers like Kimi reject.
+        from .anthropic_compat_client import AnthropicCompatClient
+
+        client = AnthropicCompatClient(
+            base_url=url, provider_name=name, api_key=resolved_key, timeout=5
+        )
     else:
         from .openai_compat_client import OpenAICompatClient
 
-        resolved_key = api_key
-        if not resolved_key and prov.env_var:
-            resolved_key = os.environ.get(prov.env_var)
-        if not resolved_key:
-            resolved_key = os.environ.get("SYNTO_API_KEY")
         client = OpenAICompatClient(
             base_url=url,
             provider_name=name,
@@ -3144,7 +3153,13 @@ def doctor(vault_str, backlog, since, reconcile):
                     )
                     console.print(f"      ${var} is not set")
                 continue
-            if any(resolved.model in m for m in models):
+            if resolved.anthropic_compat and not models:
+                # Messages-API providers expose no model list, so absence proves nothing.
+                console.print(
+                    f"  [green]✓[/green] {role}: {resolved.model}  [dim]{conn} "
+                    f"(model list unavailable — not verified)[/dim]{think_str}"
+                )
+            elif any(resolved.model in m for m in models):
                 console.print(
                     f"  [green]✓[/green] {role}: {resolved.model}  [dim]{conn}[/dim]{think_str}"
                 )

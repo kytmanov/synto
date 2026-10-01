@@ -397,3 +397,64 @@ def test_anthropic_compat_401_with_key_says_rejected_and_omits_key_value():
     assert "$KIMI_API_KEY" in msg
     assert "rejected" in msg
     assert "sk-anthropic-secret" not in msg
+
+
+# ── anthropic-compat providers (#40) ─────────────────────────────────────────
+
+KIMI_HEAVY_TOML = ISSUE_114_TOML.replace(
+    """[providers.deepinfra]
+name = "deepinfra"
+url = "https://api.deepinfra.com/v1/openai"
+timeout = 120.0
+api_key_env = "DEEPINFRA_API_KEY"
+""",
+    """[providers.kimi]
+name = "kimi"
+url = "https://api.kimi.com/coding"
+timeout = 120.0
+api_key_env = "KIMI_API_KEY"
+""",
+).replace('provider = "deepinfra"', 'provider = "kimi"')
+
+
+def test_setup_probe_uses_the_messages_api_client_for_anthropic_compat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wizard must probe Kimi with the client the pipeline uses, not OpenAI's /models."""
+    from synto.cli import _build_probe_client
+    from synto.providers import get_provider
+
+    monkeypatch.setenv("KIMI_API_KEY", "sk-kimi")
+    prov = get_provider("kimi")
+    with (
+        patch.object(AnthropicCompatClient, "healthcheck", return_value=True),
+        patch.object(OpenAICompatClient, "healthcheck", side_effect=AssertionError),
+    ):
+        client, connected, resolved_key = _build_probe_client("kimi", prov.default_url, prov)
+    try:
+        assert isinstance(client, AnthropicCompatClient)
+        assert connected is True
+        assert resolved_key == "sk-kimi"
+    finally:
+        client.close()
+
+
+def test_doctor_does_not_fail_anthropic_compat_role_for_missing_model_list(
+    tmp_path: Path,
+    runner: CliRunner,
+    fake_healthy_client,
+    cfg_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Messages-API providers have no model list; doctor must not call the model missing."""
+    monkeypatch.setenv("KIMI_API_KEY", "sk-kimi")
+
+    result = runner.invoke(cli, ["init", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    (tmp_path / CONFIG_FILE_NAME).write_text(KIMI_HEAVY_TOML)
+
+    result = runner.invoke(cli, ["doctor", "--vault", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    assert "✓ heavy" in result.output
+    assert "not verified" in result.output
+    assert "openai/gpt-oss-120b not found" not in result.output
