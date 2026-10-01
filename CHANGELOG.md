@@ -2,6 +2,45 @@
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-01
+
+Synto now handles SQL sources, remembers your vaults (`synto vault`), and shows which
+pipeline stage is running. This release also closes two MCP leaks, fixes cloud-provider
+credential diagnostics, and picks up security fixes in dependencies. Thanks to
+@balazsjdp, @AmirF194, and @PEKEW for their contributions.
+
+No schema migration. Existing vaults work unchanged.
+
+### Security
+
+- **MCP `answer_question` no longer feeds hidden articles to the model (#42).** The tool
+  read every selected page body and filtered by visibility only after the answer was
+  generated, so an article hidden by `visibility: private` or `mcp.exclude_tags` could
+  still shape the answer text. Pages are now checked before their body is read.
+  Contributed by @AmirF194 (#113).
+
+- **Query page lookup cannot leave the published wiki.** Page titles come from the fast
+  model's routing step, which the question can steer, and were joined onto `wiki/`
+  without a containment check. A title like `sources/../../raw/<note>` loaded a raw note,
+  and its `sources/` prefix also bypassed the MCP visibility gate, so an MCP client could
+  pull raw notes or unpublished drafts into an `answer_question` reply. Resolved pages
+  must now stay inside `wiki/` and outside `wiki/.drafts/`. Also, only `wiki/sources/` is
+  exempt from the MCP visibility gate, not any folder named `sources`.
+
+- **Pack article paths are validated the same way on every OS (#108).** Windows drive,
+  UNC, and backslash `..` paths are now rejected when the pack index loads, not only
+  when an article is read.
+
+- **Dependency updates.** `click` ≥ 8.3.3 (CVE-2026-7246: command injection in
+  `click.edit()`, which `synto review`'s edit action calls on a draft path built from a
+  concept name). Locked versions also include `pyjwt` 2.15.1 (five advisories, pulled in
+  via `mcp[crypto]`), `anyio` 4.15.1 (TLS hostname encoding, worker hang), and
+  `cryptography` 50.0.0.
+
+- CI and release workflows now run with a read-only `GITHUB_TOKEN` by default. The
+  release workflow also refuses to publish a tag that does not match the package
+  version.
+
 ### Fixed
 
 - **A first compile of a fresh vault produces cross-links again (#124).** Same-run wikilinks
@@ -34,6 +73,13 @@
   key was rejected) without ever echoing the key itself. The heavy role's provider prompt can
   now also take a raw key (mirroring the fast/primary role), stored only in the user-private
   global config, never the vault's `synto.toml`.
+
+- **`synto setup` and `synto doctor` handle Anthropic-compatible providers (Kimi) (#40).**
+  The setup wizard used the OpenAI client to test every cloud provider, so testing Kimi
+  hit `/models` with a Bearer header and reported a false "Cannot reach". `doctor`
+  flagged every Kimi model as "not found" because the Messages API cannot list models.
+  The wizard now uses the same client as the pipeline, and `doctor` marks the model as
+  not verified instead of failing.
 
 ### Added
 

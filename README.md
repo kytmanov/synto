@@ -422,6 +422,16 @@ synto init ~/my-wiki
 
 Creates the folder structure and a `synto.toml` pre-filled with your wizard settings.
 
+Working with more than one vault? Synto remembers every vault you `init` or pick in `setup`:
+
+```bash
+synto vault                    # list known vaults; * marks the default
+synto vault use ~/other-wiki   # make it the default (provider settings are untouched)
+synto vault forget ~/old-wiki  # drop it from the list
+```
+
+`--vault` or `SYNTO_VAULT` still override the default for a single command.
+
 ### 4. Add notes and sources
 
 Drop any `.md` files into `~/my-wiki/raw/`. Web clips, book notes, meeting notes, transcripts — anything.
