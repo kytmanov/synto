@@ -1,6 +1,6 @@
 [project]
 name = "synto"
-version = "0.7.0"
+version = "0.8.0"
 description = "Turn private notes into local knowledge packs and synthesized wikis"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -20,7 +20,7 @@ classifiers = [
     "Topic :: Utilities",
 ]
 dependencies = [
-    "click>=8.1",
+    "click>=8.3.3",
     "rich>=13.0",
     "pydantic>=2.0",
     "pyyaml>=6.0",
