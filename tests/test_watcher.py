@@ -88,13 +88,14 @@ def test_moved_event_non_md_dest_ignored():
 
 
 def test_debounce_resets_on_new_event():
-    handler, calls = _make_handler(debounce=0.15)
+    # Wide margins: a loaded runner can oversleep tens of ms and fire a short timer early.
+    handler, calls = _make_handler(debounce=0.6)
     handler.on_created(_FakeEvent("/vault/raw/a.md"))
-    time.sleep(0.05)  # before debounce fires
+    time.sleep(0.1)  # before debounce fires
     handler.on_modified(_FakeEvent("/vault/raw/b.md"))  # resets timer
-    time.sleep(0.05)  # still before debounce fires
+    time.sleep(0.1)  # still before debounce fires
     assert calls == []  # not fired yet
-    time.sleep(0.2)  # now it should fire
+    time.sleep(0.9)  # now it should fire
     assert len(calls) == 1
     assert len(calls[0]) == 2
 
