@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import re
 import unicodedata
 from collections.abc import Callable
@@ -193,7 +194,26 @@ def _load_index(config: Config) -> str:
 
 
 def _find_page(config: Config, title: str, db: StateDB | None = None) -> Path | None:
-    """Resolve a title to a file path with concept > source > synthesis precedence."""
+    """Resolve a title to a file path with concept > source > synthesis precedence.
+
+    Titles come from the fast model's page selection, which a question can steer (MCP
+    callers included), so a title like `sources/../../raw/note` must not resolve to a file
+    outside the published wiki or into unpublished drafts.
+    """
+    page = _find_page_unchecked(config, title, db=db)
+    if page is None:
+        return None
+    wiki_root = Path(os.path.normpath(config.wiki_dir))
+    normalized = Path(os.path.normpath(page))
+    if not normalized.is_relative_to(wiki_root):
+        log.warning("query: rejected page outside wiki/: %r", title)
+        return None
+    if ".drafts" in normalized.relative_to(wiki_root).parts:
+        return None
+    return normalized
+
+
+def _find_page_unchecked(config: Config, title: str, db: StateDB | None = None) -> Path | None:
 
     def priority(path: Path) -> tuple[int, str]:
         rel = path.relative_to(config.vault)

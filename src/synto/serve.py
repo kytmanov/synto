@@ -858,6 +858,8 @@ def build_tool_handlers(
             from .client_factory import build_router
             from .engines import QueryConfig, QueryEngine
 
+            sources_parts = config.sources_dir.relative_to(config.vault).parts
+
             def _page_visible(resolved_rel_path: str) -> bool:
                 # Source-summary pages (wiki/sources/) carry no `visibility`/`exclude_tags`
                 # frontmatter and are never in the reader's concept/synthesis article cache,
@@ -865,7 +867,9 @@ def build_tool_handlers(
                 # of content. They are gated by the separate source_access/license mechanism
                 # (get_source_passages etc.), not by MCP article visibility, so leave them
                 # unfiltered here rather than dropping every source page outright.
-                if "sources" in Path(resolved_rel_path).parts:
+                # Anchored to wiki/sources/ itself: a `sources` folder nested elsewhere in the
+                # wiki holds ordinary articles and must still pass the visibility gate.
+                if Path(resolved_rel_path).parts[: len(sources_parts)] == sources_parts:
                     return True
                 try:
                     _read_visible_article(reader, resolved_rel_path, config.mcp)
