@@ -15,7 +15,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from functools import cached_property
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Protocol
 
 import frontmatter
@@ -568,13 +568,15 @@ class PackReader:
         return ref
 
     def _normalize_pack_article_path(self, relative_path: str) -> str:
-        raw = Path(relative_path)
-        if raw.is_absolute():
+        # Packs move between OSes, so judge the path under both flavors: on Windows a rooted
+        # /x is not is_absolute() yet still escapes, and on POSIX C:\x or ..\x would
+        # otherwise pass as an ordinary filename (#108).
+        win = PureWindowsPath(relative_path)
+        if PurePosixPath(relative_path).is_absolute() or win.drive or win.root:
             raise MalformedPackError(f"Absolute article path not allowed: {relative_path}")
-        parts = raw.parts
-        if any(part == ".." for part in parts):
+        if ".." in win.parts:
             raise MalformedPackError(f"Path traversal not allowed: {relative_path}")
-        return raw.as_posix()
+        return win.as_posix()
 
     def _safe_article_path(self, relative_path: str) -> Path:
         normalized = self._normalize_pack_article_path(relative_path)
