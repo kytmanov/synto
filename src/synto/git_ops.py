@@ -62,6 +62,9 @@ def git_commit(
         if _has_pre_staged_changes(vault):
             log.warning("git_commit: pre-staged changes detected — skipping auto-commit")
             return "blocked"
+        paths = _committable(vault, paths)
+        if not paths:
+            return "nothing"
         _run(["git", "add"] + paths, cwd=vault)
         # Check if there's anything staged
         result = _run(["git", "status", "--porcelain"], cwd=vault)
@@ -75,6 +78,26 @@ def git_commit(
         log.warning("git commit failed: %s", e.stderr)
         _unstage(vault, paths)
         return "failed"
+
+
+def _committable(vault: Path, paths: list[str]) -> list[str]:
+    """Drop paths `git add` would reject, so they can't fail the whole commit.
+
+    `git add` exits non-zero for a path the user git-ignores (e.g. a deliberately private
+    raw/) or one that neither exists nor is tracked, and then nothing gets committed. Skip
+    such paths instead; an ignored path is never force-added.
+    """
+    kept: list[str] = []
+    for path in paths:
+        if _run(["git", "check-ignore", "-q", path], cwd=vault, check=False).returncode == 0:
+            log.debug("git_commit: skipping ignored path %s", path)
+            continue
+        if not (vault / path).exists():
+            tracked = _run(["git", "ls-files", "--", path], cwd=vault, check=False)
+            if not tracked.stdout.strip():
+                continue
+        kept.append(path)
+    return kept
 
 
 def _unstage(vault: Path, paths: list[str]) -> None:

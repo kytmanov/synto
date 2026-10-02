@@ -42,6 +42,13 @@ def test_git_log_auto_ignores_revert_subjects(monkeypatch):
 # ── git_commit return values ──────────────────────────────────────────────────
 
 
+def _make_vault_paths(root: Path) -> None:
+    """git_commit only stages paths that exist (or are tracked); give the mocks real ones."""
+    for d in ("wiki", "raw", ".synto"):
+        (root / d).mkdir(exist_ok=True)
+    (root / "vault-schema.md").write_text("schema\n", encoding="utf-8")
+
+
 def test_git_commit_returns_committed(tmp_path, monkeypatch):
     """Returns 'committed' when git stages and commits changes."""
 
@@ -50,6 +57,7 @@ def test_git_commit_returns_committed(tmp_path, monkeypatch):
         r.stdout = "M wiki/Article.md\n" if "status" in args else ""
         return r
 
+    _make_vault_paths(tmp_path)
     monkeypatch.setattr(git_ops, "_run", mock_run)
     assert git_commit(tmp_path, "test message") == "committed"
 
@@ -101,6 +109,7 @@ def test_git_commit_not_blocked_when_nothing_pre_staged(tmp_path, monkeypatch):
             r.stdout = ""
         return r
 
+    _make_vault_paths(tmp_path)
     monkeypatch.setattr(git_ops, "_run", mock_run)
     assert git_commit(tmp_path, "msg") == "committed"
 
@@ -145,16 +154,35 @@ def test_git_commit_failure_unstages_so_next_commit_is_not_blocked(tmp_path):
     assert git_commit(vault, "approve", ["wiki/"]) == "committed"
 
 
-def test_git_commit_failed_add_on_ignored_path_unstages(tmp_path):
-    """`git add` exits non-zero on an ignored path but still stages the others."""
-    vault = _real_vault(tmp_path)
-    (vault / ".gitignore").write_text(".synto/\n", encoding="utf-8")
-    (vault / ".synto").mkdir()
-    (vault / ".synto" / "state.db").write_text("x", encoding="utf-8")
+def test_git_commit_skips_ignored_path_instead_of_failing(tmp_path):
+    """`git add` exits non-zero on an ignored path, which used to fail the whole commit.
 
-    assert git_commit(vault, "ingest", ["wiki/", ".synto/"]) == "failed"
-    assert _staged(vault) == []
-    assert git_commit(vault, "ingest", ["wiki/"]) == "committed"
+    Users who keep raw/ out of git (private notes) lost every `run`/`watch` commit once those
+    commits started staging raw/. The ignored path is skipped, never force-added.
+    """
+    vault = _real_vault(tmp_path)
+    (vault / ".gitignore").write_text("raw/\n", encoding="utf-8")
+    (vault / "raw").mkdir()
+    (vault / "raw" / "private.md").write_text("secret\n", encoding="utf-8")
+
+    assert git_commit(vault, "run: 1 ingested", ["raw/", "wiki/"]) == "committed"
+    tracked = _git(["ls-files"], vault).stdout.split()
+    assert tracked == ["wiki/a.md"]
+
+
+def test_git_commit_skips_missing_untracked_path(tmp_path):
+    """A path that neither exists nor is tracked (e.g. a deleted vault-schema.md) is skipped."""
+    vault = _real_vault(tmp_path)
+    assert git_commit(vault, "ingest", ["wiki/", "vault-schema.md"]) == "committed"
+
+
+def test_git_commit_stages_deletion_of_tracked_path(tmp_path):
+    vault = _real_vault(tmp_path)
+    assert git_commit(vault, "first", ["wiki/"]) == "committed"
+    (vault / "wiki" / "a.md").unlink()
+    (vault / "wiki").rmdir()
+    assert git_commit(vault, "delete", ["wiki/"]) == "committed"
+    assert _git(["ls-files"], vault).stdout.split() == []
 
 
 def test_git_commit_failure_after_history_keeps_prior_commits(tmp_path):
