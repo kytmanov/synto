@@ -1472,8 +1472,24 @@ def _create_source_summary_page(
     if source_url:
         out_meta["source_url"] = source_url
 
+    # `synto add` records the PDF's own title/authors/year/doi in the raw note. The page keeps
+    # its file-stem name (citations link to it), but the reader should see the real title.
+    doc_title = src_meta.get("source_title")
+    doc_title = doc_title.strip() if isinstance(doc_title, str) else ""
+    authors = [a for a in src_meta.get("authors") or [] if isinstance(a, str) and a.strip()]
+    biblio_lines = []
+    if doc_title and doc_title != title:
+        biblio_lines.append(f"- **Title:** {doc_title}")
+    if authors:
+        shown = ", ".join(authors[:3]) + (" et al." if len(authors) > 3 else "")
+        biblio_lines.append(f"- **Authors:** {shown}")
+    if src_meta.get("year"):
+        biblio_lines.append(f"- **Year:** {src_meta['year']}")
+    if src_meta.get("doi"):
+        biblio_lines.append(f"- **DOI:** {src_meta['doi']}")
+
     body_parts = [
-        f"# {title}",
+        f"# {doc_title or title}",
         "",
         "## Summary",
         result.summary,
@@ -1482,6 +1498,7 @@ def _create_source_summary_page(
         concept_lines,
         "",
         "## Source Info",
+        *biblio_lines,
         f"- **Quality:** {result.quality}",
         f"- **Raw file:** {rel_raw}",
         f"- **Ingested:** {now}",

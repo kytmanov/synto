@@ -1005,6 +1005,33 @@ def test_source_page_roundtrip(vault, config, db):
     assert "## Concepts" in body
 
 
+def test_source_page_shows_pdf_bibliographic_metadata(vault, config, db):
+    """`synto add` stores the paper's own title/authors/year; the page must surface them."""
+    raw = (
+        "---\n"
+        "title: 2604.11243v2\n"
+        "source_title: 'Knowledge Compounding: An Empirical Analysis'\n"
+        "authors: [Ann Lee, Bo Wu, Cy Fox, Di Ng]\n"
+        "year: 2026\n"
+        "doi: null\n"
+        "source_type: paper\n"
+        "---\n\nContent."
+    )
+    path = _write_raw(vault, "2604-11243v2-991dd942.md", raw)
+    client = _make_client(_analysis_json(concepts=["Knowledge Compounding"]))
+    ingest_note(path, config, client, db)
+    from synto.vault import parse_note
+
+    page = vault / "wiki" / "sources" / "2604.11243v2.md"
+    meta, body = parse_note(page)
+    assert meta["title"] == "2604.11243v2"  # citations link to the file-stem name
+    assert body.startswith("# Knowledge Compounding: An Empirical Analysis")
+    assert "- **Title:** Knowledge Compounding: An Empirical Analysis" in body
+    assert "- **Authors:** Ann Lee, Bo Wu, Cy Fox et al." in body
+    assert "- **Year:** 2026" in body
+    assert "DOI" not in body
+
+
 def test_source_page_media_section(vault, config, db):
     """Raw note with images produces ## Media section in source page."""
     content = (
