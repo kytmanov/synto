@@ -314,6 +314,28 @@ def test_extract_heading_bold() -> None:
     assert _extract_heading("**Chapter 3: Methods**\nText") == "Chapter 3: Methods"
 
 
+def test_extract_heading_pymupdf4llm_128_output() -> None:
+    """pymupdf4llm 1.28 emits real heading levels (sub-sections as ####) and <sup> marks."""
+    from synto.extractors.pdf import _extract_heading, _heading_slug
+
+    assert _extract_heading("#### **6.3 Mechanism Three**\n\nText") == "6.3 Mechanism Three"
+    heading = _extract_heading("# **Boost Mission**<sup>_∗_</sup>\nBody")
+    assert heading == "Boost Mission"
+    assert _heading_slug(heading) == "boost-mission"
+
+
+def test_bibliographic_title_fallback_strips_markup(tmp_path: Path) -> None:
+    """Without a metadata title, the first line's 1.28 markup must not leak into the title."""
+    doc = fitz.open()
+    doc.new_page().insert_text((72, 72), "Boost Mission")
+    pdf_path = tmp_path / "notitle.pdf"
+    doc.save(str(pdf_path))
+    doc.close()
+    first_page = "# **Astronomical Advantages of a Boost Mission**<sup>_∗_</sup>\n\nBody."
+    meta = extract_bibliographic_metadata(pdf_path, first_page)
+    assert meta.title == "Astronomical Advantages of a Boost Mission"
+
+
 def test_extract_heading_none() -> None:
     from synto.extractors.pdf import _extract_heading
 
