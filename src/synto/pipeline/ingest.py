@@ -281,9 +281,11 @@ def _merge_chunk_results(results: list[AnalysisResult]) -> AnalysisResult:
     # conservative min, but with segment-aligned chunks a single thin or peripheral section
     # — title page, references — would drag the whole note down and, via the quality cap in
     # ingest_note, halve the extracted concept count. The note's quality should reflect its
-    # substantive majority, not its weakest section.)
+    # substantive majority, not its weakest section.) A chunk that yielded no concepts is
+    # peripheral by definition, so it only votes when no chunk yielded any.
     quality_rank = {"high": 2, "medium": 1, "low": 0}
-    quality_counts = Counter(r.quality for r in results if r.quality)
+    voters = [r for r in results if r.concepts] or results
+    quality_counts = Counter(r.quality for r in voters if r.quality)
     merged_quality = (
         max(quality_counts, key=lambda q: (quality_counts[q], quality_rank.get(q, 1)))
         if quality_counts

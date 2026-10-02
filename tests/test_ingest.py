@@ -1577,6 +1577,21 @@ def test_merge_quality_is_most_common_not_minimum():
     assert _merge_chunk_results(tie).quality == "high"
 
 
+def test_merge_quality_ignores_chunks_without_concepts():
+    """A chunk that yields no concepts (e.g. a references tail) must not outvote the rest —
+    seen in e2e: high/medium/medium(0 concepts) capped a paper at 4 concepts instead of 15."""
+    chunks = [
+        _make_result(["A", "B", "C"], quality="high"),
+        _make_result(["D", "E"], quality="medium"),
+        _make_result([], quality="medium"),
+    ]
+    assert _merge_chunk_results(chunks).quality == "high"
+
+    # No chunk yielded concepts → every chunk still votes.
+    empty = [_make_result([], quality="low"), _make_result([], quality="low")]
+    assert _merge_chunk_results([*empty, _make_result([], quality="high")]).quality == "low"
+
+
 def test_merge_unions_topics():
     r1 = _make_result(["A"], topics=["Topic A"])
     r2 = _make_result(["B"], topics=["Topic B", "Topic A"])
