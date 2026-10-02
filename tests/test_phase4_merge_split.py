@@ -1875,3 +1875,28 @@ def test_merge_punctuated_winner_with_knowledge_items_does_not_crash(tmp_path: P
         "SELECT name FROM knowledge_items WHERE lower(name) = lower(?)", ("Node.js",)
     ).fetchall()
     assert len(rows) == 1, "winner knowledge_items row should survive as the single row"
+
+
+def test_legacy_retired_drafts_moved_out_before_approve(tmp_path: Path) -> None:
+    """Vaults merged with <0.8 already hold wiki/.drafts/<name>_retired_<date>.md; opening
+    the vault must move them aside so `approve --all` can't republish them."""
+    from click.testing import CliRunner
+
+    from synto.cli import cli
+
+    runner = CliRunner()
+    vault = tmp_path / "vault"
+    assert runner.invoke(cli, ["init", str(vault)]).exit_code == 0
+    drafts = vault / "wiki" / ".drafts"
+    drafts.mkdir(parents=True, exist_ok=True)
+    legacy = drafts / "FAA Hubs_retired_20261002.md"
+    legacy.write_text("---\ntitle: FAA Hubs\nstatus: published\n---\nOld body.\n")
+    real = drafts / "Notes_retired_by_hand.md"  # not the retire pattern: a real draft
+    real.write_text("---\ntitle: Notes_retired_by_hand\nstatus: draft\n---\nBody.\n")
+
+    result = runner.invoke(cli, ["approve", "--all", "--vault", str(vault)])
+
+    assert result.exit_code == 0, result.output
+    assert not (vault / "wiki" / "FAA Hubs_retired_20261002.md").exists()
+    assert (vault / ".synto" / "retired" / "FAA Hubs_retired_20261002.md").exists()
+    assert (vault / "wiki" / "Notes_retired_by_hand.md").exists()

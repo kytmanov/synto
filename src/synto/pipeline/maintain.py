@@ -854,6 +854,33 @@ def _retire_article(article_path: Path, retired_dir: Path) -> str:
     return str(target)
 
 
+_LEGACY_RETIRED_RE = re.compile(r"_retired_\d{8}(?:_\d+)?\.md$")
+
+
+def relocate_legacy_retired_drafts(config: Config) -> list[Path]:
+    """Move articles that pre-0.8 merges/splits retired into wiki/.drafts/ out of it.
+
+    Left there, `approve --all` republishes them as wiki/<name>_retired_<date>.md.
+    Returns the new paths; a no-op when there is nothing to move.
+    """
+    drafts = config.drafts_dir
+    if not drafts.is_dir():
+        return []
+    moved: list[Path] = []
+    for path in sorted(drafts.glob("*_retired_*.md")):
+        if not _LEGACY_RETIRED_RE.search(path.name):
+            continue
+        retired_dir = config.app_dir / "retired"
+        retired_dir.mkdir(parents=True, exist_ok=True)
+        target = retired_dir / path.name
+        if target.exists():
+            continue
+        path.rename(target)
+        moved.append(target)
+        log.info("Moved retired article out of drafts: %s → %s", path.name, target)
+    return moved
+
+
 def merge_concepts(
     config: Config,
     db: StateDB,

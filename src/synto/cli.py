@@ -299,6 +299,12 @@ def _load_config(vault_str: str | None, **kwargs):
 def _load_db(config):
     from .state import StateDB
 
+    try:
+        from .pipeline.maintain import relocate_legacy_retired_drafts
+
+        relocate_legacy_retired_drafts(config)
+    except Exception:
+        pass  # housekeeping only; must never block the command that opened the vault
     return StateDB(config.state_db_path)
 
 
