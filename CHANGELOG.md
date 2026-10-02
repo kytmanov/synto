@@ -9,7 +9,9 @@ pipeline stage is running. This release also closes two MCP leaks, fixes cloud-p
 credential diagnostics, and picks up security fixes in dependencies. Thanks to
 @balazsjdp, @AmirF194, and @PEKEW for their contributions.
 
-No schema migration. Existing vaults work unchanged.
+No schema migration. Existing vaults work unchanged, except that articles retired by an
+earlier `synto concept merge` or `split` are moved from `wiki/.drafts/` to
+`.synto/retired/` the first time a command opens the vault (see Fixed).
 
 ### Security
 
@@ -41,7 +43,60 @@ No schema migration. Existing vaults work unchanged.
   release workflow also refuses to publish a tag that does not match the package
   version.
 
+### Added
+
+- **`synto doctor` warns when LM Studio's loaded context is smaller than `ctx`.** LM Studio
+  serves a model at the context length its own load settings picked, whatever
+  `synto.toml` says. When that is smaller, compile prompts overflow and every long-source
+  concept is retried with trimmed sources. Doctor now reads `loaded_context_length` from
+  LM Studio and names both fixes.
+
 ### Fixed
+
+- **Early articles in a compile now link to concepts drafted after them.** Each draft can
+  only link titles already on disk when it is written, so in a fresh compile the
+  alphabetically early articles linked to nothing (#124 fixed the other direction). After
+  the run, synto now links mentions of every sibling that actually landed. On the same
+  four papers, v0.6.3's 42 article bodies held 1 concept-to-concept link; this release's
+  36 held 86. Auto-linking also skips headings now, so the link lands in the prose
+  instead of `## [[Topic]] Overview`.
+
+- **A long source no longer crowds the other sources out of a compile.** Sources were
+  joined and the result truncated, which cut whatever came last: a short note next to an
+  80k-character paper got no text at all, yet the article listed it as a source. The
+  budget is now shared, so short sources keep their full text and long ones split the rest.
+
+- **`approve --all` no longer republishes merged-away articles.** `concept merge` and
+  `split` retired the old article into `wiki/.drafts/`, where every draft scan picked it
+  up: `status` counted it and the next `approve --all` published it back as
+  `wiki/<name>_retired_<date>.md`. Retired articles now go to `.synto/retired/`, and ones
+  already in `wiki/.drafts/` are moved there.
+
+- **Callouts, footnotes, and task boxes survive compile.** The repair that turns
+  `[Concept]` slips into links also unwrapped real markdown, publishing `> [!NOTE]` as
+  `> !NOTE`, `[^1]` as `^1`, and `- [x]` as `- x`.
+
+- **`synto run` and `synto watch` commit the notes they ingest.** Their commit staged only
+  `wiki/` and `.synto/`, so a note dropped into `raw/` under `watch` was never committed.
+
+- **Notes are written with your umask's permissions.** Every file synto wrote was `0600`
+  (owner-only), because the temp file used for atomic writes kept its private mode. The
+  global config, which can hold API keys, stays `0600`.
+
+- **PDF source pages show the paper's title, authors, and year.** `synto add` extracted
+  them, but the source page was headed with the arXiv file name (`# 2604.11243v2`).
+
+- **A trailing section with no concepts no longer lowers a paper's quality.** Chunks that
+  yielded no concepts (references, acknowledgements) still voted on the note's quality, and
+  a "medium" result caps the concepts kept. One paper went from 10 concepts to 4.
+
+- **A self-hosted server on your LAN counts as local.** LM Studio at `192.168.x.x` was
+  labelled "(cloud)" in `synto setup` and lost the retries for a model that is still
+  loading.
+
+- `synto doctor` no longer recommends `ingest --force` on a vault that hasn't been
+  ingested yet, and `synto add` of a PDF no longer prints PyMuPDF's `fitz` deprecation
+  warning.
 
 - **One failed auto-commit no longer blocks auto-commit permanently.** When `git commit`
   failed (no git identity, a rejecting pre-commit hook, a signing error) or `git add` hit an
