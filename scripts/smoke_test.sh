@@ -78,6 +78,16 @@ else
     VAULT_DIR="$(mktemp -d)"
 fi
 
+# `synto init` registers every vault it creates in the user's known-vaults list; snapshot it
+# so cleanup can drop the temp vaults again instead of leaving dead /tmp entries behind.
+KNOWN_VAULTS_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/synto/vaults.toml"
+KNOWN_VAULTS_BACKUP="$(mktemp)"
+if [[ -f "$KNOWN_VAULTS_FILE" ]]; then
+    cp "$KNOWN_VAULTS_FILE" "$KNOWN_VAULTS_BACKUP"
+else
+    rm -f "$KNOWN_VAULTS_BACKUP"
+fi
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 if [ -t 1 ]; then
     GREEN='\033[0;32m' RED='\033[0;31m' YELLOW='\033[1;33m' BOLD='\033[1m' NC='\033[0m'
@@ -157,6 +167,11 @@ _write_report() {
 
 cleanup() {
     _write_report
+    if [[ -f "$KNOWN_VAULTS_BACKUP" ]]; then
+        mv "$KNOWN_VAULTS_BACKUP" "$KNOWN_VAULTS_FILE"
+    else
+        rm -f "$KNOWN_VAULTS_FILE"
+    fi
     if [[ "$KEEP_VAULT" == "0" ]]; then
         rm -rf "$VAULT_DIR"
         rm -rf "${UNDO_VAULT_DIR:-}"
