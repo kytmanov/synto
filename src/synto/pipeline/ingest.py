@@ -329,7 +329,9 @@ def _build_segment_units(segments: list, chunk_size: int) -> list[tuple[str, lis
     ids: list[str] = []
     cur_len = 0
     for seg in segments:
-        text = seg["text"]
+        # Stored segments keep the extractor's OCR picture text verbatim (source passages
+        # quote them); only the model's copy is cleaned, as the note-body path does.
+        text = strip_image_text_blocks(seg["text"])
         seg_id = seg["id"]
         add_len = len(text) + 2  # joiner allowance
         if ids and cur_len + add_len > chunk_size:

@@ -602,6 +602,38 @@ def test_ingest_strips_ocr_picture_text_before_model(vault, config, db):
     assert "Real substantive paragraph" in prompt  # real content survives
 
 
+def test_strip_image_text_blocks_handles_pymupdf4llm_128_markers():
+    """pymupdf4llm 1.28 wraps OCR picture text in HTML comments instead of bold dash lines."""
+    from synto.vault import strip_image_text_blocks
+
+    body = (
+        "Before.\n\n<!-- Start of picture text -->\n120<br>20<br>East (m)<br>"
+        "<!-- End of picture text -->\n\nFig. 2: Drone trajectory."
+    )
+    assert strip_image_text_blocks(body) == "Before.\n\n\n\nFig. 2: Drone trajectory."
+
+
+def test_segment_units_strip_ocr_picture_text():
+    """PDF ingest analyzes stored segment text, which bypassed the note-body strip: OCR
+    picture text from every figure reached the model even before pymupdf4llm 1.28."""
+    from synto.pipeline.ingest import _build_segment_units
+
+    segments = [
+        {
+            "id": "s:0",
+            "text": "Intro.\n<!-- Start of picture text -->\nOVI CIV<br>"
+            "<!-- End of picture text -->\nCaption.",
+        },
+        {
+            "id": "s:1",
+            "text": "**----- Start of picture text -----**<br>\n1.0<br>F125LP<br>"
+            "**----- End of picture text -----**<br>\nMethods.",
+        },
+    ]
+    units = _build_segment_units(segments, chunk_size=10_000)
+    assert units == [("Intro.\n\nCaption.\n\n\nMethods.", ["s:0", "s:1"])]
+
+
 def test_ingest_note_stores_status_ingested(vault, config, db):
     path = _write_raw(vault, "note.md", "# Note\n\nSome content here.")
     client = _make_client(_analysis_json())

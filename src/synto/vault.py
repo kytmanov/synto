@@ -55,9 +55,13 @@ def update_frontmatter(path: Path, updates: dict[str, Any]) -> None:
 # and risks being copied verbatim into articles. We strip the markers + their body
 # in-memory before the content reaches a model; the raw/ file is left intact so the
 # human still sees the figure context in Obsidian. Coupled to that extractor's
-# marker format; tolerant of dash-count and surrounding whitespace.
+# marker format, which changed in pymupdf4llm 1.28 from bold dash lines
+# ("**----- Start of picture text -----**") to HTML comments
+# ("<!-- Start of picture text -->"); both are matched so vaults imported with either
+# version are cleaned. Tolerant of dash-count and surrounding whitespace.
 _PICTURE_TEXT_BLOCK_RE = re.compile(
-    r"\*\*-+\s*Start of picture text\s*-+\*\*.*?\*\*-+\s*End of picture text\s*-+\*\*(?:<br>)?",
+    r"(?:\*\*-+\s*Start of picture text\s*-+\*\*.*?\*\*-+\s*End of picture text\s*-+\*\*"
+    r"|<!--\s*Start of picture text\s*-->.*?<!--\s*End of picture text\s*-->)(?:<br>)?",
     re.IGNORECASE | re.DOTALL,
 )
 _OMITTED_PICTURE_RE = re.compile(
