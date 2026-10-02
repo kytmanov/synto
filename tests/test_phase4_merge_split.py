@@ -920,8 +920,33 @@ def test_merge_concepts_retires_loser_article(tmp_path: Path) -> None:
     merge_concepts(config, db, "Alpha", "Beta", dry_run=False)
 
     assert not (vault / "wiki" / "Alpha.md").exists()
-    drafts = list((vault / "wiki" / ".drafts").glob("Alpha_retired_*.md"))
-    assert drafts, "retired article should be in .drafts/"
+    retired = list((vault / ".synto" / "retired").glob("Alpha_retired_*.md"))
+    assert retired, "retired article should be in .synto/retired/"
+    # Never in .drafts/: approve --all would republish it as a pending draft.
+    assert not list((vault / "wiki" / ".drafts").glob("Alpha_retired_*.md"))
+
+
+def test_approve_all_after_merge_does_not_republish_loser(tmp_path: Path) -> None:
+    """Seen in e2e: merge retired 'FAA Hubs' into .drafts/, and the next `approve --all`
+    published it back as wiki/FAA Hubs_retired_<date>.md."""
+    from synto.config import Config
+    from synto.pipeline.compile import approve_drafts
+    from synto.pipeline.maintain import merge_concepts
+
+    vault = tmp_path / "vault"
+    (vault / "raw").mkdir(parents=True)
+    (vault / "wiki").mkdir(parents=True)
+    db = StateDB(vault / ".synto" / "state.db")
+    db.upsert_concepts("raw/a.md", ["Alpha"])
+    db.upsert_concepts("raw/b.md", ["Beta"])
+    _article(db, vault, "Alpha")
+    _article(db, vault, "Beta")
+    config = Config.model_validate({"vault": str(vault)})
+
+    merge_concepts(config, db, "Alpha", "Beta", dry_run=False)
+
+    assert approve_drafts(config, db) == []
+    assert sorted(p.name for p in (vault / "wiki").glob("*.md")) == ["Beta.md"]
 
 
 def test_merge_concepts_deletes_loser_article_row(tmp_path: Path) -> None:
