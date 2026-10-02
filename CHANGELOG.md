@@ -43,6 +43,14 @@ earlier `synto concept merge` or `split` are moved from `wiki/.drafts/` to
   release workflow also refuses to publish a tag that does not match the package
   version.
 
+### Changed
+
+- **Requires `pymupdf4llm` 1.28.2** (with `pymupdf` and `pymupdf-layout` 1.28.2). The lock
+  had pinned 1.27.2.3 while installs resolved 1.28.2, so tests ran a different PDF
+  extractor than users got. This is not a security update. The two versions write
+  different markdown (real heading levels, `<sup>` for superscripts), so re-importing a PDF
+  with `synto add --force` can yield slightly different notes and concepts than before.
+
 ### Added
 
 - **`synto doctor` warns when LM Studio's loaded context is smaller than `ctx`.** LM Studio
@@ -82,6 +90,17 @@ earlier `synto concept merge` or `split` are moved from `wiki/.drafts/` to
 - **Notes are written with your umask's permissions.** Every file synto wrote was `0600`
   (owner-only), because the temp file used for atomic writes kept its private mode. The
   global config, which can hold API keys, stays `0600`.
+
+- **Figure OCR text no longer reaches the model when ingesting PDFs.** PDF notes are
+  analyzed from their stored segments, and that path skipped the cleanup that removes the
+  extractor's OCR transcription of figures (axis ticks, legend fragments). pymupdf4llm 1.28
+  also changed the markers around that text, so the cleanup missed it in compile too. Both
+  marker formats are now removed before any prompt; the raw note keeps the figure text.
+
+- **PDF headings and titles read correctly with pymupdf4llm 1.28.** It emits real heading
+  levels (sub-sections as `####`) and `<sup>` for superscripts. Section detection for PDFs
+  without a table of contents now accepts every heading level, and extracted titles and
+  section names drop `<sup>` and bold/italic markup.
 
 - **PDF source pages show the paper's title, authors, and year.** `synto add` extracted
   them, but the source page was headed with the arXiv file name (`# 2604.11243v2`).
