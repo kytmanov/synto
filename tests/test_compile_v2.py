@@ -368,6 +368,16 @@ def test_repair_bare_bracket_links_leaves_unknown_bracketed_prose_plain():
     assert body == "Known [[API]]. Unknown Agile Development note."
 
 
+def test_repair_bare_bracket_links_keeps_callouts_footnotes_and_tasks():
+    """Seen in e2e: '> [!NOTE] Background' was published as '> !NOTE Background'."""
+    body = (
+        "> [!NOTE] Background\n> [!warning]- Folded\nClaim[^1] here.\n"
+        "- [x] done\n- [ ] open\n[^1]: Footnote."
+    )
+
+    assert _repair_bare_bracket_links(body, ["API"]) == body
+
+
 def test_repair_literal_newlines_converts_escaped_markdown():
     body = _repair_literal_newlines("## A\\n\\nBody\\n- item")
 

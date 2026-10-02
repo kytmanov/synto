@@ -424,6 +424,9 @@ def _repair_bare_bracket_links(content: str, known_titles: list[str] | None = No
             return match.group(0)
         if re.fullmatch(r"S\d+(?:\s*,\s*S\d+)*", target):
             return match.group(0)
+        # Real markdown, not link slips: callouts ([!NOTE]), footnotes ([^1]), task boxes ([x]).
+        if target.startswith(("!", "^")) or re.fullmatch(r"[ xX]", match.group(1)):
+            return match.group(0)
         if known and target.casefold() not in known:
             return target
         return f"[[{target}]]"
