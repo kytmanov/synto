@@ -3017,6 +3017,31 @@ def _render_mcp_backlog(db, since: str) -> None:
         )
 
 
+def _lm_studio_loaded_ctx(url: str, model: str, api_key: str | None = None) -> int | None:
+    """Context length LM Studio actually loaded ``model`` with, or None if unknown.
+
+    LM Studio serves at whatever context its load settings chose, regardless of the ``ctx``
+    synto.toml declares; when it is smaller, prompts sized for ``ctx`` overflow (HTTP 400
+    n_keep) and compile retries with trimmed sources. Only LM Studio's native REST API
+    (/api/v0) reports this; any failure means "unknown".
+    """
+    import httpx
+
+    base = url.rstrip("/")
+    base = base[: -len("/v1")] if base.endswith("/v1") else base
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    try:
+        resp = httpx.get(f"{base}/api/v0/models", headers=headers, timeout=5.0)
+        resp.raise_for_status()
+        for entry in resp.json().get("data", []):
+            if entry.get("id") == model and entry.get("state") == "loaded":
+                loaded = entry.get("loaded_context_length")
+                return int(loaded) if isinstance(loaded, int) and loaded > 0 else None
+    except Exception:
+        return None
+    return None
+
+
 @cli.command()
 @click.option("--vault", "vault_str", envvar=VAULT_ENV_VAR, default=None)
 @click.option(
@@ -3163,6 +3188,21 @@ def doctor(vault_str, backlog, since, reconcile):
                 console.print(
                     f"  [green]✓[/green] {role}: {resolved.model}  [dim]{conn}[/dim]{think_str}"
                 )
+                if resolved.provider_kind == "lm_studio" and role in ("fast", "heavy"):
+                    loaded_ctx = _lm_studio_loaded_ctx(
+                        resolved.url, resolved.model, resolved.api_key
+                    )
+                    if loaded_ctx is not None and loaded_ctx < resolved.ctx:
+                        console.print(
+                            f"      [yellow]![/yellow] LM Studio loaded it with a"
+                            f" {loaded_ctx}-token context, but synto.toml sets"
+                            f" ctx = {resolved.ctx}."
+                        )
+                        console.print(
+                            "      Long sources will overflow and be trimmed. Raise the context"
+                            " length in LM Studio, or set"
+                            f" [bold]\\[models.{role}] ctx = {loaded_ctx}[/bold]."
+                        )
             elif required:
                 pull_hint = (
                     f"run: [bold]ollama pull {resolved.model}[/bold]"
