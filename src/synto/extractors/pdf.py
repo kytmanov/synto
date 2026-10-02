@@ -14,7 +14,7 @@ import re
 from datetime import UTC, datetime
 from pathlib import Path
 
-import fitz  # pymupdf — transitive dep of pymupdf4llm
+import pymupdf as fitz  # transitive dep of pymupdf4llm; the `fitz` alias is deprecated
 import pymupdf4llm
 
 from ..models import BibliographicMetadata, SourceSegment

@@ -8,7 +8,7 @@ import zlib
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import fitz
+import pymupdf as fitz
 import pytest
 
 from synto.extractors.pdf import extract_bibliographic_metadata, extract_pdf
