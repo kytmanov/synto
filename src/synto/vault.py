@@ -128,6 +128,9 @@ def _restore_code_blocks(content: str, replacements: list[tuple[str, str]]) -> s
     return restore_markdown_regions(content, replacements)
 
 
+_HEADING_LINE_RE = re.compile(r"^#{1,6}[ \t].*$", re.MULTILINE)
+
+
 def ensure_wikilinks(content: str, targets: list[str]) -> str:
     """
     Wrap exact whole-word title matches in [[wikilinks]].
@@ -138,6 +141,15 @@ def ensure_wikilinks(content: str, targets: list[str]) -> str:
         return content
 
     masked, spans = _mask_code_blocks(content)
+    # Headings too: a link there looks broken in Obsidian, and since only the first
+    # occurrence is linked it would leave the prose mention below it plain.
+    headings: list[str] = []
+
+    def _mask_heading(m: re.Match[str]) -> str:
+        headings.append(m.group(0))
+        return f"\x00H{len(headings) - 1}\x00"
+
+    masked = _HEADING_LINE_RE.sub(_mask_heading, masked)
 
     for target in targets:
         # Match the raw title in the body, but emit the normalized link target so it
@@ -160,6 +172,7 @@ def ensure_wikilinks(content: str, targets: list[str]) -> str:
         repl = f"[[{safe_target}|{target}]]" if safe_target != target else f"[[{safe_target}]]"
         masked = pattern.sub(repl.replace("\\", "\\\\"), masked, count=1)
 
+    masked = re.sub(r"\x00H(\d+)\x00", lambda m: headings[int(m.group(1))], masked)
     return _restore_code_blocks(masked, spans)
 
 

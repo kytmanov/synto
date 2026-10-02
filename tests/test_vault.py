@@ -702,3 +702,16 @@ def test_strip_is_noop_on_clean_text():
 def test_strip_tolerates_dash_count_and_whitespace():
     body = "**---  Start of picture text  ---**<br>junk<br>**--- End of picture text ---**<br>"
     assert "picture text" not in strip_image_text_blocks(body)
+
+
+def test_ensure_wikilinks_skips_headings_and_links_prose():
+    """Seen in e2e: '## [[FAA Hub]] Classification' — the first occurrence was a heading,
+    so the link landed there and the prose mention stayed plain."""
+    content = "## FAA Hub Classification\n\nThe FAA Hub rules apply.\n\n# FAA Hub"
+    result = ensure_wikilinks(content, ["FAA Hub"])
+    assert result == "## FAA Hub Classification\n\nThe [[FAA Hub]] rules apply.\n\n# FAA Hub"
+
+
+def test_ensure_wikilinks_heading_only_mention_stays_unlinked():
+    content = "### Python\n\nNothing else here."
+    assert ensure_wikilinks(content, ["Python"]) == content
