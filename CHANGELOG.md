@@ -87,6 +87,10 @@ earlier `synto concept merge` or `split` are moved from `wiki/.drafts/` to
 - **`synto run` and `synto watch` commit the notes they ingest.** Their commit staged only
   `wiki/` and `.synto/`, so a note dropped into `raw/` under `watch` was never committed.
 
+- **Auto-commit works when `raw/` is git-ignored.** `git add` fails on an ignored or missing
+  path, and synto reported the whole commit as failed, so users who keep their notes out of
+  git lost every `synto ingest` commit. Such paths are now skipped (never force-added).
+
 - **Notes are written with your umask's permissions.** Every file synto wrote was `0600`
   (owner-only), because the temp file used for atomic writes kept its private mode. The
   global config, which can hold API keys, stays `0600`.
