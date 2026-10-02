@@ -672,10 +672,16 @@ def _inject_body_sections(
             link = f"[[sources/{safe_src}|{src_title}]]"
             source_lines.append(f"- {link}")
 
-    # ## See Also: wikilinks already in body (sorted, deduplicated)
-    linked = sorted(set(extract_wikilinks(body)))
+    sections = "\n\n## Sources"
+    if source_lines:
+        sections += "\n" + "\n".join(source_lines)
+    return body + sections + _see_also_section(body, article_title)
+
+
+def _see_also_section(body: str, article_title: str | None) -> str:
+    """## See Also: wikilinks already in body (sorted, deduplicated), or "" when none."""
     see_also_lines = []
-    for target in linked:
+    for target in sorted(set(extract_wikilinks(body))):
         if not target:
             continue
         if target.lower().startswith("sources/"):
@@ -683,14 +689,56 @@ def _inject_body_sections(
         if article_title and target.lower() == article_title.lower():
             continue
         see_also_lines.append(f"- [[{target}]]")
+    if not see_also_lines:
+        return ""
+    return "\n\n## See Also\n" + "\n".join(see_also_lines)
 
-    sections = "\n\n## Sources"
-    if source_lines:
-        sections += "\n" + "\n".join(source_lines)
-    if see_also_lines:
-        sections += "\n\n## See Also\n" + "\n".join(see_also_lines)
 
-    return body + sections
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+
+
+def _backfill_sibling_links(
+    draft_paths: list[Path], titles: list[str], db: StateDB, vault: Path
+) -> int:
+    """Link mentions of concepts whose drafts landed later in the same run.
+
+    A draft may only link titles that already resolve on disk when it is written (#65), so
+    in a fresh compile the early drafts could not link any sibling written after them. Once
+    the run is over every sibling exists, so rerun the deterministic linker over this run's
+    drafts. Returns the number of links added.
+    """
+    # Longest first, so "Qing Claw Architecture" is linked before its prefix "Qing Claw".
+    ordered = sorted(dict.fromkeys(titles), key=len, reverse=True)
+    added = 0
+    for path in draft_paths:
+        try:
+            post = fm_lib.load(path)
+        except Exception as exc:
+            log.warning("Sibling link backfill: skipping %s — %s", path.name, exc)
+            continue
+        title = str(post.get("title") or path.stem)
+        head, sep, tail = post.content.partition("\n\n## Sources")
+        comments: list[str] = []
+
+        def _mask_comment(m: re.Match[str]) -> str:
+            comments.append(m.group(0))
+            return f"\x00{len(comments) - 1}\x00"
+
+        masked = _HTML_COMMENT_RE.sub(_mask_comment, head)
+        linked = ensure_wikilinks(masked, [t for t in ordered if t.lower() != title.lower()])
+        if linked == masked:
+            continue
+        added += len(extract_wikilinks(linked)) - len(extract_wikilinks(masked))
+        new_head = re.sub(r"\x00(\d+)\x00", lambda m: comments[int(m.group(1))], linked)
+        if sep:
+            tail = re.sub(r"\n\n## See Also\b.*", "", tail, flags=re.DOTALL)
+            tail += _see_also_section(new_head, title)
+        post.content = new_head + sep + tail
+        atomic_write(path, fm_lib.dumps(post))
+        art = db.get_article(str(path.relative_to(vault)))
+        if art is not None:
+            db.upsert_article(art.model_copy(update={"content_hash": _content_hash(post.content)}))
+    return added
 
 
 def _write_draft(
@@ -1397,6 +1445,11 @@ def compile_concepts(
     if failure_categories:
         summary = ", ".join(f"{len(v)} {k}" for k, v in sorted(failure_categories.items()))
         log.warning("Compile failures by category: %s", summary)
+
+    if not dry_run and len(draft_paths) > 1:
+        backfilled = _backfill_sibling_links(draft_paths, resolvable_titles, db, config.vault)
+        if backfilled:
+            log.info("Linked %d mention(s) of concepts drafted later in this run", backfilled)
 
     # Finish compile run
     if not dry_run and db._has_table("compile_runs"):

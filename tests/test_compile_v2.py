@@ -928,6 +928,8 @@ def test_compile_concepts_draft_media_reference_mode(config, db):
 def test_compile_concepts_unwraps_same_batch_concepts_until_materialized(config, db):
     import json
 
+    from synto.openai_compat_client import LLMBadRequestError
+
     db.upsert_raw(RawNoteRecord(path="raw/a.md", content_hash="h1", status="ingested"))
     db.upsert_raw(RawNoteRecord(path="raw/b.md", content_hash="h2", status="ingested"))
     db.upsert_concepts("raw/a.md", ["Alpha"])
@@ -937,8 +939,48 @@ def test_compile_concepts_unwraps_same_batch_concepts_until_materialized(config,
 
     client = make_mock_client()
     client.generate.side_effect = [
-        json.dumps({"title": "Alpha", "content": "Alpha relates to Beta.", "tags": []}),
-        json.dumps({"title": "Beta", "content": "Beta details.", "tags": []}),
+        json.dumps({"title": "Alpha", "content": "Alpha relates to [[Beta]].", "tags": []}),
+        LLMBadRequestError("HTTP 400: model rejected the request"),
+    ]
+
+    drafts, failed, _ = compile_concepts(config, client, db)
+
+    # Beta never materialized, so Alpha must not ship a link to it (#65).
+    assert failed == ["Beta"]
+    alpha = next(path for path in drafts if path.name == "Alpha.md")
+    alpha_body = alpha.read_text()
+    assert "Beta" in alpha_body
+    assert "[[Beta]]" not in alpha_body
+
+
+def test_compile_concepts_backfills_links_to_later_siblings(config, db):
+    """An early draft gains links to siblings drafted after it in the same run.
+
+    Each draft can only link titles already on disk when it is written, so without a
+    final pass the alphabetically first concepts of a fresh compile link to nothing.
+    """
+    import hashlib
+    import json
+
+    import frontmatter
+
+    db.upsert_raw(RawNoteRecord(path="raw/a.md", content_hash="h1", status="ingested"))
+    db.upsert_raw(RawNoteRecord(path="raw/b.md", content_hash="h2", status="ingested"))
+    db.upsert_concepts("raw/a.md", ["Alpha"])
+    db.upsert_concepts("raw/b.md", ["Beta Gamma"])
+    (config.vault / "raw" / "a.md").write_text("---\ntitle: A\n---\nAlpha mentions Beta.")
+    (config.vault / "raw" / "b.md").write_text("---\ntitle: B\n---\nBeta.")
+
+    client = make_mock_client()
+    client.generate.side_effect = [
+        json.dumps(
+            {
+                "title": "Alpha",
+                "content": "## Overview\n\nAlpha relates to Beta Gamma.\n\n<!-- Beta Gamma -->",
+                "tags": [],
+            }
+        ),
+        json.dumps({"title": "Beta Gamma", "content": "Beta Gamma details.", "tags": []}),
     ]
 
     drafts, failed, _ = compile_concepts(config, client, db)
@@ -946,8 +988,16 @@ def test_compile_concepts_unwraps_same_batch_concepts_until_materialized(config,
     assert failed == []
     alpha = next(path for path in drafts if path.name == "Alpha.md")
     alpha_body = alpha.read_text()
-    assert "Beta" in alpha_body
-    assert "[[Beta]]" not in alpha_body
+    assert "Alpha relates to [[Beta Gamma]]." in alpha_body
+    assert "<!-- Beta Gamma -->" in alpha_body  # comments are never linked
+    assert alpha_body.rstrip().endswith("## See Also\n- [[Beta Gamma]]")
+    record = db.get_article("wiki/.drafts/Alpha.md")
+    assert record is not None
+    assert (
+        record.content_hash
+        == hashlib.sha256(frontmatter.load(alpha).content.encode("utf-8")).hexdigest()
+    )
+    assert alpha_body.count("[[Beta Gamma]]") == 2  # body + See Also, nothing duplicated
 
 
 def test_compile_concepts_links_to_earlier_sibling_once_materialized(config, db):
