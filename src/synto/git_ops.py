@@ -73,7 +73,20 @@ def git_commit(
         return "committed"
     except subprocess.CalledProcessError as e:
         log.warning("git commit failed: %s", e.stderr)
+        _unstage(vault, paths)
         return "failed"
+
+
+def _unstage(vault: Path, paths: list[str]) -> None:
+    # A failed add/commit (no identity, hook rejection, signing error, ignored path) leaves our
+    # paths staged; the next git_commit would then mistake them for the user's own staged work
+    # and block auto-commit for good. The pre-staged guard ran first, so the index held nothing
+    # staged before us and resetting these paths restores it exactly. `git reset` also works on
+    # an unborn branch.
+    try:
+        _run(["git", "reset", "-q", "--"] + paths, cwd=vault)
+    except subprocess.CalledProcessError as e:
+        log.warning("git reset after failed commit also failed: %s", e.stderr)
 
 
 def git_log_auto(vault: Path, n: int = 10) -> list[dict]:

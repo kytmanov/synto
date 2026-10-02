@@ -43,6 +43,12 @@ No schema migration. Existing vaults work unchanged.
 
 ### Fixed
 
+- **One failed auto-commit no longer blocks auto-commit permanently.** When `git commit`
+  failed (no git identity, a rejecting pre-commit hook, a signing error) or `git add` hit an
+  ignored path, synto left its own files staged. Every later auto-commit then took them for
+  the user's staged work and was skipped with "you have staged changes". Synto now unstages
+  its paths after a failed add or commit, so the next auto-commit runs normally.
+
 - **A first compile of a fresh vault produces cross-links again (#124).** Same-run wikilinks
   are stripped because the target concept may never materialize, but the resolvable-title
   list was built once before the loop and never updated, so a concept could not link to a
