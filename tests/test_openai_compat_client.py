@@ -226,6 +226,19 @@ def test_local_model_load_400_retries_on_not_started_loading_variant(monkeypatch
     assert sleeps == [2.0]
 
 
+def test_lan_local_server_retries_model_load_400(monkeypatch):
+    client = OpenAICompatClient(base_url="http://192.168.1.138:1234/v1", provider_name="lm_studio")
+    bad = _bad_response('{"error":"Model unloaded."}')
+    good = _ok_response("recovered")
+    client._post_chat = MagicMock(side_effect=[bad, good])
+    sleeps: list[float] = []
+
+    monkeypatch.setattr("synto.openai_compat_client.time.sleep", sleeps.append)
+
+    assert client.generate(prompt="hi", model="m") == "recovered"
+    assert sleeps == [2.0]
+
+
 def test_cloud_does_not_retry_local_model_load_style_400(monkeypatch):
     client = _make_client()
     bad = _bad_response('{"error":"Model unloaded."}')

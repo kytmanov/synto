@@ -28,9 +28,11 @@ Unsupported params: models that reject max_tokens or non-default temperature
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import time
 from typing import TYPE_CHECKING
+from urllib.parse import urlparse
 
 import httpx
 
@@ -84,6 +86,18 @@ _RETRYABLE_TRANSPORT_ERRORS = (
     httpx.PoolTimeout,
 )
 _CONNECTION_RETRY_DELAYS = (1.0, 2.0, 4.0, 8.0, 16.0)  # ~31s total, bounded
+
+
+def _is_private_host(url: str) -> bool:
+    """True for loopback, private-network, link-local, or mDNS (.local) hosts."""
+    host = (urlparse(url).hostname or "").lower()
+    if host == "localhost" or host.endswith((".localhost", ".local")):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_loopback or ip.is_private or ip.is_link_local
 
 
 def _output_cap_field(payload: dict) -> str | None:
@@ -322,9 +336,13 @@ class OpenAICompatClient:
         )
 
     def _is_local(self) -> bool:
-        return self.base_url.startswith("http://localhost") or self.base_url.startswith(
-            "http://127.0.0.1"
-        )
+        # Self-hosted servers are often on another machine on the LAN (LM Studio on a
+        # desktop, synto on a Pi), so a loopback-only URL check would treat them as
+        # cloud and skip the local model-load retries.
+        prov = get_provider(self.provider_name)
+        if prov is not None and prov.is_local:
+            return True
+        return _is_private_host(self.base_url)
 
     def _should_retry_local_model_load_400(self, resp: httpx.Response) -> bool:
         if not self._is_local() or resp.status_code != 400:
