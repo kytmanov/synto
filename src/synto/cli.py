@@ -3223,11 +3223,17 @@ def doctor(vault_str, backlog, since, reconcile):
     try:
         seg_total = db.count_source_segments()
         link_count = db.concept_occurrence_count()
-        if seg_total > 0 and link_count == 0:
+        analyzed = sum(n for status, n in raw.items() if status not in ("new", "failed"))
+        if seg_total > 0 and link_count == 0 and analyzed:
             console.print(
                 "  [yellow]![/yellow] 0 concept→segment links — get_source_passages will be"
                 " empty. Run [bold]synto ingest --force[/bold] to backfill (analysis only;"
                 " published articles are untouched)."
+            )
+        elif seg_total > 0 and link_count == 0:
+            # Freshly added sources: the first plain ingest creates the links.
+            console.print(
+                "  [dim]• concept→segment links appear after [bold]synto ingest[/bold][/dim]"
             )
         elif link_count > 0:
             console.print(

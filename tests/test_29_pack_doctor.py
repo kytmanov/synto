@@ -19,6 +19,7 @@ from click.testing import CliRunner
 
 from synto.cli import cli
 from synto.config import Config, McpConfig
+from synto.models import RawNoteRecord
 from synto.readers import Article, ConceptRef
 from synto.serve import _audit, build_tool_handlers
 from synto.state import StateDB
@@ -636,12 +637,33 @@ def test_doctor_tips_ingest_force_when_no_concept_links(
            VALUES ('s1:p:0', 's1:p:0', 0, 's1', '', '', 'body')"""
     )
     db._conn.commit()
+    db.upsert_raw(RawNoteRecord(path="raw/s1.md", content_hash="h", status="compiled"))
     db._conn.close()
 
     result = runner.invoke(cli, ["doctor", "--vault", str(vault)])
     assert result.exit_code == 0, result.output
     assert "0 concept→segment links" in result.output
     assert "ingest --force" in result.output
+
+
+def test_doctor_no_force_tip_before_first_ingest(
+    vault: Path, runner: CliRunner, fake_provider
+) -> None:
+    """Right after `synto add`, nothing has been ingested yet: a plain ingest creates the
+    links, so recommending --force (re-ingest) would be wrong advice."""
+    db = _open_vault_db(vault)
+    db._conn.execute(
+        """INSERT OR IGNORE INTO source_segments
+           (id, identity, ordinal, source_id, structural_locator, content_hash, text)
+           VALUES ('s1:p:0', 's1:p:0', 0, 's1', '', '', 'body')"""
+    )
+    db._conn.commit()
+    db._conn.close()
+
+    result = runner.invoke(cli, ["doctor", "--vault", str(vault)])
+    assert result.exit_code == 0, result.output
+    assert "ingest --force" not in result.output
+    assert "appear after synto ingest" in result.output
 
 
 def test_doctor_embed_missing_is_advisory_not_unhealthy(
