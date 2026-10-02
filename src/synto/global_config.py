@@ -92,7 +92,7 @@ def save_global_config(cfg: GlobalConfig) -> None:
     change here. Only set fields are written (exclude_unset), so a partial config stays minimal.
     """
     path = _global_config_path()
-    atomic_write(path, to_toml(cfg))
+    atomic_write(path, to_toml(cfg), mode=0o600)  # may hold provider API keys
 
 
 # ── known-vault registry (sidecar: vaults.toml, next to config.toml) ──────────

@@ -7,6 +7,7 @@ doesn't corrupt parsing.
 
 from __future__ import annotations
 
+import os
 import re
 import tempfile
 from collections.abc import Iterable
@@ -294,13 +295,32 @@ def next_available_path(path: Path, reserved_names: Iterable[str] | None = None)
     return candidate
 
 
-def atomic_write(path: Path, content: str, encoding: str = "utf-8") -> None:
-    """Write content to path atomically: write .tmp then rename (crash-safe)."""
+def _umask_file_mode() -> int:
+    # Read once at import: os.umask can only be read by setting it, which is not thread-safe.
+    mask = os.umask(0)
+    os.umask(mask)
+    return 0o666 & ~mask
+
+
+_DEFAULT_FILE_MODE = _umask_file_mode()
+
+
+def atomic_write(
+    path: Path, content: str, encoding: str = "utf-8", mode: int | None = None
+) -> None:
+    """Write content to path atomically: write .tmp then rename (crash-safe).
+
+    mkstemp creates the temp file 0600 and the rename keeps that, so without a chmod every
+    note would be private to its owner regardless of umask (unreadable to a sync daemon or
+    web server running as another user). Files get the umask default; pass ``mode`` for
+    files that must stay private (e.g. a config holding API keys).
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
     try:
         with open(fd, "w", encoding=encoding) as f:
             f.write(content)
+        os.chmod(tmp, _DEFAULT_FILE_MODE if mode is None else mode)
         Path(tmp).replace(path)
     except Exception:
         Path(tmp).unlink(missing_ok=True)
