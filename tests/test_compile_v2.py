@@ -1282,6 +1282,26 @@ def test_gather_sources_combines_multiple(vault):
     assert len(resolved) == 2
 
 
+def test_gather_sources_long_source_does_not_crowd_out_later_ones(vault):
+    """Seen in e2e: a note added after an 80k-char paper got no text in the compile prompt
+    (the joined text was truncated at the end), yet the article listed it as [S2]."""
+    (vault / "raw" / "paper.md").write_text("---\ntitle: P\n---\n" + "paper words " * 20000)
+    (vault / "raw" / "note.md").write_text("---\ntitle: N\n---\nThe note's key finding.")
+    text, resolved = _gather_sources(["raw/paper.md", "raw/note.md"], vault, max_chars=1000)
+    assert resolved == ["raw/paper.md", "raw/note.md"]
+    assert "The note's key finding." in text
+    assert "[...truncated...]" in text
+    assert len(text) <= 1000 * 4 + len("\n\n[...truncated...]")
+
+
+def test_gather_sources_splits_budget_between_long_sources(vault):
+    for name in ("a", "b"):
+        (vault / "raw" / f"{name}.md").write_text(f"---\ntitle: {name}\n---\n" + name * 9000)
+    text, _ = _gather_sources(["raw/a.md", "raw/b.md"], vault, max_chars=1000)
+    a_part, b_part = text.split("\n\n---\n\n")
+    assert abs(a_part.count("a") - b_part.count("b")) < 50  # even split, neither starved
+
+
 def test_gather_sources_bare_filename_resolved(vault):
     """Model sometimes returns bare filename without raw/ prefix."""
     (vault / "raw" / "note.md").write_text("---\ntitle: Note\n---\nBody.")

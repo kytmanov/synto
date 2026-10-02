@@ -380,8 +380,36 @@ def _gather_sources(
         except Exception as e:
             log.warning("Could not read %s: %s", sp, e)
 
-    combined = "\n\n---\n\n".join(parts)
+    combined = "\n\n---\n\n".join(_share_source_budget(parts, max_chars))
     return _truncate_to_budget(combined, max_chars), resolved
+
+
+_SOURCE_SEPARATOR = "\n\n---\n\n"
+_TRUNCATION_MARKER = "\n\n[...truncated...]"
+
+
+def _share_source_budget(parts: list[str], max_chars: int) -> list[str]:
+    """Trim sources to a shared budget so a long one can't crowd the rest out.
+
+    Truncating the concatenation cut whatever came last: an 80k-char paper first in line
+    left a short note that also feeds the concept with no text at all, so the article cited
+    it without the model ever reading it. Short sources keep their full text; the longest
+    ones split what remains evenly.
+    """
+    limit = max_chars * 4  # same chars-per-token estimate as _truncate_to_budget
+    overhead = len(_SOURCE_SEPARATOR) * (len(parts) - 1)
+    if sum(len(p) for p in parts) + overhead <= limit:
+        return parts
+    remaining = max(0, limit - overhead - len(_TRUNCATION_MARKER) * len(parts))
+    allowance: dict[int, int] = {}
+    order = sorted(range(len(parts)), key=lambda i: len(parts[i]))
+    for rank, i in enumerate(order):
+        allowance[i] = min(len(parts[i]), remaining // (len(order) - rank))
+        remaining -= allowance[i]
+    return [
+        part if allowance[i] >= len(part) else part[: allowance[i]] + _TRUNCATION_MARKER
+        for i, part in enumerate(parts)
+    ]
 
 
 def _source_quality_summary(source_paths: list[str], db: StateDB) -> str:
