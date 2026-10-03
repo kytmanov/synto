@@ -266,13 +266,20 @@ class PipelineOrchestrator:
             )
 
         # ── Commit ─────────────────────────────────────────────────────────────
-        if config.pipeline.auto_commit and not dry_run and (report.compiled or report.published):
+        changed = report.ingested or report.compiled or report.published
+        if config.pipeline.auto_commit and not dry_run and changed:
             if on_stage is not None:
                 on_stage("commit", 0, 0, "")
             msg = f"run: {report.compiled} compiled"
+            if report.ingested:
+                msg = f"run: {report.ingested} ingested, {report.compiled} compiled"
             if report.published:
                 msg += f", {report.published} published"
-            _outcome = git_commit(config.vault, msg, paths=["wiki/", ".synto/"])
+            # Commit the notes this run ingested too (as `synto ingest` does): a note dropped
+            # into raw/ under `synto watch` was otherwise never committed, so undo or a git
+            # checkout could not account for it.
+            paths = ["raw/", "wiki/", ".synto/"] if report.ingested else ["wiki/", ".synto/"]
+            _outcome = git_commit(config.vault, msg, paths=paths)
             if _outcome == "failed":
                 log.warning("Auto-commit failed — changes not committed")
             elif _outcome == "blocked":

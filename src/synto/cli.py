@@ -299,6 +299,12 @@ def _load_config(vault_str: str | None, **kwargs):
 def _load_db(config):
     from .state import StateDB
 
+    try:
+        from .pipeline.maintain import relocate_legacy_retired_drafts
+
+        relocate_legacy_retired_drafts(config)
+    except Exception:
+        pass  # housekeeping only; must never block the command that opened the vault
     return StateDB(config.state_db_path)
 
 
@@ -1262,15 +1268,24 @@ def _build_probe_client(name, url, prov, *, api_key=None):
         from .ollama_client import OllamaClient
 
         client = OllamaClient(base_url=url, timeout=5)
-        resolved_key = None
+        return client, client.healthcheck(), None
+
+    resolved_key = api_key
+    if not resolved_key and prov.env_var:
+        resolved_key = os.environ.get(prov.env_var)
+    if not resolved_key:
+        resolved_key = os.environ.get("SYNTO_API_KEY")
+    if prov.anthropic_compat:
+        # Probe with the client the pipeline will use (#40): the OpenAI client would hit
+        # /models with a Bearer header, which Messages-API providers like Kimi reject.
+        from .anthropic_compat_client import AnthropicCompatClient
+
+        client = AnthropicCompatClient(
+            base_url=url, provider_name=name, api_key=resolved_key, timeout=5
+        )
     else:
         from .openai_compat_client import OpenAICompatClient
 
-        resolved_key = api_key
-        if not resolved_key and prov.env_var:
-            resolved_key = os.environ.get(prov.env_var)
-        if not resolved_key:
-            resolved_key = os.environ.get("SYNTO_API_KEY")
         client = OpenAICompatClient(
             base_url=url,
             provider_name=name,
@@ -3008,6 +3023,31 @@ def _render_mcp_backlog(db, since: str) -> None:
         )
 
 
+def _lm_studio_loaded_ctx(url: str, model: str, api_key: str | None = None) -> int | None:
+    """Context length LM Studio actually loaded ``model`` with, or None if unknown.
+
+    LM Studio serves at whatever context its load settings chose, regardless of the ``ctx``
+    synto.toml declares; when it is smaller, prompts sized for ``ctx`` overflow (HTTP 400
+    n_keep) and compile retries with trimmed sources. Only LM Studio's native REST API
+    (/api/v0) reports this; any failure means "unknown".
+    """
+    import httpx
+
+    base = url.rstrip("/")
+    base = base[: -len("/v1")] if base.endswith("/v1") else base
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    try:
+        resp = httpx.get(f"{base}/api/v0/models", headers=headers, timeout=5.0)
+        resp.raise_for_status()
+        for entry in resp.json().get("data", []):
+            if entry.get("id") == model and entry.get("state") == "loaded":
+                loaded = entry.get("loaded_context_length")
+                return int(loaded) if isinstance(loaded, int) and loaded > 0 else None
+    except Exception:
+        return None
+    return None
+
+
 @cli.command()
 @click.option("--vault", "vault_str", envvar=VAULT_ENV_VAR, default=None)
 @click.option(
@@ -3144,10 +3184,31 @@ def doctor(vault_str, backlog, since, reconcile):
                     )
                     console.print(f"      ${var} is not set")
                 continue
-            if any(resolved.model in m for m in models):
+            if resolved.anthropic_compat and not models:
+                # Messages-API providers expose no model list, so absence proves nothing.
+                console.print(
+                    f"  [green]✓[/green] {role}: {resolved.model}  [dim]{conn} "
+                    f"(model list unavailable — not verified)[/dim]{think_str}"
+                )
+            elif any(resolved.model in m for m in models):
                 console.print(
                     f"  [green]✓[/green] {role}: {resolved.model}  [dim]{conn}[/dim]{think_str}"
                 )
+                if resolved.provider_kind == "lm_studio" and role in ("fast", "heavy"):
+                    loaded_ctx = _lm_studio_loaded_ctx(
+                        resolved.url, resolved.model, resolved.api_key
+                    )
+                    if loaded_ctx is not None and loaded_ctx < resolved.ctx:
+                        console.print(
+                            f"      [yellow]![/yellow] LM Studio loaded it with a"
+                            f" {loaded_ctx}-token context, but synto.toml sets"
+                            f" ctx = {resolved.ctx}."
+                        )
+                        console.print(
+                            "      Long sources will overflow and be trimmed. Raise the context"
+                            " length in LM Studio, or set"
+                            f" [bold]\\[models.{role}] ctx = {loaded_ctx}[/bold]."
+                        )
             elif required:
                 pull_hint = (
                     f"run: [bold]ollama pull {resolved.model}[/bold]"
@@ -3208,11 +3269,17 @@ def doctor(vault_str, backlog, since, reconcile):
     try:
         seg_total = db.count_source_segments()
         link_count = db.concept_occurrence_count()
-        if seg_total > 0 and link_count == 0:
+        analyzed = sum(n for status, n in raw.items() if status not in ("new", "failed"))
+        if seg_total > 0 and link_count == 0 and analyzed:
             console.print(
                 "  [yellow]![/yellow] 0 concept→segment links — get_source_passages will be"
                 " empty. Run [bold]synto ingest --force[/bold] to backfill (analysis only;"
                 " published articles are untouched)."
+            )
+        elif seg_total > 0 and link_count == 0:
+            # Freshly added sources: the first plain ingest creates the links.
+            console.print(
+                "  [dim]• concept→segment links appear after [bold]synto ingest[/bold][/dim]"
             )
         elif link_count > 0:
             console.print(

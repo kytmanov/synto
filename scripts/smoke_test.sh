@@ -78,6 +78,16 @@ else
     VAULT_DIR="$(mktemp -d)"
 fi
 
+# `synto init` registers every vault it creates in the user's known-vaults list; snapshot it
+# so cleanup can drop the temp vaults again instead of leaving dead /tmp entries behind.
+KNOWN_VAULTS_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/synto/vaults.toml"
+KNOWN_VAULTS_BACKUP="$(mktemp)"
+if [[ -f "$KNOWN_VAULTS_FILE" ]]; then
+    cp "$KNOWN_VAULTS_FILE" "$KNOWN_VAULTS_BACKUP"
+else
+    rm -f "$KNOWN_VAULTS_BACKUP"
+fi
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 if [ -t 1 ]; then
     GREEN='\033[0;32m' RED='\033[0;31m' YELLOW='\033[1;33m' BOLD='\033[1m' NC='\033[0m'
@@ -157,6 +167,11 @@ _write_report() {
 
 cleanup() {
     _write_report
+    if [[ -f "$KNOWN_VAULTS_BACKUP" ]]; then
+        mv "$KNOWN_VAULTS_BACKUP" "$KNOWN_VAULTS_FILE"
+    else
+        rm -f "$KNOWN_VAULTS_FILE"
+    fi
     if [[ "$KEEP_VAULT" == "0" ]]; then
         rm -rf "$VAULT_DIR"
         rm -rf "${UNDO_VAULT_DIR:-}"
@@ -882,7 +897,9 @@ fi
 
 # ── Git log ───────────────────────────────────────────────────────────────────
 header "Git history"
-git -C "$VAULT_DIR" log --oneline
+# No commits exist if every auto-commit failed (e.g. no git identity); the soft check
+# above already reports that, so don't let set -e end the run here.
+git -C "$VAULT_DIR" log --oneline || info "no git history (auto-commit never succeeded)"
 
 # ── Undo ─────────────────────────────────────────────────────────────────────
 header "synto undo"
@@ -1967,7 +1984,8 @@ header "synto undo --steps 2"
 # git revert can proceed without "would be overwritten by merge" errors.
 git -C "$VAULT_DIR" restore wiki/log.md 2>/dev/null || true
 # Count existing synto commits
-_UNDO_SYNTO_COMMITS=$(git -C "$VAULT_DIR" log --oneline --grep='\[synto\]' 2>/dev/null | wc -l | tr -d ' ')
+_UNDO_SYNTO_COMMITS=$({ git -C "$VAULT_DIR" log --oneline --grep='\[synto\]' 2>/dev/null || true; } \
+    | wc -l | tr -d ' ')
 if [[ "$_UNDO_SYNTO_COMMITS" -ge 2 ]]; then
     _UNDO2_RC=0
     UNDO2_OUT=$($OLW undo --vault "$VAULT_DIR" --steps 2 2>&1) || _UNDO2_RC=$?

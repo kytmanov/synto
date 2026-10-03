@@ -716,3 +716,24 @@ def test_escalation_still_truncated_keeps_note_frozen(config, db):
     assert db.get_raw("raw/a.md").status == "ingested"  # still frozen
     truncated = [f for f in report.failed if f.reason == FailureReason.TRUNCATED]
     assert len(truncated) == 1 and truncated[0].concept == "Fails"
+
+
+def test_orchestrator_commit_includes_ingested_raw_notes(config, db):
+    """Seen in e2e: a note dropped into raw/ under `synto watch` was ingested and compiled,
+    but the run commit staged only wiki/ and .synto/, so the note itself was never committed."""
+    config.pipeline.auto_commit = True
+    config.raw_dir.mkdir(parents=True, exist_ok=True)
+    note = config.raw_dir / "new.md"
+    note.write_text("# New\n\nBody.")
+
+    with (
+        patch("synto.pipeline.ingest.ingest_note", return_value=MagicMock()),
+        patch("synto.pipeline.orchestrator._run_compile", return_value=([], [], {})),
+        patch("synto.git_ops.git_commit", return_value="committed") as commit,
+    ):
+        PipelineOrchestrator(config, make_mock_client(), db).run(paths=[str(note)])
+
+    commit.assert_called_once()
+    _vault, message = commit.call_args.args
+    assert "raw/" in commit.call_args.kwargs["paths"]
+    assert message == "run: 1 ingested, 0 compiled"

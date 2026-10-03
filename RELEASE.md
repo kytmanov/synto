@@ -20,8 +20,9 @@ release flow is still PR-first.
 
 - Do not tag from a branch whose version files still point at the previous
   release. The `vX.Y.Z` tag must land on code that reports `X.Y.Z`.
-- The helper script currently bumps only `pyproject.toml`; also update
-  `src/synto/__init__.py` manually.
+- The helper script bumps `pyproject.toml`, `src/synto/__init__.py`, and the
+  `uv.lock` self-entry. The release workflow refuses to publish a tag that does
+  not match both version files.
 - If branch protection blocks direct pushes to `master`, merge the release PR
   normally and only then run the `--tag` step.
 - If your local `master` has diverged or contains local-only release commits,

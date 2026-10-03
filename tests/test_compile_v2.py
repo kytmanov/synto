@@ -368,6 +368,16 @@ def test_repair_bare_bracket_links_leaves_unknown_bracketed_prose_plain():
     assert body == "Known [[API]]. Unknown Agile Development note."
 
 
+def test_repair_bare_bracket_links_keeps_callouts_footnotes_and_tasks():
+    """Seen in e2e: '> [!NOTE] Background' was published as '> !NOTE Background'."""
+    body = (
+        "> [!NOTE] Background\n> [!warning]- Folded\nClaim[^1] here.\n"
+        "- [x] done\n- [ ] open\n[^1]: Footnote."
+    )
+
+    assert _repair_bare_bracket_links(body, ["API"]) == body
+
+
 def test_repair_literal_newlines_converts_escaped_markdown():
     body = _repair_literal_newlines("## A\\n\\nBody\\n- item")
 
@@ -928,6 +938,8 @@ def test_compile_concepts_draft_media_reference_mode(config, db):
 def test_compile_concepts_unwraps_same_batch_concepts_until_materialized(config, db):
     import json
 
+    from synto.openai_compat_client import LLMBadRequestError
+
     db.upsert_raw(RawNoteRecord(path="raw/a.md", content_hash="h1", status="ingested"))
     db.upsert_raw(RawNoteRecord(path="raw/b.md", content_hash="h2", status="ingested"))
     db.upsert_concepts("raw/a.md", ["Alpha"])
@@ -937,8 +949,48 @@ def test_compile_concepts_unwraps_same_batch_concepts_until_materialized(config,
 
     client = make_mock_client()
     client.generate.side_effect = [
-        json.dumps({"title": "Alpha", "content": "Alpha relates to Beta.", "tags": []}),
-        json.dumps({"title": "Beta", "content": "Beta details.", "tags": []}),
+        json.dumps({"title": "Alpha", "content": "Alpha relates to [[Beta]].", "tags": []}),
+        LLMBadRequestError("HTTP 400: model rejected the request"),
+    ]
+
+    drafts, failed, _ = compile_concepts(config, client, db)
+
+    # Beta never materialized, so Alpha must not ship a link to it (#65).
+    assert failed == ["Beta"]
+    alpha = next(path for path in drafts if path.name == "Alpha.md")
+    alpha_body = alpha.read_text()
+    assert "Beta" in alpha_body
+    assert "[[Beta]]" not in alpha_body
+
+
+def test_compile_concepts_backfills_links_to_later_siblings(config, db):
+    """An early draft gains links to siblings drafted after it in the same run.
+
+    Each draft can only link titles already on disk when it is written, so without a
+    final pass the alphabetically first concepts of a fresh compile link to nothing.
+    """
+    import hashlib
+    import json
+
+    import frontmatter
+
+    db.upsert_raw(RawNoteRecord(path="raw/a.md", content_hash="h1", status="ingested"))
+    db.upsert_raw(RawNoteRecord(path="raw/b.md", content_hash="h2", status="ingested"))
+    db.upsert_concepts("raw/a.md", ["Alpha"])
+    db.upsert_concepts("raw/b.md", ["Beta Gamma"])
+    (config.vault / "raw" / "a.md").write_text("---\ntitle: A\n---\nAlpha mentions Beta.")
+    (config.vault / "raw" / "b.md").write_text("---\ntitle: B\n---\nBeta.")
+
+    client = make_mock_client()
+    client.generate.side_effect = [
+        json.dumps(
+            {
+                "title": "Alpha",
+                "content": "## Overview\n\nAlpha relates to Beta Gamma.\n\n<!-- Beta Gamma -->",
+                "tags": [],
+            }
+        ),
+        json.dumps({"title": "Beta Gamma", "content": "Beta Gamma details.", "tags": []}),
     ]
 
     drafts, failed, _ = compile_concepts(config, client, db)
@@ -946,8 +998,16 @@ def test_compile_concepts_unwraps_same_batch_concepts_until_materialized(config,
     assert failed == []
     alpha = next(path for path in drafts if path.name == "Alpha.md")
     alpha_body = alpha.read_text()
-    assert "Beta" in alpha_body
-    assert "[[Beta]]" not in alpha_body
+    assert "Alpha relates to [[Beta Gamma]]." in alpha_body
+    assert "<!-- Beta Gamma -->" in alpha_body  # comments are never linked
+    assert alpha_body.rstrip().endswith("## See Also\n- [[Beta Gamma]]")
+    record = db.get_article("wiki/.drafts/Alpha.md")
+    assert record is not None
+    assert (
+        record.content_hash
+        == hashlib.sha256(frontmatter.load(alpha).content.encode("utf-8")).hexdigest()
+    )
+    assert alpha_body.count("[[Beta Gamma]]") == 2  # body + See Also, nothing duplicated
 
 
 def test_compile_concepts_links_to_earlier_sibling_once_materialized(config, db):
@@ -1220,6 +1280,26 @@ def test_gather_sources_combines_multiple(vault):
     assert "Content A." in text
     assert "Content B." in text
     assert len(resolved) == 2
+
+
+def test_gather_sources_long_source_does_not_crowd_out_later_ones(vault):
+    """Seen in e2e: a note added after an 80k-char paper got no text in the compile prompt
+    (the joined text was truncated at the end), yet the article listed it as [S2]."""
+    (vault / "raw" / "paper.md").write_text("---\ntitle: P\n---\n" + "paper words " * 20000)
+    (vault / "raw" / "note.md").write_text("---\ntitle: N\n---\nThe note's key finding.")
+    text, resolved = _gather_sources(["raw/paper.md", "raw/note.md"], vault, max_chars=1000)
+    assert resolved == ["raw/paper.md", "raw/note.md"]
+    assert "The note's key finding." in text
+    assert "[...truncated...]" in text
+    assert len(text) <= 1000 * 4 + len("\n\n[...truncated...]")
+
+
+def test_gather_sources_splits_budget_between_long_sources(vault):
+    for name in ("a", "b"):
+        (vault / "raw" / f"{name}.md").write_text(f"---\ntitle: {name}\n---\n" + name * 9000)
+    text, _ = _gather_sources(["raw/a.md", "raw/b.md"], vault, max_chars=1000)
+    a_part, b_part = text.split("\n\n---\n\n")
+    assert abs(a_part.count("a") - b_part.count("b")) < 50  # even split, neither starved
 
 
 def test_gather_sources_bare_filename_resolved(vault):

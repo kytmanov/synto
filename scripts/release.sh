@@ -32,9 +32,12 @@ git fetch origin master
 git checkout -b "release/v$VERSION" origin/master
 
 sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" pyproject.toml && rm pyproject.toml.bak
+sed -i.bak "s/^__version__ = \".*\"/__version__ = \"$VERSION\"/" src/synto/__init__.py \
+  && rm src/synto/__init__.py.bak
+uv lock
 echo "Bumped version to $VERSION"
 
-git add pyproject.toml
+git add pyproject.toml src/synto/__init__.py uv.lock
 git commit -m "chore: release v$VERSION"
 git push origin "release/v$VERSION"
 

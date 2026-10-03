@@ -835,19 +835,50 @@ class UnmergeReport:
     stub_path: str = ""
 
 
-def _retire_article(article_path: Path, drafts_dir: Path) -> str:
-    """Move article to .drafts/ with a date suffix. Returns the new relative path string."""
-    drafts_dir.mkdir(parents=True, exist_ok=True)
+def _retire_article(article_path: Path, retired_dir: Path) -> str:
+    """Move article to retired_dir with a date suffix. Returns the new path string.
+
+    Never retire into wiki/.drafts/: every draft scan (approve --all, verify, review,
+    status) would treat the retired article as a pending draft and republish it.
+    """
+    retired_dir.mkdir(parents=True, exist_ok=True)
     stem = article_path.stem
     date_str = datetime.now().strftime("%Y%m%d")
-    target = drafts_dir / f"{stem}_retired_{date_str}.md"
+    target = retired_dir / f"{stem}_retired_{date_str}.md"
     # Avoid clobbering if called multiple times on the same day.
     counter = 0
     while target.exists():
         counter += 1
-        target = drafts_dir / f"{stem}_retired_{date_str}_{counter}.md"
+        target = retired_dir / f"{stem}_retired_{date_str}_{counter}.md"
     article_path.rename(target)
     return str(target)
+
+
+_LEGACY_RETIRED_RE = re.compile(r"_retired_\d{8}(?:_\d+)?\.md$")
+
+
+def relocate_legacy_retired_drafts(config: Config) -> list[Path]:
+    """Move articles that pre-0.8 merges/splits retired into wiki/.drafts/ out of it.
+
+    Left there, `approve --all` republishes them as wiki/<name>_retired_<date>.md.
+    Returns the new paths; a no-op when there is nothing to move.
+    """
+    drafts = config.drafts_dir
+    if not drafts.is_dir():
+        return []
+    moved: list[Path] = []
+    for path in sorted(drafts.glob("*_retired_*.md")):
+        if not _LEGACY_RETIRED_RE.search(path.name):
+            continue
+        retired_dir = config.app_dir / "retired"
+        retired_dir.mkdir(parents=True, exist_ok=True)
+        target = retired_dir / path.name
+        if target.exists():
+            continue
+        path.rename(target)
+        moved.append(target)
+        log.info("Moved retired article out of drafts: %s → %s", path.name, target)
+    return moved
 
 
 def merge_concepts(
@@ -965,16 +996,15 @@ def merge_concepts(
     result = db.merge_entities(winner_name, loser_name)
     report.labels_absorbed = result["labels_absorbed"]
 
-    # Retire loser articles. The on-disk file moves to .drafts/; the tracked row must
+    # Retire loser articles. The on-disk file moves to .synto/retired/; the tracked row must
     # also go — merge_entities only moves DB identity, so a surviving 'published' row would
     # point at a path that no longer exists, emitting a dangling [[Loser]] in the index and
     # breaking query routing / pack export / MCP serve. Delete the row unconditionally: it
     # dangles whether or not the file was still on disk.
-    drafts_dir = config.wiki_dir / ".drafts"
     for art in loser_articles:
         art_path = config.vault / art.path
         if art_path.exists():
-            retired = _retire_article(art_path, drafts_dir)
+            retired = _retire_article(art_path, config.app_dir / "retired")
             report.files_retired.append(art.path)
             log.info("merge: retired %s → %s", art.path, retired)
         db.delete_article(art.path)
@@ -1111,13 +1141,12 @@ def split_concept(
     # Retire the original article (located + hash-gated in the preflight above).
     # split_entity does not move article rows, so orig_articles is still valid here.
     orig_body = ""
-    drafts_dir = config.wiki_dir / ".drafts"
     primary_sense = result["senses"][0]["name"]
     for art in orig_articles:
         art_path = config.vault / art.path
         if art_path.exists():
             _, orig_body = parse_note(art_path)
-            _retire_article(art_path, drafts_dir)
+            _retire_article(art_path, config.app_dir / "retired")
 
     # Create stub articles for each sense.
     for sense in result["senses"]:

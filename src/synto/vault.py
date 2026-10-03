@@ -7,6 +7,7 @@ doesn't corrupt parsing.
 
 from __future__ import annotations
 
+import os
 import re
 import tempfile
 from collections.abc import Iterable
@@ -54,9 +55,13 @@ def update_frontmatter(path: Path, updates: dict[str, Any]) -> None:
 # and risks being copied verbatim into articles. We strip the markers + their body
 # in-memory before the content reaches a model; the raw/ file is left intact so the
 # human still sees the figure context in Obsidian. Coupled to that extractor's
-# marker format; tolerant of dash-count and surrounding whitespace.
+# marker format, which changed in pymupdf4llm 1.28 from bold dash lines
+# ("**----- Start of picture text -----**") to HTML comments
+# ("<!-- Start of picture text -->"); both are matched so vaults imported with either
+# version are cleaned. Tolerant of dash-count and surrounding whitespace.
 _PICTURE_TEXT_BLOCK_RE = re.compile(
-    r"\*\*-+\s*Start of picture text\s*-+\*\*.*?\*\*-+\s*End of picture text\s*-+\*\*(?:<br>)?",
+    r"(?:\*\*-+\s*Start of picture text\s*-+\*\*.*?\*\*-+\s*End of picture text\s*-+\*\*"
+    r"|<!--\s*Start of picture text\s*-->.*?<!--\s*End of picture text\s*-->)(?:<br>)?",
     re.IGNORECASE | re.DOTALL,
 )
 _OMITTED_PICTURE_RE = re.compile(
@@ -128,6 +133,9 @@ def _restore_code_blocks(content: str, replacements: list[tuple[str, str]]) -> s
     return restore_markdown_regions(content, replacements)
 
 
+_HEADING_LINE_RE = re.compile(r"^#{1,6}[ \t].*$", re.MULTILINE)
+
+
 def ensure_wikilinks(content: str, targets: list[str]) -> str:
     """
     Wrap exact whole-word title matches in [[wikilinks]].
@@ -138,6 +146,15 @@ def ensure_wikilinks(content: str, targets: list[str]) -> str:
         return content
 
     masked, spans = _mask_code_blocks(content)
+    # Headings too: a link there looks broken in Obsidian, and since only the first
+    # occurrence is linked it would leave the prose mention below it plain.
+    headings: list[str] = []
+
+    def _mask_heading(m: re.Match[str]) -> str:
+        headings.append(m.group(0))
+        return f"\x00H{len(headings) - 1}\x00"
+
+    masked = _HEADING_LINE_RE.sub(_mask_heading, masked)
 
     for target in targets:
         # Match the raw title in the body, but emit the normalized link target so it
@@ -160,6 +177,7 @@ def ensure_wikilinks(content: str, targets: list[str]) -> str:
         repl = f"[[{safe_target}|{target}]]" if safe_target != target else f"[[{safe_target}]]"
         masked = pattern.sub(repl.replace("\\", "\\\\"), masked, count=1)
 
+    masked = re.sub(r"\x00H(\d+)\x00", lambda m: headings[int(m.group(1))], masked)
     return _restore_code_blocks(masked, spans)
 
 
@@ -281,13 +299,32 @@ def next_available_path(path: Path, reserved_names: Iterable[str] | None = None)
     return candidate
 
 
-def atomic_write(path: Path, content: str, encoding: str = "utf-8") -> None:
-    """Write content to path atomically: write .tmp then rename (crash-safe)."""
+def _umask_file_mode() -> int:
+    # Read once at import: os.umask can only be read by setting it, which is not thread-safe.
+    mask = os.umask(0)
+    os.umask(mask)
+    return 0o666 & ~mask
+
+
+_DEFAULT_FILE_MODE = _umask_file_mode()
+
+
+def atomic_write(
+    path: Path, content: str, encoding: str = "utf-8", mode: int | None = None
+) -> None:
+    """Write content to path atomically: write .tmp then rename (crash-safe).
+
+    mkstemp creates the temp file 0600 and the rename keeps that, so without a chmod every
+    note would be private to its owner regardless of umask (unreadable to a sync daemon or
+    web server running as another user). Files get the umask default; pass ``mode`` for
+    files that must stay private (e.g. a config holding API keys).
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
     try:
         with open(fd, "w", encoding=encoding) as f:
             f.write(content)
+        os.chmod(tmp, _DEFAULT_FILE_MODE if mode is None else mode)
         Path(tmp).replace(path)
     except Exception:
         Path(tmp).unlink(missing_ok=True)

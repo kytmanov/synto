@@ -62,6 +62,9 @@ def git_commit(
         if _has_pre_staged_changes(vault):
             log.warning("git_commit: pre-staged changes detected — skipping auto-commit")
             return "blocked"
+        paths = _committable(vault, paths)
+        if not paths:
+            return "nothing"
         _run(["git", "add"] + paths, cwd=vault)
         # Check if there's anything staged
         result = _run(["git", "status", "--porcelain"], cwd=vault)
@@ -73,7 +76,40 @@ def git_commit(
         return "committed"
     except subprocess.CalledProcessError as e:
         log.warning("git commit failed: %s", e.stderr)
+        _unstage(vault, paths)
         return "failed"
+
+
+def _committable(vault: Path, paths: list[str]) -> list[str]:
+    """Drop paths `git add` would reject, so they can't fail the whole commit.
+
+    `git add` exits non-zero for a path the user git-ignores (e.g. a deliberately private
+    raw/) or one that neither exists nor is tracked, and then nothing gets committed. Skip
+    such paths instead; an ignored path is never force-added.
+    """
+    kept: list[str] = []
+    for path in paths:
+        if _run(["git", "check-ignore", "-q", path], cwd=vault, check=False).returncode == 0:
+            log.debug("git_commit: skipping ignored path %s", path)
+            continue
+        if not (vault / path).exists():
+            tracked = _run(["git", "ls-files", "--", path], cwd=vault, check=False)
+            if not tracked.stdout.strip():
+                continue
+        kept.append(path)
+    return kept
+
+
+def _unstage(vault: Path, paths: list[str]) -> None:
+    # A failed add/commit (no identity, hook rejection, signing error, ignored path) leaves our
+    # paths staged; the next git_commit would then mistake them for the user's own staged work
+    # and block auto-commit for good. The pre-staged guard ran first, so the index held nothing
+    # staged before us and resetting these paths restores it exactly. `git reset` also works on
+    # an unborn branch.
+    try:
+        _run(["git", "reset", "-q", "--"] + paths, cwd=vault)
+    except subprocess.CalledProcessError as e:
+        log.warning("git reset after failed commit also failed: %s", e.stderr)
 
 
 def git_log_auto(vault: Path, n: int = 10) -> list[dict]:

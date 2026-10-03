@@ -5,12 +5,21 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: read
+
 jobs:
   test:
     name: Tests must pass
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Tag must match the package version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          grep -qx "version = \"$VERSION\"" pyproject.toml
+          grep -qx "__version__ = \"$VERSION\"" src/synto/__init__.py
 
       - name: Install uv
         uses: astral-sh/setup-uv@v4

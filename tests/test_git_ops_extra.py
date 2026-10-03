@@ -162,5 +162,7 @@ def test_git_commit_with_custom_paths(tmp_path, monkeypatch):
         return r
 
     monkeypatch.setattr(git_ops, "_run", mock_run)
+    (tmp_path / "wiki").mkdir()
+    (tmp_path / "wiki" / "Article.md").write_text("x", encoding="utf-8")
     git_commit(tmp_path, "test", paths=["wiki/Article.md"])
     assert staged_paths == ["wiki/Article.md"]

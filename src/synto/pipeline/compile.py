@@ -380,8 +380,36 @@ def _gather_sources(
         except Exception as e:
             log.warning("Could not read %s: %s", sp, e)
 
-    combined = "\n\n---\n\n".join(parts)
+    combined = "\n\n---\n\n".join(_share_source_budget(parts, max_chars))
     return _truncate_to_budget(combined, max_chars), resolved
+
+
+_SOURCE_SEPARATOR = "\n\n---\n\n"
+_TRUNCATION_MARKER = "\n\n[...truncated...]"
+
+
+def _share_source_budget(parts: list[str], max_chars: int) -> list[str]:
+    """Trim sources to a shared budget so a long one can't crowd the rest out.
+
+    Truncating the concatenation cut whatever came last: an 80k-char paper first in line
+    left a short note that also feeds the concept with no text at all, so the article cited
+    it without the model ever reading it. Short sources keep their full text; the longest
+    ones split what remains evenly.
+    """
+    limit = max_chars * 4  # same chars-per-token estimate as _truncate_to_budget
+    overhead = len(_SOURCE_SEPARATOR) * (len(parts) - 1)
+    if sum(len(p) for p in parts) + overhead <= limit:
+        return parts
+    remaining = max(0, limit - overhead - len(_TRUNCATION_MARKER) * len(parts))
+    allowance: dict[int, int] = {}
+    order = sorted(range(len(parts)), key=lambda i: len(parts[i]))
+    for rank, i in enumerate(order):
+        allowance[i] = min(len(parts[i]), remaining // (len(order) - rank))
+        remaining -= allowance[i]
+    return [
+        part if allowance[i] >= len(part) else part[: allowance[i]] + _TRUNCATION_MARKER
+        for i, part in enumerate(parts)
+    ]
 
 
 def _source_quality_summary(source_paths: list[str], db: StateDB) -> str:
@@ -423,6 +451,9 @@ def _repair_bare_bracket_links(content: str, known_titles: list[str] | None = No
         if not target:
             return match.group(0)
         if re.fullmatch(r"S\d+(?:\s*,\s*S\d+)*", target):
+            return match.group(0)
+        # Real markdown, not link slips: callouts ([!NOTE]), footnotes ([^1]), task boxes ([x]).
+        if target.startswith(("!", "^")) or re.fullmatch(r"[ xX]", match.group(1)):
             return match.group(0)
         if known and target.casefold() not in known:
             return target
@@ -672,10 +703,16 @@ def _inject_body_sections(
             link = f"[[sources/{safe_src}|{src_title}]]"
             source_lines.append(f"- {link}")
 
-    # ## See Also: wikilinks already in body (sorted, deduplicated)
-    linked = sorted(set(extract_wikilinks(body)))
+    sections = "\n\n## Sources"
+    if source_lines:
+        sections += "\n" + "\n".join(source_lines)
+    return body + sections + _see_also_section(body, article_title)
+
+
+def _see_also_section(body: str, article_title: str | None) -> str:
+    """## See Also: wikilinks already in body (sorted, deduplicated), or "" when none."""
     see_also_lines = []
-    for target in linked:
+    for target in sorted(set(extract_wikilinks(body))):
         if not target:
             continue
         if target.lower().startswith("sources/"):
@@ -683,14 +720,56 @@ def _inject_body_sections(
         if article_title and target.lower() == article_title.lower():
             continue
         see_also_lines.append(f"- [[{target}]]")
+    if not see_also_lines:
+        return ""
+    return "\n\n## See Also\n" + "\n".join(see_also_lines)
 
-    sections = "\n\n## Sources"
-    if source_lines:
-        sections += "\n" + "\n".join(source_lines)
-    if see_also_lines:
-        sections += "\n\n## See Also\n" + "\n".join(see_also_lines)
 
-    return body + sections
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+
+
+def _backfill_sibling_links(
+    draft_paths: list[Path], titles: list[str], db: StateDB, vault: Path
+) -> int:
+    """Link mentions of concepts whose drafts landed later in the same run.
+
+    A draft may only link titles that already resolve on disk when it is written (#65), so
+    in a fresh compile the early drafts could not link any sibling written after them. Once
+    the run is over every sibling exists, so rerun the deterministic linker over this run's
+    drafts. Returns the number of links added.
+    """
+    # Longest first, so "Qing Claw Architecture" is linked before its prefix "Qing Claw".
+    ordered = sorted(dict.fromkeys(titles), key=len, reverse=True)
+    added = 0
+    for path in draft_paths:
+        try:
+            post = fm_lib.load(path)
+        except Exception as exc:
+            log.warning("Sibling link backfill: skipping %s — %s", path.name, exc)
+            continue
+        title = str(post.get("title") or path.stem)
+        head, sep, tail = post.content.partition("\n\n## Sources")
+        comments: list[str] = []
+
+        def _mask_comment(m: re.Match[str]) -> str:
+            comments.append(m.group(0))
+            return f"\x00{len(comments) - 1}\x00"
+
+        masked = _HTML_COMMENT_RE.sub(_mask_comment, head)
+        linked = ensure_wikilinks(masked, [t for t in ordered if t.lower() != title.lower()])
+        if linked == masked:
+            continue
+        added += len(extract_wikilinks(linked)) - len(extract_wikilinks(masked))
+        new_head = re.sub(r"\x00(\d+)\x00", lambda m: comments[int(m.group(1))], linked)
+        if sep:
+            tail = re.sub(r"\n\n## See Also\b.*", "", tail, flags=re.DOTALL)
+            tail += _see_also_section(new_head, title)
+        post.content = new_head + sep + tail
+        atomic_write(path, fm_lib.dumps(post))
+        art = db.get_article(str(path.relative_to(vault)))
+        if art is not None:
+            db.upsert_article(art.model_copy(update={"content_hash": _content_hash(post.content)}))
+    return added
 
 
 def _write_draft(
@@ -1397,6 +1476,11 @@ def compile_concepts(
     if failure_categories:
         summary = ", ".join(f"{len(v)} {k}" for k, v in sorted(failure_categories.items()))
         log.warning("Compile failures by category: %s", summary)
+
+    if not dry_run and len(draft_paths) > 1:
+        backfilled = _backfill_sibling_links(draft_paths, resolvable_titles, db, config.vault)
+        if backfilled:
+            log.info("Linked %d mention(s) of concepts drafted later in this run", backfilled)
 
     # Finish compile run
     if not dry_run and db._has_table("compile_runs"):

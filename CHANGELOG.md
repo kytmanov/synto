@@ -2,7 +2,130 @@
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-01
+
+Synto now handles SQL sources, remembers your vaults (`synto vault`), and shows which
+pipeline stage is running. This release also closes two MCP leaks, fixes cloud-provider
+credential diagnostics, and picks up security fixes in dependencies. Thanks to
+@balazsjdp, @AmirF194, and @PEKEW for their contributions.
+
+No schema migration. Existing vaults work unchanged, except that articles retired by an
+earlier `synto concept merge` or `split` are moved from `wiki/.drafts/` to
+`.synto/retired/` the first time a command opens the vault (see Fixed).
+
+### Security
+
+- **MCP `answer_question` no longer feeds hidden articles to the model (#42).** The tool
+  read every selected page body and filtered by visibility only after the answer was
+  generated, so an article hidden by `visibility: private` or `mcp.exclude_tags` could
+  still shape the answer text. Pages are now checked before their body is read.
+  Contributed by @AmirF194 (#113).
+
+- **Query page lookup cannot leave the published wiki.** Page titles come from the fast
+  model's routing step, which the question can steer, and were joined onto `wiki/`
+  without a containment check. A title like `sources/../../raw/<note>` loaded a raw note,
+  and its `sources/` prefix also bypassed the MCP visibility gate, so an MCP client could
+  pull raw notes or unpublished drafts into an `answer_question` reply. Resolved pages
+  must now stay inside `wiki/` and outside `wiki/.drafts/`. Also, only `wiki/sources/` is
+  exempt from the MCP visibility gate, not any folder named `sources`.
+
+- **Pack article paths are validated the same way on every OS (#108).** Windows drive,
+  UNC, and backslash `..` paths are now rejected when the pack index loads, not only
+  when an article is read.
+
+- **Dependency updates.** `click` ≥ 8.3.3 (CVE-2026-7246: command injection in
+  `click.edit()`, which `synto review`'s edit action calls on a draft path built from a
+  concept name). Locked versions also include `pyjwt` 2.15.1 (five advisories, pulled in
+  via `mcp[crypto]`), `anyio` 4.15.1 (TLS hostname encoding, worker hang), and
+  `cryptography` 50.0.0.
+
+- CI and release workflows now run with a read-only `GITHUB_TOKEN` by default. The
+  release workflow also refuses to publish a tag that does not match the package
+  version.
+
+### Changed
+
+- **Requires `pymupdf4llm` 1.28.2** (with `pymupdf` and `pymupdf-layout` 1.28.2). The lock
+  had pinned 1.27.2.3 while installs resolved 1.28.2, so tests ran a different PDF
+  extractor than users got. This is not a security update. The two versions write
+  different markdown (real heading levels, `<sup>` for superscripts), so re-importing a PDF
+  with `synto add --force` can yield slightly different notes and concepts than before.
+
+### Added
+
+- **`synto doctor` warns when LM Studio's loaded context is smaller than `ctx`.** LM Studio
+  serves a model at the context length its own load settings picked, whatever
+  `synto.toml` says. When that is smaller, compile prompts overflow and every long-source
+  concept is retried with trimmed sources. Doctor now reads `loaded_context_length` from
+  LM Studio and names both fixes.
+
 ### Fixed
+
+- **Early articles in a compile now link to concepts drafted after them.** Each draft can
+  only link titles already on disk when it is written, so in a fresh compile the
+  alphabetically early articles linked to nothing (#124 fixed the other direction). After
+  the run, synto now links mentions of every sibling that actually landed. On the same
+  four papers, v0.6.3's 42 article bodies held 1 concept-to-concept link; this release's
+  36 held 86. Auto-linking also skips headings now, so the link lands in the prose
+  instead of `## [[Topic]] Overview`.
+
+- **A long source no longer crowds the other sources out of a compile.** Sources were
+  joined and the result truncated, which cut whatever came last: a short note next to an
+  80k-character paper got no text at all, yet the article listed it as a source. The
+  budget is now shared, so short sources keep their full text and long ones split the rest.
+
+- **`approve --all` no longer republishes merged-away articles.** `concept merge` and
+  `split` retired the old article into `wiki/.drafts/`, where every draft scan picked it
+  up: `status` counted it and the next `approve --all` published it back as
+  `wiki/<name>_retired_<date>.md`. Retired articles now go to `.synto/retired/`, and ones
+  already in `wiki/.drafts/` are moved there.
+
+- **Callouts, footnotes, and task boxes survive compile.** The repair that turns
+  `[Concept]` slips into links also unwrapped real markdown, publishing `> [!NOTE]` as
+  `> !NOTE`, `[^1]` as `^1`, and `- [x]` as `- x`.
+
+- **`synto run` and `synto watch` commit the notes they ingest.** Their commit staged only
+  `wiki/` and `.synto/`, so a note dropped into `raw/` under `watch` was never committed.
+
+- **Auto-commit works when `raw/` is git-ignored.** `git add` fails on an ignored or missing
+  path, and synto reported the whole commit as failed, so users who keep their notes out of
+  git lost every `synto ingest` commit. Such paths are now skipped (never force-added).
+
+- **Notes are written with your umask's permissions.** Every file synto wrote was `0600`
+  (owner-only), because the temp file used for atomic writes kept its private mode. The
+  global config, which can hold API keys, stays `0600`.
+
+- **Figure OCR text no longer reaches the model when ingesting PDFs.** PDF notes are
+  analyzed from their stored segments, and that path skipped the cleanup that removes the
+  extractor's OCR transcription of figures (axis ticks, legend fragments). pymupdf4llm 1.28
+  also changed the markers around that text, so the cleanup missed it in compile too. Both
+  marker formats are now removed before any prompt; the raw note keeps the figure text.
+
+- **PDF headings and titles read correctly with pymupdf4llm 1.28.** It emits real heading
+  levels (sub-sections as `####`) and `<sup>` for superscripts. Section detection for PDFs
+  without a table of contents now accepts every heading level, and extracted titles and
+  section names drop `<sup>` and bold/italic markup.
+
+- **PDF source pages show the paper's title, authors, and year.** `synto add` extracted
+  them, but the source page was headed with the arXiv file name (`# 2604.11243v2`).
+
+- **A trailing section with no concepts no longer lowers a paper's quality.** Chunks that
+  yielded no concepts (references, acknowledgements) still voted on the note's quality, and
+  a "medium" result caps the concepts kept. One paper went from 10 concepts to 4.
+
+- **A self-hosted server on your LAN counts as local.** LM Studio at `192.168.x.x` was
+  labelled "(cloud)" in `synto setup` and lost the retries for a model that is still
+  loading.
+
+- `synto doctor` no longer recommends `ingest --force` on a vault that hasn't been
+  ingested yet, and `synto add` of a PDF no longer prints PyMuPDF's `fitz` deprecation
+  warning.
+
+- **One failed auto-commit no longer blocks auto-commit permanently.** When `git commit`
+  failed (no git identity, a rejecting pre-commit hook, a signing error) or `git add` hit an
+  ignored path, synto left its own files staged. Every later auto-commit then took them for
+  the user's staged work and was skipped with "you have staged changes". Synto now unstages
+  its paths after a failed add or commit, so the next auto-commit runs normally.
 
 - **A first compile of a fresh vault produces cross-links again (#124).** Same-run wikilinks
   are stripped because the target concept may never materialize, but the resolvable-title
@@ -34,6 +157,13 @@
   key was rejected) without ever echoing the key itself. The heavy role's provider prompt can
   now also take a raw key (mirroring the fast/primary role), stored only in the user-private
   global config, never the vault's `synto.toml`.
+
+- **`synto setup` and `synto doctor` handle Anthropic-compatible providers (Kimi) (#40).**
+  The setup wizard used the OpenAI client to test every cloud provider, so testing Kimi
+  hit `/models` with a Bearer header and reported a false "Cannot reach". `doctor`
+  flagged every Kimi model as "not found" because the Messages API cannot list models.
+  The wizard now uses the same client as the pipeline, and `doctor` marks the model as
+  not verified instead of failing.
 
 ### Added
 

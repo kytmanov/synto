@@ -920,8 +920,33 @@ def test_merge_concepts_retires_loser_article(tmp_path: Path) -> None:
     merge_concepts(config, db, "Alpha", "Beta", dry_run=False)
 
     assert not (vault / "wiki" / "Alpha.md").exists()
-    drafts = list((vault / "wiki" / ".drafts").glob("Alpha_retired_*.md"))
-    assert drafts, "retired article should be in .drafts/"
+    retired = list((vault / ".synto" / "retired").glob("Alpha_retired_*.md"))
+    assert retired, "retired article should be in .synto/retired/"
+    # Never in .drafts/: approve --all would republish it as a pending draft.
+    assert not list((vault / "wiki" / ".drafts").glob("Alpha_retired_*.md"))
+
+
+def test_approve_all_after_merge_does_not_republish_loser(tmp_path: Path) -> None:
+    """Seen in e2e: merge retired 'FAA Hubs' into .drafts/, and the next `approve --all`
+    published it back as wiki/FAA Hubs_retired_<date>.md."""
+    from synto.config import Config
+    from synto.pipeline.compile import approve_drafts
+    from synto.pipeline.maintain import merge_concepts
+
+    vault = tmp_path / "vault"
+    (vault / "raw").mkdir(parents=True)
+    (vault / "wiki").mkdir(parents=True)
+    db = StateDB(vault / ".synto" / "state.db")
+    db.upsert_concepts("raw/a.md", ["Alpha"])
+    db.upsert_concepts("raw/b.md", ["Beta"])
+    _article(db, vault, "Alpha")
+    _article(db, vault, "Beta")
+    config = Config.model_validate({"vault": str(vault)})
+
+    merge_concepts(config, db, "Alpha", "Beta", dry_run=False)
+
+    assert approve_drafts(config, db) == []
+    assert sorted(p.name for p in (vault / "wiki").glob("*.md")) == ["Beta.md"]
 
 
 def test_merge_concepts_deletes_loser_article_row(tmp_path: Path) -> None:
@@ -1850,3 +1875,28 @@ def test_merge_punctuated_winner_with_knowledge_items_does_not_crash(tmp_path: P
         "SELECT name FROM knowledge_items WHERE lower(name) = lower(?)", ("Node.js",)
     ).fetchall()
     assert len(rows) == 1, "winner knowledge_items row should survive as the single row"
+
+
+def test_legacy_retired_drafts_moved_out_before_approve(tmp_path: Path) -> None:
+    """Vaults merged with <0.8 already hold wiki/.drafts/<name>_retired_<date>.md; opening
+    the vault must move them aside so `approve --all` can't republish them."""
+    from click.testing import CliRunner
+
+    from synto.cli import cli
+
+    runner = CliRunner()
+    vault = tmp_path / "vault"
+    assert runner.invoke(cli, ["init", str(vault)]).exit_code == 0
+    drafts = vault / "wiki" / ".drafts"
+    drafts.mkdir(parents=True, exist_ok=True)
+    legacy = drafts / "FAA Hubs_retired_20261002.md"
+    legacy.write_text("---\ntitle: FAA Hubs\nstatus: published\n---\nOld body.\n")
+    real = drafts / "Notes_retired_by_hand.md"  # not the retire pattern: a real draft
+    real.write_text("---\ntitle: Notes_retired_by_hand\nstatus: draft\n---\nBody.\n")
+
+    result = runner.invoke(cli, ["approve", "--all", "--vault", str(vault)])
+
+    assert result.exit_code == 0, result.output
+    assert not (vault / "wiki" / "FAA Hubs_retired_20261002.md").exists()
+    assert (vault / ".synto" / "retired" / "FAA Hubs_retired_20261002.md").exists()
+    assert (vault / "wiki" / "Notes_retired_by_hand.md").exists()

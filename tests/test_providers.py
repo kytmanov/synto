@@ -534,6 +534,23 @@ def test_list_models_detailed_local_provider_not_labelled_cloud():
     assert detailed == [{"name": "google/gemma-4-e4b", "size_gb": "(local)"}]
 
 
+@pytest.mark.parametrize(
+    ("base_url", "provider_name", "expected"),
+    [
+        # LM Studio on another machine on the LAN is still a local server.
+        ("http://192.168.1.138:1234/v1", "lm_studio", True),
+        ("http://desktop.local:1234/v1", "custom", True),
+        ("http://10.0.0.5:8000/v1", "custom", True),
+        ("http://[::1]:8000/v1", "custom", True),
+        ("https://llm.example.com/v1", "custom", False),
+        ("https://api.groq.com/openai/v1", "groq", False),
+    ],
+)
+def test_is_local_covers_lan_servers(base_url, provider_name, expected):
+    client = _make_client(base_url=base_url, provider_name=provider_name)
+    assert client._is_local() is expected
+
+
 def test_embed_batch_no_embeddings_support():
     client = _make_client(supports_embeddings=False)
     with pytest.raises(LLMError, match="does not support embeddings"):

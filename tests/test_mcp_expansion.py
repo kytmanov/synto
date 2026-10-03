@@ -465,3 +465,62 @@ def test_hash_args_passes_through_scalars():
     assert out["ratio"] == 0.5
     assert isinstance(out["name"], str)
     assert len(out["name"]) == 8 and out["name"] != "secret"
+
+
+def _answer_with_selected_pages(vault, monkeypatch, pages: list[str]) -> list[str]:
+    import json
+    from unittest.mock import MagicMock
+
+    from conftest import as_router
+
+    handlers, _config = _build_tools(vault)
+    prompts: list[str] = []
+
+    def side_effect(**kwargs):
+        prompts.append(kwargs["prompt"])
+        if len(prompts) == 1:
+            return json.dumps({"pages": pages})
+        return json.dumps({"answer": "a safe answer", "title": "Safe"})
+
+    client = MagicMock()
+    client.generate.side_effect = side_effect
+
+    from synto import client_factory
+
+    monkeypatch.setattr(client_factory, "build_router", lambda *_a, **_k: as_router(client))
+    handlers["answer_question"]("anything")
+    assert len(prompts) == 2
+    return prompts
+
+
+def test_answer_question_rejects_page_titles_that_escape_the_wiki(vault, db, monkeypatch):
+    """A steered page selection like `sources/../../raw/x` must not load a raw note: the
+    `sources/` prefix would otherwise also exempt it from the visibility gate."""
+    from synto.vault import write_note
+
+    wiki = vault / "wiki"
+    (wiki / "sources").mkdir(parents=True, exist_ok=True)
+    (vault / "raw").mkdir(parents=True, exist_ok=True)
+    write_note(vault / "raw" / "diary.md", {"title": "diary"}, "RAW-PRIVATE-MARKER-c0de")
+    write_note(wiki / ".drafts" / "Draft.md", {"title": "Draft"}, "DRAFT-MARKER-5eed")
+    (wiki / "index.md").write_text("# Wiki Index\n", encoding="utf-8")
+
+    prompts = _answer_with_selected_pages(
+        vault, monkeypatch, ["sources/../../raw/diary", "../raw/diary", ".drafts/Draft"]
+    )
+
+    assert "RAW-PRIVATE-MARKER-c0de" not in prompts[1]
+    assert "DRAFT-MARKER-5eed" not in prompts[1]
+
+
+def test_answer_question_gates_articles_in_a_nested_sources_folder(vault, db, monkeypatch):
+    """Only wiki/sources/ is exempt from MCP visibility — not any folder named `sources`."""
+    wiki = vault / "wiki"
+    nested = wiki / "topics" / "sources"
+    nested.mkdir(parents=True, exist_ok=True)
+    _write_article(nested / "Hidden.md", "NESTED-SECRET-MARKER-ab12", visibility="private")
+    (wiki / "index.md").write_text("# Wiki Index\n\n- [[Hidden]]\n", encoding="utf-8")
+
+    prompts = _answer_with_selected_pages(vault, monkeypatch, ["Hidden"])
+
+    assert "NESTED-SECRET-MARKER-ab12" not in prompts[1]

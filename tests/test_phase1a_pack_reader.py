@@ -205,3 +205,20 @@ def test_pack_reader_rejects_symlink_escape(tmp_path: Path) -> None:
     reader = PackReader(tmp_path)
     with pytest.raises(MalformedPackError):
         reader.read_article("Vector Clocks")
+
+
+@pytest.mark.parametrize(
+    "bad_path",
+    ["C:\\Windows\\evil.md", "C:evil.md", "\\\\server\\share\\evil.md", "..\\evil.md", "/x.md"],
+)
+def test_pack_reader_rejects_paths_unsafe_on_any_os(tmp_path: Path, bad_path: str) -> None:
+    """A pack built on one OS must be rejected the same way when read on another (#108)."""
+    _write_pack(tmp_path)
+    index_path = tmp_path / "index" / "INDEX.json"
+    data = json.loads(index_path.read_text(encoding="utf-8"))
+    data["articles"][0]["path"] = bad_path
+    index_path.write_text(json.dumps(data), encoding="utf-8")
+
+    reader = PackReader(tmp_path)
+    with pytest.raises(MalformedPackError):
+        _ = reader.index

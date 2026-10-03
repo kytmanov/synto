@@ -19,6 +19,7 @@ from click.testing import CliRunner
 
 from synto.cli import cli
 from synto.config import Config, McpConfig
+from synto.models import RawNoteRecord
 from synto.readers import Article, ConceptRef
 from synto.serve import _audit, build_tool_handlers
 from synto.state import StateDB
@@ -636,12 +637,33 @@ def test_doctor_tips_ingest_force_when_no_concept_links(
            VALUES ('s1:p:0', 's1:p:0', 0, 's1', '', '', 'body')"""
     )
     db._conn.commit()
+    db.upsert_raw(RawNoteRecord(path="raw/s1.md", content_hash="h", status="compiled"))
     db._conn.close()
 
     result = runner.invoke(cli, ["doctor", "--vault", str(vault)])
     assert result.exit_code == 0, result.output
     assert "0 concept→segment links" in result.output
     assert "ingest --force" in result.output
+
+
+def test_doctor_no_force_tip_before_first_ingest(
+    vault: Path, runner: CliRunner, fake_provider
+) -> None:
+    """Right after `synto add`, nothing has been ingested yet: a plain ingest creates the
+    links, so recommending --force (re-ingest) would be wrong advice."""
+    db = _open_vault_db(vault)
+    db._conn.execute(
+        """INSERT OR IGNORE INTO source_segments
+           (id, identity, ordinal, source_id, structural_locator, content_hash, text)
+           VALUES ('s1:p:0', 's1:p:0', 0, 's1', '', '', 'body')"""
+    )
+    db._conn.commit()
+    db._conn.close()
+
+    result = runner.invoke(cli, ["doctor", "--vault", str(vault)])
+    assert result.exit_code == 0, result.output
+    assert "ingest --force" not in result.output
+    assert "appear after synto ingest" in result.output
 
 
 def test_doctor_embed_missing_is_advisory_not_unhealthy(
@@ -676,3 +698,72 @@ def test_doctor_embed_missing_is_advisory_not_unhealthy(
     assert "Some checks need attention" not in result.output
     # ...and must not tell the user to pull a model for a feature that isn't wired up.
     assert f"ollama pull {embed_model}" not in result.output
+
+
+def test_lm_studio_loaded_ctx_reads_native_api(monkeypatch: pytest.MonkeyPatch) -> None:
+    from synto.cli import _lm_studio_loaded_ctx
+
+    seen: list[str] = []
+
+    class _Resp:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {
+                "data": [
+                    {"id": "other", "state": "loaded", "loaded_context_length": 4096},
+                    {"id": "org/m", "state": "loaded", "loaded_context_length": 17664},
+                    {"id": "idle", "state": "not-loaded"},
+                ]
+            }
+
+    def _get(url: str, **_kw) -> _Resp:
+        seen.append(url)
+        return _Resp()
+
+    monkeypatch.setattr("httpx.get", _get)
+    assert _lm_studio_loaded_ctx("http://host:1234/v1/", "org/m") == 17664
+    assert seen == ["http://host:1234/api/v0/models"]
+    # Not loaded yet (JIT) or unknown model → no claim.
+    assert _lm_studio_loaded_ctx("http://host:1234/v1", "idle") is None
+    assert _lm_studio_loaded_ctx("http://host:1234/v1", "missing") is None
+
+    def _boom(url: str, **_kw):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr("httpx.get", _boom)
+    assert _lm_studio_loaded_ctx("http://host:1234/v1", "org/m") is None
+
+
+def test_doctor_warns_when_lm_studio_context_is_smaller_than_configured(
+    vault: Path, runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """LM Studio serves at its own loaded context; a smaller one than synto.toml's ctx makes
+    long sources overflow (seen in e2e: 17664 loaded vs heavy ctx 32768)."""
+    (vault / "synto.toml").write_text(
+        '[providers.default]\nname = "lm_studio"\nurl = "http://lmstudio.test:1234/v1"\n\n'
+        '[models.fast]\nprovider = "default"\nmodel = "org/m"\nctx = 8192\n\n'
+        '[models.heavy]\nprovider = "default"\nmodel = "org/m"\nctx = 32768\n',
+        encoding="utf-8",
+    )
+
+    class _Client:
+        def require_healthy(self) -> None:
+            return None
+
+        def list_models(self) -> list[str]:
+            return ["org/m"]
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("synto.client_factory._build_client_for", lambda resolved, cache: _Client())
+    monkeypatch.setattr("synto.cli._lm_studio_loaded_ctx", lambda url, model, key=None: 17664)
+
+    result = runner.invoke(cli, ["doctor", "--vault", str(vault)])
+    assert result.exit_code == 0, result.output
+    out = " ".join(result.output.split())
+    assert "17664-token context, but synto.toml sets ctx = 32768" in out
+    assert "[models.heavy] ctx = 17664" in out
+    assert "sets ctx = 8192" not in out  # fast fits inside the loaded context

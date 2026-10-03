@@ -14,15 +14,26 @@ import re
 from datetime import UTC, datetime
 from pathlib import Path
 
-import fitz  # pymupdf — transitive dep of pymupdf4llm
+import pymupdf as fitz  # transitive dep of pymupdf4llm; the `fitz` alias is deprecated
 import pymupdf4llm
 
 from ..models import BibliographicMetadata, SourceSegment
 from ..state import StateDB
 
-# Heading patterns in pymupdf4llm markdown output
-_ATX_RE = re.compile(r"^#{1,3}\s+(.+)$", re.MULTILINE)
+# Heading patterns in pymupdf4llm markdown output. Before 1.28 every section header was
+# emitted as "##"; 1.28 derives real levels 1-6, so sub-sections arrive as "####" and up.
+_ATX_RE = re.compile(r"^#{1,6}\s+(.+)$", re.MULTILINE)
 _BOLD_RE = re.compile(r"^\*{2}(.+?)\*{2}$", re.MULTILINE)
+# 1.28 renders superscripts (footnote/affiliation marks) as <sup>…</sup>.
+_SUP_RE = re.compile(r"<sup>.*?</sup>", re.IGNORECASE | re.DOTALL)
+_EMPHASIS_RE = re.compile(r"(\*{1,2}|(?<!\w)_|_(?!\w))")
+
+
+def _plain_text(markdown_line: str) -> str:
+    """Heading/title text without superscript marks or bold/italic markers."""
+    text = _SUP_RE.sub("", markdown_line)
+    return re.sub(r"\s+", " ", _EMPHASIS_RE.sub("", text)).strip()
+
 
 # Patterns used to detect mathematical notation in markdown text
 _EQ_PATTERNS = [
@@ -45,12 +56,12 @@ def _detect_equations(text: str, page: int) -> list[str]:
 
 
 def _extract_heading(text: str) -> str | None:
-    """Return first H1-H3 or standalone bold line from the first 400 chars, or None."""
+    """Return first ATX heading or standalone bold line from the first 400 chars, or None."""
     excerpt = text[:400]
     for pat in (_ATX_RE, _BOLD_RE):
         m = pat.search(excerpt)
         if m:
-            return m.group(1).strip()
+            return _plain_text(m.group(1)) or None
     return None
 
 
@@ -342,7 +353,7 @@ def extract_bibliographic_metadata(path: Path, first_page_md: str) -> Bibliograp
     title = meta.get("title", "").strip()
     if not title:
         for line in first_page_md.splitlines():
-            line = line.strip().lstrip("#").strip()
+            line = _plain_text(line.strip().lstrip("#"))
             if line:
                 title = line
                 break

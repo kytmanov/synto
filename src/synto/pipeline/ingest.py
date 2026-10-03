@@ -281,9 +281,11 @@ def _merge_chunk_results(results: list[AnalysisResult]) -> AnalysisResult:
     # conservative min, but with segment-aligned chunks a single thin or peripheral section
     # — title page, references — would drag the whole note down and, via the quality cap in
     # ingest_note, halve the extracted concept count. The note's quality should reflect its
-    # substantive majority, not its weakest section.)
+    # substantive majority, not its weakest section.) A chunk that yielded no concepts is
+    # peripheral by definition, so it only votes when no chunk yielded any.
     quality_rank = {"high": 2, "medium": 1, "low": 0}
-    quality_counts = Counter(r.quality for r in results if r.quality)
+    voters = [r for r in results if r.concepts] or results
+    quality_counts = Counter(r.quality for r in voters if r.quality)
     merged_quality = (
         max(quality_counts, key=lambda q: (quality_counts[q], quality_rank.get(q, 1)))
         if quality_counts
@@ -327,7 +329,9 @@ def _build_segment_units(segments: list, chunk_size: int) -> list[tuple[str, lis
     ids: list[str] = []
     cur_len = 0
     for seg in segments:
-        text = seg["text"]
+        # Stored segments keep the extractor's OCR picture text verbatim (source passages
+        # quote them); only the model's copy is cleaned, as the note-body path does.
+        text = strip_image_text_blocks(seg["text"])
         seg_id = seg["id"]
         add_len = len(text) + 2  # joiner allowance
         if ids and cur_len + add_len > chunk_size:
@@ -1472,8 +1476,24 @@ def _create_source_summary_page(
     if source_url:
         out_meta["source_url"] = source_url
 
+    # `synto add` records the PDF's own title/authors/year/doi in the raw note. The page keeps
+    # its file-stem name (citations link to it), but the reader should see the real title.
+    doc_title = src_meta.get("source_title")
+    doc_title = doc_title.strip() if isinstance(doc_title, str) else ""
+    authors = [a for a in src_meta.get("authors") or [] if isinstance(a, str) and a.strip()]
+    biblio_lines = []
+    if doc_title and doc_title != title:
+        biblio_lines.append(f"- **Title:** {doc_title}")
+    if authors:
+        shown = ", ".join(authors[:3]) + (" et al." if len(authors) > 3 else "")
+        biblio_lines.append(f"- **Authors:** {shown}")
+    if src_meta.get("year"):
+        biblio_lines.append(f"- **Year:** {src_meta['year']}")
+    if src_meta.get("doi"):
+        biblio_lines.append(f"- **DOI:** {src_meta['doi']}")
+
     body_parts = [
-        f"# {title}",
+        f"# {doc_title or title}",
         "",
         "## Summary",
         result.summary,
@@ -1482,6 +1502,7 @@ def _create_source_summary_page(
         concept_lines,
         "",
         "## Source Info",
+        *biblio_lines,
         f"- **Quality:** {result.quality}",
         f"- **Raw file:** {rel_raw}",
         f"- **Ingested:** {now}",

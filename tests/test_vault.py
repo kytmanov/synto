@@ -702,3 +702,38 @@ def test_strip_is_noop_on_clean_text():
 def test_strip_tolerates_dash_count_and_whitespace():
     body = "**---  Start of picture text  ---**<br>junk<br>**--- End of picture text ---**<br>"
     assert "picture text" not in strip_image_text_blocks(body)
+
+
+def test_ensure_wikilinks_skips_headings_and_links_prose():
+    """Seen in e2e: '## [[FAA Hub]] Classification' — the first occurrence was a heading,
+    so the link landed there and the prose mention stayed plain."""
+    content = "## FAA Hub Classification\n\nThe FAA Hub rules apply.\n\n# FAA Hub"
+    result = ensure_wikilinks(content, ["FAA Hub"])
+    assert result == "## FAA Hub Classification\n\nThe [[FAA Hub]] rules apply.\n\n# FAA Hub"
+
+
+def test_ensure_wikilinks_heading_only_mention_stays_unlinked():
+    content = "### Python\n\nNothing else here."
+    assert ensure_wikilinks(content, ["Python"]) == content
+
+
+@pytest.mark.skipif(__import__("os").name == "nt", reason="POSIX file modes")
+def test_atomic_write_uses_umask_mode_not_mkstemp_private(tmp_path):
+    """mkstemp makes the temp file 0600 and the rename kept it, so every vault note was
+    unreadable to anything not running as the owner (sync daemons, web servers)."""
+    import os
+
+    target = tmp_path / "note.md"
+    vault.atomic_write(target, "hello")
+    mask = os.umask(0)
+    os.umask(mask)
+    assert target.stat().st_mode & 0o777 == 0o666 & ~mask
+
+
+@pytest.mark.skipif(__import__("os").name == "nt", reason="POSIX file modes")
+def test_global_config_stays_private(tmp_path):
+    """The global config can hold provider API keys, so it must stay owner-only."""
+    from synto.global_config import GlobalConfig, _global_config_path, save_global_config
+
+    save_global_config(GlobalConfig(vault=str(tmp_path)))
+    assert _global_config_path().stat().st_mode & 0o777 == 0o600
