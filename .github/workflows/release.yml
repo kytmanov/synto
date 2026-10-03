@@ -13,7 +13,7 @@ jobs:
     name: Tests must pass
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Tag must match the package version
         run: |
@@ -22,9 +22,11 @@ jobs:
           grep -qx "__version__ = \"$VERSION\"" src/synto/__init__.py
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@v10.2.0
         with:
           version: "latest"
+          # A tag push can restore caches written by other refs; keep them out of the publish path.
+          enable-cache: false
 
       - name: Set up Python
         run: uv python install 3.11
@@ -46,7 +48,7 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -67,7 +69,7 @@ jobs:
           echo '----- preview -----'; cat RELEASE_NOTES.md
 
       - name: Create release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           body_path: RELEASE_NOTES.md
           make_latest: true
@@ -81,12 +83,14 @@ jobs:
       id-token: write  # OIDC trusted publishing — no API token needed
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@v10.2.0
         with:
           version: "latest"
+          # A tag push can restore caches written by other refs; keep them out of the publish path.
+          enable-cache: false
 
       - name: Build package
         run: uv build

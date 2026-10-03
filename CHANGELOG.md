@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Changed
+
+- CI and release workflows use the Node 24 versions of their actions (`checkout` v7,
+  `setup-uv` v10.2.0, `upload-artifact` v7, `action-gh-release` v3), ahead of GitHub
+  removing Node 20 from its runners. The release jobs keep the uv cache off.
+
 ## [0.8.0] - 2026-10-01
 
 Synto now handles SQL sources, remembers your vaults (`synto vault`), and shows which
