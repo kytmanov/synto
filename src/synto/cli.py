@@ -4103,8 +4103,10 @@ def _review_single(
 @cli.command()
 @click.option("--vault", "vault_str", envvar=VAULT_ENV_VAR, default=None)
 @click.option(
-    "--fix", is_flag=True, help="Auto-fix missing frontmatter, invalid tags, create stubs"
-)  # noqa: E501
+    "--fix",
+    is_flag=True,
+    help="Auto-fix missing frontmatter, invalid tags, stale draft rows; create stubs",
+)
 @click.option("--stubs-only", is_flag=True, help="Only create stub articles")
 @click.option("--dry-run", is_flag=True, help="Report issues without making changes")
 @click.option("--clear-cache", is_flag=True, help="Delete all LLM cache entries")

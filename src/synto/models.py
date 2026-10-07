@@ -204,6 +204,7 @@ class LintIssue(BaseModel):
         "homonym_filename_collision",
         "manual_relabel_adopted",
         "filename_drift",
+        "stale_draft_row",
     ]
     description: str
     suggestion: str
@@ -226,6 +227,7 @@ _ADVISORY_ISSUE_TYPES = frozenset(
         "stale_legacy_backfill_alias",
         "homonym_filename_collision",
         "manual_relabel_adopted",
+        "stale_draft_row",
     }
 )
 

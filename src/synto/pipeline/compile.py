@@ -1721,6 +1721,16 @@ def compile_notes(
 # ── Approve / Reject ──────────────────────────────────────────────────────────
 
 
+def draft_db_key(config: Config, rel_to_drafts: Path) -> str:
+    """State-DB key for a draft, built from the configured drafts dir.
+
+    Callers resolve draft paths for file I/O, but the key must not come from the resolved
+    path: a symlinked wiki/.drafts resolves outside wiki/ and would miss the row compile
+    wrote under wiki/.drafts/ (#130).
+    """
+    return rel_posix(config.drafts_dir / rel_to_drafts, config.vault)
+
+
 def approve_drafts(
     config: Config,
     db: StateDB,
@@ -1782,7 +1792,7 @@ def verify_drafts(
             )
             continue
 
-        draft_rel = str(draft_path.relative_to(vault_root))
+        draft_rel = draft_db_key(config, rel_to_drafts)
         existing = db.get_article(draft_rel)
         if existing is not None and existing.status == "verified":
             log.debug("Already verified, skipping: %s", draft_path.name)
@@ -1881,7 +1891,7 @@ def publish_drafts(
         # Update state DB before removing the draft — if the process crashes between
         # these two steps the draft is a dangling orphan but the DB is consistent.
         target_rel = str(target.resolve().relative_to(vault_root))
-        draft_rel = str(draft_path.relative_to(vault_root))
+        draft_rel = draft_db_key(config, rel_to_drafts)
         db.publish_article(draft_rel, target_rel)
 
         art = db.get_article(target_rel)
@@ -1946,10 +1956,13 @@ def reject_draft(
             pass
 
     try:
-        draft_rel = str(draft_path.relative_to(config.vault.resolve()))
+        draft_rel = draft_db_key(config, draft_path.relative_to(config.drafts_dir.resolve()))
     except ValueError:
-        log.warning("Draft is outside vault: %s", draft_path)
-        return
+        try:
+            draft_rel = str(draft_path.relative_to(config.vault.resolve()))
+        except ValueError:
+            log.warning("Draft is outside vault: %s", draft_path)
+            return
     article_record = db.get_article(draft_rel)
     db.delete_article(draft_rel)
     if draft_path.exists():

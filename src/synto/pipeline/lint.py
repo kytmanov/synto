@@ -8,9 +8,10 @@ Checks:
   stale            — file hash on disk != DB content_hash (manually edited)
   low_confidence   — confidence < LOW_CONFIDENCE_THRESHOLD
   invalid_tag      — tag that is not a valid Obsidian tag name
+  stale_draft_row  — draft/verified state row that no longer matches a draft file
 
 Fix mode (--fix):
-  Auto-fixes missing_frontmatter and invalid_tag fields.
+  Auto-fixes missing_frontmatter and invalid_tag fields, and repairs stale_draft_row rows.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ from ..markdown_math import (
     restore_markdown_regions,
     sanitize_obsidian_math,
 )
-from ..models import _ADVISORY_ISSUE_TYPES, LintIssue, LintResult
+from ..models import _ADVISORY_ISSUE_TYPES, LintIssue, LintResult, WikiArticleRecord
 from ..sanitize import sanitize_tag, sanitize_tags
 from ..state import StateDB
 from ..vault import _MEDIA_EXTENSIONS, extract_wikilinks, parse_note, sanitize_filename, write_note
@@ -672,6 +673,111 @@ def _all_wiki_pages(config: Config) -> list[Path]:
     return pages
 
 
+_DRAFTS_KEY_PREFIX = "wiki/.drafts/"
+
+
+def _check_stale_draft_rows(
+    config: Config, db: StateDB, issues: list[LintIssue], fix: bool
+) -> None:
+    """Draft/verified state rows that no longer match a draft file (#130).
+
+    Two shapes, both left by approve/verify/reject under a symlinked wiki/.drafts before
+    the fix (the first also by deleting a draft by hand):
+      * a wiki/.drafts/ row whose file is gone, still counted as pending by `synto status`;
+      * a row keyed by the symlink target (e.g. Drafts/X.md) instead of wiki/.drafts/X.md.
+    Split/merge stubs are draft rows under wiki/ proper, so neither shape matches them.
+    """
+    from .compile import draft_db_key
+
+    drafts_root = config.drafts_dir.resolve()
+    for art in db.list_articles():
+        if art.status not in ("draft", "verified"):
+            continue
+        if art.path.startswith(_DRAFTS_KEY_PREFIX):
+            if (config.vault / art.path).exists():
+                continue
+            issues.append(
+                LintIssue(
+                    path=art.path,
+                    issue_type="stale_draft_row",
+                    description=(
+                        f"Draft {art.title!r} is tracked but its file is gone; "
+                        f"`synto status` still counts it as pending."
+                    ),
+                    suggestion="Run `synto maintain --fix` to drop the stale state row.",
+                    auto_fixable=True,
+                )
+            )
+            if fix:
+                _carry_entity_to_published(db, art, art.path)
+                db.delete_article(art.path)
+            continue
+
+        try:
+            rel_to_drafts = (config.vault / art.path).resolve().relative_to(drafts_root)
+        except ValueError:
+            continue
+        canonical = draft_db_key(config, rel_to_drafts)
+        issues.append(
+            LintIssue(
+                path=art.path,
+                issue_type="stale_draft_row",
+                description=(
+                    f"Draft {art.title!r} is tracked as {art.path!r} instead of "
+                    f"{canonical!r} (wiki/.drafts is a symlink)."
+                ),
+                suggestion="Run `synto maintain --fix` to merge it into the wiki/.drafts/ row.",
+                auto_fixable=True,
+            )
+        )
+        if fix:
+            _merge_stray_draft_row(config, db, art, canonical)
+
+
+def _carry_entity_to_published(db: StateDB, art: WikiArticleRecord, draft_key: str) -> None:
+    """Copy a stale draft row's entity binding onto its published article.
+
+    Approve under a symlinked wiki/.drafts never found the draft row, so it published a
+    fresh row without entity_id; the stale draft row is the only place the binding survives.
+    """
+    if not art.entity_id or db.published_path_for_entity(art.entity_id) is not None:
+        return
+    pub = db.get_article("wiki/" + draft_key.removeprefix(_DRAFTS_KEY_PREFIX))
+    if (
+        pub is None
+        or not pub.is_published
+        or pub.entity_id
+        or pub.title.casefold() != art.title.casefold()
+    ):
+        return
+    db.upsert_article(pub.model_copy(update={"entity_id": art.entity_id}))
+
+
+def _merge_stray_draft_row(
+    config: Config, db: StateDB, stray: WikiArticleRecord, canonical: str
+) -> None:
+    twin = db.get_article(canonical)
+    db.delete_article(stray.path)
+    if twin is None:
+        if (config.vault / canonical).exists():
+            db.upsert_article(stray.model_copy(update={"path": canonical}))
+        else:
+            _carry_entity_to_published(db, stray, canonical)
+        return
+    if stray.is_verified and twin.is_draft:
+        # The verify already ran its side effects (compile state) against the stray row;
+        # only the status and audit fields need to land on the real row.
+        db.upsert_article(
+            twin.model_copy(
+                update={
+                    "status": "verified",
+                    "approved_at": twin.approved_at or stray.approved_at,
+                    "approval_notes": twin.approval_notes or stray.approval_notes,
+                }
+            )
+        )
+
+
 def _check_manual_relabel(config: Config, db: StateDB, issues: list[LintIssue], fix: bool) -> None:
     """Decision 10: adopt a wiki file the user renamed on disk as the new preferred label.
 
@@ -850,6 +956,7 @@ def run_lint(config: Config, db: StateDB, fix: bool = False) -> LintResult:
 
     _check_stale_lock(config, issues)
     _check_filename_drift(config, db, issues)
+    _check_stale_draft_rows(config, db, issues, fix)
 
     title_index = _build_title_index(config, db=db)
     inbound_index = _build_inbound_index(config)
