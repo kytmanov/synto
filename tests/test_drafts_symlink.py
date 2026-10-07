@@ -133,15 +133,22 @@ def _stale_issues(result) -> list[str]:
     return sorted(i.path for i in result.issues if i.issue_type == "stale_draft_row")
 
 
-def test_lint_drops_stale_row_and_restores_entity_binding(config, db):
-    """Pre-fix approve: draft row left behind, published row built without entity_id."""
+@pytest.mark.parametrize("published_title", ["Alpha", "Alpha (edited before approve)"])
+def test_lint_drops_stale_row_and_restores_entity_binding(config, db, published_title):
+    """Pre-fix approve: draft row left behind, published row built without entity_id.
+
+    The published row takes its title from the draft's frontmatter, so a title edited
+    before approve must not stop the binding from carrying over.
+    """
     entity_id = _seed_draft(config, db)
     (config.drafts_dir / "Alpha.md").unlink()
-    (config.wiki_dir / "Alpha.md").write_text("---\ntitle: Alpha\nstatus: published\n---\nB\n")
+    (config.wiki_dir / "Alpha.md").write_text(
+        f"---\ntitle: {published_title}\nstatus: published\n---\nB\n"
+    )
     db.upsert_article(
         WikiArticleRecord(
             path="wiki/Alpha.md",
-            title="Alpha",
+            title=published_title,
             sources=[SOURCE],
             content_hash="h",
             status="published",
@@ -156,9 +163,17 @@ def test_lint_drops_stale_row_and_restores_entity_binding(config, db):
     assert _stale_issues(run_lint(config, db)) == []
 
 
-def test_lint_merges_stray_verified_row_into_tracked_row(config, db):
-    """Pre-fix verify: a second row keyed by the symlink target, the real one untouched."""
+@pytest.mark.parametrize("file_status", ["verified", "draft"])
+def test_lint_merges_stray_verified_row_into_tracked_row(config, db, file_status):
+    """Pre-fix verify: a second row keyed by the symlink target, the real one untouched.
+
+    Verify also wrote `status: verified` into the file. If the file says draft, a recompile
+    rewrote it after that verify, and the new draft must not inherit the old approval.
+    """
     _seed_draft(config, db)
+    (config.drafts_dir / "Alpha.md").write_text(
+        f"---\ntitle: Alpha\nstatus: {file_status}\nsources: [{SOURCE}]\n---\nBody.\n"
+    )
     stray_key = _stray_key(config, "Alpha.md")
     approved_at = datetime(2026, 1, 2, 3, 4, 5)
     db.upsert_article(
@@ -176,9 +191,13 @@ def test_lint_merges_stray_verified_row_into_tracked_row(config, db):
     assert _stale_issues(run_lint(config, db)) == [stray_key]
     run_lint(config, db, fix=True)
 
-    assert _rows(db) == {"wiki/.drafts/Alpha.md": "verified"}
     row = db.get_article("wiki/.drafts/Alpha.md")
-    assert (row.approved_at, row.approval_notes) == (approved_at, "ok")
+    if file_status == "verified":
+        assert _rows(db) == {"wiki/.drafts/Alpha.md": "verified"}
+        assert (row.approved_at, row.approval_notes) == (approved_at, "ok")
+    else:
+        assert _rows(db) == {"wiki/.drafts/Alpha.md": "draft"}
+        assert (row.approved_at, row.approval_notes) == (None, None)
 
 
 def test_lint_rekeys_stray_row_without_tracked_twin(config, db):

@@ -739,16 +739,13 @@ def _carry_entity_to_published(db: StateDB, art: WikiArticleRecord, draft_key: s
 
     Approve under a symlinked wiki/.drafts never found the draft row, so it published a
     fresh row without entity_id; the stale draft row is the only place the binding survives.
+    Matched by path, not title, like a working approve: the fresh row took its title from
+    the draft's frontmatter, which the user may have edited.
     """
     if not art.entity_id or db.published_path_for_entity(art.entity_id) is not None:
         return
     pub = db.get_article("wiki/" + draft_key.removeprefix(_DRAFTS_KEY_PREFIX))
-    if (
-        pub is None
-        or not pub.is_published
-        or pub.entity_id
-        or pub.title.casefold() != art.title.casefold()
-    ):
+    if pub is None or not pub.is_published or pub.entity_id or pub.kind != "concept":
         return
     db.upsert_article(pub.model_copy(update={"entity_id": art.entity_id}))
 
@@ -764,9 +761,10 @@ def _merge_stray_draft_row(
         else:
             _carry_entity_to_published(db, stray, canonical)
         return
-    if stray.is_verified and twin.is_draft:
+    if stray.is_verified and twin.is_draft and _draft_file_is_verified(config.vault / canonical):
         # The verify already ran its side effects (compile state) against the stray row;
-        # only the status and audit fields need to land on the real row.
+        # only the status and audit fields need to land on the real row. The file check
+        # matters: a recompile after that verify rewrites the draft as unreviewed.
         db.upsert_article(
             twin.model_copy(
                 update={
@@ -776,6 +774,14 @@ def _merge_stray_draft_row(
                 }
             )
         )
+
+
+def _draft_file_is_verified(path: Path) -> bool:
+    try:
+        meta, _ = parse_note(path)
+    except Exception:
+        return False
+    return meta.get("status") == "verified"
 
 
 def _check_manual_relabel(config: Config, db: StateDB, issues: list[LintIssue], fix: bool) -> None:
