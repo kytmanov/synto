@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **`approve`, `verify` and `reject` work when `wiki/.drafts` is a symlink (#130).** They
+  built the state-DB key from the resolved draft path, so a symlinked drafts folder
+  (`wiki/.drafts -> ../Drafts`, used to make drafts visible in Obsidian) produced
+  `Drafts/X.md` instead of the `wiki/.drafts/X.md` key compile wrote. Approve and reject
+  left the draft row behind, so `synto status` kept counting it as pending. Approve also
+  published a new row without the concept's entity binding. Reject did not queue the
+  concept for recompile. Verify added a second row. The key now comes from the drafts
+  folder as configured.
+
+- **`synto maintain` reports draft rows that no longer match a draft file, and `--fix`
+  repairs them.** This covers rows left by the bug above and rows for drafts deleted by
+  hand. The fix drops rows whose file is gone, merges `Drafts/X.md`-style rows into the
+  `wiki/.drafts/` row, and copies a dropped row's entity binding onto its published
+  article when that article lost it. Concepts rejected while the bug was active are not
+  re-queued; recompile one with `synto compile --concept "<name>"` if needed.
+
 ## [0.8.0] - 2026-10-01
 
 Synto now handles SQL sources, remembers your vaults (`synto vault`), and shows which
