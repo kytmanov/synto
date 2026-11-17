@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import llm_prices
+
 
 @dataclass(frozen=True)
 class Price:
@@ -16,16 +18,24 @@ _DEFAULT_PRICES: dict[str, Price] = {
     "gemma4:e4b": Price(0.0, 0.0, is_cloud=False),
     "google/gemma-4-e4b": Price(0.0, 0.0, is_cloud=False),
     "qwen2.5:14b": Price(0.0, 0.0, is_cloud=False),
-    "claude-opus-4-7": Price(15.0, 75.0, is_cloud=True),
+    "claude-opus-4-7": Price(5.0, 25.0, is_cloud=True),
     "claude-sonnet-4-6": Price(3.0, 15.0, is_cloud=True),
-    "claude-haiku-4-5-20251001": Price(0.8, 4.0, is_cloud=True),
+    "claude-haiku-4-5-20251001": Price(1.0, 5.0, is_cloud=True),
 }
 
 _CLOUD_PROVIDERS = {"anthropic", "azure-openai", "groq", "openai", "together"}
 
 
 def lookup(model_name: str) -> Price | None:
-    return _DEFAULT_PRICES.get(model_name)
+    price = _DEFAULT_PRICES.get(model_name)
+    if price is not None:
+        return price
+    # Cloud models not in the table: list prices from llm-prices, read from each
+    # provider's pricing page and dated per row.
+    listed = llm_prices.lookup(model_name)
+    if listed is None or listed.input is None or listed.output is None:
+        return None
+    return Price(listed.input, listed.output, is_cloud=True)
 
 
 def is_cloud_provider(provider_name: str) -> bool:

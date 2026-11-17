@@ -395,6 +395,15 @@ wheels = [
 ]
 
 [[package]]
+name = "llm-prices"
+version = "1.4.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/1b/4d/72d0b8776044a382a38d2fd64a2a4422ac538cc3310092dddbdfe758816f/llm_prices-1.4.0.tar.gz", hash = "sha256:b80e3c2de773d7bdc661caed7d4375f1b0c31d2153449411390cd5aa7e22b7ed", size = 42803, upload-time = "2026-11-17T01:46:34.879Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/84/e0/c9aff0833b371375c72809d89a46ebedeac51408c036f07d03d1b6146f64/llm_prices-1.4.0-py3-none-any.whl", hash = "sha256:4a11e45387d277ccb12b0cfa5141bcc2f5ed5dc9aa968e5e1722dc26c458a4f8", size = 34073, upload-time = "2026-11-17T01:46:33.634Z" },
+]
+
+[[package]]
 name = "markdown-it-py"
 version = "4.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1195,6 +1204,7 @@ dependencies = [
     { name = "click" },
     { name = "httpx" },
     { name = "jsonschema" },
+    { name = "llm-prices" },
     { name = "mcp" },
     { name = "pydantic" },
     { name = "pymupdf4llm" },
@@ -1219,6 +1229,7 @@ requires-dist = [
     { name = "click", specifier = ">=8.3.3" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "jsonschema", specifier = ">=4.0" },
+    { name = "llm-prices", specifier = ">=1.4.0" },
     { name = "mcp", specifier = ">=1.10,<2.0" },
     { name = "pydantic", specifier = ">=2.0" },
     { name = "pymupdf4llm", specifier = ">=1.28.2" },

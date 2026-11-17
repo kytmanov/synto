@@ -32,6 +32,7 @@ dependencies = [
     "pymupdf4llm>=1.28.2",
     "mcp>=1.10,<2.0",
     "tomli-w>=1.2.0",
+    "llm-prices>=1.4.0",
 ]
 
 [project.urls]
