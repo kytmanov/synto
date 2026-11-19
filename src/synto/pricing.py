@@ -16,9 +16,9 @@ _DEFAULT_PRICES: dict[str, Price] = {
     "gemma4:e4b": Price(0.0, 0.0, is_cloud=False),
     "google/gemma-4-e4b": Price(0.0, 0.0, is_cloud=False),
     "qwen2.5:14b": Price(0.0, 0.0, is_cloud=False),
-    "claude-opus-4-7": Price(15.0, 75.0, is_cloud=True),
+    "claude-opus-4-7": Price(5.0, 25.0, is_cloud=True),
     "claude-sonnet-4-6": Price(3.0, 15.0, is_cloud=True),
-    "claude-haiku-4-5-20251001": Price(0.8, 4.0, is_cloud=True),
+    "claude-haiku-4-5-20251001": Price(1.0, 5.0, is_cloud=True),
 }
 
 _CLOUD_PROVIDERS = {"anthropic", "azure-openai", "groq", "openai", "together"}
