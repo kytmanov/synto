@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Security
+
+- **Dependency updates.** `mcp` ≥ 1.30 (GHSA-84m7-p3x7-pcfv: unbounded session
+  accumulation in the Streamable HTTP transport, which `synto serve --transport
+  streamable-http` uses; also three client and bearer-auth advisories that synto's code
+  paths don't reach). Locked `certifi` is 2026.10.23, which drops the emSign root CAs
+  whose intermediate keys were compromised (GHSA-6q48-6c7w-9gw2).
+
 ### Fixed
 
 - **`approve`, `verify` and `reject` work when `wiki/.drafts` is a symlink (#130).** They
